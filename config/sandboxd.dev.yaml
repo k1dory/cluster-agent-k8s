@@ -9,6 +9,10 @@ secrets_dir: var/secrets
 ca:
   dir: var/ca
   cert_ttl: 1h
+gateway:
+  ip: 10.77.77.1
+  caddyfile_out: var/Caddyfile      # rendered only; set caddy_admin to push into a local caddy
+  dns_listen: "127.0.0.1:15353"      # try: dig @127.0.0.1 -p 15353 git.example.com
 runtime: fake
 bootstrap_tokens_file: config/bootstrap-tokens.dev.yaml
 sandbox:

@@ -1,14 +1,20 @@
+{{- if eq .Values.gateway.mode "node" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: {{ include "agent-sandbox.fullname" . }}-config
   labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
 data:
+  Caddyfile.bootstrap: |
+    {
+    	skip_install_trust
+    	admin 127.0.0.1:2019
+    }
   sandboxd.yaml: |
     listen:
-      api: {{ .Values.sandboxd.listen.api | quote }}
-      gateway: {{ .Values.sandboxd.listen.gateway | quote }}
-      ingress: {{ .Values.sandboxd.listen.ingress | quote }}
+      api: ":{{ .Values.gateway.apiPort }}"
+      gateway: "127.0.0.1:8081"
+      ingress: "127.0.0.1:8082"
     api_token: "${SANDBOXD_API_TOKEN}"
     database_url: "${DATABASE_URL}"
     policies_dir: /etc/sandbox/policies
@@ -18,7 +24,13 @@ data:
     ca:
       dir: /var/lib/sandboxd/ca
       cert_ttl: {{ .Values.sandboxd.certTtl }}
-      gateway_ca_file: /etc/sandbox/gateway-root/root.crt
+    gateway:
+      ip: {{ .Values.gateway.ip }}
+      caddy_admin: http://127.0.0.1:2019
+      caddyfile_out: /var/lib/sandboxd/Caddyfile
+      dns_listen: "{{ .Values.gateway.ip }}:53"
+      preview_tls: {{ .Values.gateway.previewTls | quote }}
+      access_log: {{ .Values.gateway.accessLog }}
     runtime: kube
     kube:
       namespace: {{ include "agent-sandbox.agentNamespace" . }}
@@ -26,9 +38,6 @@ data:
       image_pull_policy: {{ .Values.agentImage.pullPolicy }}
       service_account: {{ .Values.agent.serviceAccount }}
       network_attachment: {{ include "agent-sandbox.agentNamespace" . }}/{{ .Values.network.name }}
-      gateway_ip: {{ .Values.agent.gatewayIP }}
-      registrar_url: {{ .Values.agent.registrarUrl }}
-      api_url: {{ .Values.agent.apiUrl }}
       token_audience: {{ .Values.agent.tokenAudience }}
       runtime_class: {{ .Values.agent.runtimeClass | quote }}
       storage_class: {{ .Values.agent.storageClass | quote }}
@@ -62,4 +71,5 @@ metadata:
 data:
 {{- if .Values.policiesFromFiles }}
 {{ (.Files.Glob "policies/*.yaml").AsConfig | indent 2 }}
+{{- end }}
 {{- end }}

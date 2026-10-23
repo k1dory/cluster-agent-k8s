@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=./schema.json
 # backend-dev: full git flow (push is further limited to agent/* branches by Forgejo branch
 # protection and the per-agent token), LLM API, MCP read-only.
 slug: backend-dev

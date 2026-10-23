@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"agent-sandbox/internal/ca"
@@ -57,6 +58,21 @@ type Registrar struct {
 	TTL       time.Duration
 	GatewayCA []byte // root of the gateway's server certificates, handed to the pod
 	Log       *slog.Logger
+
+	mu sync.RWMutex
+}
+
+// SetGatewayCA replaces the gateway root handed to pods (fetched from Caddy at runtime).
+func (r *Registrar) SetGatewayCA(pem []byte) {
+	r.mu.Lock()
+	r.GatewayCA = pem
+	r.mu.Unlock()
+}
+
+func (r *Registrar) gatewayCA() []byte {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.GatewayCA
 }
 
 // BootstrapRequest is the body of POST /bootstrap.
@@ -123,7 +139,7 @@ func (r *Registrar) Bootstrap(ctx context.Context, token string, req BootstrapRe
 	r.log().Info("identity issued", "slug", pod.Slug, "instance", n, "sandbox", pod.SandboxID, "tenant", pod.Tenant, "pod", pod.Name, "serial", in.Serial)
 	return &BootstrapResponse{
 		Instance: n, Slug: pod.Slug, SandboxID: pod.SandboxID, Tenant: pod.Tenant,
-		Cert: string(certPEM), CA: string(r.CA.PEM()), GatewayCA: string(r.GatewayCA), NotAfter: cert.NotAfter,
+		Cert: string(certPEM), CA: string(r.CA.PEM()), GatewayCA: string(r.gatewayCA()), NotAfter: cert.NotAfter,
 	}, nil
 }
 

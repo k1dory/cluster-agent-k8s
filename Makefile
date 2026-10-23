@@ -2,7 +2,7 @@ BIN ?= bin
 REGISTRY ?= registry.example.com/agent-sandbox
 TAG ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 
-.PHONY: build test vet dev images helm-lint caddy-validate clean
+.PHONY: build test vet dev images helm-lint policy-test policy-render clean
 
 build:
 	mkdir -p $(BIN)
@@ -26,11 +26,19 @@ images:
 	docker build -f images/agent/Dockerfile -t $(REGISTRY)/agent:$(TAG) .
 
 helm-lint:
-	cp policies/*.yaml deploy/helm/agent-sandbox/policies/
+	cp policies/*.yaml deploy/helm/agent-sandbox/policies/ && rm -f deploy/helm/agent-sandbox/policies/tests.yaml
 	helm lint deploy/helm/agent-sandbox
+	helm lint deploy/helm/agent-sandbox --set gateway.mode=external
 
-caddy-validate:
-	caddy validate --config deploy/gateway/Caddyfile --adapter caddyfile
+# Policy-as-Code gate, same as CI.
+policy-test: build
+	$(BIN)/sandboxd policy validate policies
+	$(BIN)/sandboxd policy test policies -f policies/tests.yaml
+
+# Show the Caddyfile sandboxd would push for the dev config.
+policy-render: build
+	mkdir -p var/ca
+	$(BIN)/sandboxd policy render -config config/sandboxd.dev.yaml
 
 clean:
 	rm -rf $(BIN) var

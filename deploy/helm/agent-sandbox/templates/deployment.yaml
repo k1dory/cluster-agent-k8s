@@ -1,16 +1,17 @@
+{{- if eq .Values.gateway.mode "node" }}
+# The gateway pod: Caddy and sandboxd share the node's network namespace, so Caddy binds
+# :443/:8443 on the VLAN address and talks to sandboxd on localhost, exactly like the VM layout.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "agent-sandbox.fullname" . }}
   labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: 1
   strategy:
     type: Recreate
   selector:
-    matchLabels:
-      app.kubernetes.io/name: {{ include "agent-sandbox.name" . }}
-      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchLabels: {{- include "agent-sandbox.selector" . | nindent 6 }}
   template:
     metadata:
       labels: {{- include "agent-sandbox.labels" . | nindent 8 }}
@@ -18,12 +19,32 @@ spec:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "agent-sandbox.fullname" . }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector: {{- toYaml .Values.gateway.nodeSelector | nindent 8 }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        fsGroup: 10001
         seccompProfile: { type: RuntimeDefault }
       containers:
+        - name: caddy
+          image: {{ .Values.gateway.caddyImage }}
+          args: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+          {{- if .Values.gateway.caddyEnvSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.gateway.caddyEnvSecret }}
+          {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE"]
+          volumeMounts:
+            - { name: config, mountPath: /etc/caddy/Caddyfile, subPath: Caddyfile.bootstrap, readOnly: true }
+            - { name: caddy-data, mountPath: /data }
+            - { name: caddy-config, mountPath: /config }
         - name: sandboxd
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -31,23 +52,20 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ .Values.existingSecret }}
-          ports:
-            - { name: api, containerPort: 8080 }
-            - { name: gateway, containerPort: 8081 }
-            - { name: ingress, containerPort: 8082 }
           readinessProbe:
-            httpGet: { path: /healthz, port: api }
+            httpGet: { path: /healthz, port: {{ .Values.gateway.apiPort }} }
           livenessProbe:
-            httpGet: { path: /healthz, port: api }
+            httpGet: { path: /healthz, port: {{ .Values.gateway.apiPort }} }
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
-            capabilities: { drop: ["ALL"] }
+            capabilities:
+              drop: ["ALL"]
+              add: ["NET_BIND_SERVICE"]   # DNS on :53
           volumeMounts:
             - { name: config, mountPath: /etc/sandbox/sandboxd.yaml, subPath: sandboxd.yaml, readOnly: true }
             - { name: policies, mountPath: /etc/sandbox/policies, readOnly: true }
-            - { name: gateway-root, mountPath: /etc/sandbox/gateway-root, readOnly: true }
-            - { name: ca, mountPath: /var/lib/sandboxd/ca }
+            - { name: var, mountPath: /var/lib/sandboxd }
             {{- if .Values.tenantSecretsSecret }}
             - { name: tenant-secrets, mountPath: /etc/sandbox/secrets, readOnly: true }
             {{- end }}
@@ -56,29 +74,38 @@ spec:
           configMap: { name: {{ include "agent-sandbox.fullname" . }}-config }
         - name: policies
           configMap: { name: {{ include "agent-sandbox.fullname" . }}-policies }
-        - name: gateway-root
-          configMap: { name: {{ .Values.gatewayRootConfigMap }} }
-        - name: ca
-          persistentVolumeClaim: { claimName: {{ include "agent-sandbox.fullname" . }}-ca }
+        - name: var
+          persistentVolumeClaim: { claimName: {{ include "agent-sandbox.fullname" . }}-var }
+        - name: caddy-data
+          persistentVolumeClaim: { claimName: {{ include "agent-sandbox.fullname" . }}-caddy }
+        - name: caddy-config
+          emptyDir: {}
         {{- if .Values.tenantSecretsSecret }}
         - name: tenant-secrets
           secret: { secretName: {{ .Values.tenantSecretsSecret }} }
         {{- end }}
-      {{- with .Values.nodeSelector }}
-      nodeSelector: {{- toYaml . | nindent 8 }}
-      {{- end }}
-      {{- with .Values.tolerations }}
-      tolerations: {{- toYaml . | nindent 8 }}
-      {{- end }}
 ---
-# The agent CA key lives on a small volume; back it up, losing it means re-issuing every identity.
+# Agent CA key and rendered Caddyfile. Losing the CA key means re-issuing every identity: back it up.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "agent-sandbox.fullname" . }}-ca
+  name: {{ include "agent-sandbox.fullname" . }}-var
   labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
 spec:
   accessModes: ["ReadWriteOnce"]
   resources:
     requests:
       storage: {{ .Values.caStorage }}
+---
+# Caddy's internal CA and issued certificates.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "agent-sandbox.fullname" . }}-caddy
+  labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.caStorage }}
+{{- end }}

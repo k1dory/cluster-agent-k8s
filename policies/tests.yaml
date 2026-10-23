@@ -1,0 +1,30 @@
+# Policy expectations. `sandboxd policy test` runs them; CI blocks merges that break them.
+# Line format: "METHOD host/path" (METHOD optional, defaults to GET).
+- slug: backend-dev
+  allow:
+    - GET  git.example.com/org/repo.git/info/refs?service=git-upload-pack
+    - POST git.example.com/org/repo.git/git-upload-pack
+    - POST git.example.com/org/repo.git/git-receive-pack
+    - POST api.anthropic.com/v1/messages
+    - POST mcp.example.com/mcp
+    - GET  api.sandbox.internal/agent/runs/next
+  deny:
+    - GET  api.anthropic.com/v1/messages          # only POST to the LLM API
+    - GET  git.example.com/api/v1/repos            # Forgejo REST API is not git smart HTTP
+    - GET  netbox.example.com/api/dcim/devices/    # not this slug's business
+    - GET  evil.example.com/
+
+- slug: netops
+  allow:
+    - GET  netbox.example.com/api/dcim/devices/?limit=50
+    - GET  git.example.com/infra/netbox.git/info/refs
+  deny:
+    - POST netbox.example.com/api/dcim/devices/    # read-only
+    - POST git.example.com/infra/netbox.git/git-receive-pack   # no push
+
+- slug: unknown-agent          # falls back to default: read-only git + LLM
+  allow:
+    - POST git.example.com/org/repo.git/git-upload-pack
+  deny:
+    - POST git.example.com/org/repo.git/git-receive-pack
+    - POST mcp.example.com/mcp

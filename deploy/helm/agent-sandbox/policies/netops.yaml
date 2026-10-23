@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=./schema.json
 # netops: NetBox read-only plus Git read-only. No push, no LLM key of its own (shared one).
 slug: netops
 allow:

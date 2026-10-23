@@ -1,0 +1,7 @@
+# Minimal Caddyfile the gateway container starts with. sandboxd replaces the whole
+# configuration through the admin API within seconds of starting; this file only has to
+# bring Caddy up with the admin endpoint on localhost. Nothing else is ever edited by hand.
+{
+	skip_install_trust
+	admin 127.0.0.1:2019
+}

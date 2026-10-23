@@ -1,11 +1,23 @@
-sandboxd is deployed as {{ include "agent-sandbox.fullname" . }} in {{ .Release.Namespace }}.
+{{- if eq .Values.gateway.mode "node" }}
+Gateway mode: node. Caddy + sandboxd run on the node labelled {{ toJson .Values.gateway.nodeSelector }}.
+That node needs an interface in the sandbox VLAN with the address {{ .Values.gateway.ip }} and the
+firewall from deploy/gateway/nftables.conf (pods may reach it on 53/443/8443 only).
 
 Before agents can start:
   1. Secret {{ .Values.existingSecret }} with SANDBOXD_API_TOKEN, DATABASE_URL, PREVIEW_TICKET_KEY.
-  2. ConfigMap {{ .Values.gatewayRootConfigMap }} with root.crt = the gateway Caddy internal root.
-  3. Copy the agent CA root out (kubectl exec ... cat /var/lib/sandboxd/ca/ca.crt) to the gateway
-     as /etc/caddy/agent-ca.crt and reload Caddy.
-  4. Point the gateway's Caddy forward_auth / reverse_proxy at
-     {{ include "agent-sandbox.fullname" . }}.{{ .Release.Namespace }}.svc:8081 (or run sandboxd on the gateway VM).
+  2. Point *.{{ .Values.sandboxd.preview.domain }} at the gateway node's public address.
+  3. Push the agent image, set agentImage in values.
+API: http://<gateway node>:{{ .Values.gateway.apiPort }}/docs
+{{- else }}
+Gateway mode: external. Run deploy/gateway/docker-compose.yaml on the gateway VM with a kubeconfig
+built from the token in Secret {{ include "agent-sandbox.fullname" . }}-token:
 
-API docs: port-forward 8080 and open /docs.
+  TOKEN=$(kubectl -n {{ .Release.Namespace }} get secret {{ include "agent-sandbox.fullname" . }}-token -o jsonpath='{.data.token}' | base64 -d)
+  kubectl config view --minify --flatten --raw > kubeconfig
+  kubectl --kubeconfig kubeconfig config set-credentials sandboxd --token="$TOKEN"
+  kubectl --kubeconfig kubeconfig config set-context --current --user=sandboxd --namespace={{ include "agent-sandbox.agentNamespace" . }}
+{{- end }}
+
+Policies live in the chart's policies/ directory (a copy of your policy repository). After a change:
+  sandboxd policy test policies -f policies/tests.yaml && helm upgrade ...
+sandboxd reloads them and re-renders the gateway configuration by itself.

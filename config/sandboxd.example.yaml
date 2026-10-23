@@ -10,7 +10,17 @@ secrets_dir: /etc/sandbox/secrets  # tenants/<tenant>/<name>, shared/<name>
 ca:
   dir: /var/lib/sandboxd/ca        # ca.crt + ca.key for agent identities (generated if missing)
   cert_ttl: 168h                   # 7 days; retirement on pod deletion is what actually revokes
-  gateway_ca_file: /etc/sandbox/gateway-root.crt   # Caddy's internal root, handed to pods
+gateway:                           # sandboxd configures Caddy and serves DNS from the policies
+  ip: 10.77.77.1                   # this host's address on the sandbox VLAN
+  caddy_admin: http://127.0.0.1:2019
+  caddyfile_out: /var/lib/sandboxd/Caddyfile
+  dns_listen: "10.77.77.1:53"
+  api_host: api.sandbox.internal
+  registrar_host: registrar.sandbox.internal
+  registrar_port: 8443
+  preview_tls: ""                  # "" = on-demand certs; "dns cloudflare {env.CF_API_TOKEN}" needs a Caddy build with that module
+  access_log: stdout
+  strict_sni: true
 runtime: kube                      # kube | fake
 kube:
   kubeconfig: ""                   # empty = in-cluster
@@ -18,9 +28,6 @@ kube:
   image: registry.example.com/agent-sandbox/agent:latest
   service_account: agent
   network_attachment: agent-sandbox/sandbox-vlan
-  gateway_ip: 10.77.77.1
-  registrar_url: https://registrar.sandbox.internal:8443
-  api_url: https://api.sandbox.internal
   runtime_class: ""                # "gvisor" or "kata" once the RuntimeClass exists
   storage_class: ""
   volume_size: 10Gi

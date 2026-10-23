@@ -1,0 +1,6 @@
+# Only needed when the preview wildcard uses a DNS provider (gateway.preview_tls: "dns <provider> ...").
+# Pick the module for your provider from https://github.com/caddy-dns and review it before trusting it.
+FROM caddy:2-builder AS builder
+RUN xcaddy build --with github.com/caddy-dns/cloudflare
+FROM caddy:2
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy

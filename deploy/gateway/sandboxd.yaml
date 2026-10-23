@@ -1,0 +1,35 @@
+# sandboxd on the gateway VM (used by docker-compose.yaml). Values come from .env.
+listen:
+  api: ":8080"              # ai-web → here (put it behind your own TLS/firewall)
+  gateway: "127.0.0.1:8081" # Caddy → sandboxd, never exposed
+  ingress: "127.0.0.1:8082" # Caddy preview site → sandboxd
+api_token: "${SANDBOXD_API_TOKEN}"
+database_url: "${DATABASE_URL}"
+policies_dir: /etc/sandbox/policies
+secrets_dir: /etc/sandbox/secrets
+ca:
+  dir: /var/lib/sandboxd/ca
+  cert_ttl: 168h
+gateway:
+  ip: "${GATEWAY_IP}"
+  caddy_admin: http://127.0.0.1:2019
+  caddyfile_out: /var/lib/sandboxd/Caddyfile   # rendered copy, read-only for humans
+  dns_listen: "${GATEWAY_IP}:53"
+  preview_tls: "${PREVIEW_TLS}"
+  access_log: stdout
+runtime: kube
+kube:
+  kubeconfig: /etc/sandbox/kubeconfig
+  namespace: "${K8S_NAMESPACE}"
+  image: "${AGENT_IMAGE}"
+  service_account: agent
+  network_attachment: "${NETWORK_ATTACHMENT}"
+  volume_size: 10Gi
+  harness_command: '${HARNESS_CMD}'
+sandbox:
+  default_idle_timeout: 1h
+preview:
+  domain: "${PREVIEW_DOMAIN}"
+  auth_url: "${PREVIEW_AUTH_URL}"
+  ticket_key: "${PREVIEW_TICKET_KEY}"
+  hits_as_activity: true

@@ -1,0 +1,61 @@
+# Gateway VM: Caddy + sandboxd (+ optional Postgres), all on the host network so Caddy can
+# bind :443/:8443 on every interface and sandboxd can bind DNS on the VLAN address.
+# Copy .env.example to .env, fill it, then: docker compose up -d
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    network_mode: host
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    volumes:
+      - ./Caddyfile.bootstrap:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      # DNS-provider credentials for the preview wildcard, if gateway.preview_tls uses a dns module
+      # (then build Caddy with that module: see images/caddy/Dockerfile.example).
+      - CF_API_TOKEN=${CF_API_TOKEN:-}
+
+  sandboxd:
+    image: ${SANDBOXD_IMAGE:-registry.example.com/agent-sandbox/sandboxd:latest}
+    restart: unless-stopped
+    network_mode: host
+    depends_on: [caddy]
+    command: ["-config", "/etc/sandbox/sandboxd.yaml"]
+    environment:
+      SANDBOXD_API_TOKEN: ${SANDBOXD_API_TOKEN:?set in .env}
+      DATABASE_URL: ${DATABASE_URL:-postgres://sandbox:${POSTGRES_PASSWORD:-sandbox}@127.0.0.1:5432/sandbox?sslmode=disable}
+      PREVIEW_TICKET_KEY: ${PREVIEW_TICKET_KEY:?set in .env}
+      GATEWAY_IP: ${GATEWAY_IP:?set in .env}
+      PREVIEW_DOMAIN: ${PREVIEW_DOMAIN:?set in .env}
+      PREVIEW_AUTH_URL: ${PREVIEW_AUTH_URL:-}
+      PREVIEW_TLS: ${PREVIEW_TLS:-}
+      AGENT_IMAGE: ${AGENT_IMAGE:?set in .env}
+      K8S_NAMESPACE: ${K8S_NAMESPACE:-agent-sandbox}
+      NETWORK_ATTACHMENT: ${NETWORK_ATTACHMENT:-agent-sandbox/sandbox-vlan}
+      HARNESS_CMD: ${HARNESS_CMD:-claude -p "$$SANDBOX_TASK" --output-format stream-json --verbose}
+    volumes:
+      - ./sandboxd.yaml:/etc/sandbox/sandboxd.yaml:ro
+      - ${POLICIES_DIR:-./policies}:/etc/sandbox/policies:ro
+      - ${SECRETS_DIR:-./secrets}:/etc/sandbox/secrets:ro
+      - ${KUBECONFIG_FILE:-./kubeconfig}:/etc/sandbox/kubeconfig:ro
+      - sandboxd_var:/var/lib/sandboxd
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    network_mode: host
+    profiles: ["with-postgres"]   # docker compose --profile with-postgres up -d
+    environment:
+      POSTGRES_USER: sandbox
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sandbox}
+      POSTGRES_DB: sandbox
+    command: ["postgres", "-c", "listen_addresses=127.0.0.1"]
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+
+volumes:
+  caddy_data:
+  caddy_config:
+  sandboxd_var:
+  pg_data:

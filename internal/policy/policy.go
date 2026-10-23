@@ -7,6 +7,7 @@ package policy
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -31,12 +32,31 @@ type Rule struct {
 	Methods []string          `yaml:"methods,omitempty" json:"methods,omitempty"`
 	Inject  map[string]string `yaml:"inject,omitempty" json:"inject,omitempty"`
 	MCP     *MCPRule          `yaml:"mcp,omitempty" json:"mcp,omitempty"`
+	// Upstream overrides where the gateway sends traffic for this host (default https://<host>).
+	// Useful for internal services reachable only by IP, e.g. https://10.0.0.5:8443.
+	Upstream string `yaml:"upstream,omitempty" json:"upstream,omitempty"`
+}
+
+// Policy metadata lets a repository of policies carry ownership and review notes.
+type Meta struct {
+	Owner       string `yaml:"owner,omitempty" json:"owner,omitempty"`
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
 }
 
 // Policy is the egress policy of one slug. Slug "default" applies to slugs without a file.
 type Policy struct {
 	Slug  string `yaml:"slug" json:"slug"`
+	Meta  Meta   `yaml:"meta,omitempty" json:"meta,omitempty"`
 	Allow []Rule `yaml:"allow" json:"allow"`
+}
+
+// Host is one external name the gateway must serve, with its upstream.
+type Host struct {
+	Name     string
+	Upstream string
+	// Injected header names across all slugs: the gateway strips them from incoming requests
+	// so an agent cannot supply its own.
+	Injected []string
 }
 
 // Set is the loaded collection of policies with hot reload.
@@ -61,6 +81,7 @@ func FromPolicies(ps ...*Policy) *Set {
 	s := &Set{bySlug: map[string]*Policy{}}
 	for _, p := range ps {
 		s.bySlug[p.Slug] = p
+		s.stamp += p.Slug + ";"
 	}
 	return s
 }
@@ -74,6 +95,9 @@ func (s *Set) reload() error {
 	bySlug := map[string]*Policy{}
 	var stamp strings.Builder
 	for _, f := range files {
+		if !isPolicyFile(f) {
+			continue
+		}
 		st, err := os.Stat(f)
 		if err != nil {
 			return err
@@ -95,6 +119,9 @@ func (s *Set) reload() error {
 		}
 		bySlug[p.Slug] = &p
 	}
+	if _, err := hostsOf(bySlug); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	s.bySlug = bySlug
 	s.stamp = stamp.String()
@@ -107,6 +134,17 @@ func (p *Policy) Validate() error {
 	for i, r := range p.Allow {
 		if r.Host == "" {
 			return fmt.Errorf("allow[%d]: host is required", i)
+		}
+		if strings.ContainsAny(r.Host, "*/: ") {
+			return fmt.Errorf("allow[%d]: host %q must be a plain DNS name (the gateway issues one certificate per name)", i, r.Host)
+		}
+		if r.Upstream != "" && !strings.HasPrefix(r.Upstream, "https://") && !strings.HasPrefix(r.Upstream, "http://") {
+			return fmt.Errorf("allow[%d] (%s): upstream must start with http:// or https://", i, r.Host)
+		}
+		for _, m := range r.Methods {
+			if m != strings.ToUpper(m) {
+				return fmt.Errorf("allow[%d] (%s): method %q must be upper-case", i, r.Host, m)
+			}
 		}
 		if len(r.Paths) == 0 {
 			return fmt.Errorf("allow[%d] (%s): paths is required, use \"/**\" to allow everything", i, r.Host)
@@ -147,6 +185,9 @@ func (s *Set) reloadIfChanged(old string) error {
 	sort.Strings(files)
 	var stamp strings.Builder
 	for _, f := range files {
+		if !isPolicyFile(f) {
+			continue
+		}
 		st, err := os.Stat(f)
 		if err != nil {
 			continue
@@ -269,4 +310,68 @@ func matchSegs(ps, rs []string) bool {
 		ps, rs = ps[1:], rs[1:]
 	}
 	return len(rs) == 0
+}
+
+// Hosts returns every host the gateway must serve, sorted, with a consistent upstream.
+func (s *Set) Hosts() []Host {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	hs, _ := hostsOf(s.bySlug)
+	return hs
+}
+
+func hostsOf(bySlug map[string]*Policy) ([]Host, error) {
+	byName := map[string]*Host{}
+	for _, p := range bySlug {
+		for _, r := range p.Allow {
+			name := strings.ToLower(r.Host)
+			up := r.Upstream
+			if up == "" {
+				up = "https://" + name
+			}
+			h, ok := byName[name]
+			if !ok {
+				h = &Host{Name: name, Upstream: up}
+				byName[name] = h
+			} else if h.Upstream != up {
+				return nil, fmt.Errorf("host %s has conflicting upstreams %q and %q (slug %s)", name, h.Upstream, up, p.Slug)
+			}
+			for hdr := range r.Inject {
+				h.Injected = appendUnique(h.Injected, http.CanonicalHeaderKey(hdr))
+			}
+		}
+	}
+	out := make([]Host, 0, len(byName))
+	for _, h := range byName {
+		sort.Strings(h.Injected)
+		out = append(out, *h)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func appendUnique(xs []string, x string) []string {
+	for _, y := range xs {
+		if y == x {
+			return xs
+		}
+	}
+	return append(xs, x)
+}
+
+// Fingerprint changes whenever the loaded policies change (used to re-sync the gateway).
+func (s *Set) Fingerprint() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.stamp
+}
+
+// isPolicyFile excludes the expectations file and dot/underscore-prefixed helpers that may
+// live next to the policies (tests.yaml, _template.yaml).
+func isPolicyFile(path string) bool {
+	b := filepath.Base(path)
+	if b == "tests.yaml" || strings.HasSuffix(b, ".test.yaml") || strings.HasPrefix(b, "_") || strings.HasPrefix(b, ".") {
+		return false
+	}
+	return true
 }

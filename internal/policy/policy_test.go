@@ -51,3 +51,41 @@ func TestMatch(t *testing.T) {
 		t.Fatal("default policy must not allow push")
 	}
 }
+
+func TestHostsAndExpectations(t *testing.T) {
+	s := FromPolicies(
+		&Policy{Slug: "a", Allow: []Rule{
+			{Host: "git.example.com", Paths: []string{"/**"}, Inject: map[string]string{"authorization": "x"}},
+			{Host: "internal.example.com", Paths: []string{"/**"}, Upstream: "https://10.0.0.5:8443"},
+		}},
+		&Policy{Slug: "b", Allow: []Rule{{Host: "git.example.com", Paths: []string{"/*/*/info/refs"}}}},
+	)
+	hs := s.Hosts()
+	if len(hs) != 2 || hs[0].Name != "git.example.com" || hs[0].Upstream != "https://git.example.com" || hs[0].Injected[0] != "Authorization" {
+		t.Fatalf("hosts: %+v", hs)
+	}
+	if hs[1].Upstream != "https://10.0.0.5:8443" {
+		t.Fatalf("upstream override lost: %+v", hs[1])
+	}
+	if _, err := hostsOf(map[string]*Policy{
+		"x": {Slug: "x", Allow: []Rule{{Host: "h", Paths: []string{"/"}, Upstream: "https://1"}}},
+		"y": {Slug: "y", Allow: []Rule{{Host: "h", Paths: []string{"/"}, Upstream: "https://2"}}},
+	}); err == nil {
+		t.Fatal("conflicting upstreams must be rejected")
+	}
+	res, err := s.RunTests([]Expectation{{Slug: "b",
+		Allow: []string{"git.example.com/org/repo.git/info/refs", "GET https://git.example.com/o/r/info/refs?service=x"},
+		Deny:  []string{"POST git.example.com/org/repo.git/git-receive-pack", "internal.example.com/"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range res {
+		if !r.Pass() {
+			t.Errorf("%s %s: want %v got %v (%s)", r.Slug, r.Line, r.Want, r.Got, r.Reason)
+		}
+	}
+	bad := &Policy{Slug: "bad", Allow: []Rule{{Host: "*.example.com", Paths: []string{"/"}}}}
+	if err := bad.Validate(); err == nil {
+		t.Fatal("wildcard host must be rejected")
+	}
+}

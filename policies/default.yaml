@@ -1,3 +1,4 @@
+# yaml-language-server: $schema=./schema.json
 # Fallback policy for slugs without their own file. Read-only Git and the LLM API, nothing else.
 slug: default
 allow:

@@ -1,0 +1,12 @@
+{{- if eq .Values.gateway.mode "external" }}
+# Long-lived token for the sandboxd running on the gateway VM. Build its kubeconfig with:
+#   kubectl -n {{ .Release.Namespace }} get secret {{ include "agent-sandbox.fullname" . }}-token -o jsonpath='{.data.token}' | base64 -d
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "agent-sandbox.fullname" . }}-token
+  labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/service-account.name: {{ include "agent-sandbox.fullname" . }}
+type: kubernetes.io/service-account-token
+{{- end }}

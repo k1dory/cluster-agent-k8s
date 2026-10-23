@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -24,8 +25,24 @@ type Config struct {
 	CA          struct {
 		Dir           string        `yaml:"dir"` // ca.crt + ca.key, generated if missing
 		CertTTL       time.Duration `yaml:"cert_ttl"`
-		GatewayCAFile string        `yaml:"gateway_ca_file"` // Caddy root handed to pods
+		GatewayCAFile string        `yaml:"gateway_ca_file"` // optional override; normally fetched from Caddy's admin API
 	} `yaml:"ca"`
+	// Gateway: sandboxd drives Caddy and serves DNS; nothing on the gateway is configured by hand.
+	Gateway struct {
+		IP            string        `yaml:"ip"`             // gateway address on the sandbox VLAN
+		CaddyAdmin    string        `yaml:"caddy_admin"`    // http://127.0.0.1:2019; "" = render only
+		CaddyfileOut  string        `yaml:"caddyfile_out"`  // rendered copy for inspection
+		DNSListen     string        `yaml:"dns_listen"`     // "10.77.77.1:53"; "" disables the built-in DNS
+		APIHost       string        `yaml:"api_host"`       // default api.sandbox.internal
+		RegistrarHost string        `yaml:"registrar_host"` // default registrar.sandbox.internal
+		RegistrarPort int           `yaml:"registrar_port"` // default 8443
+		SandboxdAddr  string        `yaml:"sandboxd_addr"`  // how Caddy reaches listen.gateway (default derived)
+		IngressAddr   string        `yaml:"ingress_addr"`   // how Caddy reaches listen.ingress (default derived)
+		PreviewTLS    string        `yaml:"preview_tls"`    // e.g. "dns cloudflare {env.CF_API_TOKEN}"; "" = on_demand
+		AccessLog     string        `yaml:"access_log"`     // "stdout" or a file path
+		StrictSNI     *bool         `yaml:"strict_sni"`     // default true
+		SyncEvery     time.Duration `yaml:"sync_every"`     // policy → Caddy re-sync interval, default 5s
+	} `yaml:"gateway"`
 	Runtime string `yaml:"runtime"` // kube | fake
 	Kube    struct {
 		Kubeconfig         string            `yaml:"kubeconfig"`
@@ -99,16 +116,62 @@ func Load(path string) (*Config, error) {
 	if c.Kube.TokenAudience == "" {
 		c.Kube.TokenAudience = "agent-sandbox"
 	}
+	if c.Preview.Domain == "" {
+		c.Preview.Domain = "preview.localhost"
+	}
+	g := &c.Gateway
+	if g.APIHost == "" {
+		g.APIHost = "api.sandbox.internal"
+	}
+	if g.RegistrarHost == "" {
+		g.RegistrarHost = "registrar.sandbox.internal"
+	}
+	if g.RegistrarPort == 0 {
+		g.RegistrarPort = 8443
+	}
+	if g.SandboxdAddr == "" {
+		g.SandboxdAddr = loopbackFor(c.Listen.Gateway)
+	}
+	if g.IngressAddr == "" && c.Listen.Ingress != "" {
+		g.IngressAddr = loopbackFor(c.Listen.Ingress)
+	}
+	if g.AccessLog == "" {
+		g.AccessLog = "stdout"
+	}
+	if g.StrictSNI == nil {
+		t := true
+		g.StrictSNI = &t
+	}
+	if g.SyncEvery == 0 {
+		g.SyncEvery = 5 * time.Second
+	}
+	if c.Kube.GatewayIP == "" {
+		c.Kube.GatewayIP = g.IP
+	}
+	if c.Kube.RegistrarURL == "" {
+		c.Kube.RegistrarURL = fmt.Sprintf("https://%s:%d", g.RegistrarHost, g.RegistrarPort)
+	}
+	if c.Kube.APIURL == "" {
+		c.Kube.APIURL = "https://" + g.APIHost
+	}
 	if c.Runtime == "kube" {
-		for k, v := range map[string]string{"kube.image": c.Kube.Image, "kube.network_attachment": c.Kube.NetworkAttachment,
-			"kube.gateway_ip": c.Kube.GatewayIP, "kube.registrar_url": c.Kube.RegistrarURL, "kube.api_url": c.Kube.APIURL} {
+		for k, v := range map[string]string{"kube.image": c.Kube.Image, "kube.network_attachment": c.Kube.NetworkAttachment, "gateway.ip": g.IP} {
 			if v == "" {
 				return nil, fmt.Errorf("%s: %s is required for runtime kube", path, k)
 			}
 		}
 	}
-	if c.Preview.Domain == "" {
-		c.Preview.Domain = "preview.localhost"
-	}
 	return &c, nil
+}
+
+// loopbackFor turns a listen address like ":8081" or "0.0.0.0:8081" into a dial address Caddy can use.
+func loopbackFor(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return listen
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
 }

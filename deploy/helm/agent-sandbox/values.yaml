@@ -1,3 +1,22 @@
+# agent-sandbox Helm chart.
+#
+# gateway.mode decides where the control plane runs:
+#   node      Caddy + sandboxd run as one hostNetwork pod on a cluster node that has an interface
+#             in the sandbox VLAN (label it agent-sandbox.io/gateway=true). Everything via Helm.
+#   external  the gateway is a separate VM (deploy/gateway/docker-compose.yaml); the chart only
+#             creates the cluster-side pieces and a ServiceAccount token for that sandboxd.
+
+gateway:
+  mode: node
+  nodeSelector:
+    agent-sandbox.io/gateway: "true"
+  ip: 10.77.77.1                 # gateway address on the sandbox VLAN
+  caddyImage: caddy:2
+  previewTls: ""                 # "" = on-demand certificates; or "dns cloudflare {env.CF_API_TOKEN}" with a custom Caddy build
+  caddyEnvSecret: ""             # optional Secret with DNS-provider credentials for Caddy
+  accessLog: stdout
+  apiPort: 8080                  # ai-web talks to this on the gateway node's address
+
 image:
   repository: registry.example.com/agent-sandbox/sandboxd
   tag: latest
@@ -8,22 +27,12 @@ agentImage:
   tag: latest
   pullPolicy: IfNotPresent
 
-replicaCount: 1   # the orchestrator keeps in-memory wake state; run one replica
-
 # Secrets are referenced, never written here.
 existingSecret: agent-sandbox-secrets   # keys: SANDBOXD_API_TOKEN, DATABASE_URL, PREVIEW_TICKET_KEY
-caSecret: agent-sandbox-ca              # keys: ca.crt, ca.key (created on first run if `createCA`)
-createCA: true                          # let sandboxd generate the agent CA into an emptyDir+secret? no: use a PVC
-caStorage: 100Mi
-gatewayRootConfigMap: agent-sandbox-gateway-root  # key: root.crt (Caddy's internal root)
-tenantSecretsSecret: ""                 # optional: mounted at /etc/sandbox/secrets (tenants/<t>/<name>)
+tenantSecretsSecret: ""                 # optional: mounted at /etc/sandbox/secrets (tenants/<t>/<name>, shared/<name>)
+caStorage: 100Mi                        # PVC for the agent CA key; back it up
 
 sandboxd:
-  logLevel: info
-  listen:
-    api: ":8080"
-    gateway: ":8081"
-    ingress: ":8082"
   sandbox:
     defaultIdleTimeout: 1h
     readyTimeout: 3m
@@ -39,9 +48,6 @@ sandboxd:
 agent:
   namespace: ""            # defaults to the release namespace
   serviceAccount: agent
-  gatewayIP: 10.77.77.1
-  registrarUrl: https://registrar.sandbox.internal:8443
-  apiUrl: https://api.sandbox.internal
   tokenAudience: agent-sandbox
   runtimeClass: ""         # gvisor | kata later
   storageClass: ""
@@ -70,12 +76,8 @@ network:
     gateway: 10.77.77.1
     exclude: ["10.77.77.1/32"]
 
-service:
-  type: ClusterIP
-
-# Policies: every file under policies/ of the chart becomes a key of the ConfigMap.
+# Policies: every file under policies/ of the chart becomes a key of the ConfigMap (Policy-as-Code:
+# keep that directory a copy of your policy repository, CI runs `sandboxd policy test` before helm upgrade).
 policiesFromFiles: true
 
-nodeSelector: {}
 tolerations: []
-affinity: {}
