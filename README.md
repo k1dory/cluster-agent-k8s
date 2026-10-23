@@ -4,6 +4,8 @@ Run coding agents in isolated Kubernetes pods: one network interface per pod, an
 gateway (Caddy) that enforces per-agent host+path policy and injects secrets, and one Go service
 (`sandboxd`) that owns identities, sandboxes, runs, the preview proxy and the gateway's configuration.
 
+![Architecture](docs/architecture.svg)
+
 Policy-as-Code: `policies/*.yaml` is the single source of truth. From it sandboxd renders the
 Caddy configuration (one TLS site per host, client-certificate check, header stripping), answers
 DNS for exactly those names and decides every request. Nobody edits the gateway by hand.
@@ -64,5 +66,9 @@ curl -s -H 'Authorization: Bearer dev-token' localhost:8080/v1/sandboxes \
 dig @127.0.0.1 -p 15353 git.example.com
 open http://127.0.0.1:8080/docs
 ```
+
+## License
+
+Apache-2.0, see [LICENSE](LICENSE).
 
 Design notes, decisions and the threat model live in the wiki, not here.

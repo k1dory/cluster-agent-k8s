@@ -1,0 +1,205 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="860" viewBox="0 0 1240 860" font-family="Inter, Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#374151"/></marker>
+    <marker id="arrb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1d4ed8"/></marker>
+    <marker id="arrg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#047857"/></marker>
+  </defs>
+  <style>
+    .zone { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.5; stroke-dasharray: 6 4; }
+    .box  { fill: #ffffff; stroke: #334155; stroke-width: 1.5; }
+    .sub  { fill: #eef2ff; stroke: #6366f1; stroke-width: 1.2; }
+    .ext  { fill: #fff7ed; stroke: #ea580c; stroke-width: 1.5; }
+    .pod  { fill: #ecfdf5; stroke: #059669; stroke-width: 1.5; }
+    .t    { fill: #0f172a; }
+    .h    { fill: #0f172a; font-weight: 600; font-size: 14px; }
+    .zt   { fill: #475569; font-weight: 600; font-size: 13px; }
+    .s    { fill: #475569; font-size: 11.5px; }
+    .l    { fill: #374151; font-size: 11.5px; }
+    .lb   { fill: #1d4ed8; font-size: 11.5px; }
+    .lg   { fill: #047857; font-size: 11.5px; font-weight: 600; }
+    .flow { fill: none; stroke: #374151; stroke-width: 1.5; marker-end: url(#arr); }
+    .ctl  { fill: none; stroke: #1d4ed8; stroke-width: 1.5; stroke-dasharray: 5 3; marker-end: url(#arrb); }
+    .egr  { fill: none; stroke: #047857; stroke-width: 2.2; marker-end: url(#arrg); }
+  </style>
+  <rect width="1240" height="860" fill="#ffffff"/>
+  <text x="24" y="32" class="h" font-size="18">agent-sandbox: one interface per pod, one exit through the gateway, identity in the certificate, rules in git</text>
+
+  <!-- column A: inputs -->
+  <rect x="24" y="160" width="230" height="64" rx="8" class="box"/>
+  <text x="40" y="184" class="h">Frontend (ai-web)</text>
+  <text x="40" y="204" class="s">REST + SSE, bearer token → API :8080</text>
+  <path d="M254 192 L 320 192" class="flow"/>
+
+  <rect x="24" y="250" width="230" height="64" rx="8" class="box"/>
+  <text x="40" y="274" class="h">Policy repository (git)</text>
+  <text x="40" y="294" class="s">policies/*.yaml, tests.yaml, CI gate</text>
+  <path d="M254 282 L 320 282" class="ctl"/>
+
+  <rect x="24" y="340" width="230" height="64" rx="8" class="box"/>
+  <text x="40" y="364" class="h">Postgres</text>
+  <text x="40" y="384" class="s">sandboxes, runs, events, identities</text>
+  <path d="M254 372 L 320 372" class="flow"/>
+
+  <!-- browser above caddy -->
+  <rect x="650" y="56" width="230" height="44" rx="8" class="box"/>
+  <text x="666" y="76" class="h">Browser (preview)</text>
+  <text x="666" y="92" class="s">https://shop-lev.preview.example.com</text>
+  <path d="M765 100 L 765 160" class="flow"/>
+
+  <!-- gateway zone -->
+  <rect x="300" y="120" width="600" height="360" rx="10" class="zone"/>
+  <text x="316" y="142" class="zt">GATEWAY  10.77.77.1   a VM with docker compose, or a cluster node via Helm</text>
+
+  <rect x="320" y="160" width="260" height="300" rx="8" class="box"/>
+  <text x="336" y="182" class="h">sandboxd (Go, one binary)</text>
+  <rect x="332" y="196" width="236" height="44" rx="6" class="sub"/>
+  <text x="342" y="213" class="t">orchestrator</text>
+  <text x="342" y="229" class="s">pods, idle sleep, wake, runs, API</text>
+  <rect x="332" y="248" width="236" height="44" rx="6" class="sub"/>
+  <text x="342" y="265" class="t">registrar + CA</text>
+  <text x="342" y="281" class="s">TokenReview, instance n, signs CSR</text>
+  <rect x="332" y="300" width="236" height="44" rx="6" class="sub"/>
+  <text x="342" y="317" class="t">authz</text>
+  <text x="342" y="333" class="s">cert → who, policy → allow + secrets</text>
+  <rect x="332" y="352" width="236" height="44" rx="6" class="sub"/>
+  <text x="342" y="369" class="t">gateway sync + DNS</text>
+  <text x="342" y="385" class="s">renders Caddy config, allowlist DNS</text>
+  <rect x="332" y="404" width="236" height="44" rx="6" class="sub"/>
+  <text x="342" y="421" class="t">ingress</text>
+  <text x="342" y="437" class="s">preview host → pod IP:port, tickets</text>
+
+  <!-- arrows between sandboxd and caddy -->
+  <path d="M650 322 L 568 322" class="flow"/>
+  <text x="609" y="315" class="l" text-anchor="middle">/authz</text>
+  <path d="M568 374 L 650 374" class="ctl"/>
+  <text x="609" y="367" class="lb" text-anchor="middle">config</text>
+
+  <rect x="650" y="160" width="230" height="300" rx="8" class="box"/>
+  <text x="666" y="182" class="h">Caddy</text>
+  <text x="666" y="204" class="s">:443  one TLS site per allowlisted host</text>
+  <text x="666" y="220" class="s">internal CA, client certificate required</text>
+  <text x="666" y="244" class="s">per request: forward_auth → /authz,</text>
+  <text x="666" y="260" class="s">copies secret headers, strips agent's</text>
+  <text x="666" y="276" class="s">own Authorization / X-Api-Key</text>
+  <text x="666" y="300" class="s">:8443  /bootstrap only, no client cert</text>
+  <text x="666" y="324" class="s">:443  *.preview.domain → ingress</text>
+  <text x="666" y="348" class="s">admin API 127.0.0.1:2019: config is</text>
+  <text x="666" y="364" class="s">pushed by sandboxd, never hand-edited</text>
+  <text x="666" y="388" class="s">JSON access log: slug/n, tenant, host,</text>
+  <text x="666" y="404" class="s">path, verdict. Bodies are not logged.</text>
+  <text x="666" y="428" class="s">upstream per site is fixed: SNI or Host</text>
+  <text x="666" y="444" class="s">games cannot redirect traffic</text>
+
+  <!-- egress to external -->
+  <path d="M880 230 L 940 230" class="egr"/>
+
+  <!-- external zone -->
+  <rect x="940" y="120" width="276" height="360" rx="10" class="zone"/>
+  <text x="956" y="142" class="zt">EXTERNAL  allowlist only, via gateway</text>
+  <rect x="960" y="160" width="236" height="76" rx="8" class="ext"/>
+  <text x="976" y="182" class="h">Git (Forgejo, GitHub)</text>
+  <text x="976" y="200" class="s">info/refs, upload-pack, receive-pack</text>
+  <text x="976" y="216" class="s">push only to agent/* (branch protection)</text>
+  <rect x="960" y="252" width="236" height="76" rx="8" class="ext"/>
+  <text x="976" y="274" class="h">LLM API</text>
+  <text x="976" y="292" class="s">key injected per tenant by the gateway,</text>
+  <text x="976" y="308" class="s">the agent never holds it</text>
+  <rect x="960" y="344" width="236" height="76" rx="8" class="ext"/>
+  <text x="976" y="366" class="h">MCP servers (prov1, NetBox…)</text>
+  <text x="976" y="384" class="s">receive X-Agent-Slug/Instance/Tenant and</text>
+  <text x="976" y="400" class="s">X-Agent-Access: read-only from the gateway</text>
+  <text x="960" y="448" class="s">Adding a host = one rule in a policy file.</text>
+  <text x="960" y="464" class="s">sandboxd renders site, DNS and stripping.</text>
+
+  <!-- cluster zone -->
+  <rect x="300" y="520" width="916" height="320" rx="10" class="zone"/>
+  <text x="350" y="542" class="zt">KUBERNETES WORKERS</text>
+  <text x="350" y="558" class="s">sandbox VLAN 10.77.77.0/25, Multus macvlan</text>
+  <text x="350" y="572" class="s">(private) is the pod's only network: no Service,</text>
+  <text x="350" y="586" class="s">no CoreDNS, default route and DNS = 10.77.77.1.</text>
+  <text x="350" y="600" class="s">runc + hardened securityContext now,</text>
+  <text x="350" y="614" class="s">gVisor or Kata later via RuntimeClass.</text>
+
+  <rect x="320" y="632" width="220" height="100" rx="8" class="box"/>
+  <text x="336" y="654" class="h">Kubernetes API</text>
+  <text x="336" y="674" class="s">sandboxd creates/deletes pods</text>
+  <text x="336" y="690" class="s">and PVCs, verifies bootstrap</text>
+  <text x="336" y="706" class="s">tokens with TokenReview</text>
+  <text x="336" y="722" class="s">(kubeconfig or in-cluster)</text>
+  <path d="M330 460 L 330 632" class="flow"/>
+  <text x="338" y="492" class="l">pods, PVCs,</text>
+  <text x="338" y="506" class="l">TokenReview</text>
+  <text x="320" y="760" class="s">Prerequisites on the cluster:</text>
+  <text x="320" y="776" class="s">Multus + whereabouts, a VLAN on</text>
+  <text x="320" y="792" class="s">the worker nodes, nothing else.</text>
+
+  <!-- pods -->
+  <rect x="560" y="586" width="210" height="236" rx="8" class="pod"/>
+  <text x="572" y="606" class="h">pod sb_a1 · 10.77.77.10</text>
+  <text x="572" y="624" class="s">cert backend-dev/7 · tenant lev</text>
+  <rect x="572" y="634" width="186" height="38" rx="6" class="sub"/>
+  <text x="580" y="650" class="t">init: agent-init</text>
+  <text x="580" y="665" class="s">key in tmpfs → CSR → cert + n</text>
+  <rect x="572" y="680" width="186" height="38" rx="6" class="sub"/>
+  <text x="580" y="696" class="t">agent-runner → harness</text>
+  <text x="580" y="711" class="s">polls runs, streams output</text>
+  <rect x="572" y="726" width="186" height="38" rx="6" class="sub"/>
+  <text x="580" y="742" class="t">/workspace PVC</text>
+  <text x="580" y="757" class="s">survives sleep · app on :3000</text>
+  <text x="572" y="784" class="s">idle 1h without user input →</text>
+  <text x="572" y="800" class="s">pod deleted, n retired</text>
+
+  <rect x="780" y="586" width="210" height="236" rx="8" class="pod"/>
+  <text x="792" y="606" class="h">pod sb_b2 · 10.77.77.11</text>
+  <text x="792" y="624" class="s">cert backend-dev/8 · tenant anna</text>
+  <text x="792" y="656" class="s">same slug, same policy,</text>
+  <text x="792" y="672" class="s">own LLM key and Git token</text>
+  <text x="792" y="688" class="s">(resolved by tenant at the gateway)</text>
+  <text x="792" y="720" class="s">pods cannot see each other:</text>
+  <text x="792" y="736" class="s">macvlan private mode plus</text>
+  <text x="792" y="752" class="s">switch port isolation</text>
+
+  <rect x="1000" y="586" width="200" height="236" rx="8" class="pod" stroke-dasharray="5 3"/>
+  <text x="1012" y="606" class="h">sb_c3 · sleeping</text>
+  <text x="1012" y="624" class="s">no pod, PVC kept</text>
+  <text x="1012" y="656" class="s">wakes on a new task,</text>
+  <text x="1012" y="672" class="s">POST /wake or a preview hit</text>
+  <text x="1012" y="704" class="s">new pod → new CSR → n=9</text>
+  <text x="1012" y="720" class="s">old certificate stays rejected</text>
+  <text x="1012" y="736" class="s">by authz even if still valid</text>
+
+  <!-- pod flows up -->
+  <path d="M600 586 C 600 540, 548 520, 548 460" class="flow"/>
+  <text x="612" y="552" class="l">DNS :53 → gateway IP</text>
+  <text x="612" y="566" class="l">or NXDOMAIN</text>
+  <path d="M700 586 L 700 460" class="egr"/>
+  <text x="708" y="488" class="lg">:443 mTLS</text>
+  <text x="708" y="503" class="lg">client cert = identity</text>
+  <text x="708" y="518" class="lg">the only way out</text>
+  <path d="M850 586 L 850 460" class="flow"/>
+  <text x="858" y="488" class="l">:8443 bootstrap</text>
+  <text x="858" y="502" class="l">once per pod</text>
+
+  <!-- legend -->
+  <text x="24" y="440" class="zt">Legend</text>
+  <line x1="24" y1="458" x2="64" y2="458" class="egr"/><text x="72" y="462" class="l">agent egress</text>
+  <line x1="24" y1="480" x2="64" y2="480" class="flow"/><text x="72" y="484" class="l">control and data</text>
+  <line x1="24" y1="502" x2="64" y2="502" class="ctl"/><text x="72" y="506" class="l">configuration from policies</text>
+
+  <text x="24" y="540" class="zt">Who vs what</text>
+  <text x="24" y="558" class="s">Certificate says WHO:</text>
+  <text x="24" y="574" class="s">spiffe://sandbox/agent/{slug}/{n},</text>
+  <text x="24" y="590" class="s">/sandbox/{id}, /tenant/{tenant}.</text>
+  <text x="24" y="606" class="s">Policy says WHAT: host + path +</text>
+  <text x="24" y="622" class="s">method per slug, deny by default.</text>
+  <text x="24" y="638" class="s">secret:NAME resolves per tenant at</text>
+  <text x="24" y="654" class="s">the gateway, never inside the pod.</text>
+
+  <text x="24" y="690" class="zt">Yes, it is TLS interception</text>
+  <text x="24" y="708" class="s">Pods trust Caddy's internal root, so</text>
+  <text x="24" y="724" class="s">the gateway sees paths and injects</text>
+  <text x="24" y="740" class="s">secrets. SNI is not identity. The</text>
+  <text x="24" y="756" class="s">firewall lets pods reach only</text>
+  <text x="24" y="772" class="s">53/443/8443 on the gateway;</text>
+  <text x="24" y="788" class="s">nothing else leaves the VLAN.</text>
+</svg>
