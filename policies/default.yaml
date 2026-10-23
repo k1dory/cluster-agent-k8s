@@ -1,0 +1,11 @@
+# Fallback policy for slugs without their own file. Read-only Git and the LLM API, nothing else.
+slug: default
+allow:
+  - host: git.example.com
+    paths: ["/*/*/info/refs", "/*/*/git-upload-pack"]
+    inject:
+      Authorization: "Basic secret:forgejo-basic"
+  - host: api.anthropic.com
+    paths: ["/v1/**"]
+    inject:
+      x-api-key: "secret:anthropic"

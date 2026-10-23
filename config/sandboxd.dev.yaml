@@ -1,0 +1,19 @@
+# Local development: no Kubernetes, no Postgres. `make dev` uses this file.
+listen:
+  api: "127.0.0.1:8080"
+  gateway: "127.0.0.1:8081"
+  ingress: "127.0.0.1:8082"
+api_token: "dev-token"
+policies_dir: policies
+secrets_dir: var/secrets
+ca:
+  dir: var/ca
+  cert_ttl: 1h
+runtime: fake
+bootstrap_tokens_file: config/bootstrap-tokens.dev.yaml
+sandbox:
+  default_idle_timeout: 1h
+  idle_check_every: 10s
+preview:
+  domain: preview.localhost
+  ticket_key: dev-ticket-key

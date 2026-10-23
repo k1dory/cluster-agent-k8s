@@ -1,0 +1,43 @@
+# sandboxd configuration. ${VAR} is expanded from the environment, so secrets stay out of git.
+listen:
+  api: ":8080"             # frontend (ai-web) → bearer token
+  gateway: "127.0.0.1:8081" # Caddy only: /authz, /bootstrap, /agent/*
+  ingress: ":8082"          # preview proxy; Caddy *.preview.<domain> → here
+api_token: "${SANDBOXD_API_TOKEN}"
+database_url: "${DATABASE_URL}"   # empty = in-memory (dev only)
+policies_dir: policies
+secrets_dir: /etc/sandbox/secrets  # tenants/<tenant>/<name>, shared/<name>
+ca:
+  dir: /var/lib/sandboxd/ca        # ca.crt + ca.key for agent identities (generated if missing)
+  cert_ttl: 168h                   # 7 days; retirement on pod deletion is what actually revokes
+  gateway_ca_file: /etc/sandbox/gateway-root.crt   # Caddy's internal root, handed to pods
+runtime: kube                      # kube | fake
+kube:
+  kubeconfig: ""                   # empty = in-cluster
+  namespace: agent-sandbox
+  image: registry.example.com/agent-sandbox/agent:latest
+  service_account: agent
+  network_attachment: agent-sandbox/sandbox-vlan
+  gateway_ip: 10.77.77.1
+  registrar_url: https://registrar.sandbox.internal:8443
+  api_url: https://api.sandbox.internal
+  runtime_class: ""                # "gvisor" or "kata" once the RuntimeClass exists
+  storage_class: ""
+  volume_size: 10Gi
+  cpu_request: 250m
+  cpu_limit: "2"
+  memory_request: 1Gi
+  memory_limit: 4Gi
+  harness_command: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose'
+  env:
+    ANTHROPIC_BASE_URL: https://api.anthropic.com   # the gateway injects the real key
+sandbox:
+  default_idle_timeout: 1h
+  ready_timeout: 3m
+  idle_check_every: 1m
+preview:
+  domain: preview.example.com
+  auth_url: https://ai.example.com/api/preview/auth   # frontend checks the user, mints a ticket
+  ticket_key: "${PREVIEW_TICKET_KEY}"
+  cookie_ttl: 1h
+  hits_as_activity: true

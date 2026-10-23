@@ -1,0 +1,25 @@
+# Requires Multus and whereabouts to be installed on the cluster.
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: {{ .Values.network.name }}
+  namespace: {{ include "agent-sandbox.agentNamespace" . }}
+  labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "name": {{ .Values.network.name | quote }},
+      "type": "macvlan",
+      "master": {{ .Values.network.master | quote }},
+      "mode": {{ .Values.network.mode | quote }},
+      "ipam": {
+        "type": {{ .Values.network.ipam.type | quote }},
+        "range": {{ .Values.network.ipam.range | quote }},
+        "range_start": {{ .Values.network.ipam.range_start | quote }},
+        "range_end": {{ .Values.network.ipam.range_end | quote }},
+        "exclude": {{ .Values.network.ipam.exclude | toJson }},
+        "gateway": {{ .Values.network.ipam.gateway | quote }},
+        "routes": [ { "dst": "0.0.0.0/0", "gw": {{ .Values.network.ipam.gateway | quote }} } ]
+      }
+    }

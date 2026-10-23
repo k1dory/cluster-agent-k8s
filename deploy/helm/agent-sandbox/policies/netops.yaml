@@ -1,0 +1,18 @@
+# netops: NetBox read-only plus Git read-only. No push, no LLM key of its own (shared one).
+slug: netops
+allow:
+  - host: git.example.com
+    paths: ["/*/*/info/refs", "/*/*/git-upload-pack"]
+    inject:
+      Authorization: "Basic secret:forgejo-basic"
+  - host: netbox.example.com
+    paths: ["/api/**"]
+    methods: [GET, HEAD]
+    inject:
+      Authorization: "Token secret:netbox"
+  - host: api.anthropic.com
+    paths: ["/v1/**"]
+    inject:
+      x-api-key: "secret:anthropic"
+  - host: api.sandbox.internal
+    paths: ["/agent/**"]

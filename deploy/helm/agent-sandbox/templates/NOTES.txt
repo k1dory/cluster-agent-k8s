@@ -1,0 +1,11 @@
+sandboxd is deployed as {{ include "agent-sandbox.fullname" . }} in {{ .Release.Namespace }}.
+
+Before agents can start:
+  1. Secret {{ .Values.existingSecret }} with SANDBOXD_API_TOKEN, DATABASE_URL, PREVIEW_TICKET_KEY.
+  2. ConfigMap {{ .Values.gatewayRootConfigMap }} with root.crt = the gateway Caddy internal root.
+  3. Copy the agent CA root out (kubectl exec ... cat /var/lib/sandboxd/ca/ca.crt) to the gateway
+     as /etc/caddy/agent-ca.crt and reload Caddy.
+  4. Point the gateway's Caddy forward_auth / reverse_proxy at
+     {{ include "agent-sandbox.fullname" . }}.{{ .Release.Namespace }}.svc:8081 (or run sandboxd on the gateway VM).
+
+API docs: port-forward 8080 and open /docs.

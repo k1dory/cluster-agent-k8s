@@ -1,0 +1,65 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "agent-sandbox.fullname" . }}-config
+  labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
+data:
+  sandboxd.yaml: |
+    listen:
+      api: {{ .Values.sandboxd.listen.api | quote }}
+      gateway: {{ .Values.sandboxd.listen.gateway | quote }}
+      ingress: {{ .Values.sandboxd.listen.ingress | quote }}
+    api_token: "${SANDBOXD_API_TOKEN}"
+    database_url: "${DATABASE_URL}"
+    policies_dir: /etc/sandbox/policies
+    {{- if .Values.tenantSecretsSecret }}
+    secrets_dir: /etc/sandbox/secrets
+    {{- end }}
+    ca:
+      dir: /var/lib/sandboxd/ca
+      cert_ttl: {{ .Values.sandboxd.certTtl }}
+      gateway_ca_file: /etc/sandbox/gateway-root/root.crt
+    runtime: kube
+    kube:
+      namespace: {{ include "agent-sandbox.agentNamespace" . }}
+      image: "{{ .Values.agentImage.repository }}:{{ .Values.agentImage.tag }}"
+      image_pull_policy: {{ .Values.agentImage.pullPolicy }}
+      service_account: {{ .Values.agent.serviceAccount }}
+      network_attachment: {{ include "agent-sandbox.agentNamespace" . }}/{{ .Values.network.name }}
+      gateway_ip: {{ .Values.agent.gatewayIP }}
+      registrar_url: {{ .Values.agent.registrarUrl }}
+      api_url: {{ .Values.agent.apiUrl }}
+      token_audience: {{ .Values.agent.tokenAudience }}
+      runtime_class: {{ .Values.agent.runtimeClass | quote }}
+      storage_class: {{ .Values.agent.storageClass | quote }}
+      volume_size: {{ .Values.agent.volumeSize }}
+      cpu_request: {{ .Values.agent.resources.cpuRequest | quote }}
+      cpu_limit: {{ .Values.agent.resources.cpuLimit | quote }}
+      memory_request: {{ .Values.agent.resources.memoryRequest | quote }}
+      memory_limit: {{ .Values.agent.resources.memoryLimit | quote }}
+      harness_command: {{ .Values.agent.harnessCommand | quote }}
+      termination_seconds: {{ .Values.agent.terminationSeconds }}
+      env:
+        {{- range $k, $v := .Values.agent.env }}
+        {{ $k }}: {{ $v | quote }}
+        {{- end }}
+    sandbox:
+      default_idle_timeout: {{ .Values.sandboxd.sandbox.defaultIdleTimeout }}
+      ready_timeout: {{ .Values.sandboxd.sandbox.readyTimeout }}
+      idle_check_every: {{ .Values.sandboxd.sandbox.idleCheckEvery }}
+    preview:
+      domain: {{ .Values.sandboxd.preview.domain }}
+      auth_url: {{ .Values.sandboxd.preview.authUrl | quote }}
+      ticket_key: "${PREVIEW_TICKET_KEY}"
+      cookie_ttl: {{ .Values.sandboxd.preview.cookieTtl }}
+      hits_as_activity: {{ .Values.sandboxd.preview.hitsAsActivity }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "agent-sandbox.fullname" . }}-policies
+  labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
+data:
+{{- if .Values.policiesFromFiles }}
+{{ (.Files.Glob "policies/*.yaml").AsConfig | indent 2 }}
+{{- end }}

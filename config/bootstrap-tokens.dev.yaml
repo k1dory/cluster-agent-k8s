@@ -1,0 +1,8 @@
+# Static bootstrap tokens for runtime: fake (stands in for Kubernetes TokenReview).
+# token → pod. The sandbox id must exist (create it through the API first and put its id here).
+dev-token-pod-1:
+  name: agent-dev-1
+  namespace: agent-sandbox
+  sandboxid: REPLACE_WITH_SANDBOX_ID
+  slug: backend-dev
+  tenant: lev

@@ -1,0 +1,84 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agent-sandbox.fullname" . }}
+  labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "agent-sandbox.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels: {{- include "agent-sandbox.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "agent-sandbox.fullname" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: sandboxd
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["-config", "/etc/sandbox/sandboxd.yaml"]
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          ports:
+            - { name: api, containerPort: 8080 }
+            - { name: gateway, containerPort: 8081 }
+            - { name: ingress, containerPort: 8082 }
+          readinessProbe:
+            httpGet: { path: /healthz, port: api }
+          livenessProbe:
+            httpGet: { path: /healthz, port: api }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: config, mountPath: /etc/sandbox/sandboxd.yaml, subPath: sandboxd.yaml, readOnly: true }
+            - { name: policies, mountPath: /etc/sandbox/policies, readOnly: true }
+            - { name: gateway-root, mountPath: /etc/sandbox/gateway-root, readOnly: true }
+            - { name: ca, mountPath: /var/lib/sandboxd/ca }
+            {{- if .Values.tenantSecretsSecret }}
+            - { name: tenant-secrets, mountPath: /etc/sandbox/secrets, readOnly: true }
+            {{- end }}
+      volumes:
+        - name: config
+          configMap: { name: {{ include "agent-sandbox.fullname" . }}-config }
+        - name: policies
+          configMap: { name: {{ include "agent-sandbox.fullname" . }}-policies }
+        - name: gateway-root
+          configMap: { name: {{ .Values.gatewayRootConfigMap }} }
+        - name: ca
+          persistentVolumeClaim: { claimName: {{ include "agent-sandbox.fullname" . }}-ca }
+        {{- if .Values.tenantSecretsSecret }}
+        - name: tenant-secrets
+          secret: { secretName: {{ .Values.tenantSecretsSecret }} }
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+# The agent CA key lives on a small volume; back it up, losing it means re-issuing every identity.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "agent-sandbox.fullname" . }}-ca
+  labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.caStorage }}

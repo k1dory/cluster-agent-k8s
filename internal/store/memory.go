@@ -1,0 +1,254 @@
+package store
+
+import (
+	"context"
+	"sort"
+	"sync"
+	"time"
+
+	"agent-sandbox/internal/model"
+)
+
+// Memory is an in-memory Store for tests and `runtime: fake` development.
+type Memory struct {
+	mu        sync.Mutex
+	sandboxes map[string]*model.Sandbox
+	runs      map[string]*model.Run
+	events    []*model.Event
+	instances map[int]*model.Instance
+	nextInst  int
+	nextEvent int64
+}
+
+// NewMemory returns an empty in-memory store.
+func NewMemory() *Memory {
+	return &Memory{
+		sandboxes: map[string]*model.Sandbox{},
+		runs:      map[string]*model.Run{},
+		instances: map[int]*model.Instance{},
+	}
+}
+
+func cloneSandbox(s *model.Sandbox) *model.Sandbox {
+	c := *s
+	if s.Preview != nil {
+		p := *s.Preview
+		c.Preview = &p
+	}
+	return &c
+}
+
+func (m *Memory) CreateSandbox(_ context.Context, s *model.Sandbox) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sandboxes[s.ID] = cloneSandbox(s)
+	return nil
+}
+
+func (m *Memory) GetSandbox(_ context.Context, id string) (*model.Sandbox, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.sandboxes[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return cloneSandbox(s), nil
+}
+
+func (m *Memory) ListSandboxes(_ context.Context) ([]*model.Sandbox, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]*model.Sandbox, 0, len(m.sandboxes))
+	for _, s := range m.sandboxes {
+		out = append(out, cloneSandbox(s))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (m *Memory) UpdateSandbox(_ context.Context, s *model.Sandbox) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.sandboxes[s.ID]; !ok {
+		return ErrNotFound
+	}
+	m.sandboxes[s.ID] = cloneSandbox(s)
+	return nil
+}
+
+func (m *Memory) DeleteSandbox(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.sandboxes[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.sandboxes, id)
+	return nil
+}
+
+func (m *Memory) SandboxByPreviewHost(_ context.Context, host string) (*model.Sandbox, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, s := range m.sandboxes {
+		if s.Preview != nil && s.Preview.Host == host {
+			return cloneSandbox(s), nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (m *Memory) CreateRun(_ context.Context, r *model.Run) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := *r
+	m.runs[r.ID] = &c
+	return nil
+}
+
+func (m *Memory) GetRun(_ context.Context, id string) (*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	c := *r
+	return &c, nil
+}
+
+func (m *Memory) UpdateRun(_ context.Context, r *model.Run) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.runs[r.ID]; !ok {
+		return ErrNotFound
+	}
+	c := *r
+	m.runs[r.ID] = &c
+	return nil
+}
+
+func (m *Memory) runsOf(sandboxID string) []*model.Run {
+	var out []*model.Run
+	for _, r := range m.runs {
+		if r.SandboxID == sandboxID {
+			c := *r
+			out = append(out, &c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out
+}
+
+func (m *Memory) ListRuns(_ context.Context, sandboxID string) ([]*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.runsOf(sandboxID), nil
+}
+
+func (m *Memory) NextQueuedRun(_ context.Context, sandboxID string) (*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.runsOf(sandboxID) {
+		if r.Status == model.RunQueued {
+			return r, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (m *Memory) RunningRun(_ context.Context, sandboxID string) (*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.runsOf(sandboxID) {
+		if r.Status == model.RunRunning {
+			return r, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (m *Memory) AppendEvent(_ context.Context, e *model.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextEvent++
+	e.ID = m.nextEvent
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
+	c := *e
+	m.events = append(m.events, &c)
+	return nil
+}
+
+func (m *Memory) ListEvents(_ context.Context, sandboxID string, afterID int64, limit int) ([]*model.Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.Event
+	for _, e := range m.events {
+		if e.SandboxID == sandboxID && e.ID > afterID {
+			c := *e
+			out = append(out, &c)
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func (m *Memory) NextInstance(_ context.Context) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nextInst++
+	return m.nextInst, nil
+}
+
+func (m *Memory) CreateInstance(_ context.Context, in *model.Instance) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := *in
+	m.instances[in.N] = &c
+	return nil
+}
+
+func (m *Memory) InstanceBySerial(_ context.Context, serial string) (*model.Instance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, in := range m.instances {
+		if in.Serial == serial {
+			c := *in
+			return &c, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (m *Memory) RetireInstance(_ context.Context, n int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	in, ok := m.instances[n]
+	if !ok {
+		return ErrNotFound
+	}
+	if in.RetiredAt == nil {
+		t := time.Now()
+		in.RetiredAt = &t
+	}
+	return nil
+}
+
+func (m *Memory) ListInstances(_ context.Context, sandboxID string) ([]*model.Instance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.Instance
+	for _, in := range m.instances {
+		if in.SandboxID == sandboxID {
+			c := *in
+			out = append(out, &c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].N < out[j].N })
+	return out, nil
+}
+
+func (m *Memory) Close() error { return nil }

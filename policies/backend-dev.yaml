@@ -1,0 +1,18 @@
+# backend-dev: full git flow (push is further limited to agent/* branches by Forgejo branch
+# protection and the per-agent token), LLM API, MCP read-only.
+slug: backend-dev
+allow:
+  - host: git.example.com
+    paths: ["/*/*/info/refs", "/*/*/git-upload-pack", "/*/*/git-receive-pack"]
+    inject:
+      Authorization: "Basic secret:forgejo-basic"
+  - host: api.anthropic.com
+    paths: ["/v1/**"]
+    methods: [POST]
+    inject:
+      x-api-key: "secret:anthropic"
+  - host: mcp.example.com
+    paths: ["/mcp", "/mcp/**"]
+    mcp: { read_only: true }
+  - host: api.sandbox.internal
+    paths: ["/agent/**"]

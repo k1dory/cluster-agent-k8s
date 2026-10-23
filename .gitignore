@@ -1,0 +1,5 @@
+/bin/
+/var/
+*.key
+*.pem
+!deploy/**/*.example.*

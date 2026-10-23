@@ -1,0 +1,81 @@
+image:
+  repository: registry.example.com/agent-sandbox/sandboxd
+  tag: latest
+  pullPolicy: IfNotPresent
+
+agentImage:
+  repository: registry.example.com/agent-sandbox/agent
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1   # the orchestrator keeps in-memory wake state; run one replica
+
+# Secrets are referenced, never written here.
+existingSecret: agent-sandbox-secrets   # keys: SANDBOXD_API_TOKEN, DATABASE_URL, PREVIEW_TICKET_KEY
+caSecret: agent-sandbox-ca              # keys: ca.crt, ca.key (created on first run if `createCA`)
+createCA: true                          # let sandboxd generate the agent CA into an emptyDir+secret? no: use a PVC
+caStorage: 100Mi
+gatewayRootConfigMap: agent-sandbox-gateway-root  # key: root.crt (Caddy's internal root)
+tenantSecretsSecret: ""                 # optional: mounted at /etc/sandbox/secrets (tenants/<t>/<name>)
+
+sandboxd:
+  logLevel: info
+  listen:
+    api: ":8080"
+    gateway: ":8081"
+    ingress: ":8082"
+  sandbox:
+    defaultIdleTimeout: 1h
+    readyTimeout: 3m
+    idleCheckEvery: 1m
+  preview:
+    domain: preview.example.com
+    authUrl: https://ai.example.com/api/preview/auth
+    cookieTtl: 1h
+    hitsAsActivity: true
+  certTtl: 168h
+
+# How agent pods are built.
+agent:
+  namespace: ""            # defaults to the release namespace
+  serviceAccount: agent
+  gatewayIP: 10.77.77.1
+  registrarUrl: https://registrar.sandbox.internal:8443
+  apiUrl: https://api.sandbox.internal
+  tokenAudience: agent-sandbox
+  runtimeClass: ""         # gvisor | kata later
+  storageClass: ""
+  volumeSize: 10Gi
+  resources:
+    cpuRequest: 250m
+    cpuLimit: "2"
+    memoryRequest: 1Gi
+    memoryLimit: 4Gi
+  harnessCommand: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose'
+  env:
+    ANTHROPIC_BASE_URL: https://api.anthropic.com
+  terminationSeconds: 30
+
+# Multus NetworkAttachmentDefinition: the pod's ONLY network. macvlan in private mode so pods on
+# one node cannot see each other; whereabouts IPAM gives cluster-wide unique addresses.
+network:
+  name: sandbox-vlan
+  master: eth1            # node interface in the sandbox VLAN
+  mode: private
+  ipam:
+    type: whereabouts
+    range: 10.77.77.0/25
+    range_start: 10.77.77.10
+    range_end: 10.77.77.126
+    gateway: 10.77.77.1
+    exclude: ["10.77.77.1/32"]
+
+service:
+  type: ClusterIP
+
+# Policies: every file under policies/ of the chart becomes a key of the ConfigMap.
+policiesFromFiles: true
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

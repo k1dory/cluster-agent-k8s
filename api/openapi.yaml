@@ -1,0 +1,436 @@
+openapi: 3.1.0
+info:
+  title: agent-sandbox control API
+  version: 0.1.0
+  description: |
+    Control plane for isolated agent sandboxes. The frontend (ai-web) talks only to this API;
+    Kubernetes, the gateway and identities are hidden behind it.
+
+    Two audiences:
+    * **Platform API** (`/v1/...`, port 8080): bearer token, used by the frontend.
+    * **Agent API** (`/agent/...`, port 8081): reached by the agent pod through the mTLS gateway;
+      identity comes from the client certificate that Caddy forwards in `X-Agent-Cert`.
+      `/authz` and `/bootstrap` on the same port are called by Caddy and the init container.
+servers:
+  - url: http://localhost:8080
+    description: platform API
+security:
+  - bearer: []
+tags:
+  - name: sandboxes
+  - name: runs
+  - name: events
+  - name: preview
+  - name: agent
+  - name: gateway
+paths:
+  /v1/sandboxes:
+    get:
+      tags: [sandboxes]
+      summary: List sandboxes
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Sandbox" }
+    post:
+      tags: [sandboxes]
+      summary: Create a sandbox and start its first pod
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateSandbox" }
+      responses:
+        "201":
+          description: Created (status is `waking` until the pod is ready)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+        "400": { $ref: "#/components/responses/Error" }
+  /v1/sandboxes/{id}:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    get:
+      tags: [sandboxes]
+      summary: Get a sandbox
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [sandboxes]
+      summary: Delete a sandbox, its pod and its volume
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/sandboxes/{id}/sleep:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    post:
+      tags: [sandboxes]
+      summary: Sleep now (delete the pod, keep the volume)
+      parameters:
+        - name: force
+          in: query
+          schema: { type: boolean, default: false }
+          description: Cancel a run in progress instead of refusing with 409.
+      responses:
+        "200":
+          description: Sleeping
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+        "409": { $ref: "#/components/responses/Error" }
+  /v1/sandboxes/{id}/wake:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    post:
+      tags: [sandboxes]
+      summary: Wake without a task (for example to serve the preview)
+      responses:
+        "200":
+          description: Waking or already running
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+  /v1/sandboxes/{id}/touch:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    post:
+      tags: [sandboxes]
+      summary: Record user activity (postpones the idle timer)
+      responses:
+        "204": { description: Recorded }
+  /v1/sandboxes/{id}/runs:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    get:
+      tags: [runs]
+      summary: List runs
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Run" }
+    post:
+      tags: [runs]
+      summary: Queue a task for the agent; wakes a sleeping sandbox
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task]
+              properties:
+                task: { type: string, description: Task text handed to the harness }
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+  /v1/sandboxes/{id}/runs/{run}/input:
+    parameters:
+      - { $ref: "#/components/parameters/id" }
+      - { name: run, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [runs]
+      summary: Send a user message to a run in progress
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string }
+      responses:
+        "204": { description: Delivered to the event stream }
+  /v1/sandboxes/{id}/events:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    get:
+      tags: [events]
+      summary: Event stream (SSE) with replay
+      description: |
+        `text/event-stream`. Each message is `id: <event id>` and `data: <Event JSON>`.
+        Pass `after` (or the `Last-Event-ID` header) to replay from the persisted log.
+      parameters:
+        - name: after
+          in: query
+          schema: { type: integer, format: int64, default: 0 }
+      responses:
+        "200":
+          description: Stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+  /v1/sandboxes/{id}/preview:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    put:
+      tags: [preview]
+      summary: Expose a port of the sandbox under a stable host name
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [port]
+              properties:
+                port: { type: integer, description: "0 removes the preview" }
+                access: { type: string, enum: [link, sso, members], default: members }
+      responses:
+        "200":
+          description: Preview set
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+  /v1/sandboxes/{id}/preview/ticket:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    post:
+      tags: [preview]
+      summary: Mint a short-lived sign-in ticket for the preview (frontend checked the user)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user]
+              properties:
+                user: { type: string }
+      responses:
+        "200":
+          description: Ticket and the callback URL to redirect the browser to
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ticket: { type: string }
+                  redirect: { type: string, format: uri }
+  /v1/policies:
+    get:
+      tags: [sandboxes]
+      summary: Loaded egress policy slugs
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { type: string }
+  /healthz:
+    get:
+      security: []
+      summary: Liveness
+      responses:
+        "200": { description: OK }
+
+  /agent/runs/next:
+    get:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Long-poll for the next queued run of the calling sandbox
+      parameters:
+        - name: wait
+          in: query
+          schema: { type: string, default: 30s }
+      responses:
+        "200":
+          description: A run, now marked running
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "204": { description: Nothing queued within `wait` }
+  /agent/runs/{run}/events:
+    parameters: [{ name: run, in: path, required: true, schema: { type: string } }]
+    post:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Append output (one event per line of the body, or a JSON event)
+      requestBody:
+        content:
+          text/plain:
+            schema: { type: string }
+      responses:
+        "204": { description: Appended }
+  /agent/runs/{run}/input:
+    parameters: [{ name: run, in: path, required: true, schema: { type: string } }]
+    get:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Long-poll for user input events addressed to this run
+      parameters:
+        - { name: after, in: query, schema: { type: integer, format: int64 } }
+        - { name: wait, in: query, schema: { type: string, default: 30s } }
+      responses:
+        "200":
+          description: Input events
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Event" }
+  /agent/runs/{run}/finish:
+    parameters: [{ name: run, in: path, required: true, schema: { type: string } }]
+    post:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Mark the run finished
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                exit_code: { type: integer }
+      responses:
+        "204": { description: Recorded }
+
+  /bootstrap:
+    post:
+      tags: [gateway]
+      security: [{ bootstrapToken: [] }]
+      summary: Issue the agent identity (called once by the init container)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [csr]
+              properties:
+                csr: { type: string, description: PEM certificate request; its subject is ignored }
+      responses:
+        "200":
+          description: Certificate and instance number
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  instance: { type: integer }
+                  slug: { type: string }
+                  sandbox_id: { type: string }
+                  tenant: { type: string }
+                  cert: { type: string, description: PEM leaf certificate }
+                  ca: { type: string, description: PEM agent CA root }
+                  gateway_ca: { type: string, description: PEM root to trust for TLS to the gateway }
+                  not_after: { type: string, format: date-time }
+        "401": { $ref: "#/components/responses/Error" }
+  /authz:
+    get:
+      tags: [gateway]
+      security: []
+      summary: Caddy forward_auth hook
+      description: |
+        Reads `X-Agent-Cert`, `X-Forwarded-Host`, `X-Forwarded-Method`, `X-Forwarded-Uri`.
+        200 means allowed; response headers `Authorization`, `X-Api-Key`, `X-Agent-*` are copied
+        onto the upstream request by Caddy. 403 otherwise.
+      responses:
+        "200": { description: Allowed }
+        "403": { description: Denied }
+  /crl.pem:
+    get:
+      tags: [gateway]
+      security: []
+      summary: CRL of retired, not yet expired agent certificates
+      responses:
+        "200":
+          description: PEM CRL
+          content:
+            application/x-pem-file:
+              schema: { type: string }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+    mtls:
+      type: mutualTLS
+    bootstrapToken:
+      type: http
+      scheme: bearer
+      description: Projected Kubernetes ServiceAccount token with audience `agent-sandbox`
+  parameters:
+    id:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }
+  schemas:
+    CreateSandbox:
+      type: object
+      required: [name, slug, owner]
+      properties:
+        name: { type: string, description: "Project name, DNS label; part of the preview host" }
+        slug: { type: string, description: "Agent definition (harness config, skills, policy file)" }
+        owner: { type: string, description: "User login" }
+        tenant: { type: string, description: "Billing/secret scope; defaults to owner" }
+        repo: { type: string, description: "Repository URL the agent works on" }
+        idle_timeout: { type: integer, description: "Seconds without user activity before sleep; 0 = never", default: 3600 }
+        wake_on_preview: { type: boolean, default: true }
+    Sandbox:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        slug: { type: string }
+        owner: { type: string }
+        tenant: { type: string }
+        repo: { type: string }
+        idle_timeout: { type: integer }
+        wake_on_preview: { type: boolean }
+        status: { type: string, enum: [creating, waking, running, stopping, sleeping, error] }
+        ip: { type: string }
+        instance: { type: integer, description: "Current identity number; grows on every wake" }
+        pod_name: { type: string }
+        last_activity: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        preview:
+          type: object
+          nullable: true
+          properties:
+            port: { type: integer }
+            access: { type: string, enum: [link, sso, members] }
+            host: { type: string }
+        error: { type: string }
+    Run:
+      type: object
+      properties:
+        id: { type: string }
+        sandbox_id: { type: string }
+        task: { type: string }
+        status: { type: string, enum: [queued, running, done, failed, cancelled] }
+        exit_code: { type: integer }
+        created_at: { type: string, format: date-time }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+    Event:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        sandbox_id: { type: string }
+        run_id: { type: string }
+        type: { type: string, enum: [status, run.queued, run.started, run.output, run.finished, input] }
+        data: { type: string }
+        at: { type: string, format: date-time }
