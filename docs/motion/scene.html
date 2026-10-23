@@ -21,7 +21,7 @@
 <text x="100" y="86" class="mono t3" style="font-size:22px">agent-sandbox · how one task flows through the system</text>
 
 <!-- ===================== STAGE A ===================== -->
-<g id="stageA">
+<g id="stageA" style="transform-box:view-box;transform-origin:1220px 540px">
 
   <!-- API client -->
   <g id="client" data-a>
@@ -147,7 +147,7 @@
 </g>
 
 <!-- ===================== STAGE B: the fleet ===================== -->
-<g id="stageB">
+<g id="stageB" style="transform-box:view-box;transform-origin:960px 535px">
   <g id="fgw" data-a>
     <rect x="810" y="470" width="300" height="130" class="card" stroke="#82AAFF"/>
     <text x="960" y="520" text-anchor="middle" class="h">gateway</text>
@@ -217,6 +217,16 @@
     <text x="1370" y="854" class="t3" style="font-size:22px">numbers never repeat</text>
     <path d="M1340 805 C 1220 805, 1180 570, 1110 550" class="wire"/>
   </g>
+
+  <!-- second wave: the fleet is bigger than six cards -->
+  <g id="m1" data-a><rect x="620" y="200" width="180" height="52" rx="8" class="card" stroke="#1E2127"/><text x="640" y="233" class="t3" style="font-size:20px">qa <tspan class="mono num">/ 12</tspan> · e2e</text></g>
+  <g id="m2" data-a><rect x="1120" y="200" width="200" height="52" rx="8" class="card" stroke="#1E2127"/><text x="1140" y="233" class="t3" style="font-size:20px">sre <tspan class="mono num">/ 13</tspan> · NetBox</text></g>
+  <g id="m3" data-a><rect x="640" y="800" width="200" height="52" rx="8" class="card" stroke="#1E2127"/><text x="660" y="833" class="t3" style="font-size:20px">reviewer <tspan class="mono num">/ 14</tspan></text></g>
+  <g id="m4" data-a><rect x="860" y="800" width="200" height="52" rx="8" class="card" stroke="#1E2127"/><text x="880" y="833" class="t3" style="font-size:20px">docs-writer <tspan class="mono num">/ 15</tspan></text></g>
+  <g id="m5" data-a><rect x="1080" y="800" width="200" height="52" rx="8" class="card" stroke="#1E2127"/><text x="1100" y="833" class="t3" style="font-size:20px">backend-dev <tspan class="mono num">/ 16</tspan></text></g>
+  <g id="m6" data-a><rect x="640" y="862" width="200" height="52" rx="8" class="card" stroke="#1E2127"/><text x="660" y="895" class="t3" style="font-size:20px">data <tspan class="mono num">/ 17</tspan></text></g>
+  <g id="m7" data-a><rect x="860" y="862" width="200" height="52" rx="8" class="card" stroke="#1E2127"/><text x="880" y="895" class="t3" style="font-size:20px">frontend-dev <tspan class="mono num">/ 18</tspan></text></g>
+  <g id="m8" data-a><rect x="1080" y="862" width="200" height="52" rx="8" class="card" stroke="#1E2127"/><text x="1100" y="895" class="t3" style="font-size:20px">security <tspan class="mono num">/ 19</tspan></text></g>
 </g>
 
 <!-- ===================== END CARD ===================== -->
@@ -238,6 +248,7 @@
   <g id="c5" data-a><text x="100" y="985" class="cap"><tspan class="fn mono">3</tspan>  The agent tries somewhere else.</text><text x="100" y="1030" class="sub">No rule, no route. Everything is logged with the agent's identity.</text></g>
   <g id="c6" data-a><text x="100" y="985" class="cap"><tspan class="fn mono">4</tspan>  Zoom out: many pods, one gateway, one policy repository.</text><text x="100" y="1030" class="sub">Each pod carries its own number and answers to the same rules.</text></g>
   <g id="c7" data-a><text x="100" y="985" class="cap"><tspan class="fn mono">4</tspan>  An hour without the user: the pod is deleted, its disk stays.</text><text x="100" y="1030" class="sub">The next task wakes a new pod with the next number. Old certificates stay dead.</text></g>
+  <g id="c8" data-a><text x="100" y="985" class="cap"><tspan class="fn mono">4</tspan>  …and more. Up to 124 pods per VLAN, one gateway for all of them.</text><text x="100" y="1030" class="sub">Adding a pod is an API call. Adding a host is a line in a policy file. Nothing else changes.</text></g>
 </g>
 </svg>
 
@@ -297,21 +308,29 @@ show('vBad', 29.0, .3); show('nomatch', 29.2, .4);
 dim('pl1', 29.1, .4, .35); dim('pl2', 29.1, .4, .35); dim('pl3', 29.1, .4, .35); dim('pl4', 29.1, .4, .35); dim('pl5', 29.1, .4, .35);
 show('deny', 29.9); show('log', 31.2, .6);
 
-// ---- transition to the fleet (35–36.5) ----
+// ---- camera: pull back from the gateway (35–37.2) ----
 hide('c5', 34.6, .3);
-add('stageA', 35.0, 1.2, { opacity: [1, 0], scale: [1, .7] });
+// stage A shrinks around its gateway and slides it onto the fleet gateway's spot, then fades
+add('stageA', 35.0, 1.8, { scale: [1, .42], x: [0, -260], y: [0, -5] });
+add('stageA', 36.2, .7, { opacity: [1, 0] });
+// the fleet comes in from a close-up on the same gateway
+add('stageB', 35.4, 1.8, { scale: [2.6, 1] });
+add('stageB', 35.6, .9, { opacity: [0, 1] });
 
-// ---- chapter 4: the fleet (36–48.5) ----
-show('c6', 36.2);
-show('fgw', 36.4); show('fext', 36.9);
-show('f1', 37.5); show('f2', 38.3); show('f3', 39.1); show('tracker', 39.6);
-show('f4', 40.4); show('browser', 40.9); show('f5', 41.7); show('f6', 45.6);
-hide('c6', 42.6, .3); show('c7', 43.0);
-add('f5', 43.6, .8, { opacity: [1, .45], scale: [1, .97] }); add('f5s', 43.6, .4, { opacity: [1, 0] }); show('f5x', 43.8, .5);
+// ---- chapter 4: the fleet (36–50) ----
+show('fgw', 35.6, .4); show('c6', 36.8);
+show('fext', 37.2);
+show('f1', 37.8); show('f2', 38.6); show('f3', 39.4); show('tracker', 39.9);
+show('f4', 40.7); show('browser', 41.2); show('f5', 42.0);
+hide('c6', 42.9, .3); show('c7', 43.3);
+add('f5', 43.9, .8, { opacity: [1, .45], scale: [1, .97] }); add('f5s', 43.9, .4, { opacity: [1, 0] }); show('f5x', 44.1, .5);
+show('f6', 45.6);
+hide('c7', 46.6, .3); show('c8', 47.0);
+show('m1', 47.2, .35); show('m2', 47.4, .35); show('m3', 47.6, .35); show('m4', 47.8, .35); show('m5', 48.0, .35); show('m6', 48.2, .35); show('m7', 48.4, .35); show('m8', 48.6, .35);
 
-// ---- end card (48.5–54) ----
-add('stageB', 48.4, .8, { opacity: [1, 0] }); add('caps', 48.4, .8, { opacity: [1, 0] });
-show('e0', 49.2, .7); show('e1', 50.0, .6); show('e2', 50.6, .6); show('e3', 51.2, .6); show('e4', 52.2, .6);
+// ---- end card (50.6–56) ----
+add('stageB', 50.4, .8, { opacity: [1, 0] }); add('caps', 50.4, .8, { opacity: [1, 0] });
+show('e0', 51.2, .7); show('e1', 52.0, .6); show('e2', 52.6, .6); show('e3', 53.2, .6); show('e4', 54.2, .6);
 
 tracks.sort((a, b) => a.at - b.at);
 const state = new Map();
@@ -340,9 +359,9 @@ function seek(ms) {
   for (const [el, cur] of state) {
     if (cur.opacity !== undefined) el.style.opacity = cur.opacity;
     const p = pos.get(el);
-    const tx = p ? p.x : 0, ty = p ? p.y : 0;
+    const tx = p ? p.x : (cur.x || 0), ty = p ? p.y : (cur.y || 0);
     const s = cur.scale !== undefined ? cur.scale : 1;
-    if (p || s !== 1) el.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
+    if (p || s !== 1 || tx || ty) el.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`;
   }
   for (const [el, p] of pos) if (!state.has(el)) el.style.transform = `translate(${p.x}px, ${p.y}px)`;
   state.clear();
@@ -350,7 +369,7 @@ function seek(ms) {
   for (const tr of tracks) if (tr.text !== undefined && ms < tr.at) tr.el.textContent = '';
 }
 window.seek = seek;
-window.DURATION_MS = 54000;
+window.DURATION_MS = 56000;
 // live preview in a browser tab
 if (!navigator.webdriver) { const t0 = performance.now(); (function loop(){ seek((performance.now() - t0) % window.DURATION_MS); requestAnimationFrame(loop); })(); }
 </script>
