@@ -1,5 +1,5 @@
 {{- if eq .Values.gateway.mode "node" }}
-# Frontend-facing API. With hostNetwork the API is also reachable on the gateway node's address.
+# Client-facing API. With hostNetwork the API is also reachable on the gateway node's address.
 apiVersion: v1
 kind: Service
 metadata:

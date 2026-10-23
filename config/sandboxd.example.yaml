@@ -1,6 +1,6 @@
 # sandboxd configuration. ${VAR} is expanded from the environment, so secrets stay out of git.
 listen:
-  api: ":8080"             # frontend (ai-web) → bearer token
+  api: ":8080"             # your client (UI, CLI, CI) → bearer token
   gateway: "127.0.0.1:8081" # Caddy only: /authz, /bootstrap, /agent/*
   ingress: ":8082"          # preview proxy; Caddy *.preview.<domain> → here
 api_token: "${SANDBOXD_API_TOKEN}"
@@ -44,7 +44,7 @@ sandbox:
   idle_check_every: 1m
 preview:
   domain: preview.example.com
-  auth_url: https://ai.example.com/api/preview/auth   # frontend checks the user, mints a ticket
+  auth_url: https://ai.example.com/api/preview/auth   # your auth service checks the user, mints a ticket
   ticket_key: "${PREVIEW_TICKET_KEY}"
   cookie_ttl: 1h
   hits_as_activity: true

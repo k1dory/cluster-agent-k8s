@@ -1,6 +1,6 @@
 # sandboxd on the gateway VM (used by docker-compose.yaml). Values come from .env.
 listen:
-  api: ":8080"              # ai-web → here (put it behind your own TLS/firewall)
+  api: ":8080"              # API clients → here (put it behind your own TLS/firewall)
   gateway: "127.0.0.1:8081" # Caddy → sandboxd, never exposed
   ingress: "127.0.0.1:8082" # Caddy preview site → sandboxd
 api_token: "${SANDBOXD_API_TOKEN}"

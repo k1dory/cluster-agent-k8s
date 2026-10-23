@@ -44,7 +44,7 @@ func newStack(t *testing.T) *stack {
 		{Host: "api.anthropic.com", Paths: []string{"/v1/**"}, Inject: map[string]string{"X-Api-Key": "secret:anthropic"}},
 		{Host: "api.sandbox.internal", Paths: []string{"/agent/**"}},
 	}})
-	az := &authz.Handler{Policies: pols, Secrets: secrets.Static{"lev/anthropic": "sk-lev"}, Checker: reg, Toucher: orch}
+	az := &authz.Handler{Policies: pols, Secrets: secrets.Static{"alice/anthropic": "sk-alice"}, Checker: reg, Toucher: orch}
 	ing := &ingress.Handler{Store: st, Waker: orch, TicketKey: []byte("k")}
 	p := &Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: "t0k"}
 	g := &Gateway{Orch: orch, Registrar: reg, Authz: az}
@@ -91,7 +91,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("expected 401, got %d", resp.StatusCode)
 	}
 	// Create a sandbox.
-	resp, body := call(t, "POST", api+"/v1/sandboxes", "t0k", map[string]any{"name": "shop", "slug": "backend-dev", "owner": "lev"}, nil)
+	resp, body := call(t, "POST", api+"/v1/sandboxes", "t0k", map[string]any{"name": "shop", "slug": "backend-dev", "owner": "alice"}, nil)
 	if resp.StatusCode != 201 {
 		t.Fatalf("create: %d %s", resp.StatusCode, body)
 	}
@@ -108,7 +108,7 @@ func TestEndToEnd(t *testing.T) {
 	}
 
 	// Bootstrap: the init container's call.
-	s.tokens["pod-token"] = registrar.PodInfo{Name: "agent-x", SandboxID: sb.ID, Slug: "backend-dev", Tenant: "lev"}
+	s.tokens["pod-token"] = registrar.PodInfo{Name: "agent-x", SandboxID: sb.ID, Slug: "backend-dev", Tenant: "alice"}
 	_, csr, _ := ca.NewCSR("backend-dev")
 	resp, body = call(t, "POST", gw+"/bootstrap", "pod-token", registrar.BootstrapRequest{CSR: string(csr)}, nil)
 	if resp.StatusCode != 200 {
@@ -135,7 +135,7 @@ func TestEndToEnd(t *testing.T) {
 		h[k] = v
 	}
 	resp, _ = call(t, "GET", gw+"/authz", "", nil, h)
-	if resp.StatusCode != 200 || resp.Header.Get("X-Api-Key") != "sk-lev" || resp.Header.Get(authz.HeaderInstance) != "1" {
+	if resp.StatusCode != 200 || resp.Header.Get("X-Api-Key") != "sk-alice" || resp.Header.Get(authz.HeaderInstance) != "1" {
 		t.Fatalf("authz allow: %d %v", resp.StatusCode, resp.Header)
 	}
 	h["X-Forwarded-Host"] = "evil.example.com"
@@ -203,11 +203,11 @@ func TestEndToEnd(t *testing.T) {
 
 	// Preview + ticket.
 	resp, body = call(t, "PUT", api+"/v1/sandboxes/"+sb.ID+"/preview", "t0k", map[string]any{"port": 3000, "access": "members"}, nil)
-	if resp.StatusCode != 200 || !strings.Contains(string(body), `"host":"shop-lev.preview.test"`) {
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"host":"shop-alice.preview.test"`) {
 		t.Fatalf("preview: %d %s", resp.StatusCode, body)
 	}
-	resp, body = call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/preview/ticket", "t0k", map[string]string{"user": "lev"}, nil)
-	if resp.StatusCode != 200 || !strings.Contains(string(body), "https://shop-lev.preview.test/__sandbox/auth?ticket=") {
+	resp, body = call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/preview/ticket", "t0k", map[string]string{"user": "alice"}, nil)
+	if resp.StatusCode != 200 || !strings.Contains(string(body), "https://shop-alice.preview.test/__sandbox/auth?ticket=") {
 		t.Fatalf("ticket: %d %s", resp.StatusCode, body)
 	}
 

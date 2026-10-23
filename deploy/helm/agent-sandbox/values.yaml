@@ -15,7 +15,7 @@ gateway:
   previewTls: ""                 # "" = on-demand certificates; or "dns cloudflare {env.CF_API_TOKEN}" with a custom Caddy build
   caddyEnvSecret: ""             # optional Secret with DNS-provider credentials for Caddy
   accessLog: stdout
-  apiPort: 8080                  # ai-web talks to this on the gateway node's address
+  apiPort: 8080                  # API clients reach this on the gateway node's address
 
 image:
   repository: registry.example.com/agent-sandbox/sandboxd

@@ -5,4 +5,4 @@ dev-token-pod-1:
   namespace: agent-sandbox
   sandboxid: REPLACE_WITH_SANDBOX_ID
   slug: backend-dev
-  tenant: lev
+  tenant: alice

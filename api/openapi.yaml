@@ -3,11 +3,11 @@ info:
   title: agent-sandbox control API
   version: 0.1.0
   description: |
-    Control plane for isolated agent sandboxes. The frontend (ai-web) talks only to this API;
+    Control plane for isolated agent sandboxes. Clients (a UI, a CLI, CI) talk only to this API;
     Kubernetes, the gateway and identities are hidden behind it.
 
     Two audiences:
-    * **Platform API** (`/v1/...`, port 8080): bearer token, used by the frontend.
+    * **Platform API** (`/v1/...`, port 8080): bearer token, used by your client.
     * **Agent API** (`/agent/...`, port 8081): reached by the agent pod through the mTLS gateway;
       identity comes from the client certificate that Caddy forwards in `X-Agent-Cert`.
       `/authz` and `/bootstrap` on the same port are called by Caddy and the init container.
@@ -196,7 +196,7 @@ paths:
     parameters: [{ $ref: "#/components/parameters/id" }]
     post:
       tags: [preview]
-      summary: Mint a short-lived sign-in ticket for the preview (frontend checked the user)
+      summary: Mint a short-lived sign-in ticket for the preview (your auth service checked the user)
       requestBody:
         required: true
         content:

@@ -29,7 +29,7 @@ func TestLifecycle(t *testing.T) {
 	ctx := context.Background()
 	o := New(store.NewMemory(), NewFakeRuntime(), nil, events.New(), Config{PreviewDomain: "preview.test", IdleCheckEvery: 10 * time.Millisecond}, nil)
 	one := 1
-	sb, err := o.Create(ctx, CreateRequest{Name: "shop", Slug: "backend-dev", Owner: "lev", IdleTimeout: &one})
+	sb, err := o.Create(ctx, CreateRequest{Name: "shop", Slug: "backend-dev", Owner: "alice", IdleTimeout: &one})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,10 +70,10 @@ func TestLifecycle(t *testing.T) {
 	waitStatus(t, o, sb.ID, model.StatusRunning)
 
 	sb, err = o.SetPreview(ctx, sb.ID, 3000, "")
-	if err != nil || sb.Preview == nil || sb.Preview.Host != "shop-lev.preview.test" || sb.Preview.Access != model.AccessMembers {
+	if err != nil || sb.Preview == nil || sb.Preview.Host != "shop-alice.preview.test" || sb.Preview.Access != model.AccessMembers {
 		t.Fatalf("preview: %v %+v", err, sb.Preview)
 	}
-	if _, err := o.Store.SandboxByPreviewHost(ctx, "shop-lev.preview.test"); err != nil {
+	if _, err := o.Store.SandboxByPreviewHost(ctx, "shop-alice.preview.test"); err != nil {
 		t.Fatal("preview host lookup failed")
 	}
 	evs, _ := o.Store.ListEvents(ctx, sb.ID, 0, 0)

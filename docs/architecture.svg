@@ -26,7 +26,7 @@
 
   <!-- column A: inputs -->
   <rect x="24" y="160" width="230" height="64" rx="8" class="box"/>
-  <text x="40" y="184" class="h">Frontend (ai-web)</text>
+  <text x="40" y="184" class="h">API client (your UI, CLI, CI)</text>
   <text x="40" y="204" class="s">REST + SSE, bearer token → API :8080</text>
   <path d="M254 192 L 320 192" class="flow"/>
 
@@ -43,7 +43,7 @@
   <!-- browser above caddy -->
   <rect x="650" y="56" width="230" height="44" rx="8" class="box"/>
   <text x="666" y="76" class="h">Browser (preview)</text>
-  <text x="666" y="92" class="s">https://shop-lev.preview.example.com</text>
+  <text x="666" y="92" class="s">https://shop-alice.preview.example.com</text>
   <path d="M765 100 L 765 160" class="flow"/>
 
   <!-- gateway zone -->
@@ -105,7 +105,7 @@
   <text x="976" y="292" class="s">key injected per tenant by the gateway,</text>
   <text x="976" y="308" class="s">the agent never holds it</text>
   <rect x="960" y="344" width="236" height="76" rx="8" class="ext"/>
-  <text x="976" y="366" class="h">MCP servers (prov1, NetBox…)</text>
+  <text x="976" y="366" class="h">MCP servers (internal tools)</text>
   <text x="976" y="384" class="s">receive X-Agent-Slug/Instance/Tenant and</text>
   <text x="976" y="400" class="s">X-Agent-Access: read-only from the gateway</text>
   <text x="960" y="448" class="s">Adding a host = one rule in a policy file.</text>
@@ -136,7 +136,7 @@
   <!-- pods -->
   <rect x="560" y="586" width="210" height="236" rx="8" class="pod"/>
   <text x="572" y="606" class="h">pod sb_a1 · 10.77.77.10</text>
-  <text x="572" y="624" class="s">cert backend-dev/7 · tenant lev</text>
+  <text x="572" y="624" class="s">cert backend-dev/7 · tenant alice</text>
   <rect x="572" y="634" width="186" height="38" rx="6" class="sub"/>
   <text x="580" y="650" class="t">init: agent-init</text>
   <text x="580" y="665" class="s">key in tmpfs → CSR → cert + n</text>
@@ -151,7 +151,7 @@
 
   <rect x="780" y="586" width="210" height="236" rx="8" class="pod"/>
   <text x="792" y="606" class="h">pod sb_b2 · 10.77.77.11</text>
-  <text x="792" y="624" class="s">cert backend-dev/8 · tenant anna</text>
+  <text x="792" y="624" class="s">cert backend-dev/8 · tenant bob</text>
   <text x="792" y="656" class="s">same slug, same policy,</text>
   <text x="792" y="672" class="s">own LLM key and Git token</text>
   <text x="792" y="688" class="s">(resolved by tenant at the gateway)</text>

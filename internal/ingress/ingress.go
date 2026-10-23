@@ -1,7 +1,7 @@
 // Package ingress is the preview proxy: <name>-<owner>.<domain> → sandbox IP:port.
 //
 // Access levels: link (anyone with the URL), sso / members (needs a cookie issued from an
-// HMAC ticket that the platform frontend obtains after checking the user; the frontend's
+// HMAC ticket that your auth service mints after checking the user; that service's
 // URL is AuthURL). A sleeping sandbox gets woken (if wake_on_preview) and a 503 page.
 package ingress
 
@@ -37,7 +37,7 @@ type Handler struct {
 	Store          store.Store
 	Waker          Waker
 	AuthURL        string // where to send unauthenticated users; "" disables sso/members
-	TicketKey      []byte // HMAC key shared with the frontend
+	TicketKey      []byte // HMAC key shared with your auth service
 	CookieTTL      time.Duration
 	HitsAsActivity bool
 	Log            *slog.Logger
@@ -139,7 +139,7 @@ func (h *Handler) authorized(r *http.Request, sb *model.Sandbox) bool {
 	return t.Host == sb.Preview.Host
 }
 
-// callback receives ?ticket=<signed> from the frontend and sets the cookie.
+// callback receives ?ticket=<signed> from the auth service and sets the cookie.
 func (h *Handler) callback(w http.ResponseWriter, r *http.Request, sb *model.Sandbox) {
 	t, err := h.verify(r.URL.Query().Get("ticket"))
 	if err != nil || t.Host != sb.Preview.Host {
@@ -159,7 +159,7 @@ func (h *Handler) callback(w http.ResponseWriter, r *http.Request, sb *model.San
 	http.Redirect(w, r, next, http.StatusFound)
 }
 
-// Sign produces host.user.exp.sig (base64url parts). The frontend calls this with a short exp.
+// Sign produces host.user.exp.sig (base64url parts). The API mints these with a short exp.
 func (h *Handler) Sign(t ticket) string {
 	body, _ := json.Marshal(t)
 	b := base64.RawURLEncoding.EncodeToString(body)

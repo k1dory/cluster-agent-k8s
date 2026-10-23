@@ -62,7 +62,7 @@ VM) is enough: sandboxd reloads, re-renders and pushes the gateway configuration
 ```sh
 make dev            # fake runtime, in-memory store, API on 127.0.0.1:8080, token dev-token, DNS on 127.0.0.1:15353
 curl -s -H 'Authorization: Bearer dev-token' localhost:8080/v1/sandboxes \
-  -d '{"name":"shop","slug":"backend-dev","owner":"lev"}'
+  -d '{"name":"shop","slug":"backend-dev","owner":"alice"}'
 dig @127.0.0.1 -p 15353 git.example.com
 open http://127.0.0.1:8080/docs
 ```
@@ -71,4 +71,3 @@ open http://127.0.0.1:8080/docs
 
 Apache-2.0, see [LICENSE](LICENSE).
 
-Design notes, decisions and the threat model live in the wiki, not here.

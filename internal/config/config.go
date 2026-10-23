@@ -14,7 +14,7 @@ import (
 // through environment variables so the file can live in git.
 type Config struct {
 	Listen struct {
-		API     string `yaml:"api"`     // frontend-facing, default :8080
+		API     string `yaml:"api"`     // client-facing, default :8080
 		Gateway string `yaml:"gateway"` // Caddy-facing, default 127.0.0.1:8081
 		Ingress string `yaml:"ingress"` // preview proxy, default :8082 ("" disables)
 	} `yaml:"listen"`

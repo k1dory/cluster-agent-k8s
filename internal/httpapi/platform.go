@@ -1,4 +1,4 @@
-// Package httpapi exposes sandboxd over HTTP: the platform API for the frontend and the
+// Package httpapi exposes sandboxd over HTTP: the platform API for clients and the
 // gateway-facing API (authz, bootstrap, agent endpoints).
 package httpapi
 
@@ -23,7 +23,7 @@ import (
 	"agent-sandbox/internal/store"
 )
 
-// Platform is the frontend-facing API.
+// Platform is the client-facing API.
 type Platform struct {
 	Orch     *orchestrator.Orchestrator
 	Hub      *events.Hub
