@@ -6,7 +6,7 @@ gateway (Caddy) that enforces per-agent host+path policy and injects secrets, an
 
 ![How a task flows through the gateway, then the fleet](docs/motion/agent-sandbox.gif)
 
-*56 seconds in five chapters: a task arrives through the API; sandboxd starts a pod with one interface and a certificate; the agent's requests are checked at the gateway against the slug's policy (MCP allowed, Git allowed with the token injected, anything else denied with the reason); then the camera pulls back from the gateway to the fleet: pods taking tasks, reviewing, writing docs, serving a preview, sleeping and waking with new numbers, and a second wave of them. [MP4, 1080p](docs/motion/agent-sandbox.mp4) · source `docs/motion/scene.html`, rendered by `docs/motion/render.mjs`.*
+[MP4 version](docs/motion/agent-sandbox.mp4)
 
 <details><summary>Static architecture diagram</summary>
 
