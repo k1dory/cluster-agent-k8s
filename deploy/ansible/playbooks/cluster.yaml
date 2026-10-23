@@ -1,0 +1,7 @@
+# Cluster side: namespace, RBAC, NetworkAttachmentDefinition, Secret; gateway pod when gateway_mode == node.
+- name: agent-sandbox cluster resources
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  roles:
+    - cluster_apply

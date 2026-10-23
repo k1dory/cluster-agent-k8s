@@ -163,7 +163,7 @@ func (g *Gateway) pollInput(w http.ResponseWriter, r *http.Request, id *identity
 		}
 		out := []*model.Event{}
 		for _, e := range evs {
-			if e.Type == model.EventInput && (e.RunID == "" || e.RunID == run.ID) {
+			if (e.Type == model.EventInput || e.Type == model.EventRunCancel) && (e.RunID == "" || e.RunID == run.ID) {
 				out = append(out, e)
 			}
 		}

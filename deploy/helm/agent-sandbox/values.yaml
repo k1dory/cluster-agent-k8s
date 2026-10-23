@@ -76,6 +76,8 @@ network:
     gateway: 10.77.77.1
     exclude: ["10.77.77.1/32"]
 
+createNamespace: false   # true when rendering plain manifests for kubectl apply
+
 # Policies: every file under policies/ of the chart becomes a key of the ConfigMap (Policy-as-Code:
 # keep that directory a copy of your policy repository, CI runs `sandboxd policy test` before helm upgrade).
 policiesFromFiles: true

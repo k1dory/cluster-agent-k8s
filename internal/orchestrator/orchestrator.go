@@ -402,6 +402,9 @@ func (o *Orchestrator) FinishRun(ctx context.Context, sandboxID, runID string, e
 	if r.SandboxID != sandboxID {
 		return store.ErrNotFound
 	}
+	if r.Status == model.RunCancelled {
+		return nil
+	}
 	now := time.Now()
 	r.FinishedAt, r.ExitCode = &now, exitCode
 	r.Status = model.RunDone
@@ -413,6 +416,27 @@ func (o *Orchestrator) FinishRun(ctx context.Context, sandboxID, runID string, e
 	}
 	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventRunDone, Data: string(r.Status)})
 	return nil
+}
+
+// CancelRun stops a queued or running run. A running run is cancelled by telling the agent
+// through an input event ("\x04" end-of-input marker) and marking the run; the runner exits the harness.
+func (o *Orchestrator) CancelRun(ctx context.Context, sandboxID, runID string) (*model.Run, error) {
+	r, err := o.Store.GetRun(ctx, runID)
+	if err != nil || r.SandboxID != sandboxID {
+		return nil, store.ErrNotFound
+	}
+	switch r.Status {
+	case model.RunDone, model.RunFailed, model.RunCancelled:
+		return r, nil
+	}
+	now := time.Now()
+	r.Status, r.FinishedAt = model.RunCancelled, &now
+	if err := o.Store.UpdateRun(ctx, r); err != nil {
+		return nil, err
+	}
+	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventRunCancel})
+	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventRunDone, Data: string(model.RunCancelled)})
+	return r, nil
 }
 
 // SetPreview exposes a port of the sandbox under a stable host name.

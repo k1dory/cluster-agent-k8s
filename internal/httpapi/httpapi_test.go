@@ -201,6 +201,30 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("event trail %v, want %v", types, want)
 	}
 
+	// Second run: cancel it; the agent sees run.cancel on the input poll; JSON event page filters by run.
+	resp, body = call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/runs", "t0k", map[string]string{"task": "long job"}, nil)
+	var run2 model.Run
+	_ = json.Unmarshal(body, &run2)
+	call(t, "GET", gw+"/agent/runs/next?wait=2s", "", nil, certHdr)
+	resp, body = call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/runs/"+run2.ID+"/cancel", "t0k", nil, nil)
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"status":"cancelled"`) {
+		t.Fatalf("cancel: %d %s", resp.StatusCode, body)
+	}
+	resp, body = call(t, "GET", gw+"/agent/runs/"+run2.ID+"/input?wait=2s", "", nil, certHdr)
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"type":"run.cancel"`) {
+		t.Fatalf("agent must see run.cancel: %d %s", resp.StatusCode, body)
+	}
+	resp, body = call(t, "GET", api+"/v1/sandboxes/"+sb.ID+"/events?stream=false&run="+run2.ID, "t0k", nil, nil)
+	var page []model.Event
+	_ = json.Unmarshal(body, &page)
+	if resp.StatusCode != 200 || len(page) != 4 || page[0].Type != "run.queued" || page[3].Type != "run.finished" {
+		t.Fatalf("json events for run2: %d %s", resp.StatusCode, body)
+	}
+	resp, body = call(t, "GET", api+"/v1/sandboxes/"+sb.ID+"/runs/"+run2.ID, "t0k", nil, nil)
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"status":"cancelled"`) {
+		t.Fatalf("get run: %d %s", resp.StatusCode, body)
+	}
+
 	// Preview + ticket.
 	resp, body = call(t, "PUT", api+"/v1/sandboxes/"+sb.ID+"/preview", "t0k", map[string]any{"port": 3000, "access": "members"}, nil)
 	if resp.StatusCode != 200 || !strings.Contains(string(body), `"host":"shop-alice.preview.test"`) {

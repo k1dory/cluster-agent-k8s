@@ -1,0 +1,6 @@
+# Gateway VM: firewall, Docker, compose stack (Caddy + sandboxd [+ Postgres]).
+- name: agent-sandbox gateway VM
+  hosts: gateway
+  become: true
+  roles:
+    - gateway_vm

@@ -52,6 +52,8 @@ func (p *Platform) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/sandboxes/{id}/touch", p.auth(p.touch))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/runs", p.auth(p.listRuns))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/runs", p.auth(p.createRun))
+	mux.HandleFunc("GET /v1/sandboxes/{id}/runs/{run}", p.auth(p.getRun))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/runs/{run}/cancel", p.auth(p.cancelRun))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/runs/{run}/input", p.auth(p.input))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/events", p.auth(p.events))
 	mux.HandleFunc("PUT /v1/sandboxes/{id}/preview", p.auth(p.setPreview))
@@ -176,6 +178,24 @@ func (p *Platform) createRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, run)
 }
 
+func (p *Platform) getRun(w http.ResponseWriter, r *http.Request) {
+	run, err := p.Orch.Store.GetRun(r.Context(), r.PathValue("run"))
+	if err != nil || run.SandboxID != r.PathValue("id") {
+		writeErr(w, http.StatusNotFound, store.ErrNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+func (p *Platform) cancelRun(w http.ResponseWriter, r *http.Request) {
+	run, err := p.Orch.CancelRun(r.Context(), r.PathValue("id"), r.PathValue("run"))
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
 func (p *Platform) input(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Text string `json:"text"`
@@ -202,6 +222,28 @@ func (p *Platform) events(w http.ResponseWriter, r *http.Request) {
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
 		after, _ = strconv.ParseInt(v, 10, 64)
 	}
+	runFilter := r.URL.Query().Get("run")
+	want := func(e model.Event) bool { return runFilter == "" || e.RunID == runFilter }
+	if stream, _ := strconv.ParseBool(r.URL.Query().Get("stream")); r.URL.Query().Has("stream") && !stream {
+		// Plain JSON page of the log, for clients that do not speak SSE.
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		if limit <= 0 || limit > 5000 {
+			limit = 1000
+		}
+		evs, err := p.Orch.Store.ListEvents(r.Context(), id, after, limit)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		out := []*model.Event{}
+		for _, e := range evs {
+			if want(*e) {
+				out = append(out, e)
+			}
+		}
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
@@ -226,7 +268,9 @@ func (p *Platform) events(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		for _, e := range evs {
-			send(*e)
+			if want(*e) {
+				send(*e)
+			}
 			after = e.ID
 		}
 	}
@@ -238,7 +282,9 @@ func (p *Platform) events(w http.ResponseWriter, r *http.Request) {
 			return
 		case e := <-ch:
 			if e.ID > after {
-				send(e)
+				if want(e) {
+					send(e)
+				}
 				after = e.ID
 			}
 		case <-keepalive.C:

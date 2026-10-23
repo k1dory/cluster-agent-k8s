@@ -1,0 +1,8 @@
+gateway_mode: external
+kubeconfig: ~/.kube/config
+k8s_namespace: agent-sandbox
+gateway_node_label: agent-sandbox.io/gateway=true
+gateway_node_name: ""
+manifests_dir: "{{ playbook_dir }}/../../k8s"
+# vault: sandboxd_api_token, preview_ticket_key, database_url (postgres URL), postgres_password
+database_url: "postgres://sandbox:{{ postgres_password | default('change-me') }}@postgres.{{ k8s_namespace }}.svc:5432/sandbox?sslmode=disable"

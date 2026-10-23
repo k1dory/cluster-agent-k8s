@@ -117,7 +117,11 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 		cmdline = `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose`
 	}
 	fmt.Printf("agent-runner: run %s: %q\n", run.ID, truncate(run.Task, 80))
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-lc", cmdline)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, "/bin/sh", "-lc", cmdline)
+	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.WaitDelay = 20 * time.Second
 	cmd.Env = append(os.Environ(), "SANDBOX_TASK="+run.Task, "SANDBOX_RUN_ID="+run.ID)
 	cmd.Dir = os.Getenv("PWD")
 	stdin, err := cmd.StdinPipe()
@@ -136,12 +140,10 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	// Harnesses that take the task on stdin get it first; CLI-arg harnesses just ignore it.
 	go func() { _, _ = io.WriteString(stdin, run.Task+"\n") }()
 
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); streamOutput(c, run.ID, stdout) }()
-	go func() { defer wg.Done(); forwardInput(runCtx, c, run.ID, stdin) }()
+	go func() { defer wg.Done(); forwardInput(runCtx, c, run.ID, stdin, cancel) }()
 
 	err = cmd.Wait()
 	cancel()
@@ -205,7 +207,7 @@ func (c *client) post(runID string, lines []string) {
 	resp.Body.Close()
 }
 
-func forwardInput(ctx context.Context, c *client, runID string, w io.WriteCloser) {
+func forwardInput(ctx context.Context, c *client, runID string, w io.WriteCloser, cancelRun context.CancelFunc) {
 	defer w.Close()
 	var after int64
 	for ctx.Err() == nil {
@@ -220,6 +222,11 @@ func forwardInput(ctx context.Context, c *client, runID string, w io.WriteCloser
 		}
 		for _, e := range evs {
 			after = e.ID
+			if e.Type == model.EventRunCancel {
+				fmt.Println("agent-runner: run cancelled by the control plane")
+				cancelRun()
+				return
+			}
 			if _, err := io.WriteString(w, e.Data+"\n"); err != nil {
 				return
 			}

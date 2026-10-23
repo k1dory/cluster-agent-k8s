@@ -1,0 +1,126 @@
+- name: Require secrets from vault
+  ansible.builtin.assert:
+    that:
+      - sandboxd_api_token is defined
+      - preview_ticket_key is defined
+      - with_postgres == false or postgres_password is defined
+    fail_msg: "define sandboxd_api_token, preview_ticket_key (and postgres_password) in ansible-vault"
+
+- name: Packages
+  ansible.builtin.apt:
+    name: [nftables, docker.io, docker-compose-v2, git, ca-certificates]
+    state: present
+    update_cache: true
+
+- name: No forwarding, no IPv6 on the sandbox interface
+  ansible.builtin.copy:
+    dest: /etc/sysctl.d/90-sandbox-gw.conf
+    mode: "0644"
+    content: |
+      net.ipv4.ip_forward=0
+      net.ipv6.conf.{{ sandbox_iface }}.disable_ipv6=1
+  notify: reload nftables
+- name: Apply sysctl
+  ansible.builtin.command: sysctl --system
+  changed_when: false
+
+- name: Firewall for the sandbox VLAN
+  ansible.builtin.template:
+    src: nftables.nft.j2
+    dest: /etc/nftables.d/sandbox-gw.nft
+    mode: "0644"
+  notify: reload nftables
+- name: Include it from nftables.conf
+  ansible.builtin.lineinfile:
+    path: /etc/nftables.conf
+    line: 'include "/etc/nftables.d/sandbox-gw.nft"'
+    create: true
+    mode: "0644"
+  notify: reload nftables
+- name: nftables enabled
+  ansible.builtin.systemd:
+    name: nftables
+    enabled: true
+    state: started
+
+- name: systemd-resolved must not listen on the VLAN address (sandboxd serves DNS there)
+  ansible.builtin.copy:
+    dest: /etc/systemd/resolved.conf.d/sandbox.conf
+    mode: "0644"
+    content: |
+      [Resolve]
+      DNSStubListener=no
+  when: ansible_facts.services['systemd-resolved.service'] is defined
+  notify: restart systemd-resolved
+
+- name: Install directory
+  ansible.builtin.file:
+    path: "{{ install_dir }}/{{ item }}"
+    state: directory
+    mode: "0750"
+  loop: ["", "secrets", "secrets/shared", "secrets/tenants"]
+
+- name: Gather service facts
+  ansible.builtin.service_facts:
+
+- name: Compose files
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../gateway/{{ item }}"
+    dest: "{{ install_dir }}/{{ item }}"
+    mode: "0644"
+  loop: [docker-compose.yaml, sandboxd.yaml, Caddyfile.bootstrap]
+  notify: compose up
+
+- name: Environment
+  ansible.builtin.template:
+    src: env.j2
+    dest: "{{ install_dir }}/.env"
+    mode: "0600"
+  notify: compose up
+  no_log: true
+
+- name: kubeconfig for sandboxd
+  ansible.builtin.copy:
+    src: "{{ kubeconfig_src }}"
+    dest: "{{ install_dir }}/kubeconfig"
+    mode: "0600"
+  notify: compose up
+  no_log: true
+
+- name: Policies from git
+  ansible.builtin.git:
+    repo: "{{ policies_repo }}"
+    dest: "{{ install_dir }}/policies"
+    version: "{{ policies_version }}"
+    force: true
+  when: policies_repo != ""
+- name: Policies from the controller
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../../policies/"
+    dest: "{{ install_dir }}/policies/"
+    mode: "0644"
+  when: policies_repo == ""
+
+- name: Tenant secrets
+  ansible.builtin.copy:
+    src: "{{ secrets_src }}/"
+    dest: "{{ install_dir }}/secrets/"
+    mode: "0600"
+    directory_mode: "0700"
+  when: secrets_src != ""
+  no_log: true
+
+- name: Pull images
+  ansible.builtin.command:
+    argv: ["docker", "compose", "--profile", "{{ 'with-postgres' if with_postgres else 'none' }}", "pull", "-q"]
+    chdir: "{{ install_dir }}"
+  register: pull
+  changed_when: false
+  failed_when: pull.rc != 0 and 'manifest unknown' not in pull.stderr
+
+- name: Stack up
+  ansible.builtin.command:
+    argv: ["docker", "compose", "--profile", "{{ 'with-postgres' if with_postgres else 'none' }}", "up", "-d", "--remove-orphans"]
+    chdir: "{{ install_dir }}"
+  register: up
+  changed_when: "'Started' in up.stderr or 'Created' in up.stderr or 'Recreated' in up.stderr"

@@ -135,6 +135,33 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Run" }
+  /v1/sandboxes/{id}/runs/{run}:
+    parameters:
+      - { $ref: "#/components/parameters/id" }
+      - { name: run, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [runs]
+      summary: Get one run
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/sandboxes/{id}/runs/{run}/cancel:
+    parameters:
+      - { $ref: "#/components/parameters/id" }
+      - { name: run, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [runs]
+      summary: Cancel a queued or running run (the agent receives a run.cancel event and stops the harness)
+      responses:
+        "200":
+          description: Cancelled (or already finished)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
   /v1/sandboxes/{id}/runs/{run}/input:
     parameters:
       - { $ref: "#/components/parameters/id" }
@@ -157,20 +184,26 @@ paths:
     parameters: [{ $ref: "#/components/parameters/id" }]
     get:
       tags: [events]
-      summary: Event stream (SSE) with replay
+      summary: Event stream (SSE) with replay, or a JSON page with stream=false
       description: |
-        `text/event-stream`. Each message is `id: <event id>` and `data: <Event JSON>`.
-        Pass `after` (or the `Last-Event-ID` header) to replay from the persisted log.
+        Default: `text/event-stream`, each message is `id: <event id>`, `event: <type>`, `data: <Event JSON>`.
+        Pass `after` (or the `Last-Event-ID` header) to replay from the persisted log, `run` to see one run only.
+        With `stream=false` the same filter returns a JSON array (up to `limit`, default 1000) and closes.
       parameters:
-        - name: after
-          in: query
-          schema: { type: integer, format: int64, default: 0 }
+        - { name: after, in: query, schema: { type: integer, format: int64, default: 0 } }
+        - { name: run, in: query, schema: { type: string } }
+        - { name: stream, in: query, schema: { type: boolean, default: true } }
+        - { name: limit, in: query, schema: { type: integer, default: 1000 } }
       responses:
         "200":
-          description: Stream
+          description: Stream or page
           content:
             text/event-stream:
               schema: { type: string }
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Event" }
   /v1/sandboxes/{id}/preview:
     parameters: [{ $ref: "#/components/parameters/id" }]
     put:
@@ -431,6 +464,6 @@ components:
         id: { type: integer, format: int64 }
         sandbox_id: { type: string }
         run_id: { type: string }
-        type: { type: string, enum: [status, run.queued, run.started, run.output, run.finished, input] }
+        type: { type: string, enum: [status, run.queued, run.started, run.output, run.finished, run.cancel, input] }
         data: { type: string }
         at: { type: string, format: date-time }

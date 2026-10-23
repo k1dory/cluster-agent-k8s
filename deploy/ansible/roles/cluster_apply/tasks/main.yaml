@@ -1,0 +1,85 @@
+- name: Require secrets from vault
+  ansible.builtin.assert:
+    that:
+      - sandboxd_api_token is defined
+      - preview_ticket_key is defined
+    fail_msg: "define sandboxd_api_token and preview_ticket_key (ansible-vault group_vars/all/vault.yaml)"
+
+- name: Apply cluster manifests
+  ansible.builtin.command:
+    argv:
+      - kubectl
+      - --kubeconfig={{ kubeconfig | expanduser }}
+      - apply
+      - -f
+      - "{{ manifests_dir }}/{{ 'gateway-on-node.yaml' if gateway_mode == 'node' else 'cluster-only.yaml' }}"
+  register: apply
+  changed_when: "'configured' in apply.stdout or 'created' in apply.stdout"
+
+- name: Create or update the Secret (values never touch disk)
+  ansible.builtin.shell: |
+    set -o pipefail
+    kubectl --kubeconfig={{ kubeconfig | expanduser }} -n {{ k8s_namespace }} create secret generic agent-sandbox-secrets \
+      --from-literal=SANDBOXD_API_TOKEN='{{ sandboxd_api_token }}' \
+      --from-literal=PREVIEW_TICKET_KEY='{{ preview_ticket_key }}' \
+      --from-literal=DATABASE_URL='{{ database_url }}' \
+      --dry-run=client -o yaml | kubectl --kubeconfig={{ kubeconfig | expanduser }} apply -f -
+  args:
+    executable: /bin/bash
+  register: secret
+  changed_when: "'configured' in secret.stdout or 'created' in secret.stdout"
+  no_log: true
+
+- name: Label the gateway node
+  ansible.builtin.command:
+    argv: ["kubectl", "--kubeconfig={{ kubeconfig | expanduser }}", "label", "node", "{{ gateway_node_name }}", "{{ gateway_node_label }}", "--overwrite"]
+  when: gateway_mode == 'node' and gateway_node_name != ""
+  register: label
+  changed_when: "'labeled' in label.stdout"
+
+- name: Fetch the sandboxd token for the external gateway
+  ansible.builtin.command:
+    argv: ["kubectl", "--kubeconfig={{ kubeconfig | expanduser }}", "-n", "{{ k8s_namespace }}", "get", "secret", "agent-sandbox-sandboxd-token", "-o", "jsonpath={.data.token}"]
+  when: gateway_mode == 'external'
+  register: sa_token
+  changed_when: false
+  no_log: true
+
+- name: Build a kubeconfig for the gateway VM
+  when: gateway_mode == 'external'
+  block:
+    - name: Read API server address
+      ansible.builtin.command:
+        argv: ["kubectl", "--kubeconfig={{ kubeconfig | expanduser }}", "config", "view", "--minify", "-o", "jsonpath={.clusters[0].cluster.server}"]
+      register: api_server
+      changed_when: false
+    - name: Read cluster CA
+      ansible.builtin.command:
+        argv: ["kubectl", "--kubeconfig={{ kubeconfig | expanduser }}", "config", "view", "--minify", "--raw", "-o", "jsonpath={.clusters[0].cluster.certificate-authority-data}"]
+      register: cluster_ca
+      changed_when: false
+      no_log: true
+    - name: Write kubeconfig for sandboxd
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../sandboxd.kubeconfig"
+        mode: "0600"
+        content: |
+          apiVersion: v1
+          kind: Config
+          clusters:
+            - name: cluster
+              cluster:
+                server: {{ api_server.stdout }}
+                certificate-authority-data: {{ cluster_ca.stdout }}
+          users:
+            - name: sandboxd
+              user:
+                token: {{ sa_token.stdout | b64decode }}
+          contexts:
+            - name: sandboxd
+              context: { cluster: cluster, user: sandboxd, namespace: {{ k8s_namespace }} }
+          current-context: sandboxd
+      no_log: true
+    - name: Where the kubeconfig went
+      ansible.builtin.debug:
+        msg: "sandboxd kubeconfig written to deploy/ansible/sandboxd.kubeconfig; gateway.yaml copies it to the VM"

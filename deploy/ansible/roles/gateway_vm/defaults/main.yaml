@@ -1,0 +1,18 @@
+sandbox_iface: sbx0
+gateway_ip: 10.77.77.1
+install_dir: /opt/agent-sandbox
+preview_domain: preview.example.com
+preview_auth_url: ""
+preview_tls: ""
+agent_image: registry.example.com/agent-sandbox/agent:latest
+sandboxd_image: registry.example.com/agent-sandbox/sandboxd:latest
+k8s_namespace: agent-sandbox
+network_attachment: agent-sandbox/sandbox-vlan
+harness_cmd: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose'
+policies_repo: ""
+policies_version: main
+with_postgres: true
+database_url: ""
+secrets_src: ""
+kubeconfig_src: "{{ playbook_dir }}/../sandboxd.kubeconfig"
+# vault: sandboxd_api_token, preview_ticket_key, postgres_password

@@ -1,0 +1,24 @@
+#!/usr/sbin/nft -f
+# agent-sandbox gateway: pods reach this VM on DNS, 443 and 8443 only; nothing is forwarded.
+flush table inet sbxgw
+table inet sbxgw {
+	chain input {
+		type filter hook input priority 0; policy accept;
+		iifname "{{ sandbox_iface }}" jump from_sandbox
+	}
+	chain from_sandbox {
+		ct state established,related accept
+		ip saddr != {{ sandbox_cidr | default(gateway_ip.rsplit('.', 1)[0] ~ '.0/25') }} drop
+		meta nfproto ipv6 drop
+		udp dport 53 accept
+		tcp dport 53 accept
+		tcp dport { 443, 8443 } accept
+		icmp type echo-request accept
+		counter drop
+	}
+	chain forward {
+		type filter hook forward priority 0; policy drop;
+		iifname "{{ sandbox_iface }}" counter drop
+		oifname "{{ sandbox_iface }}" counter drop
+	}
+}

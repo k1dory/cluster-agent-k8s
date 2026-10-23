@@ -1,0 +1,14 @@
+- name: reload nftables
+  ansible.builtin.command: nft -f /etc/nftables.conf
+  changed_when: true
+
+- name: restart systemd-resolved
+  ansible.builtin.systemd:
+    name: systemd-resolved
+    state: restarted
+
+- name: compose up
+  ansible.builtin.command:
+    argv: ["docker", "compose", "--profile", "{{ 'with-postgres' if with_postgres else 'none' }}", "up", "-d", "--remove-orphans"]
+    chdir: "{{ install_dir }}"
+  changed_when: true

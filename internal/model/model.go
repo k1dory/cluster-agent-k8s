@@ -92,6 +92,7 @@ const (
 	EventRunStart  = "run.started"
 	EventRunOutput = "run.output"
 	EventRunDone   = "run.finished"
+	EventRunCancel = "run.cancel" // control event: the runner must stop the harness
 	EventInput     = "input"
 )
 

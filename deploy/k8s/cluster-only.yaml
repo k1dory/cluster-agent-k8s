@@ -1,0 +1,160 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-sandbox
+  labels:
+    app.kubernetes.io/name: agent-sandbox
+    app.kubernetes.io/instance: agent-sandbox
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: agent-sandbox-0.1.0
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-sandbox-sandboxd
+  labels:
+    app.kubernetes.io/name: agent-sandbox
+    app.kubernetes.io/instance: agent-sandbox
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: agent-sandbox-0.1.0
+
+---
+# Identity of agent pods. No RBAC at all: the projected token is only a bootstrap credential
+# that the Registrar verifies with TokenReview.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent
+  namespace: agent-sandbox
+  labels:
+    app.kubernetes.io/name: agent-sandbox
+    app.kubernetes.io/instance: agent-sandbox
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: agent-sandbox-0.1.0
+automountServiceAccountToken: false
+
+---
+# Long-lived token for the sandboxd running on the gateway VM. Build its kubeconfig with:
+#   kubectl -n agent-sandbox get secret agent-sandbox-sandboxd-token -o jsonpath='{.data.token}' | base64 -d
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agent-sandbox-sandboxd-token
+  labels:
+    app.kubernetes.io/name: agent-sandbox
+    app.kubernetes.io/instance: agent-sandbox
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: agent-sandbox-0.1.0
+  annotations:
+    kubernetes.io/service-account.name: agent-sandbox-sandboxd
+type: kubernetes.io/service-account-token
+
+---
+# TokenReview is cluster-scoped.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agent-sandbox-sandboxd-tokenreview
+  labels:
+    app.kubernetes.io/name: agent-sandbox
+    app.kubernetes.io/instance: agent-sandbox
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: agent-sandbox-0.1.0
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-sandbox-sandboxd-tokenreview
+  labels:
+    app.kubernetes.io/name: agent-sandbox
+    app.kubernetes.io/instance: agent-sandbox
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: agent-sandbox-0.1.0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agent-sandbox-sandboxd-tokenreview
+subjects:
+  - kind: ServiceAccount
+    name: agent-sandbox-sandboxd
+    namespace: agent-sandbox
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-sandbox-sandboxd
+  namespace: agent-sandbox
+  labels:
+    app.kubernetes.io/name: agent-sandbox
+    app.kubernetes.io/instance: agent-sandbox
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: agent-sandbox-0.1.0
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "create", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-sandbox-sandboxd
+  namespace: agent-sandbox
+  labels:
+    app.kubernetes.io/name: agent-sandbox
+    app.kubernetes.io/instance: agent-sandbox
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: agent-sandbox-0.1.0
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agent-sandbox-sandboxd
+subjects:
+  - kind: ServiceAccount
+    name: agent-sandbox-sandboxd
+    namespace: agent-sandbox
+
+---
+# Requires Multus and whereabouts to be installed on the cluster.
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: sandbox-vlan
+  namespace: agent-sandbox
+  labels:
+    app.kubernetes.io/name: agent-sandbox
+    app.kubernetes.io/instance: agent-sandbox
+    app.kubernetes.io/version: "0.1.0"
+    helm.sh/chart: agent-sandbox-0.1.0
+spec:
+  config: |
+    {
+      "cniVersion": "0.3.1",
+      "name": "sandbox-vlan",
+      "type": "macvlan",
+      "master": "eth1",
+      "mode": "private",
+      "ipam": {
+        "type": "whereabouts",
+        "range": "10.77.77.0/25",
+        "range_start": "10.77.77.10",
+        "range_end": "10.77.77.126",
+        "exclude": ["10.77.77.1/32"],
+        "gateway": "10.77.77.1",
+        "routes": [ { "dst": "0.0.0.0/0", "gw": "10.77.77.1" } ]
+      }
+    }

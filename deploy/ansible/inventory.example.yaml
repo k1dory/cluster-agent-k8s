@@ -1,0 +1,30 @@
+all:
+  vars:
+    # which layout: "node" (gateway pod on a cluster node, gateway.yaml not needed) or "external" (gateway VM)
+    gateway_mode: external
+    kubeconfig: ~/.kube/config
+    k8s_namespace: agent-sandbox
+    gateway_node_label: agent-sandbox.io/gateway=true
+    gateway_node_name: worker-gw            # only for mode node
+    # secrets live in group_vars/all/vault.yaml (ansible-vault): sandboxd_api_token, preview_ticket_key, postgres_password
+  children:
+    gateway:
+      hosts:
+        gw1:
+          ansible_host: 192.0.2.10
+          ansible_user: ops
+      vars:
+        sandbox_iface: sbx0
+        gateway_ip: 10.77.77.1
+        preview_domain: preview.example.com
+        preview_auth_url: ""                   # your auth endpoint that mints preview tickets; "" = link-only previews
+        preview_tls: ""                        # "" = on-demand; or "dns cloudflare {env.CF_API_TOKEN}" with a custom Caddy build
+        agent_image: registry.example.com/agent-sandbox/agent:latest
+        sandboxd_image: registry.example.com/agent-sandbox/sandboxd:latest
+        network_attachment: agent-sandbox/sandbox-vlan
+        harness_cmd: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose'
+        policies_repo: https://github.com/you/agent-policies.git   # or "" to copy ../../policies from the controller
+        policies_version: main
+        with_postgres: true                    # compose profile; false when database_url points elsewhere
+        database_url: ""
+        secrets_src: ""                        # optional local dir with tenants/<t>/<name>, shared/<name>
