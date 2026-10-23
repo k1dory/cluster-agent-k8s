@@ -11,7 +11,7 @@ jobs:
     container: golang:1.26
     steps:
       - uses: actions/checkout@v4
-      - run: go build -o /tmp/sandboxd ./cmd/sandboxd
+      - run: go build -buildvcs=false -o /tmp/sandboxd ./cmd/sandboxd
       - run: /tmp/sandboxd policy validate policies
       - run: /tmp/sandboxd policy test policies -f policies/tests.yaml
       - name: render the gateway config the way production will see it
