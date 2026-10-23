@@ -4,7 +4,15 @@ Run coding agents in isolated Kubernetes pods: one network interface per pod, an
 gateway (Caddy) that enforces per-agent host+path policy and injects secrets, and one Go service
 (`sandboxd`) that owns identities, sandboxes, runs, the preview proxy and the gateway's configuration.
 
+![How a task flows through the gateway, then the fleet](docs/motion/agent-sandbox.gif)
+
+*26 seconds: one task from the API to the pod, the agent's requests checked at the gateway (MCP ✓, Git ✓, anything else ✗ with the rule that denied it), then the fleet: pods starting, sleeping, reviewing PRs, writing docs, taking tasks, serving a preview. [MP4](docs/motion/agent-sandbox.mp4) · source `docs/motion/scene.html`, rendered by `docs/motion/render.mjs`.*
+
+<details><summary>Static architecture diagram</summary>
+
 ![Architecture](docs/architecture.svg)
+
+</details>
 
 Policy-as-Code: `policies/*.yaml` is the single source of truth. From it sandboxd renders the
 Caddy configuration (one TLS site per host, client-certificate check, header stripping), answers
