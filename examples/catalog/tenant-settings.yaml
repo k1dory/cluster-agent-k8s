@@ -1,5 +1,6 @@
 # TenantSettings (admin): what tenant acme may have. Quota replaces the server defaults for the
-# tenant; environments confines its agents to the listed profiles (own by name, shared/name).
+# tenant; environments confines its agents to the listed profiles (own by name, shared/name);
+# hosts lets it connect MCP servers and APIs of its own without a policy file change.
 # Apply: sandboxctl apply -f examples/catalog/tenant-settings.yaml -tenant acme
 kind: TenantSettings
 spec:
@@ -9,3 +10,6 @@ spec:
   environments:
     - python-dev                    # the tenant's own profile
     - shared/base                   # a shared profile the admin keeps
+  hosts:                            # hosts the tenant may reach through its own connections, beyond
+    - mcp.tools.example.com         # what the policy repository serves (exact names or *.suffix)
+    - "*.internal.example.com"

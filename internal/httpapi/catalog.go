@@ -72,6 +72,9 @@ func (p *Platform) resolveAgentRef(r *http.Request, req *orchestrator.CreateRequ
 	req.EnvironmentRef = res.EnvironmentRef
 	req.EnvironmentRevision = res.Environment.Revision
 	launch := res.Launch
+	if p.Connections != nil {
+		launch.MCPServers = p.Connections.Endpoints(r.Context(), scope, res.Connections)
+	}
 	req.Launch = &launch
 	req.Connections = res.Connections
 	return nil

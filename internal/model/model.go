@@ -53,13 +53,22 @@ type Launch struct {
 	Instructions string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
 	// Env is the profile's own variables for the agent container. They never reach the init
 	// containers and never shadow a platform variable (see PlatformEnv).
-	Env           map[string]string `json:"env,omitempty"`
-	CPURequest    string            `json:"cpu_request,omitempty"`
-	CPULimit      string            `json:"cpu_limit,omitempty"`
-	MemoryRequest string            `json:"memory_request,omitempty"`
-	MemoryLimit   string            `json:"memory_limit,omitempty"`
-	VolumeSize    string            `json:"volume_size,omitempty"`
-	RuntimeClass  string            `json:"runtime_class,omitempty"`
+	Env map[string]string `json:"env,omitempty"`
+	// MCPServers are the MCP endpoints the agent's connections give it, exported to the pod as
+	// SANDBOX_MCP_SERVERS (JSON) so the harness can register them.
+	MCPServers    []MCPServer `json:"mcp_servers,omitempty"`
+	CPURequest    string      `json:"cpu_request,omitempty"`
+	CPULimit      string      `json:"cpu_limit,omitempty"`
+	MemoryRequest string      `json:"memory_request,omitempty"`
+	MemoryLimit   string      `json:"memory_limit,omitempty"`
+	VolumeSize    string      `json:"volume_size,omitempty"`
+	RuntimeClass  string      `json:"runtime_class,omitempty"`
+}
+
+// MCPServer is one MCP endpoint of a launch: the connection's name and its URL.
+type MCPServer struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
 }
 
 // PlatformEnv reports whether an environment variable name belongs to the platform: the

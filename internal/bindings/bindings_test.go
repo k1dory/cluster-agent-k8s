@@ -96,3 +96,49 @@ func TestBindingsGrantAndRevoke(t *testing.T) {
 		t.Fatalf("replica after refresh: %v", err)
 	}
 }
+
+// ownHosts stands in for the connections service's self-service hosts.
+type ownHosts struct {
+	hosts []policy.Host
+	fp    string
+}
+
+func (o ownHosts) OwnHosts() ([]policy.Host, string) { return o.hosts, o.fp }
+func (o ownHosts) HeadersFor(context.Context, string, string, string) (map[string]string, error) {
+	return nil, nil
+}
+func (o ownHosts) RuleFor(_ context.Context, sandboxID, _, host, _, _ string) (*policy.Rule, bool, error) {
+	if sandboxID == "sb" && host == "tools.example.com" {
+		return &policy.Rule{Host: host, Paths: []string{"/**"}}, true, nil
+	}
+	return nil, false, nil
+}
+
+func TestGuardMergesConnectionHosts(t *testing.T) {
+	pols := policy.FromPolicies(&policy.Policy{Slug: "dev", Allow: []policy.Rule{{Host: "api.github.com", Paths: []string{"/**"}}}})
+	g := &Guard{Set: pols, Bindings: New(store.NewMemory(), pols)}
+	// Without a host source the guard is the repository.
+	if hs := g.Hosts(); len(hs) != 1 || g.Fingerprint() != pols.Fingerprint() {
+		t.Fatalf("plain guard: %+v", hs)
+	}
+	g.Headers = ownHosts{hosts: []policy.Host{
+		{Name: "tools.example.com", Upstream: "https://10.0.0.5", MCP: true, Injected: []string{"Authorization"}},
+		{Name: "api.github.com", Upstream: "https://evil", Injected: []string{"X-Shadow"}}, // a repository host stays the repository's
+	}, fp: "c1"}
+	hs := g.Hosts()
+	if len(hs) != 2 || hs[0].Name != "api.github.com" || hs[0].Upstream != "https://api.github.com" || hs[1].Name != "tools.example.com" || !hs[1].MCP {
+		t.Fatalf("merged hosts: %+v", hs)
+	}
+	if info, ok := g.HostInfo("tools.example.com"); !ok || info.Upstream != "https://10.0.0.5" {
+		t.Fatalf("host info: %v %+v", ok, info)
+	}
+	if _, ok := g.HostInfo("nope.example.com"); ok {
+		t.Fatal("unknown host")
+	}
+	if fp := g.Fingerprint(); fp != pols.Fingerprint()+"+c1" {
+		t.Fatalf("fingerprint: %s", fp)
+	}
+	if r, ok, _ := g.RuleFor(context.Background(), "sb", "acme", "tools.example.com", "POST", "/mcp"); !ok || r.Host != "tools.example.com" {
+		t.Fatal("rule through the guard")
+	}
+}

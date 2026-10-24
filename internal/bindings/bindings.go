@@ -149,9 +149,17 @@ type HeaderSource interface {
 	HeadersFor(ctx context.Context, sandboxID, tenant, host string) (map[string]string, error)
 }
 
+// HostSource is what connections add to the policy repository's hosts: the hosts live
+// connections serve on their own (the connections service's OwnHosts) and the rule a sandbox's
+// connection gives it for such a host (RuleFor).
+type HostSource interface {
+	OwnHosts() ([]policy.Host, string)
+	RuleFor(ctx context.Context, sandboxID, tenant, host, method, reqPath string) (*policy.Rule, bool, error)
+}
+
 // Guard is the effective policy the orchestrator, the gateway and the catalogue decide with:
-// the repository's rules and ownership lists, the live bindings, and the connections' headers.
-// Every other policy question (rules, hosts, fingerprints) is answered by the embedded set.
+// the repository's rules and ownership lists, the live bindings, and the connections' headers
+// and self-service hosts. Every other policy question is answered by the embedded set.
 type Guard struct {
 	*policy.Set
 	Bindings *Service
@@ -164,6 +172,66 @@ func (g *Guard) HeadersFor(ctx context.Context, sandboxID, tenant, host string) 
 		return nil, nil
 	}
 	return g.Headers.HeadersFor(ctx, sandboxID, tenant, host)
+}
+
+func (g *Guard) hostSource() HostSource {
+	hs, ok := g.Headers.(HostSource)
+	if !ok {
+		return nil
+	}
+	return hs
+}
+
+// Hosts is the repository's host list plus the hosts live connections serve on their own: what
+// the gateway renders sites for, the DNS answers and the MCP proxy accepts. A repository host
+// stays the repository's whatever a connection says.
+func (g *Guard) Hosts() []policy.Host {
+	hs := g.Set.Hosts()
+	src := g.hostSource()
+	if src == nil {
+		return hs
+	}
+	own, _ := src.OwnHosts()
+	seen := map[string]bool{}
+	for _, h := range hs {
+		seen[h.Name] = true
+	}
+	for _, h := range own {
+		if !seen[h.Name] {
+			hs = append(hs, h)
+		}
+	}
+	return hs
+}
+
+// HostInfo looks a host up in Hosts.
+func (g *Guard) HostInfo(name string) (policy.Host, bool) {
+	for _, h := range g.Hosts() {
+		if h.Name == name {
+			return h, true
+		}
+	}
+	return policy.Host{}, false
+}
+
+// Fingerprint changes when the repository or the connections' hosts change: the gateway syncer
+// re-renders on either.
+func (g *Guard) Fingerprint() string {
+	fp := g.Set.Fingerprint()
+	if src := g.hostSource(); src != nil {
+		_, own := src.OwnHosts()
+		fp += "+" + own
+	}
+	return fp
+}
+
+// RuleFor forwards to the connections service (see authz.ConnectionRules).
+func (g *Guard) RuleFor(ctx context.Context, sandboxID, tenant, host, method, reqPath string) (*policy.Rule, bool, error) {
+	src := g.hostSource()
+	if src == nil {
+		return nil, false, nil
+	}
+	return src.RuleFor(ctx, sandboxID, tenant, host, method, reqPath)
 }
 
 // AllowedFor: the repository grants it, or a live binding does.

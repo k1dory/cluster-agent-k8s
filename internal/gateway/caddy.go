@@ -354,10 +354,17 @@ type HeaderSource interface {
 	HostHeaders() (map[string][]string, string)
 }
 
+// HostLister is where the gateway's hosts come from: the policy set alone, or the guard that
+// adds the hosts live connections serve on their own (bindings.Guard).
+type HostLister interface {
+	Hosts() []policy.Host
+	Fingerprint() string
+}
+
 // Syncer keeps Caddy in step with the policy set (and the connections' header names).
 type Syncer struct {
 	Cfg      Config
-	Policies *policy.Set
+	Policies HostLister
 	Headers  HeaderSource // optional
 	AgentCA  []byte
 	Log      *slog.Logger

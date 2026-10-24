@@ -149,10 +149,10 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	// The gateway syncer starts once the connections service exists (its header names are part
 	// of the rendered config); see below.
-	var startSyncer func(gateway.HeaderSource)
+	var startSyncer func(gateway.HostLister, gateway.HeaderSource)
 	if cfg.Gateway.CaddyAdmin != "" || cfg.Gateway.CaddyfileOut != "" {
-		startSyncer = func(h gateway.HeaderSource) {
-			syncer := &gateway.Syncer{Cfg: gwCfg, Policies: pols, Headers: h, AgentCA: agentCA.PEM(), Log: log.With("log", "gateway")}
+		startSyncer = func(hosts gateway.HostLister, h gateway.HeaderSource) {
+			syncer := &gateway.Syncer{Cfg: gwCfg, Policies: hosts, Headers: h, AgentCA: agentCA.PEM(), Log: log.With("log", "gateway")}
 			go syncer.Run(ctx, cfg.Gateway.SyncEvery)
 		}
 	}
@@ -183,18 +183,23 @@ func serve(cfgPath string, log *slog.Logger) error {
 	default:
 		log.Warn("no gateway.caddy_admin and no ca.gateway_ca_file: pods will not get a gateway root to trust")
 	}
+	// The DNS starts once the services exist: the connections' own hosts resolve too (below).
+	var startDNS func(gateway.HostLister) error
 	if cfg.Gateway.DNSListen != "" {
 		ip := net.ParseIP(cfg.Gateway.IP)
 		if ip == nil {
 			return fmt.Errorf("gateway.ip %q is not an IP address", cfg.Gateway.IP)
 		}
-		d := &gateway.DNS{IP: ip, Policies: pols, Extra: gwCfg.InternalHosts(), Log: log.With("log", "dns")}
-		go func() {
-			if err := d.ListenAndServe(ctx, cfg.Gateway.DNSListen); err != nil {
-				log.Error("dns", "err", err)
-			}
-		}()
-		log.Info("dns listening", "addr", cfg.Gateway.DNSListen)
+		startDNS = func(hosts gateway.HostLister) error {
+			d := &gateway.DNS{IP: ip, Policies: hosts, Extra: gwCfg.InternalHosts(), Log: log.With("log", "dns")}
+			go func() {
+				if err := d.ListenAndServe(ctx, cfg.Gateway.DNSListen); err != nil {
+					log.Error("dns", "err", err)
+				}
+			}()
+			log.Info("dns listening", "addr", cfg.Gateway.DNSListen)
+			return nil
+		}
 	}
 
 	var rt orchestrator.Runtime
@@ -320,7 +325,12 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	services.Watch(ctx, log)
 	if startSyncer != nil {
-		startSyncer(services.Connections)
+		startSyncer(services.Guard, services.Connections)
+	}
+	if startDNS != nil {
+		if err := startDNS(services.Guard); err != nil {
+			return err
+		}
 	}
 	az := &authz.Handler{Policies: services.Guard, Secrets: secretProvider, Checker: reg, Toucher: orch, Recorder: orch,
 		Trace: cfg.Accounting.EgressTrace, Quiet: map[string]bool{cfg.Gateway.APIHost: true}, Audit: log.With("log", "egress")}
@@ -352,7 +362,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 		return errors.New("no api_token, api_tokens or oidc configured: nobody could call the API to issue tenant keys")
 	}
 	gw := &httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, Log: log.With("log", "gateway-api"),
-		MCP: &mcpproxy.Handler{Authz: az, Hosts: pols, Log: log.With("log", "mcp")}}
+		MCP: &mcpproxy.Handler{Authz: az, Hosts: services.Guard, Log: log.With("log", "mcp")}}
 
 	servers := []*http.Server{
 		{Addr: cfg.Listen.API, Handler: platform.Routes(), ReadHeaderTimeout: 10 * time.Second},

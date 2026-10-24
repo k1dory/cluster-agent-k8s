@@ -53,6 +53,7 @@ func Wire(ctx context.Context, d Deps) (*Services, error) {
 	bind := bindings.New(d.Store, d.Policies)
 	tset := tenants.New(d.Store, defaults)
 	conns := connections.New(d.Store, d.Secrets, d.Store)
+	conns.Hosts = hostPolicy{set: d.Policies, tenants: tset}
 	for name, r := range map[string]interface{ Refresh(context.Context) error }{"bindings": bind, "tenant settings": tset, "connections": conns} {
 		if err := r.Refresh(ctx); err != nil {
 			return nil, fmt.Errorf("load %s: %w", name, err)
@@ -110,3 +111,14 @@ func (l limits) SlugQuota(slug, tenant string) orchestrator.Quota {
 	}
 	return orchestrator.Quota{}
 }
+
+// hostPolicy answers which hosts a connection may serve on its own: the repository's hosts are
+// the repository's (a connection adds headers only); any other host needs the tenant's
+// settings to list it.
+type hostPolicy struct {
+	set     *policy.Set
+	tenants *tenants.Service
+}
+
+func (h hostPolicy) HostInfo(name string) (policy.Host, bool) { return h.set.HostInfo(name) }
+func (h hostPolicy) HostAllowed(tenant, host string) bool     { return h.tenants.HostAllowed(tenant, host) }

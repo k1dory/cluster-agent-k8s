@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/policy"
 	res "agent-sandbox/internal/resource"
 	"agent-sandbox/internal/secrets"
 	"agent-sandbox/internal/store"
@@ -150,5 +151,115 @@ func TestHeadersForGatewayDecision(t *testing.T) {
 	s.Secrets = secrets.Static{}
 	if _, err := s.HeadersFor(ctx, "broken", "acme", "api.github.com"); err == nil {
 		t.Fatal("unresolvable reference must fail the decision")
+	}
+}
+
+// repoHosts is the policy repository's host list for the self-service tests, plus which hosts
+// each tenant's settings allow.
+type repoHosts struct {
+	repo    map[string]policy.Host
+	allowed map[string][]string // tenant → hosts
+}
+
+func (r repoHosts) HostInfo(name string) (policy.Host, bool) { h, ok := r.repo[name]; return h, ok }
+func (r repoHosts) HostAllowed(tenant, host string) bool {
+	for _, h := range r.allowed[tenant] {
+		if h == host {
+			return true
+		}
+	}
+	return false
+}
+
+func TestSelfServiceHostsAreTheConnection(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+	sbs := sandboxes{
+		"with":    {ID: "with", Tenant: "acme", Connections: []string{"tools", "shared/vendor"}},
+		"without": {ID: "without", Tenant: "acme", Connections: []string{"shared/vendor"}},
+	}
+	s := New(st, secrets.Static{"acme/tools": "tok", "shared/vendor": "v"}, sbs)
+	s.Hosts = repoHosts{
+		repo:    map[string]policy.Host{"api.github.com": {Name: "api.github.com", Upstream: "https://api.github.com"}},
+		allowed: map[string][]string{"acme": {"tools.acme.example.com"}},
+	}
+	// A repository host takes headers only.
+	if _, err := s.Put(ctx, "acme", doc("gh", `{"type":"http","host":"api.github.com","upstream":"https://10.0.0.1"}`), false, "x"); !errors.Is(err, res.ErrInvalid) {
+		t.Fatalf("upstream on a repository host: %v", err)
+	}
+	// A host the tenant's settings do not list is refused; a listed one is served.
+	if _, err := s.Put(ctx, "acme", doc("bad", `{"type":"mcp","host":"mcp.other.example.com"}`), false, "x"); !errors.Is(err, res.ErrForbidden) {
+		t.Fatalf("host outside the tenant's list: %v", err)
+	}
+	for _, bad := range []string{
+		`{"type":"mcp","host":"tools.acme.example.com","upstream":"ftp://x"}`,
+		`{"type":"mcp","host":"tools.acme.example.com","upstream":"https://user:pw@x"}`,
+		`{"type":"mcp","host":"tools.acme.example.com","paths":["mcp"]}`,
+		`{"type":"http","host":"tools.acme.example.com","mcp":{"read_only":true}}`,
+	} {
+		if _, err := s.Put(ctx, "acme", doc("bad", bad), false, "x"); !errors.Is(err, res.ErrInvalid) {
+			t.Errorf("%s must be invalid: %v", bad, err)
+		}
+	}
+	if _, err := s.Put(ctx, "acme", doc("tools", `{"type":"mcp","host":"tools.acme.example.com","upstream":"https://10.0.0.5:8443","paths":["/mcp","/mcp/**"],"mcp":{"read_only":true,"tools":["get_*"]},"headers":{"Authorization":"Bearer secret:tools"}}`), false, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	// The admin's shared connections may name any host; a second connection for a host must
+	// agree with the first on upstream and kind.
+	if _, err := s.Put(ctx, "", doc("vendor", `{"type":"mcp","host":"mcp.vendor.example.com"}`), true, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Put(ctx, "acme", doc("vendor2", `{"type":"mcp","host":"tools.acme.example.com","upstream":"https://10.0.0.6"}`), false, "alice"); !errors.Is(err, res.ErrInvalid) {
+		t.Fatalf("conflicting upstream: %v", err)
+	}
+	if _, err := s.Put(ctx, "acme", doc("vendor2", `{"type":"http","host":"tools.acme.example.com","upstream":"https://10.0.0.5:8443"}`), false, "alice"); !errors.Is(err, res.ErrInvalid) {
+		t.Fatalf("conflicting kind: %v", err)
+	}
+	// The hosts the gateway must serve beyond the repository's, with their header names.
+	own, fp := s.OwnHosts()
+	if len(own) != 2 || own[0].Name != "mcp.vendor.example.com" || !own[0].MCP || own[0].Upstream != "https://mcp.vendor.example.com" ||
+		own[1].Name != "tools.acme.example.com" || own[1].Upstream != "https://10.0.0.5:8443" || !own[1].MCP || strings.Join(own[1].Injected, ",") != "Authorization" || fp == "" {
+		t.Fatalf("own hosts: %+v %s", own, fp)
+	}
+	// The rule a sandbox gets: only through a connection it carries, only on its paths, with
+	// the connection's MCP restriction; a repository host is never answered here.
+	rule, ok, err := s.RuleFor(ctx, "with", "acme", "tools.acme.example.com", "POST", "/mcp")
+	if err != nil || !ok || rule.Upstream != "https://10.0.0.5:8443" || rule.MCP == nil || !rule.MCP.ReadOnly || !rule.MCP.ToolAllowed("get_x") || rule.MCP.ToolAllowed("delete_x") {
+		t.Fatalf("rule: %v %v %+v", err, ok, rule)
+	}
+	if _, ok, _ := s.RuleFor(ctx, "with", "acme", "tools.acme.example.com", "POST", "/admin"); ok {
+		t.Fatal("path outside the connection's paths")
+	}
+	if _, ok, _ := s.RuleFor(ctx, "without", "acme", "tools.acme.example.com", "POST", "/mcp"); ok {
+		t.Fatal("a sandbox without the connection")
+	}
+	if rule, ok, _ := s.RuleFor(ctx, "without", "acme", "mcp.vendor.example.com", "POST", "/anything"); !ok || rule.MCP == nil || rule.MCP.ReadOnly {
+		t.Fatalf("shared mcp connection without restrictions: %v %+v", ok, rule)
+	}
+	if _, ok, _ := s.RuleFor(ctx, "with", "acme", "api.github.com", "GET", "/"); ok {
+		t.Fatal("a repository host is the repository's")
+	}
+	if _, _, err := s.RuleFor(ctx, "with", "mallory", "tools.acme.example.com", "POST", "/mcp"); err == nil {
+		t.Fatal("identity tenant must be the sandbox's")
+	}
+	// What the pod is told: the MCP endpoints of the agent's connections.
+	eps := s.Endpoints(ctx, "acme", []string{"tools", "shared/vendor", "gone"})
+	if len(eps) != 2 || eps[0].Name != "tools" || eps[0].URL != "https://tools.acme.example.com/mcp" || eps[1].URL != "https://mcp.vendor.example.com/mcp" {
+		t.Fatalf("endpoints: %+v", eps)
+	}
+	// Deleting the connection withdraws the host and the rule.
+	if err := s.Delete(ctx, "acme", "tools"); err != nil {
+		t.Fatal(err)
+	}
+	if own, _ := s.OwnHosts(); len(own) != 1 {
+		t.Fatalf("after delete: %+v", own)
+	}
+	if _, ok, _ := s.RuleFor(ctx, "with", "acme", "tools.acme.example.com", "POST", "/mcp"); ok {
+		t.Fatal("deleted connection still grants")
+	}
+	// Without a host policy, connections add headers only (no self-service at all).
+	plain := New(store.NewMemory(), nil, nil)
+	if _, err := plain.Put(ctx, "acme", doc("x", `{"type":"mcp","host":"a.example.com","paths":["/"]}`), false, "x"); !errors.Is(err, res.ErrInvalid) {
+		t.Fatalf("self-service without a host policy: %v", err)
 	}
 }

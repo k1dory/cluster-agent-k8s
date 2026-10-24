@@ -1420,6 +1420,14 @@ components:
       description: The environment profile rendered at creation, kept on the sandbox; every pod of the sandbox starts with it
       properties:
         image: { type: string }
+        mcp_servers:
+          type: array
+          description: "The MCP endpoints the agent's connections give it; exported to the pod as SANDBOX_MCP_SERVERS"
+          items:
+            type: object
+            properties:
+              name: { type: string, description: "The connection as the agent named it" }
+              url: { type: string }
         harness_command: { type: string }
         harness_resume_command: { type: string }
         resume_prompt: { type: string }
@@ -1599,11 +1607,20 @@ components:
       additionalProperties: false
       properties:
         type: { type: string, enum: [http, mcp] }
-        host: { type: string, description: "External host name (lower-case, no scheme or port) a policy serves" }
+        host: { type: string, description: "External host name (lower-case, no scheme or port). A host the policy repository serves takes headers only; any other host needs the tenant's settings to list it (admin shared connections: any host) and the connection is then its egress rule" }
         headers:
           type: object
           additionalProperties: { type: string }
           description: "Headers the gateway adds for agents using this connection. Values are templates: secret:NAME is resolved from the tenant's secrets at request time. A credential header (Authorization, Cookie, anything named like a key or token) must be a reference such as \"Bearer secret:NAME\"; a literal value is refused and never echoed"
+        upstream: { type: string, description: "Self-service hosts only: where the gateway sends the traffic (http(s) URL; default https://<host>). Every live connection for a host must agree" }
+        paths: { type: array, items: { type: string }, description: "Self-service hosts only: policy path patterns the agent may call (default /**)" }
+        mcp:
+          type: object
+          additionalProperties: false
+          description: "Self-service hosts of type mcp only: what the MCP proxy lets through (absent: every method and tool, the body is still inspected)"
+          properties:
+            read_only: { type: boolean }
+            tools: { type: array, items: { type: string }, description: "Globs of tools/call names allowed when read_only" }
     ConnectionDocument:
       type: object
       required: [spec]
@@ -1645,6 +1662,7 @@ components:
             max_sandboxes: { type: integer, minimum: 0 }
             max_awake: { type: integer, minimum: 0 }
         environments: { type: array, items: { type: string }, description: "Environment references the tenant's agents may use (name = its own, shared/name); empty = every visible one. Checked when an agent is written and when a sandbox is created" }
+        hosts: { type: array, items: { type: string }, description: "Hosts the tenant may reach through its own connections beyond what the policy repository serves: exact names or *.suffix. Empty = none" }
     TenantSettingsDocument:
       type: object
       required: [spec]

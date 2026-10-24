@@ -14,11 +14,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
 
 	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/policy"
 	res "agent-sandbox/internal/resource"
 	"agent-sandbox/internal/secrets"
 	"agent-sandbox/internal/store"
@@ -31,14 +33,38 @@ const (
 )
 
 // Spec is a Connection.
+//
+// For a host the policy repository serves, the connection only adds headers. For any other
+// host the connection is the whole egress rule: the gateway gets a site for it (certificate,
+// DNS, forward_auth, the MCP proxy for type mcp), and an agent that names the connection may
+// call it on Paths. A tenant may declare such a host only when its settings list it
+// (`hosts`); the admin's shared connections may name any host.
 type Spec struct {
 	Type string `yaml:"type" json:"type"` // http | mcp
-	Host string `yaml:"host" json:"host"` // external host name the policy serves
+	Host string `yaml:"host" json:"host"` // external host name
 	// Headers the gateway adds to requests of agents that use this connection. Values are
 	// templates: `secret:NAME` is replaced from the tenant's secrets. Credential headers
 	// (Authorization, Cookie, anything named like a key or token) must be references.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	// Upstream is where the gateway sends traffic for a host the policy repository does not
+	// serve (default https://<host>); ignored for a repository host, whose policy decides.
+	Upstream string `yaml:"upstream,omitempty" json:"upstream,omitempty"`
+	// Paths an agent may call on such a host (policy path patterns; default "/**").
+	Paths []string `yaml:"paths,omitempty" json:"paths,omitempty"`
+	// MCP is what the proxy enforces on a type mcp connection for such a host: read_only with
+	// an allowlist of tools. Absent: every method and tool passes (the body is still inspected).
+	MCP *policy.MCPRule `yaml:"mcp,omitempty" json:"mcp,omitempty"`
 }
+
+// HostPolicy says which hosts a connection may name: a repository host (headers only), or a
+// host the tenant's settings allow it to serve on its own.
+type HostPolicy interface {
+	HostInfo(name string) (policy.Host, bool) // the policy repository's hosts
+	HostAllowed(tenant, host string) bool     // tenant settings
+}
+
+// MCPServer is an MCP endpoint an agent's connections give it (exported to the pod).
+type MCPServer = model.MCPServer
 
 var (
 	hostRe       = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
@@ -58,7 +84,10 @@ type Service struct {
 	Store     store.Catalog
 	Secrets   secrets.Provider // optional: when set, every reference must resolve at write time
 	Sandboxes Sandboxes        // for HeadersFor (the gateway decision)
-	snap      res.Snapshot     // every live connection, for the gateway's header-name list
+	// Hosts decides which hosts a connection may serve on its own. nil: only repository hosts
+	// (a connection adds headers and nothing else).
+	Hosts HostPolicy
+	snap  res.Snapshot // every live connection, for the gateway's header-name and host lists
 }
 
 // New returns a service over st; call Refresh (and Watch) so the gateway knows the header names.
@@ -93,6 +122,9 @@ func (s *Service) Validate(ctx context.Context, tenant string, d *res.Document, 
 	if !hostRe.MatchString(sp.Host) {
 		return nil, fmt.Errorf("%w: spec.host must be a lower-case host name without scheme or port", res.ErrInvalid)
 	}
+	if err := s.checkOwnHost(tenant, &sp); err != nil {
+		return nil, err
+	}
 	for name, v := range sp.Headers {
 		if !headerRe.MatchString(name) {
 			return nil, fmt.Errorf("%w: spec.headers: %q is not a header name", res.ErrInvalid, name)
@@ -114,6 +146,177 @@ func (s *Service) Validate(ctx context.Context, tenant string, d *res.Document, 
 		return nil, err
 	}
 	return &model.CatalogItem{Kind: model.KindConnection, Tenant: tenant, Name: d.Name, Description: d.Description, Spec: spec, CreatedBy: who}, nil
+}
+
+// checkOwnHost validates the egress part of a connection for a host the repository does not
+// serve, and refuses it when the tenant may not serve that host on its own.
+func (s *Service) checkOwnHost(tenant string, sp *Spec) error {
+	repoHost := s.Hosts != nil && func() bool { _, ok := s.Hosts.HostInfo(sp.Host); return ok }()
+	if repoHost || s.Hosts == nil {
+		// The policy repository decides upstream, paths and MCP for this host; a connection
+		// declaring them would promise what it cannot deliver.
+		if sp.Upstream != "" || len(sp.Paths) > 0 || sp.MCP != nil {
+			if repoHost {
+				return fmt.Errorf("%w: %s is served by the policy repository: a connection for it adds headers only (no upstream, paths or mcp)", res.ErrInvalid, sp.Host)
+			}
+			return fmt.Errorf("%w: self-service hosts are not enabled: a connection adds headers only", res.ErrInvalid)
+		}
+		return nil
+	}
+	if tenant != "" && !s.Hosts.HostAllowed(tenant, sp.Host) {
+		return fmt.Errorf("%w: tenant %s may not reach %s: it is neither served by the policy repository nor listed under the tenant's hosts", res.ErrForbidden, tenant, sp.Host)
+	}
+	if sp.Upstream != "" {
+		u, err := url.Parse(sp.Upstream)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return fmt.Errorf("%w: spec.upstream must be an http(s) URL with a host and nothing else", res.ErrInvalid)
+		}
+	}
+	for _, p := range sp.Paths {
+		if !strings.HasPrefix(p, "/") {
+			return fmt.Errorf("%w: spec.paths: %q must start with /", res.ErrInvalid, p)
+		}
+	}
+	if sp.MCP != nil && sp.Type != TypeMCP {
+		return fmt.Errorf("%w: spec.mcp needs type mcp", res.ErrInvalid)
+	}
+	// One host, one upstream and one kind across every live connection: the gateway serves a
+	// host one way.
+	for _, it := range s.snap.All() {
+		if it.Tenant == tenant && it.Name == sp.Host {
+			continue
+		}
+		var other Spec
+		if err := res.DecodeStrict(it.Spec, &other); err != nil || other.Host != sp.Host {
+			continue
+		}
+		if upstreamOf(&other) != upstreamOf(sp) {
+			return fmt.Errorf("%w: %s already goes to %s (connection %s): a host has one upstream", res.ErrInvalid, sp.Host, upstreamOf(&other), res.RefOf(it, tenant))
+		}
+		if (other.Type == TypeMCP) != (sp.Type == TypeMCP) {
+			return fmt.Errorf("%w: %s is already a %s connection (%s): a host has one type", res.ErrInvalid, sp.Host, other.Type, res.RefOf(it, tenant))
+		}
+	}
+	return nil
+}
+
+func upstreamOf(sp *Spec) string {
+	if sp.Upstream != "" {
+		return sp.Upstream
+	}
+	return "https://" + sp.Host
+}
+
+// OwnHosts lists the hosts live connections serve on their own (not the repository's), with
+// their upstream, type and header names, and a fingerprint of the list. The guard merges
+// them into the policy hosts the gateway, the DNS and the MCP proxy work from.
+func (s *Service) OwnHosts() ([]policy.Host, string) {
+	byName := map[string]*policy.Host{}
+	for _, it := range s.snap.All() {
+		var sp Spec
+		if err := res.DecodeStrict(it.Spec, &sp); err != nil {
+			continue
+		}
+		if s.Hosts != nil {
+			if _, repo := s.Hosts.HostInfo(sp.Host); repo {
+				continue
+			}
+		}
+		h, ok := byName[sp.Host]
+		if !ok {
+			h = &policy.Host{Name: sp.Host, Upstream: upstreamOf(&sp), MCP: sp.Type == TypeMCP}
+			byName[sp.Host] = h
+		}
+		for name := range sp.Headers {
+			h.Injected = appendUnique(h.Injected, http.CanonicalHeaderKey(name))
+		}
+	}
+	names := make([]string, 0, len(byName))
+	for n := range byName {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	hash := sha256.New()
+	out := make([]policy.Host, 0, len(names))
+	for _, n := range names {
+		h := byName[n]
+		sort.Strings(h.Injected)
+		out = append(out, *h)
+		fmt.Fprintf(hash, "%s %s mcp=%v %s\n", h.Name, h.Upstream, h.MCP, strings.Join(h.Injected, ","))
+	}
+	return out, hex.EncodeToString(hash.Sum(nil))[:12]
+}
+
+// RuleFor is the egress rule a sandbox's connections give it for a host the repository does
+// not serve: the first connection of the sandbox naming the host whose paths match. Nothing
+// for a repository host (its policy decides), nothing for a sandbox without such a connection.
+func (s *Service) RuleFor(ctx context.Context, sandboxID, tenant, host, method, reqPath string) (*policy.Rule, bool, error) {
+	if s.Sandboxes == nil || sandboxID == "" {
+		return nil, false, nil
+	}
+	if s.Hosts != nil {
+		if _, repo := s.Hosts.HostInfo(host); repo {
+			return nil, false, nil
+		}
+	}
+	sb, err := s.Sandboxes.GetSandbox(ctx, sandboxID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if sb.Tenant != tenant {
+		return nil, false, fmt.Errorf("identity tenant %q is not the sandbox's %q", tenant, sb.Tenant)
+	}
+	for _, ref := range sb.Connections {
+		sp, err := s.spec(ctx, sb.Tenant, ref)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, false, fmt.Errorf("connection %s: %w", ref, err)
+		}
+		if sp.Host != host {
+			continue
+		}
+		paths := sp.Paths
+		if len(paths) == 0 {
+			paths = []string{"/**"}
+		}
+		for _, pat := range paths {
+			if policy.PathMatch(pat, reqPath) {
+				rule := &policy.Rule{Host: sp.Host, Paths: paths, Upstream: upstreamOf(sp)}
+				if sp.Type == TypeMCP {
+					rule.MCP = sp.MCP
+					if rule.MCP == nil {
+						rule.MCP = &policy.MCPRule{}
+					}
+				}
+				return rule, true, nil
+			}
+		}
+	}
+	return nil, false, nil
+}
+
+// Endpoints lists the MCP servers the connections named by refs (from tenant's scope) give an
+// agent: what the pod is told about, so a harness can register them without anyone editing
+// its configuration by hand. Unresolvable references are skipped (the launch validated them).
+func (s *Service) Endpoints(ctx context.Context, tenant string, refs []string) []MCPServer {
+	var out []MCPServer
+	for _, ref := range refs {
+		sp, err := s.spec(ctx, tenant, ref)
+		if err != nil || sp.Type != TypeMCP {
+			continue
+		}
+		p := "/mcp"
+		if len(sp.Paths) > 0 && !strings.ContainsAny(sp.Paths[0], "*") {
+			p = sp.Paths[0]
+		}
+		out = append(out, MCPServer{Name: ref, URL: "https://" + sp.Host + p})
+	}
+	return out
 }
 
 func (s *Service) refresh(ctx context.Context) error {

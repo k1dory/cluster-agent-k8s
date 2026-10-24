@@ -32,8 +32,14 @@ of a policy slug to a tenant (with an expiry and per-slug limits); `tenant-setti
 the tenant's quota and the environments its agents may use. All three are versioned and keep
 their history like the catalogue.
 
+`connection-mcp.yaml` is a host no policy file names: the admin listed it under the tenant's
+settings (`hosts`), so the tenant's connection is the whole rule for it (upstream, paths, MCP
+restrictions) and agents naming the connection get it as an MCP server. See
+[docs/self-service.md](../../docs/self-service.md).
+
 ```sh
 sandboxctl apply -f examples/catalog/connection-github.yaml                 # tenant token: own scope
+sandboxctl apply -f examples/catalog/connection-mcp.yaml                    # tenant token: a self-service MCP host
 sandboxctl apply -f examples/catalog/binding-backend.yaml -tenant acme      # admin
 sandboxctl apply -f examples/catalog/tenant-settings.yaml -tenant acme      # admin
 sandboxctl list bindings                                                     # a tenant sees its own

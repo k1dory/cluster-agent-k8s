@@ -7,20 +7,20 @@ import (
 	"strings"
 
 	"github.com/miekg/dns"
-
-	"agent-sandbox/internal/policy"
 )
 
 // DNS is the pods' only resolver: allowlisted names → gateway IP, everything else NXDOMAIN.
 // No upstream, so no query ever leaves the VLAN and no DNS tunnelling is possible.
 type DNS struct {
 	IP       net.IP
-	Policies *policy.Set
-	Extra    []string // internal hosts (api, registrar)
+	Policies HostLister // the policy set, or the guard that adds the connections' hosts
+	Extra    []string   // internal hosts (api, registrar)
 	Log      *slog.Logger
 }
 
-func (d *DNS) allowed(name string) bool {
+// Allowed reports whether the gateway serves name (an internal host, a repository host or a
+// connection's own host).
+func (d *DNS) Allowed(name string) bool {
 	name = strings.ToLower(strings.TrimSuffix(name, "."))
 	for _, h := range d.Extra {
 		if strings.EqualFold(h, name) {
@@ -47,7 +47,7 @@ func (d *DNS) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 		return
 	}
 	q := r.Question[0]
-	if !d.allowed(q.Name) {
+	if !d.Allowed(q.Name) {
 		m.Rcode = dns.RcodeNameError
 		if d.Log != nil {
 			d.Log.Warn("dns", "verdict", "nxdomain", "name", q.Name, "type", dns.TypeToString[q.Qtype], "src", w.RemoteAddr().String())
