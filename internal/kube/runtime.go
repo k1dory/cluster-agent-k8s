@@ -112,7 +112,7 @@ func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 	e.UserEnv = nil
 	l := sb.Launch
 	if l == nil {
-		return e
+		l = &model.Launch{}
 	}
 	pick := func(dst *string, v string) {
 		if v != "" {
@@ -131,21 +131,40 @@ func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 	pick(&e.Model, l.Model)
 	pick(&e.Instructions, l.Instructions)
 	e.UserEnv = l.Env
-	// A profile request above the configured limit raises the limit to it: the profile sized the
-	// pod; a request over its limit would be an invalid pod, not a smaller one.
-	raise := func(req, lim *string) {
-		if *req == "" || *lim == "" {
-			return
-		}
-		rq, err1 := resource.ParseQuantity(*req)
-		lq, err2 := resource.ParseQuantity(*lim)
-		if err1 == nil && err2 == nil && rq.Cmp(lq) > 0 {
-			*lim = *req
-		}
-	}
-	raise(&e.CPURequest, &e.CPULimit)
-	raise(&e.MemoryRequest, &e.MemoryLimit)
+	e.CPURequest, e.CPULimit = reconcile(e.CPURequest, e.CPULimit, l.CPURequest, l.CPULimit, defaultCPURequest, defaultCPULimit)
+	e.MemoryRequest, e.MemoryLimit = reconcile(e.MemoryRequest, e.MemoryLimit, l.MemoryRequest, l.MemoryLimit, defaultMemoryRequest, defaultMemoryLimit)
 	return e
+}
+
+// Built-in pod resources when neither the operator nor the profile sets one.
+const (
+	defaultCPURequest    = "250m"
+	defaultCPULimit      = "2"
+	defaultMemoryRequest = "1Gi"
+	defaultMemoryLimit   = "4Gi"
+)
+
+// reconcile fills the request/limit pair with the defaults, then makes it a valid pod: a
+// profile value is what the author asked for, so when the pair contradicts, the side the
+// profile did not set moves (a request above a default limit raises the limit; a limit below
+// a default request lowers the request). Both profile sides were validated together by the
+// catalogue; a contradiction the operator configured resolves by raising the limit.
+func reconcile(req, lim, profileReq, profileLim, defReq, defLim string) (string, string) {
+	if req == "" {
+		req = defReq
+	}
+	if lim == "" {
+		lim = defLim
+	}
+	rq, err1 := resource.ParseQuantity(req)
+	lq, err2 := resource.ParseQuantity(lim)
+	if err1 != nil || err2 != nil || rq.Cmp(lq) <= 0 {
+		return req, lim
+	}
+	if profileLim != "" && profileReq == "" {
+		return lim, lim
+	}
+	return req, req
 }
 
 // Annotation carrying the agent image on the pod, so `kubectl get pod -o yaml` tells the version.
@@ -220,10 +239,11 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 		}
 		rl[name] = resource.MustParse(v)
 	}
-	setQ(requests, corev1.ResourceCPU, c.CPURequest, "250m")
-	setQ(requests, corev1.ResourceMemory, c.MemoryRequest, "1Gi")
-	setQ(limits, corev1.ResourceCPU, c.CPULimit, "2")
-	setQ(limits, corev1.ResourceMemory, c.MemoryLimit, "4Gi")
+	// Defaults and request/limit consistency were settled in effective().
+	setQ(requests, corev1.ResourceCPU, c.CPURequest, defaultCPURequest)
+	setQ(requests, corev1.ResourceMemory, c.MemoryRequest, defaultMemoryRequest)
+	setQ(limits, corev1.ResourceCPU, c.CPULimit, defaultCPULimit)
+	setQ(limits, corev1.ResourceMemory, c.MemoryLimit, defaultMemoryLimit)
 
 	env := []corev1.EnvVar{
 		{Name: "SANDBOX_ID", Value: sb.ID},

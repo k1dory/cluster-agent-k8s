@@ -58,6 +58,11 @@ type Platform struct {
 	Log          *slog.Logger
 }
 
+// SetServices installs the configuration services (see internal/app).
+func (p *Platform) SetServices(cat *catalog.Service, conns *connections.Service, bind *bindings.Service, tset *tenants.Service) {
+	p.Catalog, p.Connections, p.Bindings, p.TenantSettings = cat, conns, bind, tset
+}
+
 // Principal is who is calling: the admin (every tenant) or one tenant. Expires is set for
 // credentials with a lifetime of their own (OIDC tokens); zero for static tokens.
 type Principal struct {
@@ -398,6 +403,11 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 			writeCatalogErr(w, err)
 			return
 		}
+	} else if !pr.admin() && p.TenantSettings != nil && p.TenantSettings.Restricted(req.Tenant) {
+		// The bare-slug path runs the server's default environment; a tenant confined to listed
+		// environments (tenant settings) must create through an agent that names one of them.
+		writeErr(w, http.StatusForbidden, errors.New("tenant "+req.Tenant+" is confined to its allowed environments: create with agent_ref"))
+		return
 	}
 	sb, err := p.Orch.Create(r.Context(), req)
 	if err != nil && sb == nil {

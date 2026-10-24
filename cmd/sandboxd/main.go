@@ -27,12 +27,10 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"agent-sandbox/internal/app"
 	"agent-sandbox/internal/authz"
-	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/ca"
-	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/config"
-	"agent-sandbox/internal/connections"
 	"agent-sandbox/internal/events"
 	"agent-sandbox/internal/gateway"
 	"agent-sandbox/internal/httpapi"
@@ -46,7 +44,6 @@ import (
 	"agent-sandbox/internal/registrar"
 	"agent-sandbox/internal/secrets"
 	"agent-sandbox/internal/store"
-	"agent-sandbox/internal/tenants"
 	"agent-sandbox/internal/usage"
 )
 
@@ -149,9 +146,14 @@ func serve(cfgPath string, log *slog.Logger) error {
 		}
 		log.Info("gateway root shared through the database", "dir", cfg.Gateway.RootDir)
 	}
+	// The gateway syncer starts once the connections service exists (its header names are part
+	// of the rendered config); see below.
+	var startSyncer func(gateway.HeaderSource)
 	if cfg.Gateway.CaddyAdmin != "" || cfg.Gateway.CaddyfileOut != "" {
-		syncer := &gateway.Syncer{Cfg: gwCfg, Policies: pols, AgentCA: agentCA.PEM(), Log: log.With("log", "gateway")}
-		go syncer.Run(ctx, cfg.Gateway.SyncEvery)
+		startSyncer = func(h gateway.HeaderSource) {
+			syncer := &gateway.Syncer{Cfg: gwCfg, Policies: pols, Headers: h, AgentCA: agentCA.PEM(), Log: log.With("log", "gateway")}
+			go syncer.Run(ctx, cfg.Gateway.SyncEvery)
+		}
 	}
 	gatewayRoot := make(chan []byte, 1) // delivered once the root is known; published to pods below
 	switch {
@@ -286,23 +288,6 @@ func serve(cfgPath string, log *slog.Logger) error {
 		DefaultQuota: cfg.Quotas.Default, Quotas: cfg.Quotas.Tenants,
 		DefaultAgentVersion: cfg.Agent.Default, Versions: cfg.Agent.Versions, EnvVersion: envVersion,
 	}, log)
-	// Ownership: the policy repository's lists plus the admin's PolicyBindings; quotas: the
-	// server defaults overridden by TenantSettings, and per-slug limits from the bindings.
-	bind := bindings.New(st, pols)
-	tset := tenants.New(st, func(t string) tenants.Quota {
-		q := orch.Cfg.QuotaFor(t)
-		return tenants.Quota{MaxSandboxes: q.MaxSandboxes, MaxAwake: q.MaxAwake}
-	})
-	for name, r := range map[string]interface{ Refresh(context.Context) error }{"bindings": bind, "tenant settings": tset} {
-		if err := r.Refresh(ctx); err != nil {
-			return fmt.Errorf("load %s: %w", name, err)
-		}
-	}
-	go bind.Watch(ctx, log)
-	go tset.Watch(ctx, log)
-	guard := &bindings.Guard{Set: pols, Bindings: bind}
-	orch.Policies = guard
-	orch.Quotas = limits{tenants: tset, bindings: bind}
 	orch.ListenerPublishes = hasListener
 	go orch.Run(ctx) // reconciler on the replica holding the lease
 
@@ -326,7 +311,17 @@ func serve(cfgPath string, log *slog.Logger) error {
 		log.Warn("no secrets provider configured: secret: references in policies cannot be resolved")
 	}
 	log.Info("secrets provider", "provider", cfg.Secrets.Provider)
-	az := &authz.Handler{Policies: guard, Secrets: secretProvider, Checker: reg, Toucher: orch, Recorder: orch,
+	// The configuration services: ownership guard, quotas, connections, catalogue (one wiring
+	// for sandboxd and the integration tests, see internal/app).
+	services, err := app.Wire(ctx, app.Deps{Store: st, Policies: pols, Secrets: secretProvider, Orch: orch, Log: log})
+	if err != nil {
+		return err
+	}
+	services.Watch(ctx, log)
+	if startSyncer != nil {
+		startSyncer(services.Connections)
+	}
+	az := &authz.Handler{Policies: services.Guard, Secrets: secretProvider, Checker: reg, Toucher: orch, Recorder: orch,
 		Trace: cfg.Accounting.EgressTrace, Quiet: map[string]bool{cfg.Gateway.APIHost: true}, Audit: log.With("log", "egress")}
 
 	var ing *ingress.Handler
@@ -339,11 +334,9 @@ func serve(cfgPath string, log *slog.Logger) error {
 	for _, t := range cfg.APITokens {
 		tokenTenants[t.Token] = t.Tenant
 	}
-	conns := &connections.Service{Store: st, Secrets: secretProvider}
-	cat := &catalog.Service{Store: st, Images: orch.Cfg, Policies: guard, Connections: conns, Tenants: tset}
-	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Catalog: cat, Connections: conns, Bindings: bind,
-		TenantSettings: tset, Token: cfg.APIToken, Tenants: tokenTenants,
+	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken, Tenants: tokenTenants,
 		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Log: log.With("log", "api")}
+	services.Install(platform)
 	if cfg.OIDC != nil {
 		v, err := oidc.New(*cfg.OIDC)
 		if err != nil {
@@ -480,22 +473,4 @@ func policyCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "unknown policy subcommand", sub)
 		return 2
 	}
-}
-
-// limits composes the orchestrator's quotas from tenant settings and policy bindings.
-type limits struct {
-	tenants  *tenants.Service
-	bindings *bindings.Service
-}
-
-func (l limits) QuotaFor(tenant string) orchestrator.Quota {
-	q := l.tenants.QuotaFor(tenant)
-	return orchestrator.Quota{MaxSandboxes: q.MaxSandboxes, MaxAwake: q.MaxAwake}
-}
-
-func (l limits) SlugQuota(slug, tenant string) orchestrator.Quota {
-	if b, ok := l.bindings.Active(slug, tenant); ok {
-		return orchestrator.Quota{MaxSandboxes: b.MaxSandboxes, MaxAwake: b.MaxAwake}
-	}
-	return orchestrator.Quota{}
 }

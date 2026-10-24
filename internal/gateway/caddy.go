@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"text/template"
 	"time"
@@ -346,22 +347,56 @@ func FetchRoot(ctx context.Context, adminURL string) ([]byte, error) {
 	return []byte(out.Root), nil
 }
 
-// Syncer keeps Caddy in step with the policy set.
+// HeaderSource adds header names the gateway must strip from agent requests and copy from the
+// decision, per host, beyond what policies inject (the connections service). The fingerprint
+// changes when the list does.
+type HeaderSource interface {
+	HostHeaders() (map[string][]string, string)
+}
+
+// Syncer keeps Caddy in step with the policy set (and the connections' header names).
 type Syncer struct {
 	Cfg      Config
 	Policies *policy.Set
+	Headers  HeaderSource // optional
 	AgentCA  []byte
 	Log      *slog.Logger
 	last     string
 }
 
-// SyncOnce renders and (if configured) pushes the config when policies changed since last time.
+// hosts is the policy set's host list with the extra header names merged in.
+func (s *Syncer) hosts() ([]policy.Host, string) {
+	hs, fp := s.Policies.Hosts(), s.Policies.Fingerprint()
+	if s.Headers == nil {
+		return hs, fp
+	}
+	extra, efp := s.Headers.HostHeaders()
+	for i := range hs {
+		for _, name := range extra[hs[i].Name] {
+			hs[i].Injected = appendUnique(hs[i].Injected, name)
+		}
+		sort.Strings(hs[i].Injected)
+	}
+	return hs, fp + "+" + efp
+}
+
+func appendUnique(xs []string, x string) []string {
+	for _, y := range xs {
+		if y == x {
+			return xs
+		}
+	}
+	return append(xs, x)
+}
+
+// SyncOnce renders and (if configured) pushes the config when policies or connection header
+// names changed since last time.
 func (s *Syncer) SyncOnce(ctx context.Context, force bool) error {
-	fp := s.Policies.Fingerprint()
+	hs, fp := s.hosts()
 	if !force && fp == s.last {
 		return nil
 	}
-	cf, err := Render(s.Cfg, s.Policies.Hosts(), s.AgentCA)
+	cf, err := Render(s.Cfg, hs, s.AgentCA)
 	if err != nil {
 		return err
 	}

@@ -8,66 +8,34 @@ import (
 	"testing"
 	"time"
 
+	"agent-sandbox/internal/app"
 	"agent-sandbox/internal/authz"
 	"agent-sandbox/internal/bindings"
-	"agent-sandbox/internal/catalog"
-	"agent-sandbox/internal/connections"
 	"agent-sandbox/internal/identity"
 	"agent-sandbox/internal/model"
-	"agent-sandbox/internal/orchestrator"
 	"agent-sandbox/internal/policy"
 	"agent-sandbox/internal/secrets"
-	"agent-sandbox/internal/tenants"
 )
 
 const leaked = "ghp_SECRET_VALUE_42"
 
-type limits struct {
-	tenants  *tenants.Service
-	bindings *bindings.Service
-}
-
-func (l limits) QuotaFor(tenant string) orchestrator.Quota {
-	q := l.tenants.QuotaFor(tenant)
-	return orchestrator.Quota{MaxSandboxes: q.MaxSandboxes, MaxAwake: q.MaxAwake}
-}
-
-func (l limits) SlugQuota(slug, tenant string) orchestrator.Quota {
-	if b, ok := l.bindings.Active(slug, tenant); ok {
-		return orchestrator.Quota{MaxSandboxes: b.MaxSandboxes, MaxAwake: b.MaxAwake}
-	}
-	return orchestrator.Quota{}
-}
-
-// configStack wires the step 2.2 services the way sandboxd does: guard over policies and
-// bindings, quotas from tenant settings and bindings, connections over the secrets provider.
+// configStack wires the configuration services exactly as sandboxd does (internal/app).
 func configStack(t *testing.T) (*stack, *bindings.Guard) {
 	t.Helper()
 	s := newStack(t)
-	ctx := context.Background()
 	pols := policy.FromPolicies(
 		&policy.Policy{Slug: "backend-dev", Tenants: []string{"alice"}, Allow: []policy.Rule{{Host: "api.github.com", Paths: []string{"/**"}}}},
 	)
 	pols.Strict = true
-	st := s.orch.Store
-	bind := bindings.New(st, pols)
-	tset := tenants.New(st, func(tenant string) tenants.Quota {
-		q := s.orch.Cfg.QuotaFor(tenant)
-		return tenants.Quota{MaxSandboxes: q.MaxSandboxes, MaxAwake: q.MaxAwake}
-	})
-	if err := bind.Refresh(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := tset.Refresh(ctx); err != nil {
-		t.Fatal(err)
-	}
-	guard := &bindings.Guard{Set: pols, Bindings: bind}
-	s.orch.Policies, s.orch.Quotas, s.p.Policies = guard, limits{tset, bind}, pols
+	s.p.Policies = pols
 	s.orch.Cfg.Versions = map[string]string{"stable": "reg/agent:1.0"}
-	conns := &connections.Service{Store: st, Secrets: secrets.Static{"alice/github": leaked, "bob/github": "bob-" + leaked}}
-	s.p.Catalog = &catalog.Service{Store: st, Images: s.orch.Cfg, Policies: guard, Connections: conns, Tenants: tset}
-	s.p.Connections, s.p.Bindings, s.p.TenantSettings = conns, bind, tset
-	return s, guard
+	services, err := app.Wire(context.Background(), app.Deps{Store: s.orch.Store, Policies: pols,
+		Secrets: secrets.Static{"alice/github": leaked, "bob/github": "bob-" + leaked}, Orch: s.orch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	services.Install(s.p)
+	return s, services.Guard
 }
 
 func TestConnectionsIsolationAndNoSecretLeak(t *testing.T) {

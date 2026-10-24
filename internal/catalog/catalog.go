@@ -304,8 +304,9 @@ func (s *Service) Delete(ctx context.Context, kind, tenant, name string) error {
 type Resolved struct {
 	Agent          *model.CatalogItem
 	Environment    *model.CatalogItem
-	AgentRef       string // the agent as named from the caller's scope: "name" or "shared/name"
-	EnvironmentRef string // the environment as named from the agent's scope
+	AgentRef       string   // the agent as named from the caller's scope: "name" or "shared/name"
+	EnvironmentRef string   // the environment as named from the agent's scope
+	Connections    []string // the agent's connections as named from the caller's scope
 	AgentSpec      AgentSpec
 	EnvSpec        EnvironmentSpec
 	Launch         model.Launch
@@ -369,8 +370,16 @@ func (s *Service) Resolve(ctx context.Context, tenant, agentRef string, admin bo
 	if len(envVars) == 0 {
 		envVars = nil
 	}
+	// A shared agent's connections are shared ones: name them so from the caller's scope.
+	var conns []string
+	for _, c := range as.Connections {
+		if agent.Tenant == "" && tenant != "" && !strings.HasPrefix(c, res.SharedPrefix) {
+			c = res.SharedPrefix + c
+		}
+		conns = append(conns, c)
+	}
 	return &Resolved{
-		Agent: agent, Environment: env, AgentRef: res.RefOf(agent, tenant), EnvironmentRef: res.RefOf(env, agent.Tenant),
+		Agent: agent, Environment: env, AgentRef: res.RefOf(agent, tenant), EnvironmentRef: res.RefOf(env, agent.Tenant), Connections: conns,
 		AgentSpec: as, EnvSpec: es, Image: image,
 		Launch: model.Launch{
 			Image: image, HarnessCommand: es.Harness.Command, HarnessResumeCommand: es.Harness.ResumeCommand,

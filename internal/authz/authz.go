@@ -47,6 +47,13 @@ type Policies interface {
 	Revoked(slug, tenant string, adminGrant bool) bool
 }
 
+// Connections is what a policy side may add to Policies: the headers of the sandbox's
+// connections for a host (bindings.Guard forwards to the connections service). A plain policy
+// set has none.
+type Connections interface {
+	HeadersFor(ctx context.Context, sandboxID, tenant, host string) (map[string]string, error)
+}
+
 // Handler is the forward_auth endpoint.
 type Handler struct {
 	Policies Policies
@@ -116,6 +123,20 @@ func (h *Handler) Decide(ctx context.Context, r *http.Request, host, method, p s
 			return d
 		}
 		headers[http.CanonicalHeaderKey(name)] = v
+	}
+	// The agent's connections add their headers for this host under the policy's: a policy
+	// injection (the admin's) is never replaced by a tenant's connection.
+	if conns, ok := h.Policies.(Connections); ok {
+		ch, err := conns.HeadersFor(ctx, id.SandboxID, id.Tenant, host)
+		if err != nil {
+			d.Code, d.Reason = http.StatusBadGateway, "connection: "+err.Error()
+			return d
+		}
+		for name, v := range ch {
+			if _, set := headers[name]; !set {
+				headers[name] = v
+			}
+		}
 	}
 	headers[HeaderSlug] = id.Slug
 	headers[HeaderInstance] = strconv.Itoa(id.Instance)

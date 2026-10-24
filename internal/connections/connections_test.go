@@ -82,3 +82,73 @@ func TestConnectionsValidateAndNeverStoreSecrets(t *testing.T) {
 		t.Fatalf("deleted connection must not resolve: %v", err)
 	}
 }
+
+type sandboxes map[string]*model.Sandbox
+
+func (s sandboxes) GetSandbox(_ context.Context, id string) (*model.Sandbox, error) {
+	if sb, ok := s[id]; ok {
+		return sb, nil
+	}
+	return nil, store.ErrNotFound
+}
+
+func TestHeadersForGatewayDecision(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+	sbs := sandboxes{
+		"own":    {ID: "own", Tenant: "acme", Connections: []string{"github", "shared/registry"}},
+		"shared": {ID: "shared", Tenant: "acme", Connections: []string{"shared/registry"}},
+		"broken": {ID: "broken", Tenant: "acme", Connections: []string{"nokey"}},
+	}
+	s := New(st, secrets.Static{"acme/github": "ghp_VALUE", "shared/registry": "reg-VALUE"}, sbs)
+	for _, d := range []struct{ tenant, name, spec string }{
+		{"acme", "github", `{"type":"http","host":"api.github.com","headers":{"Authorization":"Bearer secret:github","X-Version":"1"}}`},
+		{"", "registry", `{"type":"mcp","host":"mcp.registry.example.com","headers":{"X-Auth-Token":"secret:registry"}}`},
+	} {
+		if _, err := s.Put(ctx, d.tenant, doc(d.name, d.spec), d.tenant == "", "x"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The gateway's strip/copy list knows every live connection's header names per host.
+	names, fp := s.HostHeaders()
+	if len(names["api.github.com"]) != 2 || names["mcp.registry.example.com"][0] != "X-Auth-Token" || fp == "" {
+		t.Fatalf("host headers: %v %s", names, fp)
+	}
+	h, err := s.HeadersFor(ctx, "own", "acme", "api.github.com")
+	if err != nil || h["Authorization"] != "Bearer ghp_VALUE" || h["X-Version"] != "1" || len(h) != 2 {
+		t.Fatalf("own host: %v %v", err, h)
+	}
+	if h, err := s.HeadersFor(ctx, "own", "acme", "mcp.registry.example.com"); err != nil || h["X-Auth-Token"] != "reg-VALUE" {
+		t.Fatalf("shared connection through a tenant sandbox: %v %v", err, h)
+	}
+	if h, err := s.HeadersFor(ctx, "own", "acme", "other.example.com"); err != nil || h != nil {
+		t.Fatalf("host without connections: %v %v", err, h)
+	}
+	if _, err := s.HeadersFor(ctx, "own", "mallory", "api.github.com"); err == nil {
+		t.Fatal("identity tenant must be the sandbox's")
+	}
+	if h, err := s.HeadersFor(ctx, "gone", "acme", "api.github.com"); err != nil || h != nil {
+		t.Fatalf("unknown sandbox: %v %v", err, h)
+	}
+	// A deleted connection adds nothing; an unresolvable one is an error so nothing partial is sent.
+	if err := s.Delete(ctx, "acme", "github"); err != nil {
+		t.Fatal(err)
+	}
+	if h, err := s.HeadersFor(ctx, "own", "acme", "api.github.com"); err != nil || h != nil {
+		t.Fatalf("deleted connection: %v %v", err, h)
+	}
+	if names, _ := s.HostHeaders(); len(names["api.github.com"]) != 0 {
+		t.Fatalf("deleted connection still in the gateway list: %v", names)
+	}
+	if _, err := s.Put(ctx, "acme", doc("nokey", `{"type":"http","host":"api.github.com","headers":{"X-Trace":"secret:absent"}}`), false, "x"); err == nil {
+		t.Fatal("unresolvable reference accepted at write")
+	}
+	s.Secrets = nil // the reference was accepted earlier (another provider); now it does not resolve
+	if _, err := s.Put(ctx, "acme", doc("nokey", `{"type":"http","host":"api.github.com","headers":{"X-Trace":"secret:absent"}}`), false, "x"); err != nil {
+		t.Fatal(err)
+	}
+	s.Secrets = secrets.Static{}
+	if _, err := s.HeadersFor(ctx, "broken", "acme", "api.github.com"); err == nil {
+		t.Fatal("unresolvable reference must fail the decision")
+	}
+}

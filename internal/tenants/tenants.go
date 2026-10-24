@@ -137,6 +137,14 @@ func (s *Service) QuotaFor(tenant string) Quota {
 	return Quota{}
 }
 
+// Restricted reports whether tenant's agents are confined to listed environments. A
+// restricted tenant cannot create sandboxes by bare slug: that path runs the server's default
+// environment, which is not one of the listed ones.
+func (s *Service) Restricted(tenant string) bool {
+	sp := s.current(tenant)
+	return sp != nil && len(sp.Environments) > 0
+}
+
 // EnvironmentAllowed reports whether tenant may use the environment named by ref ("name" or
 // "shared/name", as resource.RefOf renders it).
 func (s *Service) EnvironmentAllowed(tenant, ref string) bool {

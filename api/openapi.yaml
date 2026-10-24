@@ -34,7 +34,9 @@ info:
     * **Connections** (`/v1/connections`) name external services (HTTP APIs, MCP servers) with the
       headers the gateway adds; credentials are `secret:NAME` references resolved from the tenant's
       secrets provider at request time and never stored, returned or traced. Agents list the
-      connections they use.
+      connections they use; a sandbox records them (`connections`) and the gateway adds their
+      headers (under the policy's own injections) to every allowed request for their hosts, through
+      forward_auth and the MCP proxy alike.
     * **PolicyBindings** (`/v1/bindings`, admin writes) grant a policy slug to a tenant at runtime,
       with an expiry and per-slug limits. Removing or expiring a binding revokes the slug: new
       sandboxes and wakes are refused, the gateway denies running agents at their next request and
@@ -110,6 +112,8 @@ paths:
         The record is created first; if the cluster then refuses the volume or pod, you still get
         201 with `status: error` and the reason in `error`. The sandbox is yours to wake again or
         delete. Supports `Idempotency-Key`. A tenant token forces its tenant (403 for another).
+        A tenant whose settings list allowed environments must create through `agent_ref`: the
+        bare-slug path runs the server's default environment and answers 403 for such a tenant.
       parameters: [{ $ref: "#/components/parameters/idempotencyKey" }]
       requestBody:
         required: true
@@ -123,7 +127,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Sandbox" }
         "400": { $ref: "#/components/responses/Error" }
-        "403": { $ref: "#/components/responses/Error" }
+        "403": { description: "Another tenant's scope; the tenant does not own the slug (policy list or binding); the environment is not allowed by the tenant settings, or a restricted tenant created by bare slug", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "409": { description: "Idempotency-Key request still in progress (Retry-After)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "422": { description: "Idempotency-Key reused with a different body", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "429": { $ref: "#/components/responses/Error" }
@@ -1002,6 +1006,7 @@ components:
         pod_name: { type: string }
         agent_version: { type: string, description: "Agent image the current (or last) pod runs" }
         agent_ref: { type: string, description: "AgentDefinition the sandbox was created from, with its scope: name, or shared/name (absent for bare-slug sandboxes)" }
+        connections: { type: array, items: { type: string }, description: "Connections the agent uses, as references from the sandbox tenant's scope, fixed at creation; the gateway adds their headers to requests for their hosts" }
         agent_revision: { type: integer }
         environment_ref: { type: string }
         environment_revision: { type: integer }
