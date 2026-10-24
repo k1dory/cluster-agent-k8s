@@ -120,7 +120,13 @@ func (r *Registrar) Bootstrap(ctx context.Context, token string, req BootstrapRe
 		return nil, err
 	}
 	id := identity.Identity{Slug: pod.Slug, Instance: n, SandboxID: pod.SandboxID, Tenant: pod.Tenant}
-	cert, certPEM, err := r.CA.Sign(ca.SignRequest{CSR: csr, CN: pod.Slug, URIs: id.URIs(), TTL: r.TTL})
+	// The identity never outlives the sandbox: a TTL set on the sandbox (explicitly, or from the
+	// OIDC token that created it) caps the certificate too.
+	var cap time.Time
+	if sb.ExpiresAt != nil {
+		cap = *sb.ExpiresAt
+	}
+	cert, certPEM, err := r.CA.Sign(ca.SignRequest{CSR: csr, CN: pod.Slug, URIs: id.URIs(), TTL: r.TTL, NotAfter: cap})
 	if err != nil {
 		return nil, err
 	}
@@ -131,10 +137,26 @@ func (r *Registrar) Bootstrap(ctx context.Context, token string, req BootstrapRe
 	if err := r.Store.CreateInstance(ctx, in); err != nil {
 		return nil, err
 	}
-	sb.Instance = n
-	sb.PodName = pod.Name
-	if err := r.Store.UpdateSandbox(ctx, sb); err != nil {
-		return nil, err
+	// The orchestrator may be writing the same row (pod name, status): reload and retry on conflict.
+	for attempt := 0; ; attempt++ {
+		sb.Instance = n
+		if sb.PodName != "" && sb.PodName != pod.Name {
+			// The orchestrator already named a newer pod (a rollout replaced this one while it was
+			// still starting): keep its name, the identity we issue is retired with the old pod anyway.
+			r.log().Warn("bootstrap from a pod that is no longer current", "pod", pod.Name, "current", sb.PodName, "sandbox", sb.ID)
+		} else {
+			sb.PodName = pod.Name
+		}
+		err := r.Store.UpdateSandbox(ctx, sb)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, store.ErrConflict) || attempt >= 10 {
+			return nil, err
+		}
+		if sb, err = r.Store.GetSandbox(ctx, pod.SandboxID); err != nil {
+			return nil, err
+		}
 	}
 	r.log().Info("identity issued", "slug", pod.Slug, "instance", n, "sandbox", pod.SandboxID, "tenant", pod.Tenant, "pod", pod.Name, "serial", in.Serial)
 	return &BootstrapResponse{

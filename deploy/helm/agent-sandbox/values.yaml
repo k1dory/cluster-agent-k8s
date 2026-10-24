@@ -8,6 +8,12 @@
 
 gateway:
   mode: node
+  # replicas > 1 needs: several labelled gateway nodes (one Caddy + sandboxd per node, a VIP or
+  # DNS round-robin in front of them), Postgres (database_url) and sandboxd.ca.source db, so every
+  # replica signs agent identities with one key and every Caddy issues site certificates under one
+  # shared gateway root. The reconciler runs on the replica holding the lease; writes are
+  # revision-checked, quotas are decided under a shared lock.
+  replicas: 1
   nodeSelector:
     agent-sandbox.io/gateway: "true"
   ip: 10.77.77.1                 # gateway address on the sandbox VLAN
@@ -43,6 +49,41 @@ sandboxd:
     cookieTtl: 1h
     hitsAsActivity: true
   certTtl: 168h
+  ca:
+    source: file          # file (PVC) | db (shared through Postgres; required for replicas > 1)
+  # policiesStrict: a policy without a tenants list is admin-only and a slug without a policy file
+  # is refused for tenants (no fallback to default).
+  policiesStrict: false
+  # OIDC: accept JWTs from this issuer next to the static tokens. Leave issuer empty to disable.
+  oidc:
+    issuer: ""                      # https://login.example.com/realms/platform
+    clientId: sandboxd              # expected audience
+    tenantClaim: tenant             # or groups + tenantPrefix "sandbox-tenant:"
+    tenantPrefix: ""
+    adminClaim: roles
+    adminValue: sandbox-admin
+    ttlFromToken: true              # sandboxes and agent certificates expire with the token
+  # Where `secret:NAME` references in policies are resolved: file (tenantSecretsSecret mounted
+  # at /etc/sandbox/secrets), vault (Vault or OpenBao KV v2) or infisical.
+  secrets:
+    provider: file
+    cacheTtl: 60s
+    vault:
+      addr: ""                      # https://vault.example.com
+      kubernetesRole: sandboxd      # Kubernetes auth with the sandboxd ServiceAccount token
+      kubernetesMount: kubernetes
+      mount: secret
+      tenantPath: agent-sandbox/tenants/{tenant}
+      sharedPath: agent-sandbox/shared
+      namespace: ""
+      # a static token instead of Kubernetes auth: put VAULT_TOKEN into existingSecret
+    infisical:
+      siteUrl: https://app.infisical.com
+      projectId: ""
+      environment: prod
+      tenantPath: /tenants/{tenant}
+      sharedPath: /shared
+      # INFISICAL_CLIENT_ID and INFISICAL_CLIENT_SECRET come from existingSecret
 
 # How agent pods are built.
 agent:
@@ -58,9 +99,20 @@ agent:
     memoryRequest: 1Gi
     memoryLimit: 4Gi
   harnessCommand: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose'
+  # Continue a run interrupted by a forced rollout ($SANDBOX_SESSION is the harness session id
+  # captured from its output). Codex: 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'
+  harnessResumeCommand: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose'
+  resumePrompt: ""
   env:
     ANTHROPIC_BASE_URL: https://api.anthropic.com
   terminationSeconds: 30
+  # Version catalogue: names tenants may pass as agent_version (create) or version (rollout).
+  # The admin may also pass any image reference. default: the image used when none is named
+  # (empty = agentImage above).
+  versions: {}
+  #  stable: registry.example.com/agent-sandbox/agent:1.4.2
+  #  canary: registry.example.com/agent-sandbox/agent:1.5.0-rc1
+  defaultVersion: ""
 
 # Multus NetworkAttachmentDefinition: the pod's ONLY network. macvlan in private mode so pods on
 # one node cannot see each other; whereabouts IPAM gives cluster-wide unique addresses.

@@ -9,6 +9,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -17,6 +19,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"sort"
 	"syscall"
 	"time"
 
@@ -30,6 +34,8 @@ import (
 	"agent-sandbox/internal/httpapi"
 	"agent-sandbox/internal/ingress"
 	"agent-sandbox/internal/kube"
+	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/oidc"
 	"agent-sandbox/internal/orchestrator"
 	"agent-sandbox/internal/policy"
 	"agent-sandbox/internal/registrar"
@@ -37,6 +43,23 @@ import (
 	"agent-sandbox/internal/store"
 	"agent-sandbox/internal/usage"
 )
+
+// Version is set at build time (-ldflags "-X main.Version=v1.2.3"); otherwise the VCS revision.
+var Version = ""
+
+func buildVersion() string {
+	if Version != "" {
+		return Version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range bi.Settings {
+			if s.Key == "vcs.revision" && len(s.Value) >= 12 {
+				return "dev-" + s.Value[:12]
+			}
+		}
+	}
+	return "dev"
+}
 
 func main() {
 	args := os.Args[1:]
@@ -91,17 +114,35 @@ func serve(cfgPath string, log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("policies: %w", err)
 	}
-	log.Info("policies loaded", "slugs", pols.Slugs(), "hosts", len(pols.Hosts()))
+	pols.Strict = cfg.PoliciesStrict
+	log.Info("policies loaded", "slugs", pols.Slugs(), "hosts", len(pols.Hosts()), "strict", pols.Strict)
 	go pols.Watch(ctx.Done(), 5*time.Second, func(err error) { log.Error("policy reload rejected, keeping previous policies", "err", err) })
 
-	agentCA, err := ca.LoadOrCreate(cfg.CA.Dir)
-	if err != nil {
+	var agentCA *ca.CA
+	if cfg.CA.Source == "db" {
+		if agentCA, err = ca.LoadOrCreateShared(ctx, st); err != nil {
+			return fmt.Errorf("ca (db): %w", err)
+		}
+		log.Info("agent CA loaded from the database (shared by replicas)")
+	} else if agentCA, err = ca.LoadOrCreate(cfg.CA.Dir); err != nil {
 		return fmt.Errorf("ca: %w", err)
 	}
 	reg := &registrar.Registrar{CA: agentCA, Store: st, TTL: cfg.CA.CertTTL, Log: log}
 
 	// Gateway: push Caddy config, learn Caddy's root, serve DNS.
 	gwCfg := gatewayConfig(cfg)
+	if cfg.CA.Source == "db" && cfg.Gateway.RootDir != "" {
+		// One gateway root for every replica: Caddy signs its site certificates under it, so an
+		// agent bootstrapped through one replica trusts the others.
+		root, err := ca.LoadOrCreateSharedNamed(ctx, st, "gateway-ca", "agent-sandbox gateway root")
+		if err != nil {
+			return fmt.Errorf("gateway root (db): %w", err)
+		}
+		if gwCfg.RootCert, gwCfg.RootKey, err = root.WriteTo(cfg.Gateway.RootDir, "gateway-root"); err != nil {
+			return fmt.Errorf("gateway root: %w", err)
+		}
+		log.Info("gateway root shared through the database", "dir", cfg.Gateway.RootDir)
+	}
 	if cfg.Gateway.CaddyAdmin != "" || cfg.Gateway.CaddyfileOut != "" {
 		syncer := &gateway.Syncer{Cfg: gwCfg, Policies: pols, AgentCA: agentCA.PEM(), Log: log.With("log", "gateway")}
 		go syncer.Run(ctx, cfg.Gateway.SyncEvery)
@@ -157,7 +198,8 @@ func serve(cfgPath string, log *slog.Logger) error {
 			NetworkAttachment: k.NetworkAttachment, GatewayIP: k.GatewayIP, RegistrarURL: k.RegistrarURL, APIURL: k.APIURL,
 			TokenAudience: k.TokenAudience, RuntimeClassName: k.RuntimeClassName, StorageClass: k.StorageClass,
 			VolumeSize: k.VolumeSize, CPURequest: k.CPURequest, CPULimit: k.CPULimit, MemoryRequest: k.MemoryRequest,
-			MemoryLimit: k.MemoryLimit, HarnessCommand: k.HarnessCommand, Env: k.Env, PriorityClassName: k.PriorityClassName,
+			MemoryLimit: k.MemoryLimit, HarnessCommand: k.HarnessCommand, HarnessResumeCommand: k.HarnessResumeCommand,
+			ResumePrompt: k.ResumePrompt, Env: k.Env, PriorityClassName: k.PriorityClassName,
 			TerminationSeconds: k.TerminationSeconds,
 		}}
 		reg.Resolver = &kube.Resolver{Client: client, Namespace: k.Namespace, Audience: k.TokenAudience}
@@ -180,17 +222,58 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 
 	hub := events.New()
+	// Events appended by any replica (this one included) reach the SSE clients through the store,
+	// so the orchestrator does not publish locally as well.
+	listener, hasListener := st.(store.EventListener)
+	if hasListener {
+		go listener.ListenEvents(ctx, func(e *model.Event) { hub.Publish(*e) })
+	}
+	// The environment version: everything that shapes a pod besides the task. A change here
+	// shows as drift between a sandbox's env_version and GET /v1/version.
+	envVersion := func(sb *model.Sandbox) string {
+		h := sha256.New()
+		fmt.Fprintf(h, "policy=%s\nimage=%s\nharness=%s\nresume=%s\n", pols.ContentHash(sb.Slug), sb.AgentVersion, cfg.Kube.HarnessCommand, cfg.Kube.HarnessResumeCommand)
+		keys := make([]string, 0, len(cfg.Kube.Env))
+		for k := range cfg.Kube.Env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			fmt.Fprintf(h, "env %s=%s\n", k, cfg.Kube.Env[k])
+		}
+		fmt.Fprintf(h, "runtime=%s\nresources=%s/%s/%s/%s\n", cfg.Kube.RuntimeClassName, cfg.Kube.CPURequest, cfg.Kube.CPULimit, cfg.Kube.MemoryRequest, cfg.Kube.MemoryLimit)
+		return hex.EncodeToString(h.Sum(nil))[:12]
+	}
 	orch := orchestrator.New(st, rt, reg, hub, orchestrator.Config{
 		DefaultIdleTimeout: cfg.Sandbox.DefaultIdleTimeout, PreviewDomain: cfg.Preview.Domain,
 		ReadyTimeout: cfg.Sandbox.ReadyTimeout, IdleCheckEvery: cfg.Sandbox.IdleCheckEvery,
 		DefaultQuota: cfg.Quotas.Default, Quotas: cfg.Quotas.Tenants,
+		DefaultAgentVersion: cfg.Agent.Default, Versions: cfg.Agent.Versions, EnvVersion: envVersion,
 	}, log)
-	go orch.IdleLoop(ctx)
+	orch.Policies = pols
+	orch.ListenerPublishes = hasListener
+	go orch.Run(ctx) // reconciler on the replica holding the lease
 
 	var secretProvider secrets.Provider = secrets.Static{}
-	if cfg.SecretsDir != "" {
+	switch cfg.Secrets.Provider {
+	case "file":
 		secretProvider = secrets.FileProvider{Dir: cfg.SecretsDir}
+	case "vault":
+		v, err := secrets.NewVault(cfg.Secrets.Vault)
+		if err != nil {
+			return fmt.Errorf("secrets: %w", err)
+		}
+		secretProvider = secrets.NewCached(v, cfg.Secrets.CacheTTL)
+	case "infisical":
+		i, err := secrets.NewInfisical(cfg.Secrets.Infisical)
+		if err != nil {
+			return fmt.Errorf("secrets: %w", err)
+		}
+		secretProvider = secrets.NewCached(i, cfg.Secrets.CacheTTL)
+	default:
+		log.Warn("no secrets provider configured: secret: references in policies cannot be resolved")
 	}
+	log.Info("secrets provider", "provider", cfg.Secrets.Provider)
 	az := &authz.Handler{Policies: pols, Secrets: secretProvider, Checker: reg, Toucher: orch, Recorder: orch,
 		Trace: cfg.Accounting.EgressTrace, Quiet: map[string]bool{cfg.Gateway.APIHost: true}, Audit: log.With("log", "egress")}
 
@@ -205,7 +288,18 @@ func serve(cfgPath string, log *slog.Logger) error {
 		tenants[t.Token] = t.Tenant
 	}
 	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken, Tenants: tenants,
-		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Log: log.With("log", "api")}
+		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Log: log.With("log", "api")}
+	if cfg.OIDC != nil {
+		v, err := oidc.New(*cfg.OIDC)
+		if err != nil {
+			return fmt.Errorf("oidc: %w", err)
+		}
+		platform.Verifier, platform.TTLFromToken = v, cfg.OIDC.TTLFromToken
+		log.Info("oidc enabled", "issuer", cfg.OIDC.Issuer, "ttl_from_token", cfg.OIDC.TTLFromToken)
+	}
+	if cfg.APIToken == "" && len(tenants) == 0 && cfg.OIDC == nil {
+		return errors.New("no api_token, api_tokens or oidc configured: nobody could call the API")
+	}
 	gw := &httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, Log: log.With("log", "gateway-api")}
 
 	servers := []*http.Server{

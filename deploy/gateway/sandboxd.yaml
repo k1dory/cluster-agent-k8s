@@ -12,12 +12,32 @@ quotas:
   default: { max_sandboxes: 0, max_awake: 0 }
   # tenants:
   #   acme: { max_sandboxes: 20, max_awake: 5 }
+# OIDC instead of (or next to) static tokens: tenant from a claim, admin from a role, token
+# expiry bounds the session and, with ttl_from_token, the sandboxes and certificates it creates.
+# oidc:
+#   issuer: https://login.example.com/realms/platform
+#   client_id: sandboxd
+#   tenant_claim: groups
+#   tenant_prefix: "sandbox-tenant:"
+#   admin_claim: roles
+#   admin_value: sandbox-admin
+#   ttl_from_token: true
 database_url: "${DATABASE_URL}"
 policies_dir: /etc/sandbox/policies
+policies_strict: false           # true: slugs without a tenants list are admin-only
 secrets_dir: /etc/sandbox/secrets
+# secrets:                       # instead of the directory: Vault/OpenBao or Infisical
+#   provider: vault
+#   vault: { addr: https://vault.example.com, token: "${VAULT_TOKEN}", mount: secret }
 ca:
   dir: /var/lib/sandboxd/ca
+  source: file                   # db: share the key between replicas through Postgres
   cert_ttl: 168h
+agent:                           # version catalogue for agent_version / rollouts (names → images)
+  default: "${AGENT_IMAGE}"
+  versions:
+    stable: "${AGENT_IMAGE}"
+  #  canary: registry.example.com/agent-sandbox/agent:1.5.0-rc1
 gateway:
   ip: "${GATEWAY_IP}"
   caddy_admin: http://127.0.0.1:2019
@@ -34,6 +54,8 @@ kube:
   network_attachment: "${NETWORK_ATTACHMENT}"
   volume_size: 10Gi
   harness_command: '${HARNESS_CMD}'
+  # harness_resume_command: continues a run interrupted by a forced rollout; default is Claude Code's --resume.
+  # Codex: 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'
 sandbox:
   default_idle_timeout: 1h
 # Accounting: GET /v1/usage prices pod time with this; the trace records gateway decisions.

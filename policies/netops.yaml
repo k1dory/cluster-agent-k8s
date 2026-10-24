@@ -1,6 +1,7 @@
 # yaml-language-server: $schema=./schema.json
 # netops: NetBox read-only plus Git read-only. No push, no LLM key of its own (shared one).
 slug: netops
+tenants: [netops]     # only the netops tenant (and the admin) may run this agent
 allow:
   - host: git.example.com
     paths: ["/*/*/info/refs", "/*/*/git-upload-pack"]
@@ -15,5 +16,3 @@ allow:
     paths: ["/v1/**"]
     inject:
       x-api-key: "secret:anthropic"
-  - host: api.sandbox.internal
-    paths: ["/agent/**"]

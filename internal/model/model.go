@@ -31,24 +31,33 @@ type Preview struct {
 }
 
 // Sandbox is one agent workspace: a persistent volume plus, while awake, one pod.
+//
+// Versions: AgentVersion is the agent image the current (or last) pod runs; DesiredVersion is
+// a rollout target not yet applied (empty when none); EnvVersion identifies the environment the
+// pod was started under (policy content, harness command, image, pod env). Revision is the
+// optimistic-locking counter every update must match.
 type Sandbox struct {
-	ID            string        `json:"id"`
-	Name          string        `json:"name"`
-	Slug          string        `json:"slug"`
-	Owner         string        `json:"owner"`
-	Tenant        string        `json:"tenant"`
-	Repo          string        `json:"repo"`
-	IdleTimeout   int           `json:"idle_timeout"` // seconds; 0 = never sleep
-	WakeOnPreview bool          `json:"wake_on_preview"`
-	Status        SandboxStatus `json:"status"`
-	IP            string        `json:"ip,omitempty"`
-	Instance      int           `json:"instance"`
-	PodName       string        `json:"pod_name,omitempty"`
-	LastActivity  time.Time     `json:"last_activity"`
-	CreatedAt     time.Time     `json:"created_at"`
-	ExpiresAt     *time.Time    `json:"expires_at,omitempty"` // when set, the sandbox is deleted after this time
-	Preview       *Preview      `json:"preview,omitempty"`
-	Error         string        `json:"error,omitempty"`
+	ID             string        `json:"id"`
+	Name           string        `json:"name"`
+	Slug           string        `json:"slug"`
+	Owner          string        `json:"owner"`
+	Tenant         string        `json:"tenant"`
+	Repo           string        `json:"repo"`
+	IdleTimeout    int           `json:"idle_timeout"` // seconds; 0 = never sleep
+	WakeOnPreview  bool          `json:"wake_on_preview"`
+	Status         SandboxStatus `json:"status"`
+	IP             string        `json:"ip,omitempty"`
+	Instance       int           `json:"instance"`
+	PodName        string        `json:"pod_name,omitempty"`
+	AgentVersion   string        `json:"agent_version"`
+	DesiredVersion string        `json:"desired_version,omitempty"`
+	EnvVersion     string        `json:"env_version,omitempty"`
+	Revision       int64         `json:"revision"`
+	LastActivity   time.Time     `json:"last_activity"`
+	CreatedAt      time.Time     `json:"created_at"`
+	ExpiresAt      *time.Time    `json:"expires_at,omitempty"` // when set, the sandbox is deleted after this time
+	Preview        *Preview      `json:"preview,omitempty"`
+	Error          string        `json:"error,omitempty"`
 }
 
 // IdleDuration returns the idle timeout as a duration.
@@ -99,14 +108,21 @@ func (u Usage) IsZero() bool {
 // Run is one task handed to the agent inside a sandbox. Tenant and slug are copied from the
 // sandbox so accounting survives the sandbox being deleted.
 type Run struct {
-	ID         string     `json:"id"`
-	SandboxID  string     `json:"sandbox_id"`
-	Tenant     string     `json:"tenant,omitempty"`
-	Slug       string     `json:"slug,omitempty"`
-	Task       string     `json:"task"`
-	Status     RunStatus  `json:"status"`
-	ExitCode   int        `json:"exit_code"`
-	Usage      Usage      `json:"usage"`
+	ID        string    `json:"id"`
+	SandboxID string    `json:"sandbox_id"`
+	Tenant    string    `json:"tenant,omitempty"`
+	Slug      string    `json:"slug,omitempty"`
+	Task      string    `json:"task"`
+	Status    RunStatus `json:"status"`
+	ExitCode  int       `json:"exit_code"`
+	Usage     Usage     `json:"usage"`
+	// AgentVersion is the agent image that executed the run (set when the run is claimed).
+	AgentVersion string `json:"agent_version,omitempty"`
+	// ResumeOf names the run this one continues after a forced rollout interrupted it.
+	ResumeOf string `json:"resume_of,omitempty"`
+	// Session is the harness's own conversation id (Claude Code `session_id`, Codex thread id),
+	// captured from the output stream so a resume run can continue where the agent stopped.
+	Session    string     `json:"session,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
@@ -149,6 +165,25 @@ type Egress struct {
 	Reason string `json:"reason,omitempty"` // on deny: why
 }
 
+// Rollout is the payload of a rollout event: one sandbox moving to another agent version.
+type Rollout struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	// Mode: now (pod restarted at once), forced (run interrupted and re-queued as a resume),
+	// deferred (applied when the current run finishes), wake (applied on the next wake).
+	Mode     string `json:"mode"`
+	RunID    string `json:"run_id,omitempty"`    // forced: the interrupted run
+	ResumeID string `json:"resume_id,omitempty"` // forced: the run that continues it
+}
+
+// Rollout modes.
+const (
+	RolloutNow      = "now"
+	RolloutForced   = "forced"
+	RolloutDeferred = "deferred"
+	RolloutWake     = "wake"
+)
+
 // Event types.
 const (
 	EventStatus    = "status"
@@ -160,6 +195,7 @@ const (
 	EventInput     = "input"
 	EventEgressOK  = "egress.allow" // data: Egress JSON
 	EventEgressDen = "egress.deny"
+	EventRollout   = "rollout" // data: Rollout JSON
 )
 
 // Instance is one issued agent identity: a certificate bound to one pod incarnation.

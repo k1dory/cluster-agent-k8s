@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -36,6 +37,7 @@ type stack struct {
 	tokens            registrar.StaticResolver
 	rt                *orchestrator.FakeRuntime
 	orch              *orchestrator.Orchestrator
+	p                 *Platform
 }
 
 func newStack(t *testing.T) *stack {
@@ -57,7 +59,7 @@ func newStack(t *testing.T) *stack {
 	ing := &ingress.Handler{Store: st, Waker: orch, TicketKey: []byte("k")}
 	p := &Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: "t0k", Tenants: map[string]string{"alice-tok": "alice", "bob-tok": "bob"}}
 	g := &Gateway{Orch: orch, Registrar: reg, Authz: az}
-	s := &stack{platform: httptest.NewServer(p.Routes()), gateway: httptest.NewServer(g.Routes()), tokens: tokens, rt: rt, orch: orch}
+	s := &stack{platform: httptest.NewServer(p.Routes()), gateway: httptest.NewServer(g.Routes()), tokens: tokens, rt: rt, orch: orch, p: p}
 	t.Cleanup(s.platform.Close)
 	t.Cleanup(s.gateway.Close)
 	return s
@@ -608,5 +610,165 @@ func TestSafeNext(t *testing.T) {
 		if got := SafeNext(in); got != want {
 			t.Errorf("SafeNext(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// fakeVerifier stands in for the OIDC verifier: token "jwt.<tenant>.<ttl-seconds>" (or "jwt.admin.<ttl>").
+type fakeVerifier struct{}
+
+func (fakeVerifier) Verify(_ context.Context, tok string) (Principal, error) {
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 || parts[0] != "jwt" {
+		return Principal{}, errors.New("not a token we know")
+	}
+	secs, _ := strconv.Atoi(parts[2])
+	exp := time.Now().Add(time.Duration(secs) * time.Second)
+	pr := Principal{Subject: "user@" + parts[1], Expires: &exp}
+	if parts[1] == "admin" {
+		pr.Admin = true
+	} else {
+		pr.Tenant = parts[1]
+	}
+	return pr, nil
+}
+
+// TestOwnershipVersionsAndRollouts covers the slug ownership check, OIDC principals with a
+// token-bound TTL (sandbox and certificate), the version catalogue and the rollout endpoint.
+func TestOwnershipVersionsAndRollouts(t *testing.T) {
+	s := newStack(t)
+	api, gw := s.platform.URL, s.gateway.URL
+	// Rebuild the policy set with ownership and a version catalogue.
+	pols := policy.FromPolicies(
+		&policy.Policy{Slug: "backend-dev", Tenants: []string{"alice"}, Allow: []policy.Rule{{Host: "api.anthropic.com", Paths: []string{"/v1/**"}}}},
+		&policy.Policy{Slug: "netops", Tenants: []string{"*"}, Allow: []policy.Rule{{Host: "netbox.example.com", Paths: []string{"/api/**"}}}},
+	)
+	s.orch.Policies = pols
+	s.orch.Cfg.DefaultAgentVersion = "reg/agent:1.0"
+	s.orch.Cfg.Versions = map[string]string{"stable": "reg/agent:1.0", "canary": "reg/agent:1.1"}
+	s.orch.Cfg.EnvVersion = func(sb *model.Sandbox) string { return pols.ContentHash(sb.Slug) + "-" + sb.AgentVersion }
+	s.p.Policies, s.p.Verifier, s.p.TTLFromToken, s.p.Build = pols, fakeVerifier{}, true, "test-build"
+
+	// Ownership: bob may not use backend-dev, anyone may use netops.
+	resp, body := call(t, "POST", api+"/v1/sandboxes", "bob-tok", map[string]any{"name": "x", "slug": "backend-dev", "owner": "bob"}, nil)
+	var eb ErrorBody
+	_ = json.Unmarshal(body, &eb)
+	if resp.StatusCode != 403 || eb.Code != CodeForbidden {
+		t.Fatalf("bob on backend-dev: %d %s", resp.StatusCode, body)
+	}
+	if resp, body := call(t, "POST", api+"/v1/sandboxes", "bob-tok", map[string]any{"name": "x", "slug": "netops", "owner": "bob"}, nil); resp.StatusCode != 201 {
+		t.Fatalf("bob on netops: %d %s", resp.StatusCode, body)
+	}
+	// Tenants are confined to the catalogue; the admin may pass any image.
+	if resp, _ := call(t, "POST", api+"/v1/sandboxes", "alice-tok", map[string]any{"name": "x", "slug": "backend-dev", "owner": "alice", "agent_version": "reg/evil:1"}, nil); resp.StatusCode != 403 {
+		t.Fatalf("arbitrary image from a tenant: %d", resp.StatusCode)
+	}
+	resp, body = call(t, "POST", api+"/v1/sandboxes", "alice-tok", map[string]any{"name": "a1", "slug": "backend-dev", "owner": "alice", "agent_version": "canary"}, nil)
+	var a1 model.Sandbox
+	_ = json.Unmarshal(body, &a1)
+	if resp.StatusCode != 201 || a1.AgentVersion != "reg/agent:1.1" || a1.EnvVersion == "" || a1.Revision == 0 {
+		t.Fatalf("create with version: %d %+v", resp.StatusCode, a1)
+	}
+	resp, body = call(t, "POST", api+"/v1/sandboxes", "t0k", map[string]any{"name": "adm", "slug": "backend-dev", "owner": "root", "agent_version": "reg/custom:7"}, nil)
+	var adm model.Sandbox
+	_ = json.Unmarshal(body, &adm)
+	if resp.StatusCode != 201 || adm.AgentVersion != "reg/custom:7" {
+		t.Fatalf("admin with image ref: %d %+v", resp.StatusCode, adm)
+	}
+
+	// OIDC principal: whoami, tenant scoping, and the token lifetime caps sandbox and certificate.
+	resp, body = call(t, "GET", api+"/v1/whoami", "jwt.carol.600", nil, nil)
+	var who Principal
+	_ = json.Unmarshal(body, &who)
+	if resp.StatusCode != 200 || who.Tenant != "carol" || who.Admin || who.Subject != "user@carol" || who.Expires == nil || time.Until(*who.Expires) < 9*time.Minute {
+		t.Fatalf("whoami via oidc: %d %s", resp.StatusCode, body)
+	}
+	if resp, _ := call(t, "GET", api+"/v1/whoami", "jwt.bad", nil, nil); resp.StatusCode != 401 {
+		t.Fatalf("bad jwt: %d", resp.StatusCode)
+	}
+	resp, body = call(t, "POST", api+"/v1/sandboxes", "jwt.carol.600", map[string]any{"name": "c1", "slug": "netops", "owner": "carol", "ttl": 86400}, nil)
+	var c1 model.Sandbox
+	_ = json.Unmarshal(body, &c1)
+	if resp.StatusCode != 201 || c1.Tenant != "carol" || c1.ExpiresAt == nil || time.Until(*c1.ExpiresAt) > 11*time.Minute {
+		t.Fatalf("oidc create must cap ttl at the token's expiry: %d %+v", resp.StatusCode, c1)
+	}
+	resp, body = call(t, "PATCH", api+"/v1/sandboxes/"+c1.ID, "jwt.carol.600", map[string]any{"ttl": 86400}, nil)
+	_ = json.Unmarshal(body, &c1)
+	if resp.StatusCode != 200 || c1.ExpiresAt == nil || time.Until(*c1.ExpiresAt) > 11*time.Minute {
+		t.Fatalf("PATCH must not extend past the token's expiry: %d %+v", resp.StatusCode, c1)
+	}
+	if resp, _ := call(t, "GET", api+"/v1/whoami", "t0k", nil, nil); resp.StatusCode != 200 {
+		t.Fatal("whoami with the admin token")
+	}
+	if resp, _ := call(t, "GET", api+"/v1/sandboxes/"+a1.ID, "jwt.carol.600", nil, nil); resp.StatusCode != 403 {
+		t.Fatalf("oidc tenant on alice's sandbox: %d", resp.StatusCode)
+	}
+	if resp, _ := call(t, "GET", api+"/v1/sandboxes/"+a1.ID, "jwt.admin.600", nil, nil); resp.StatusCode != 200 {
+		t.Fatalf("oidc admin on alice's sandbox: %d", resp.StatusCode)
+	}
+	// The agent certificate of a token-bound sandbox cannot outlive the sandbox.
+	s.tokens["c1-pod"] = registrar.PodInfo{Name: "agent-c1", SandboxID: c1.ID, Slug: "netops", Tenant: "carol"}
+	_, csr, _ := ca.NewCSR("netops")
+	resp, body = call(t, "POST", gw+"/bootstrap", "c1-pod", registrar.BootstrapRequest{CSR: string(csr)}, nil)
+	var boot registrar.BootstrapResponse
+	_ = json.Unmarshal(body, &boot)
+	if resp.StatusCode != 200 || boot.NotAfter.After(*c1.ExpiresAt) {
+		t.Fatalf("certificate must expire with the sandbox: %d not_after=%s expires=%s", resp.StatusCode, boot.NotAfter, c1.ExpiresAt)
+	}
+
+	// Version endpoint.
+	resp, body = call(t, "GET", api+"/v1/version", "alice-tok", nil, nil)
+	var ver struct {
+		Sandboxd string `json:"sandboxd"`
+		Agent    struct {
+			Default  string            `json:"default"`
+			Versions map[string]string `json:"versions"`
+		} `json:"agent"`
+		Env map[string]string `json:"env"`
+	}
+	_ = json.Unmarshal(body, &ver)
+	if resp.StatusCode != 200 || ver.Sandboxd != "test-build" || ver.Agent.Versions["canary"] != "reg/agent:1.1" || ver.Env["backend-dev"] == "" {
+		t.Fatalf("version: %d %s", resp.StatusCode, body)
+	}
+
+	// Rollouts: alice moves her slug; bob cannot touch alice's sandbox; selectors are validated.
+	deadline := time.Now().Add(5 * time.Second)
+	for a1.Status != model.StatusRunning && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		_, body = call(t, "GET", api+"/v1/sandboxes/"+a1.ID, "alice-tok", nil, nil)
+		_ = json.Unmarshal(body, &a1)
+	}
+	resp, body = call(t, "POST", api+"/v1/rollouts", "alice-tok", map[string]any{"version": "stable", "slug": "backend-dev"}, nil)
+	var ro orchestrator.RolloutResult
+	_ = json.Unmarshal(body, &ro)
+	if resp.StatusCode != 200 || ro.Version != "reg/agent:1.0" || ro.Targeted != 1 || ro.Items[0].Sandbox != a1.ID || ro.Items[0].Mode != model.RolloutNow {
+		t.Fatalf("rollout: %d %s", resp.StatusCode, body)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for (a1.Status != model.StatusRunning || a1.AgentVersion != "reg/agent:1.0") && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+		_, body = call(t, "GET", api+"/v1/sandboxes/"+a1.ID, "alice-tok", nil, nil)
+		_ = json.Unmarshal(body, &a1)
+	}
+	if a1.AgentVersion != "reg/agent:1.0" || a1.DesiredVersion != "" {
+		t.Fatalf("after rollout: %+v", a1)
+	}
+	if resp, _ := call(t, "POST", api+"/v1/rollouts", "bob-tok", map[string]any{"version": "stable", "sandbox": a1.ID}, nil); resp.StatusCode != 403 {
+		t.Fatalf("bob rolling out alice's sandbox: %d", resp.StatusCode)
+	}
+	if resp, _ := call(t, "POST", api+"/v1/rollouts", "bob-tok", map[string]any{"version": "stable", "slug": "backend-dev"}, nil); resp.StatusCode != 403 {
+		t.Fatalf("bob rolling out a slug he does not own: %d", resp.StatusCode)
+	}
+	if resp, _ := call(t, "POST", api+"/v1/rollouts", "alice-tok", map[string]any{"version": "stable"}, nil); resp.StatusCode != 400 {
+		t.Fatalf("rollout without selector: %d", resp.StatusCode)
+	}
+	if resp, _ := call(t, "POST", api+"/v1/rollouts", "alice-tok", map[string]any{"version": "reg/evil:1", "all": true}, nil); resp.StatusCode != 403 {
+		t.Fatalf("tenant rollout to an arbitrary image: %d", resp.StatusCode)
+	}
+	// The trace carries the rollout decision.
+	_, body = call(t, "GET", api+"/v1/trace?tenant=alice&type=rollout", "alice-tok", nil, nil)
+	var trace []model.Event
+	_ = json.Unmarshal(body, &trace)
+	if len(trace) != 1 || !strings.Contains(trace[0].Data, `"to":"reg/agent:1.0"`) {
+		t.Fatalf("rollout trace: %s", body)
 	}
 }

@@ -4,7 +4,6 @@ package kube
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -18,6 +17,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/orchestrator"
 )
 
 // Labels placed on agent pods; the Registrar reads them back during bootstrap.
@@ -30,27 +30,44 @@ const (
 
 // PodConfig describes how agent pods are built.
 type PodConfig struct {
-	Namespace          string
-	Image              string
-	ImagePullPolicy    string
-	ServiceAccount     string
-	NetworkAttachment  string // Multus NetworkAttachmentDefinition name (namespace/name allowed)
-	GatewayIP          string // DNS server and HTTP gateway for the pod
-	RegistrarURL       string // reachable WITHOUT a client cert, e.g. https://registrar.sandbox.internal:8443
-	APIURL             string // agent-facing API behind mTLS, e.g. https://api.sandbox.internal
-	TokenAudience      string
-	RuntimeClassName   string // "" = runc, "gvisor" / "kata" later
-	StorageClass       string
-	VolumeSize         string
-	CPURequest         string
-	CPULimit           string
-	MemoryRequest      string
-	MemoryLimit        string
-	HarnessCommand     string // run by agent-runner; task in $SANDBOX_TASK and stdin
-	Env                map[string]string
-	PriorityClassName  string
-	TerminationSeconds int64
+	Namespace         string
+	Image             string
+	ImagePullPolicy   string
+	ServiceAccount    string
+	NetworkAttachment string // Multus NetworkAttachmentDefinition name (namespace/name allowed)
+	GatewayIP         string // DNS server and HTTP gateway for the pod
+	RegistrarURL      string // reachable WITHOUT a client cert, e.g. https://registrar.sandbox.internal:8443
+	APIURL            string // agent-facing API behind mTLS, e.g. https://api.sandbox.internal
+	TokenAudience     string
+	RuntimeClassName  string // "" = runc, "gvisor" / "kata" later
+	StorageClass      string
+	VolumeSize        string
+	CPURequest        string
+	CPULimit          string
+	MemoryRequest     string
+	MemoryLimit       string
+	HarnessCommand    string // run by agent-runner; task in $SANDBOX_TASK and stdin
+	// HarnessResumeCommand continues an interrupted run: $SANDBOX_SESSION is the harness's
+	// conversation id, $SANDBOX_RESUME_PROMPT the text to continue with, $SANDBOX_RESUME_OF the
+	// interrupted run. Empty: the task is simply run again.
+	HarnessResumeCommand string
+	ResumePrompt         string
+	Env                  map[string]string
+	PriorityClassName    string
+	TerminationSeconds   int64
 }
+
+// ImageFor is the agent image a sandbox's pod runs: its AgentVersion (an image reference set
+// by the orchestrator from the version catalogue) or the configured default.
+func (c PodConfig) ImageFor(sb *model.Sandbox) string {
+	if sb.AgentVersion != "" {
+		return sb.AgentVersion
+	}
+	return c.Image
+}
+
+// Annotation carrying the agent image on the pod, so `kubectl get pod -o yaml` tells the version.
+const AnnotationVersion = "agent-sandbox.io/agent-version"
 
 // Runtime drives pods and PVCs.
 type Runtime struct {
@@ -136,7 +153,12 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 		{Name: "CERT_DIR", Value: "/certs"},
 		{Name: "HOME", Value: "/workspace/home"},
 		{Name: "HARNESS_CMD", Value: c.HarnessCommand},
+		{Name: "HARNESS_RESUME_CMD", Value: c.HarnessResumeCommand},
+		{Name: "SANDBOX_RESUME_PROMPT", Value: c.ResumePrompt},
+		{Name: "SANDBOX_AGENT_VERSION", Value: c.ImageFor(sb)},
+		{Name: "SANDBOX_ENV_VERSION", Value: sb.EnvVersion},
 	}
+	image := c.ImageFor(sb)
 	for k, v := range c.Env {
 		env = append(env, corev1.EnvVar{Name: k, Value: v})
 	}
@@ -174,6 +196,7 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 			Annotations: map[string]string{
 				// Multus: use the sandbox VLAN as the pod's ONLY network.
 				"v1.multus-cni.io/default-network": c.NetworkAttachment,
+				AnnotationVersion:                  image,
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -190,12 +213,12 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			InitContainers: []corev1.Container{{
-				Name: "agent-init", Image: c.Image, ImagePullPolicy: pullPolicy,
+				Name: "agent-init", Image: image, ImagePullPolicy: pullPolicy,
 				Command: []string{"/usr/local/bin/agent-init"}, Env: env,
 				VolumeMounts: mounts, SecurityContext: secCtx,
 			}},
 			Containers: []corev1.Container{{
-				Name: "agent", Image: c.Image, ImagePullPolicy: pullPolicy,
+				Name: "agent", Image: image, ImagePullPolicy: pullPolicy,
 				Command: []string{"/usr/local/bin/agent-runner"}, Env: env,
 				WorkingDir: "/workspace", VolumeMounts: mounts, SecurityContext: secCtx,
 				Resources: corev1.ResourceRequirements{Requests: requests, Limits: limits},
@@ -238,7 +261,7 @@ func (r *Runtime) PodStatus(ctx context.Context, sb *model.Sandbox) (bool, strin
 	}
 	pod, err := r.Client.CoreV1().Pods(r.Cfg.Namespace).Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return false, "", errors.New("pod not found")
+		return false, "", orchestrator.ErrPodNotFound
 	}
 	if err != nil {
 		return false, "", err

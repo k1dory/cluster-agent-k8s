@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
+	"agent-sandbox/internal/oidc"
 	"agent-sandbox/internal/orchestrator"
+	"agent-sandbox/internal/secrets"
 )
 
 // Config is the whole sandboxd configuration. Secrets (API token, DB URL) are referenced
@@ -31,19 +34,41 @@ type Config struct {
 		Default orchestrator.Quota            `yaml:"default"`
 		Tenants map[string]orchestrator.Quota `yaml:"tenants"`
 	} `yaml:"quotas"`
-	DatabaseURL string `yaml:"database_url"` // empty → in-memory store
-	PoliciesDir string `yaml:"policies_dir"`
-	SecretsDir  string `yaml:"secrets_dir"`
-	CA          struct {
-		Dir           string        `yaml:"dir"` // ca.crt + ca.key, generated if missing
+	// OIDC: bearer JWTs from this issuer are accepted next to the static tokens.
+	OIDC        *oidc.Config `yaml:"oidc"`
+	DatabaseURL string       `yaml:"database_url"` // empty → in-memory store
+	PoliciesDir string       `yaml:"policies_dir"`
+	// PoliciesStrict: a policy without a tenants list is admin-only and a slug without a policy
+	// file is refused for tenants (no silent fallback to default).
+	PoliciesStrict bool   `yaml:"policies_strict"`
+	SecretsDir     string `yaml:"secrets_dir"` // file provider (tenants/<t>/<name>, shared/<name>)
+	// Secrets: where `secret:NAME` references in policies are resolved. provider file (default
+	// when secrets_dir is set), vault (Vault or OpenBao KV v2) or infisical.
+	Secrets struct {
+		Provider  string                  `yaml:"provider"`
+		CacheTTL  time.Duration           `yaml:"cache_ttl"` // default 60s
+		Vault     secrets.VaultConfig     `yaml:"vault"`
+		Infisical secrets.InfisicalConfig `yaml:"infisical"`
+	} `yaml:"secrets"`
+	CA struct {
+		Dir           string        `yaml:"dir"`    // ca.crt + ca.key, generated if missing
+		Source        string        `yaml:"source"` // file (default) | db: key shared by replicas through Postgres
 		CertTTL       time.Duration `yaml:"cert_ttl"`
 		GatewayCAFile string        `yaml:"gateway_ca_file"` // optional override; normally fetched from Caddy's admin API
 	} `yaml:"ca"`
+	// Agent versions: what `agent_version` in the API may name. default is the image used when
+	// a request names none; versions maps names (stable, canary, 1.5.0) to image references.
+	// Tenants are confined to these names, the admin may also pass any image reference.
+	Agent struct {
+		Default  string            `yaml:"default"`
+		Versions map[string]string `yaml:"versions"`
+	} `yaml:"agent"`
 	// Gateway: sandboxd drives Caddy and serves DNS; nothing on the gateway is configured by hand.
 	Gateway struct {
 		IP            string        `yaml:"ip"`             // gateway address on the sandbox VLAN
 		CaddyAdmin    string        `yaml:"caddy_admin"`    // http://127.0.0.1:2019; "" = render only
 		CaddyfileOut  string        `yaml:"caddyfile_out"`  // rendered copy for inspection
+		RootDir       string        `yaml:"root_dir"`       // ca.source db: where the shared gateway root is written for Caddy (default: dir of caddyfile_out)
 		DNSListen     string        `yaml:"dns_listen"`     // "10.77.77.1:53"; "" disables the built-in DNS
 		APIHost       string        `yaml:"api_host"`       // default api.sandbox.internal
 		RegistrarHost string        `yaml:"registrar_host"` // default registrar.sandbox.internal
@@ -57,27 +82,32 @@ type Config struct {
 	} `yaml:"gateway"`
 	Runtime string `yaml:"runtime"` // kube | fake
 	Kube    struct {
-		Kubeconfig         string            `yaml:"kubeconfig"`
-		Namespace          string            `yaml:"namespace"`
-		Image              string            `yaml:"image"`
-		ImagePullPolicy    string            `yaml:"image_pull_policy"`
-		ServiceAccount     string            `yaml:"service_account"`
-		NetworkAttachment  string            `yaml:"network_attachment"`
-		GatewayIP          string            `yaml:"gateway_ip"`
-		RegistrarURL       string            `yaml:"registrar_url"`
-		APIURL             string            `yaml:"api_url"`
-		TokenAudience      string            `yaml:"token_audience"`
-		RuntimeClassName   string            `yaml:"runtime_class"`
-		StorageClass       string            `yaml:"storage_class"`
-		VolumeSize         string            `yaml:"volume_size"`
-		CPURequest         string            `yaml:"cpu_request"`
-		CPULimit           string            `yaml:"cpu_limit"`
-		MemoryRequest      string            `yaml:"memory_request"`
-		MemoryLimit        string            `yaml:"memory_limit"`
-		HarnessCommand     string            `yaml:"harness_command"`
-		Env                map[string]string `yaml:"env"`
-		PriorityClassName  string            `yaml:"priority_class"`
-		TerminationSeconds int64             `yaml:"termination_seconds"`
+		Kubeconfig        string `yaml:"kubeconfig"`
+		Namespace         string `yaml:"namespace"`
+		Image             string `yaml:"image"`
+		ImagePullPolicy   string `yaml:"image_pull_policy"`
+		ServiceAccount    string `yaml:"service_account"`
+		NetworkAttachment string `yaml:"network_attachment"`
+		GatewayIP         string `yaml:"gateway_ip"`
+		RegistrarURL      string `yaml:"registrar_url"`
+		APIURL            string `yaml:"api_url"`
+		TokenAudience     string `yaml:"token_audience"`
+		RuntimeClassName  string `yaml:"runtime_class"`
+		StorageClass      string `yaml:"storage_class"`
+		VolumeSize        string `yaml:"volume_size"`
+		CPURequest        string `yaml:"cpu_request"`
+		CPULimit          string `yaml:"cpu_limit"`
+		MemoryRequest     string `yaml:"memory_request"`
+		MemoryLimit       string `yaml:"memory_limit"`
+		HarnessCommand    string `yaml:"harness_command"`
+		// HarnessResumeCommand continues a run interrupted by a forced rollout: $SANDBOX_SESSION
+		// is the harness session id captured from its output, $SANDBOX_RESUME_PROMPT the text to
+		// continue with. Default: Claude Code's --resume. Codex: 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'.
+		HarnessResumeCommand string            `yaml:"harness_resume_command"`
+		ResumePrompt         string            `yaml:"resume_prompt"`
+		Env                  map[string]string `yaml:"env"`
+		PriorityClassName    string            `yaml:"priority_class"`
+		TerminationSeconds   int64             `yaml:"termination_seconds"`
 	} `yaml:"kube"`
 	BootstrapTokensFile string `yaml:"bootstrap_tokens_file"` // fake runtime: static token → pod table
 	Sandbox             struct {
@@ -123,6 +153,45 @@ func Load(path string) (*Config, error) {
 	}
 	if c.CA.CertTTL == 0 {
 		c.CA.CertTTL = 7 * 24 * time.Hour
+	}
+	switch c.CA.Source {
+	case "":
+		c.CA.Source = "file"
+	case "file":
+	case "db":
+		if c.DatabaseURL == "" {
+			return nil, fmt.Errorf("%s: ca.source db needs database_url", path)
+		}
+	default:
+		return nil, fmt.Errorf("%s: ca.source must be file or db", path)
+	}
+	switch c.Secrets.Provider {
+	case "":
+		if c.SecretsDir != "" {
+			c.Secrets.Provider = "file"
+		}
+	case "file":
+		if c.SecretsDir == "" {
+			return nil, fmt.Errorf("%s: secrets.provider file needs secrets_dir", path)
+		}
+	case "vault", "infisical":
+	default:
+		return nil, fmt.Errorf("%s: secrets.provider must be file, vault or infisical", path)
+	}
+	if c.Secrets.CacheTTL == 0 {
+		c.Secrets.CacheTTL = time.Minute
+	}
+	if c.OIDC != nil && c.OIDC.Issuer == "" {
+		return nil, fmt.Errorf("%s: oidc.issuer is required when oidc is set", path)
+	}
+	if c.Agent.Default == "" {
+		c.Agent.Default = c.Kube.Image
+	}
+	if c.Kube.Image == "" {
+		c.Kube.Image = c.Agent.Default
+	}
+	if c.Kube.HarnessResumeCommand == "" {
+		c.Kube.HarnessResumeCommand = `claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose`
 	}
 	if c.Runtime == "" {
 		c.Runtime = "kube"
@@ -176,6 +245,12 @@ func Load(path string) (*Config, error) {
 	}
 	if g.SyncEvery == 0 {
 		g.SyncEvery = 5 * time.Second
+	}
+	if g.RootDir == "" && g.CaddyfileOut != "" {
+		g.RootDir = filepath.Dir(g.CaddyfileOut)
+	}
+	if c.CA.Source == "db" && g.CaddyAdmin != "" && g.RootDir == "" {
+		return nil, fmt.Errorf("%s: ca.source db with a managed Caddy needs gateway.root_dir (or caddyfile_out) so every replica's Caddy uses the shared root", path)
 	}
 	if c.Kube.GatewayIP == "" {
 		c.Kube.GatewayIP = g.IP

@@ -8,7 +8,6 @@ metadata:
     app.kubernetes.io/instance: agent-sandbox
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: agent-sandbox-0.1.0
-
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -19,7 +18,6 @@ metadata:
     app.kubernetes.io/instance: agent-sandbox
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: agent-sandbox-0.1.0
-
 ---
 # Identity of agent pods. No RBAC at all: the projected token is only a bootstrap credential
 # that the Registrar verifies with TokenReview.
@@ -34,7 +32,6 @@ metadata:
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: agent-sandbox-0.1.0
 automountServiceAccountToken: false
-
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -59,9 +56,14 @@ data:
     api_token: "${SANDBOXD_API_TOKEN}"
     database_url: "${DATABASE_URL}"
     policies_dir: /etc/sandbox/policies
+    policies_strict: false
     ca:
       dir: /var/lib/sandboxd/ca
+      source: file
       cert_ttl: 168h
+    agent:
+      default: ""
+      versions:
     gateway:
       ip: 10.77.77.1
       caddy_admin: http://127.0.0.1:2019
@@ -85,6 +87,8 @@ data:
       memory_request: "1Gi"
       memory_limit: "4Gi"
       harness_command: "claude -p \"$SANDBOX_TASK\" --output-format stream-json --verbose"
+      harness_resume_command: "claude -p \"$SANDBOX_RESUME_PROMPT\" --resume \"$SANDBOX_SESSION\" --output-format stream-json --verbose"
+      resume_prompt: ""
       termination_seconds: 30
       env:
         ANTHROPIC_BASE_URL: "https://api.anthropic.com"
@@ -98,7 +102,6 @@ data:
       ticket_key: "${PREVIEW_TICKET_KEY}"
       cookie_ttl: 1h
       hits_as_activity: true
-
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -115,6 +118,7 @@ data:
     # backend-dev: full git flow (push is further limited to agent/* branches by Forgejo branch
     # protection and the per-agent token), LLM API, MCP read-only.
     slug: backend-dev
+    tenants: ["*"]        # any tenant may create backend-dev sandboxes; list tenants to restrict
     allow:
       - host: git.example.com
         paths: ["/*/*/info/refs", "/*/*/git-upload-pack", "/*/*/git-receive-pack"]
@@ -128,8 +132,6 @@ data:
       - host: mcp.example.com
         paths: ["/mcp", "/mcp/**"]
         mcp: { read_only: true }
-      - host: api.sandbox.internal
-        paths: ["/agent/**"]
   default.yaml: |
     # yaml-language-server: $schema=./schema.json
     # Fallback policy for slugs without their own file. Read-only Git and the LLM API, nothing else.
@@ -147,6 +149,7 @@ data:
     # yaml-language-server: $schema=./schema.json
     # netops: NetBox read-only plus Git read-only. No push, no LLM key of its own (shared one).
     slug: netops
+    tenants: [netops]     # only the netops tenant (and the admin) may run this agent
     allow:
       - host: git.example.com
         paths: ["/*/*/info/refs", "/*/*/git-upload-pack"]
@@ -161,11 +164,9 @@ data:
         paths: ["/v1/**"]
         inject:
           x-api-key: "secret:anthropic"
-      - host: api.sandbox.internal
-        paths: ["/agent/**"]
-
 ---
-# Agent CA key and rendered Caddyfile. Losing the CA key means re-issuing every identity: back it up.
+# Agent CA key (ca.source file) and rendered Caddyfile. Losing the CA key means re-issuing every
+# identity: back it up. With ca.source db both CAs live in Postgres and no claim is created.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -180,7 +181,6 @@ spec:
   resources:
     requests:
       storage: 100Mi
-
 ---
 # Caddy's internal CA and issued certificates.
 apiVersion: v1
@@ -197,7 +197,6 @@ spec:
   resources:
     requests:
       storage: 100Mi
-
 ---
 # TokenReview is cluster-scoped.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -213,7 +212,6 @@ rules:
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -232,7 +230,6 @@ subjects:
   - kind: ServiceAccount
     name: agent-sandbox-sandboxd
     namespace: agent-sandbox
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -254,7 +251,6 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "create", "delete"]
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -274,7 +270,6 @@ subjects:
   - kind: ServiceAccount
     name: agent-sandbox-sandboxd
     namespace: agent-sandbox
-
 ---
 # Client-facing API. With hostNetwork the API is also reachable on the gateway node's address.
 apiVersion: v1
@@ -293,7 +288,6 @@ spec:
     app.kubernetes.io/instance: agent-sandbox
   ports:
     - { name: api, port: 8080, targetPort: 8080 }
-
 ---
 # The gateway pod: Caddy and sandboxd share the node's network namespace, so Caddy binds
 # :443/:8443 on the VLAN address and talks to sandboxd on localhost, exactly like the VM layout.
@@ -322,7 +316,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: agent-sandbox-0.1.0
       annotations:
-        checksum/config: 29795e80d5790faaa3707fc87336297fc09aee59f91f7333ef6ae3b4d62c4adc
+        checksum/config: d8d1d668b9baca671716a6b18a81eca08580b70721e0fd26d811c78556b16c08
     spec:
       serviceAccountName: agent-sandbox-sandboxd
       hostNetwork: true
@@ -376,7 +370,6 @@ spec:
           persistentVolumeClaim: { claimName: agent-sandbox-sandboxd-caddy }
         - name: caddy-config
           emptyDir: {}
-
 ---
 # Requires Multus and whereabouts to be installed on the cluster.
 apiVersion: k8s.cni.cncf.io/v1

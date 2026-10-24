@@ -17,6 +17,9 @@ gateway:
   dns_listen: "127.0.0.1:15353"      # try: dig @127.0.0.1 -p 15353 git.example.com
 runtime: fake
 bootstrap_tokens_file: config/bootstrap-tokens.dev.yaml
+agent:                              # version catalogue for `sandboxctl create -version` / `sandboxctl rollout`
+  default: agent:dev
+  versions: { stable: agent:dev, canary: agent:dev-next }
 sandbox:
   default_idle_timeout: 1h
   idle_check_every: 10s

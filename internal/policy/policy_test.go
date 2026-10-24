@@ -89,3 +89,41 @@ func TestHostsAndExpectations(t *testing.T) {
 		t.Fatal("wildcard host must be rejected")
 	}
 }
+
+func TestTenantOwnership(t *testing.T) {
+	s := FromPolicies(
+		&Policy{Slug: "backend-dev", Tenants: []string{"acme"}, Allow: []Rule{{Host: "git.example.com", Paths: []string{"/**"}}}},
+		&Policy{Slug: "shared", Tenants: []string{"*"}, Allow: []Rule{{Host: "git.example.com", Paths: []string{"/**"}}}},
+		&Policy{Slug: "open", Allow: []Rule{{Host: "git.example.com", Paths: []string{"/**"}}}},
+		&Policy{Slug: "default", Allow: []Rule{{Host: "git.example.com", Paths: []string{"/**"}}}},
+	)
+	cases := []struct {
+		slug, tenant string
+		strict, want bool
+	}{
+		{"backend-dev", "acme", false, true},
+		{"backend-dev", "evil", false, false},
+		{"shared", "anyone", false, true},
+		{"shared", "anyone", true, true},
+		{"open", "anyone", false, true},
+		{"open", "anyone", true, false}, // no tenants list: admin-only in strict mode
+		{"unknown", "anyone", false, true},
+		{"unknown", "anyone", true, false}, // no fallback to default in strict mode
+	}
+	for _, c := range cases {
+		s.Strict = c.strict
+		if got := s.AllowedFor(c.slug, c.tenant); got != c.want {
+			t.Errorf("AllowedFor(%s, %s, strict=%v) = %v, want %v", c.slug, c.tenant, c.strict, got, c.want)
+		}
+	}
+	if h := s.ContentHash("backend-dev"); h == "" || h == s.ContentHash("shared") {
+		t.Fatalf("content hashes must identify the policy: %q", h)
+	}
+	if s.ContentHash("unknown") != s.ContentHash("default") {
+		t.Fatal("a slug without a file carries the default policy's hash")
+	}
+	p := &Policy{Slug: "x", Tenants: []string{"a b"}, Allow: []Rule{{Host: "h.example.com", Paths: []string{"/"}}}}
+	if err := p.Validate(); err == nil {
+		t.Fatal("tenant names with spaces must be rejected")
+	}
+}

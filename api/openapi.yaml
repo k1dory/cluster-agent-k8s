@@ -10,6 +10,18 @@ info:
     * **Platform API** (`/v1/...`, port 8080): bearer token, used by your client. The admin token
       (`api_token`) sees every tenant; a tenant token (`api_tokens[]`) is confined to its tenant:
       creation forces the tenant, foreign sandboxes answer 403, lists, usage and trace are filtered.
+      With `oidc` configured, a JWT from the identity provider is accepted too: the tenant comes
+      from a claim, the admin role from another, and the token's expiry bounds the session (and,
+      with `ttl_from_token`, the sandboxes and agent certificates it creates). `GET /v1/whoami`
+      shows the resolved principal.
+    * **Ownership.** A policy's `tenants` list says which tenants may create sandboxes (and roll out
+      agents) with that slug; a slug outside the list answers 403.
+    * **Versions.** Every sandbox carries `agent_version` (the agent image its pod runs),
+      `desired_version` (a rollout not yet applied) and `env_version` (fingerprint of policy content,
+      harness command, image and pod environment the pod was started under). `GET /v1/version`
+      lists the control plane build, the version catalogue and the current environment version per
+      slug; `POST /v1/rollouts` moves agents between versions, with canary shares, deferred or forced
+      updates and resume runs.
     * **Agent API** (`/agent/...`, port 8081): reached by the agent pod through the mTLS gateway;
       identity comes from the client certificate that Caddy forwards in `X-Agent-Cert`.
       `/authz` and `/bootstrap` on the same port are called by Caddy and the init container.
@@ -36,6 +48,7 @@ security:
   - bearer: []
 tags:
   - name: sandboxes
+  - name: rollouts
   - name: runs
   - name: events
   - name: preview
@@ -336,7 +349,95 @@ paths:
                 type: object
                 properties:
                   admin: { type: boolean }
-                  tenant: { type: string, description: "Empty for the admin token" }
+                  tenant: { type: string, description: "Empty for the admin" }
+                  subject: { type: string, description: "admin-token, tenant-token, or the OIDC subject" }
+                  expires: { type: string, format: date-time, description: "OIDC tokens: when the credential expires (zero time for static tokens)" }
+  /v1/version:
+    get:
+      tags: [rollouts]
+      summary: Control plane build, agent version catalogue and environment versions
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sandboxd: { type: string, description: "Build version of the control plane" }
+                  agent:
+                    type: object
+                    properties:
+                      default: { type: string, description: "Image used when a request names no version" }
+                      versions:
+                        type: object
+                        additionalProperties: { type: string }
+                        description: "Version names tenants may use → image references"
+                  env:
+                    type: object
+                    additionalProperties: { type: string }
+                    description: "Current environment version per policy slug; compare with a sandbox's env_version to see drift"
+  /v1/rollouts:
+    post:
+      tags: [rollouts]
+      summary: Move agents to another version
+      description: |
+        Selects sandboxes by exactly one of `sandbox`, `instance` (agent identity number), `slug` or
+        `all`; a tenant token is confined to its own sandboxes and to slugs it owns. `percent` keeps a
+        deterministic share of the selection (canary: the same percent targets the same sandboxes, a
+        larger one a superset). For each target:
+
+        * sleeping / error → `wake`: the version is applied on the next wake;
+        * running and idle → `now`: the pod is replaced at once (the identity is retired, a new one issued);
+        * running with a run in progress → `deferred`: applied when the run finishes, or with
+          `force` → `forced`: the run is cancelled, the pod replaced, and (unless `resume: false`) a
+          new run with `resume_of` and the captured harness `session` is queued so the agent
+          continues the conversation on the new version;
+        * creating / waking / stopping → `deferred`; deleting → `skipped`.
+
+        Tenants may only name versions from the catalogue (`GET /v1/version`); the admin may pass
+        any image reference. Every decision is a `rollout` event in the sandbox's trace.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties:
+                version: { type: string, description: "Version name (tenants) or image reference (admin)" }
+                sandbox: { type: string }
+                instance: { type: integer }
+                slug: { type: string }
+                all: { type: boolean }
+                percent: { type: integer, minimum: 0, maximum: 100 }
+                force: { type: boolean }
+                resume: { type: boolean, default: true }
+      responses:
+        "200":
+          description: Outcome per targeted sandbox
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string, description: "Resolved image reference" }
+                  selected: { type: integer }
+                  targeted: { type: integer, description: "After percent" }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        sandbox: { type: string }
+                        slug: { type: string }
+                        from: { type: string }
+                        mode: { type: string, enum: [now, forced, deferred, wake, skipped] }
+                        reason: { type: string }
+                        run_id: { type: string, description: "forced: the interrupted run" }
+                        resume_id: { type: string, description: "forced: the run that continues it" }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
   /openapi.yaml:
     get:
       security: []
@@ -630,7 +731,8 @@ components:
         repo: { type: string, description: "Repository URL the agent works on" }
         idle_timeout: { type: integer, description: "Seconds without user activity before sleep; 0 = never", default: 3600 }
         wake_on_preview: { type: boolean, default: true }
-        ttl: { type: integer, description: "Seconds until the sandbox is deleted (pod, volume; runs and events stay); absent/0 = keep" }
+        ttl: { type: integer, description: "Seconds until the sandbox is deleted (pod, volume; runs and events stay); absent/0 = keep. Capped at the token's expiry when oidc.ttl_from_token is on" }
+        agent_version: { type: string, description: "Version name from the catalogue (tenants) or an image reference (admin); absent = default" }
     UpdateSandbox:
       type: object
       description: Only the fields present are changed
@@ -654,6 +756,10 @@ components:
         ip: { type: string }
         instance: { type: integer, description: "Current identity number; grows on every wake" }
         pod_name: { type: string }
+        agent_version: { type: string, description: "Agent image the current (or last) pod runs" }
+        desired_version: { type: string, description: "Rollout target not yet applied; absent when none" }
+        env_version: { type: string, description: "Fingerprint of policy content, harness command, image and pod environment at the last pod start" }
+        revision: { type: integer, format: int64, description: "Changes on every update; every write is conditional on it (optimistic locking across replicas)" }
         last_activity: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
         expires_at: { type: string, format: date-time, nullable: true, description: "Deleted after this time when set" }
@@ -676,6 +782,9 @@ components:
         status: { type: string, enum: [queued, running, done, failed, cancelled] }
         exit_code: { type: integer }
         usage: { $ref: "#/components/schemas/Usage" }
+        agent_version: { type: string, description: "Agent image that executed the run" }
+        resume_of: { type: string, description: "The run this one continues after a forced rollout" }
+        session: { type: string, description: "Harness conversation id captured from the output (Claude Code session_id, Codex thread_id)" }
         created_at: { type: string, format: date-time }
         started_at: { type: string, format: date-time, nullable: true }
         finished_at: { type: string, format: date-time, nullable: true }
@@ -710,8 +819,8 @@ components:
         tenant: { type: string }
         slug: { type: string }
         run_id: { type: string }
-        type: { type: string, enum: [status, run.queued, run.started, run.output, run.finished, run.cancel, input, egress.allow, egress.deny] }
-        data: { type: string, description: "status: new status; run.finished: final run status; egress.*: Egress JSON" }
+        type: { type: string, enum: [status, run.queued, run.started, run.output, run.finished, run.cancel, input, egress.allow, egress.deny, rollout] }
+        data: { type: string, description: "status: new status; run.started: agent version; run.finished: final run status; egress.*: Egress JSON; rollout: {from, to, mode, run_id, resume_id}" }
         at: { type: string, format: date-time }
     UsageTotals:
       type: object

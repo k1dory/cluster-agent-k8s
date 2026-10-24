@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,11 +21,23 @@ var migrations string
 // Postgres is the production Store.
 type Postgres struct {
 	pool *pgxpool.Pool
+	// lockers bounds how many WithTenantLock calls hold a pool connection at once, so the
+	// queries they run through other connections always have some left (half the pool).
+	lockers chan struct{}
 }
 
-// OpenPostgres connects and applies the schema (idempotent).
+// OpenPostgres connects and applies the schema (idempotent). Unless the URL sets pool_max_conns,
+// the pool holds up to 16 connections; the leadership lease and the event listener use
+// dedicated connections outside the pool.
 func OpenPostgres(ctx context.Context, url string) (*Postgres, error) {
-	pool, err := pgxpool.New(ctx, url)
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.Contains(url, "pool_max_conns") && cfg.MaxConns < 16 {
+		cfg.MaxConns = 16
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -32,20 +45,27 @@ func OpenPostgres(ctx context.Context, url string) (*Postgres, error) {
 		pool.Close()
 		return nil, err
 	}
-	return &Postgres{pool: pool}, nil
+	return &Postgres{pool: pool, lockers: make(chan struct{}, max(1, int(cfg.MaxConns)/2))}, nil
+}
+
+// dedicated opens a connection outside the pool for long-held session state (locks, LISTEN).
+func (p *Postgres) dedicated(ctx context.Context) (*pgx.Conn, error) {
+	return pgx.ConnectConfig(ctx, p.pool.Config().ConnConfig.Copy())
 }
 
 func (p *Postgres) Close() error { p.pool.Close(); return nil }
 
 const sandboxCols = `id, name, slug, owner, tenant, repo, idle_timeout, wake_on_preview, status, ip, instance,
-	pod_name, last_activity, created_at, expires_at, preview_port, preview_access, preview_host, error`
+	pod_name, last_activity, created_at, expires_at, preview_port, preview_access, preview_host, error,
+	agent_version, desired_version, env_version, revision`
 
 func scanSandbox(row pgx.Row) (*model.Sandbox, error) {
 	var s model.Sandbox
 	var pPort *int
 	var pAccess, pHost *string
 	err := row.Scan(&s.ID, &s.Name, &s.Slug, &s.Owner, &s.Tenant, &s.Repo, &s.IdleTimeout, &s.WakeOnPreview,
-		&s.Status, &s.IP, &s.Instance, &s.PodName, &s.LastActivity, &s.CreatedAt, &s.ExpiresAt, &pPort, &pAccess, &pHost, &s.Error)
+		&s.Status, &s.IP, &s.Instance, &s.PodName, &s.LastActivity, &s.CreatedAt, &s.ExpiresAt, &pPort, &pAccess, &pHost, &s.Error,
+		&s.AgentVersion, &s.DesiredVersion, &s.EnvVersion, &s.Revision)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -73,11 +93,167 @@ func previewCols(s *model.Sandbox) (*int, *string, *string) {
 
 func (p *Postgres) CreateSandbox(ctx context.Context, s *model.Sandbox) error {
 	port, access, host := previewCols(s)
+	s.Revision = 1
 	_, err := p.pool.Exec(ctx, `INSERT INTO sandboxes (`+sandboxCols+`)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
-		s.PodName, s.LastActivity, s.CreatedAt, s.ExpiresAt, port, access, host, s.Error)
+		s.PodName, s.LastActivity, s.CreatedAt, s.ExpiresAt, port, access, host, s.Error,
+		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision)
 	return err
+}
+
+// WithTenantLock holds a transaction-scoped advisory lock keyed by the tenant while fn runs.
+// Other replicas calling it for the same tenant wait; the lock goes with the transaction.
+func (p *Postgres) WithTenantLock(ctx context.Context, tenant string, fn func(ctx context.Context) error) error {
+	select {
+	case p.lockers <- struct{}{}:
+		defer func() { <-p.lockers }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "tenant:"+tenant); err != nil {
+		return err
+	}
+	if err := fn(ctx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+type pgLease struct {
+	conn *pgx.Conn
+	name string
+	once sync.Once
+}
+
+func (l *pgLease) Ping(ctx context.Context) error {
+	// A session-level advisory lock lives exactly as long as this connection: if the round trip
+	// works the lock is still ours, if the connection is gone so is the leadership.
+	var one int
+	return l.conn.QueryRow(ctx, `SELECT 1`).Scan(&one)
+}
+
+func (l *pgLease) Release() {
+	l.once.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, _ = l.conn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext($1))`, l.name)
+		_ = l.conn.Close(ctx)
+	})
+}
+
+// TryLead takes a session-level advisory lock on a dedicated connection (outside the pool, so
+// it never starves request handlers). The lock is held as long as the connection lives, so a
+// crashed replica loses leadership automatically.
+func (p *Postgres) TryLead(ctx context.Context, name string) (Lease, bool, error) {
+	conn, err := p.dedicated(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	var got bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, name).Scan(&got); err != nil {
+		_ = conn.Close(ctx)
+		return nil, false, err
+	}
+	if !got {
+		_ = conn.Close(ctx)
+		return nil, false, nil
+	}
+	return &pgLease{conn: conn, name: name}, true, nil
+}
+
+func (p *Postgres) GetOrCreateBlob(ctx context.Context, name string, create func() ([]byte, error)) ([]byte, error) {
+	var data []byte
+	err := p.pool.QueryRow(ctx, `SELECT data FROM blobs WHERE name=$1`, name).Scan(&data)
+	if err == nil {
+		return data, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+	fresh, err := create()
+	if err != nil {
+		return nil, err
+	}
+	// Exactly one INSERT wins; everyone reads back whatever is stored.
+	if _, err := p.pool.Exec(ctx, `INSERT INTO blobs (name, data) VALUES ($1,$2) ON CONFLICT (name) DO NOTHING`, name, fresh); err != nil {
+		return nil, err
+	}
+	if err := p.pool.QueryRow(ctx, `SELECT data FROM blobs WHERE name=$1`, name).Scan(&data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+const eventsChannel = "agent_sandbox_events"
+
+// ListenEvents feeds events appended by any replica to fn, in id order, until ctx ends.
+// NOTIFY wakes the loop; the query by id guarantees nothing is skipped or duplicated even
+// when notifications coalesce or the connection is replaced.
+func (p *Postgres) ListenEvents(ctx context.Context, fn func(e *model.Event)) {
+	var last int64
+	_ = p.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM events`).Scan(&last)
+	for ctx.Err() == nil {
+		if err := p.listenOnce(ctx, &last, fn); err != nil && ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+}
+
+func (p *Postgres) listenOnce(ctx context.Context, last *int64, fn func(e *model.Event)) error {
+	conn, err := p.dedicated(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = conn.Close(cctx)
+	}()
+	if _, err := conn.Exec(ctx, `LISTEN `+eventsChannel); err != nil {
+		return err
+	}
+	drain := func() error {
+		for {
+			evs, err := p.QueryEvents(ctx, Filter{AfterID: *last, Limit: 500})
+			if err != nil {
+				return err
+			}
+			for _, e := range evs {
+				fn(e)
+				*last = e.ID
+			}
+			if len(evs) < 500 {
+				return nil
+			}
+		}
+	}
+	if err := drain(); err != nil {
+		return err
+	}
+	for {
+		// A timeout keeps the loop polling slowly even if a NOTIFY is lost.
+		wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		_, err := conn.WaitForNotification(wctx)
+		cancel()
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := drain(); err != nil {
+			return err
+		}
+	}
 }
 
 func (p *Postgres) GetSandbox(ctx context.Context, id string) (*model.Sandbox, error) {
@@ -124,6 +300,9 @@ func (p *Postgres) QuerySandboxes(ctx context.Context, f SandboxFilter) ([]*mode
 	if f.Status != "" {
 		add("status=$%d", f.Status)
 	}
+	if f.Instance != 0 {
+		add("instance=$%d", f.Instance)
+	}
 	if !f.Cursor.IsZero() {
 		args = append(args, f.Cursor.At, f.Cursor.ID)
 		conds = append(conds, fmt.Sprintf("(created_at, id) > ($%d, $%d)", len(args)-1, len(args)))
@@ -158,10 +337,29 @@ func (p *Postgres) CountSandboxes(ctx context.Context, tenant string) (SandboxCo
 func (p *Postgres) UpdateSandbox(ctx context.Context, s *model.Sandbox) error {
 	port, access, host := previewCols(s)
 	tag, err := p.pool.Exec(ctx, `UPDATE sandboxes SET name=$2, slug=$3, owner=$4, tenant=$5, repo=$6, idle_timeout=$7,
-		wake_on_preview=$8, status=$9, ip=$10, instance=$11, pod_name=$12, last_activity=$13, expires_at=$14,
-		preview_port=$15, preview_access=$16, preview_host=$17, error=$18 WHERE id=$1`,
+		wake_on_preview=$8, status=$9, ip=$10, instance=$11, pod_name=$12, last_activity=GREATEST(last_activity, $13), expires_at=$14,
+		preview_port=$15, preview_access=$16, preview_host=$17, error=$18,
+		agent_version=$19, desired_version=$20, env_version=$21, revision=revision+1
+		WHERE id=$1 AND revision=$22`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
-		s.PodName, s.LastActivity, s.ExpiresAt, port, access, host, s.Error)
+		s.PodName, s.LastActivity, s.ExpiresAt, port, access, host, s.Error,
+		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		var one int
+		if err := p.pool.QueryRow(ctx, `SELECT 1 FROM sandboxes WHERE id=$1`, s.ID).Scan(&one); errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return ErrConflict
+	}
+	s.Revision++
+	return nil
+}
+
+func (p *Postgres) TouchSandbox(ctx context.Context, id string, at time.Time) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE sandboxes SET last_activity=GREATEST(last_activity, $2) WHERE id=$1`, id, at)
 	if err != nil {
 		return err
 	}
@@ -183,13 +381,15 @@ func (p *Postgres) DeleteSandbox(ctx context.Context, id string) error {
 }
 
 const runCols = `id, sandbox_id, tenant, slug, task, status, exit_code, created_at, started_at, finished_at,
-	model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, turns`
+	model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, turns,
+	agent_version, resume_of, session`
 
 func scanRun(row pgx.Row) (*model.Run, error) {
 	var r model.Run
 	u := &r.Usage
 	err := row.Scan(&r.ID, &r.SandboxID, &r.Tenant, &r.Slug, &r.Task, &r.Status, &r.ExitCode, &r.CreatedAt, &r.StartedAt, &r.FinishedAt,
-		&u.Model, &u.InputTokens, &u.OutputTokens, &u.CacheRead, &u.CacheWrite, &u.CostUSD, &u.Turns)
+		&u.Model, &u.InputTokens, &u.OutputTokens, &u.CacheRead, &u.CacheWrite, &u.CostUSD, &u.Turns,
+		&r.AgentVersion, &r.ResumeOf, &r.Session)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -201,9 +401,10 @@ func scanRun(row pgx.Row) (*model.Run, error) {
 
 func (p *Postgres) CreateRun(ctx context.Context, r *model.Run) error {
 	u := r.Usage
-	_, err := p.pool.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+	_, err := p.pool.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
 		r.ID, r.SandboxID, r.Tenant, r.Slug, r.Task, r.Status, r.ExitCode, r.CreatedAt, r.StartedAt, r.FinishedAt,
-		u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns)
+		u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
+		r.AgentVersion, r.ResumeOf, r.Session)
 	return err
 }
 
@@ -214,8 +415,10 @@ func (p *Postgres) GetRun(ctx context.Context, id string) (*model.Run, error) {
 func (p *Postgres) UpdateRun(ctx context.Context, r *model.Run) error {
 	u := r.Usage
 	tag, err := p.pool.Exec(ctx, `UPDATE runs SET status=$2, exit_code=$3, started_at=$4, finished_at=$5,
-		model=$6, input_tokens=$7, output_tokens=$8, cache_read_tokens=$9, cache_write_tokens=$10, cost_usd=$11, turns=$12 WHERE id=$1`,
-		r.ID, r.Status, r.ExitCode, r.StartedAt, r.FinishedAt, u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns)
+		model=$6, input_tokens=$7, output_tokens=$8, cache_read_tokens=$9, cache_write_tokens=$10, cost_usd=$11, turns=$12,
+		agent_version=$13, session=$14 WHERE id=$1`,
+		r.ID, r.Status, r.ExitCode, r.StartedAt, r.FinishedAt, u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
+		r.AgentVersion, r.Session)
 	if err != nil {
 		return err
 	}
@@ -262,7 +465,10 @@ func (p *Postgres) AppendEvent(ctx context.Context, e *model.Event) error {
 	if e.At.IsZero() {
 		e.At = time.Now()
 	}
-	return p.pool.QueryRow(ctx, `INSERT INTO events (sandbox_id, tenant, slug, run_id, type, data, at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+	// The NOTIFY wakes every replica's ListenEvents so their SSE clients see this event.
+	return p.pool.QueryRow(ctx, `WITH ins AS (
+			INSERT INTO events (sandbox_id, tenant, slug, run_id, type, data, at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id)
+		SELECT id FROM ins, pg_notify('`+eventsChannel+`', id::text)`,
 		e.SandboxID, e.Tenant, e.Slug, e.RunID, e.Type, e.Data, e.At).Scan(&e.ID)
 }
 

@@ -8,7 +8,6 @@ metadata:
     app.kubernetes.io/instance: agent-sandbox
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: agent-sandbox-0.1.0
-
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -19,7 +18,6 @@ metadata:
     app.kubernetes.io/instance: agent-sandbox
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: agent-sandbox-0.1.0
-
 ---
 # Identity of agent pods. No RBAC at all: the projected token is only a bootstrap credential
 # that the Registrar verifies with TokenReview.
@@ -34,7 +32,6 @@ metadata:
     app.kubernetes.io/version: "0.1.0"
     helm.sh/chart: agent-sandbox-0.1.0
 automountServiceAccountToken: false
-
 ---
 # Long-lived token for the sandboxd running on the gateway VM. Build its kubeconfig with:
 #   kubectl -n agent-sandbox get secret agent-sandbox-sandboxd-token -o jsonpath='{.data.token}' | base64 -d
@@ -50,7 +47,6 @@ metadata:
   annotations:
     kubernetes.io/service-account.name: agent-sandbox-sandboxd
 type: kubernetes.io/service-account-token
-
 ---
 # TokenReview is cluster-scoped.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -66,7 +62,6 @@ rules:
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -85,7 +80,6 @@ subjects:
   - kind: ServiceAccount
     name: agent-sandbox-sandboxd
     namespace: agent-sandbox
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -107,7 +101,6 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "create", "delete"]
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -127,7 +120,6 @@ subjects:
   - kind: ServiceAccount
     name: agent-sandbox-sandboxd
     namespace: agent-sandbox
-
 ---
 # Requires Multus and whereabouts to be installed on the cluster.
 apiVersion: k8s.cni.cncf.io/v1

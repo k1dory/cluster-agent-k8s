@@ -118,13 +118,31 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	if cmdline == "" {
 		cmdline = `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose`
 	}
+	env := append(os.Environ(), "SANDBOX_TASK="+run.Task, "SANDBOX_RUN_ID="+run.ID)
+	// A resume run continues a conversation an earlier pod started (the sandbox was rolled out
+	// to a new agent version mid-task). The harness's own session lives on the workspace volume.
+	if run.ResumeOf != "" {
+		env = append(env, "SANDBOX_RESUME_OF="+run.ResumeOf, "SANDBOX_SESSION="+run.Session)
+		if os.Getenv("SANDBOX_RESUME_PROMPT") == "" {
+			env = append(env, "SANDBOX_RESUME_PROMPT=The sandbox was restarted to update the agent. Continue the task where you left off.")
+		}
+		switch resume := os.Getenv("HARNESS_RESUME_CMD"); {
+		case run.Session != "" && resume != "":
+			cmdline = resume
+			fmt.Printf("agent-runner: run %s resumes %s (session %s)\n", run.ID, run.ResumeOf, run.Session)
+		case run.Session != "":
+			fmt.Printf("agent-runner: run %s resumes %s but HARNESS_RESUME_CMD is not set: running the task again\n", run.ID, run.ResumeOf)
+		default:
+			fmt.Printf("agent-runner: run %s resumes %s but no session id was captured: running the task again\n", run.ID, run.ResumeOf)
+		}
+	}
 	fmt.Printf("agent-runner: run %s: %q\n", run.ID, truncate(run.Task, 80))
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "/bin/sh", "-lc", cmdline)
 	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
 	cmd.WaitDelay = 20 * time.Second
-	cmd.Env = append(os.Environ(), "SANDBOX_TASK="+run.Task, "SANDBOX_RUN_ID="+run.ID)
+	cmd.Env = env
 	cmd.Dir = os.Getenv("PWD")
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

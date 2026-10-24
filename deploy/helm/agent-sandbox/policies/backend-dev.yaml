@@ -2,6 +2,7 @@
 # backend-dev: full git flow (push is further limited to agent/* branches by Forgejo branch
 # protection and the per-agent token), LLM API, MCP read-only.
 slug: backend-dev
+tenants: ["*"]        # any tenant may create backend-dev sandboxes; list tenants to restrict
 allow:
   - host: git.example.com
     paths: ["/*/*/info/refs", "/*/*/git-upload-pack", "/*/*/git-receive-pack"]
@@ -15,5 +16,3 @@ allow:
   - host: mcp.example.com
     paths: ["/mcp", "/mcp/**"]
     mcp: { read_only: true }
-  - host: api.sandbox.internal
-    paths: ["/agent/**"]

@@ -77,6 +77,7 @@ type Filter struct {
 // SandboxFilter selects sandboxes for a list page.
 type SandboxFilter struct {
 	Tenant, Owner, Slug, Status string
+	Instance                    int // current agent (identity) number; 0 = any
 	Cursor                      Cursor
 	Limit                       int
 }
@@ -110,9 +111,28 @@ type EventCount struct {
 // ErrNotFound is returned when a record does not exist.
 var ErrNotFound = errors.New("not found")
 
+// ErrConflict is returned by UpdateSandbox when the row changed since it was read (the
+// revision in the record is stale). Callers reload and reapply their change.
+var ErrConflict = errors.New("sandbox changed concurrently")
+
+// Lease is a held leadership lock. Ping fails once the lock is lost (connection gone), at
+// which point the holder must stop acting as leader. Release gives the lock up.
+type Lease interface {
+	Ping(ctx context.Context) error
+	Release()
+}
+
+// EventListener is implemented by stores that can tell this process about events other
+// processes appended (Postgres LISTEN/NOTIFY). fn is called for every new event, in id order,
+// until ctx ends. Replicas use it to feed their local event hub.
+type EventListener interface {
+	ListenEvents(ctx context.Context, fn func(e *model.Event))
+}
+
 // Store is the persistence interface. Postgres is the production implementation,
 // Memory is used for tests and local development.
 type Store interface {
+	// CreateSandbox inserts the record and sets its Revision to 1.
 	CreateSandbox(ctx context.Context, s *model.Sandbox) error
 	GetSandbox(ctx context.Context, id string) (*model.Sandbox, error)
 	ListSandboxes(ctx context.Context) ([]*model.Sandbox, error)
@@ -120,9 +140,23 @@ type Store interface {
 	QuerySandboxes(ctx context.Context, f SandboxFilter) ([]*model.Sandbox, error)
 	// CountSandboxes counts a tenant's sandboxes without paging.
 	CountSandboxes(ctx context.Context, tenant string) (SandboxCounts, error)
+	// UpdateSandbox writes the record if its Revision still matches the stored one, then
+	// increments it (in the store and in s). ErrConflict otherwise.
 	UpdateSandbox(ctx context.Context, s *model.Sandbox) error
+	// TouchSandbox records activity without bumping the revision: it happens on every allowed
+	// egress request and must never make another writer's update fail.
+	TouchSandbox(ctx context.Context, id string, at time.Time) error
 	DeleteSandbox(ctx context.Context, id string) error
 	SandboxByPreviewHost(ctx context.Context, host string) (*model.Sandbox, error)
+
+	// WithTenantLock runs fn while holding a lock shared by every replica for that tenant,
+	// so a quota check and the allocation it guards cannot interleave with another one.
+	WithTenantLock(ctx context.Context, tenant string, fn func(ctx context.Context) error) error
+	// TryLead attempts to take the named leadership lock. held=false means another replica has it.
+	TryLead(ctx context.Context, name string) (lease Lease, held bool, err error)
+	// GetOrCreateBlob returns the stored bytes under name, creating them with create when
+	// absent. Exactly one creator wins across replicas (the shared agent CA key lives here).
+	GetOrCreateBlob(ctx context.Context, name string, create func() ([]byte, error)) ([]byte, error)
 
 	CreateRun(ctx context.Context, r *model.Run) error
 	GetRun(ctx context.Context, id string) (*model.Run, error)

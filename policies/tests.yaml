@@ -7,7 +7,6 @@
     - POST git.example.com/org/repo.git/git-receive-pack
     - POST api.anthropic.com/v1/messages
     - POST mcp.example.com/mcp
-    - GET  api.sandbox.internal/agent/runs/next
   deny:
     - GET  api.anthropic.com/v1/messages          # only POST to the LLM API
     - GET  git.example.com/api/v1/repos            # Forgejo REST API is not git smart HTTP

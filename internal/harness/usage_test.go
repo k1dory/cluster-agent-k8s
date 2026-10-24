@@ -21,3 +21,19 @@ func TestParseUsage(t *testing.T) {
 		}
 	}
 }
+
+func TestParseSession(t *testing.T) {
+	cases := map[string]string{
+		`{"type":"system","subtype":"init","session_id":"abc-123","model":"x"}`: "abc-123",
+		`{"type":"thread.started","thread_id":"th_9"}`:                          "th_9",
+		`{"type":"result","session_id":"abc-123","total_cost_usd":0.1}`:         "abc-123",
+		`plain text with session_id in it`:                                      "",
+		`{"type":"usage","input_tokens":1}`:                                     "",
+	}
+	for line, want := range cases {
+		got, ok := ParseSession(line)
+		if got != want || ok != (want != "") {
+			t.Errorf("ParseSession(%q) = %q,%v want %q", line, got, ok, want)
+		}
+	}
+}

@@ -28,7 +28,7 @@ import (
 const usage = `sandboxctl <command> [flags]
 
   create   -name shop -slug backend-dev -owner alice [-tenant t] [-repo url] [-idle 3600] [-ttl 86400]
-           [-wake-on-preview=false] [-key idempotency-key]
+           [-wake-on-preview=false] [-version stable] [-key idempotency-key]
   list     [-tenant t] [-owner o] [-slug s] [-status running] [-n 100] [-after cursor]
   get      <sandbox>
   update   <sandbox> [-idle 600] [-ttl 0] [-wake-on-preview=true] [-repo url]
@@ -46,6 +46,10 @@ const usage = `sandboxctl <command> [flags]
   delete   <sandbox>
   policies
   whoami
+  version                                  control plane build, agent versions, environment versions per slug
+  rollout  -version 1.5.0 (-sandbox sb_1 | -instance 42 | -slug backend-dev | -all) [-percent 10] [-force] [-resume=false]
+           move agents to a version: sleeping ones on next wake, idle ones now, busy ones when their run ends;
+           -force interrupts runs and re-queues them as resume runs; -percent keeps a canary share
   usage    [-tenant t] [-slug s] [-sandbox id] [-run id] [-since 720h | -from DATE -to DATE] [-by tenant|slug|sandbox|run|day] [-json]
   trace    [-tenant t] [-slug s] [-sandbox id] [-run id] [-since 24h] [-type egress.deny,run.finished|all] [-n 500] [-f] [-json]
 
@@ -165,9 +169,10 @@ func (c *cli) run(cmd string, args []string) error {
 		idle := fs.Int("idle", -1, "idle timeout seconds (default server-side 3600, 0 = never)")
 		ttl := fs.Int("ttl", 0, "delete the sandbox after this many seconds (0 = keep)")
 		wop := fs.Bool("wake-on-preview", true, "wake a sleeping sandbox when its preview is opened")
+		version := fs.String("version", "", "agent version name (see `sandboxctl version`); default server-side")
 		key := fs.String("key", "", "Idempotency-Key: a repeat with the same key returns the same sandbox")
 		_ = fs.Parse(flags)
-		req := map[string]any{"name": *name, "slug": *slug, "owner": *owner, "tenant": *tenant, "repo": *repo, "wake_on_preview": *wop}
+		req := map[string]any{"name": *name, "slug": *slug, "owner": *owner, "tenant": *tenant, "repo": *repo, "wake_on_preview": *wop, "agent_version": *version}
 		if *idle >= 0 {
 			req["idle_timeout"] = *idle
 		}
@@ -194,7 +199,7 @@ func (c *cli) run(cmd string, args []string) error {
 			return err
 		}
 		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tNAME\tSLUG\tOWNER\tTENANT\tSTATUS\tIP\tN\tIDLE\tEXPIRES\tPREVIEW")
+		fmt.Fprintln(tw, "ID\tNAME\tSLUG\tOWNER\tTENANT\tSTATUS\tIP\tN\tAGENT\tENV\tIDLE\tEXPIRES\tPREVIEW")
 		for _, s := range sbs {
 			pv, exp := "", ""
 			if s.Preview != nil {
@@ -203,8 +208,12 @@ func (c *cli) run(cmd string, args []string) error {
 			if s.ExpiresAt != nil {
 				exp = time.Until(*s.ExpiresAt).Round(time.Minute).String()
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n", s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Status, s.IP, s.Instance,
-				time.Since(s.LastActivity).Round(time.Second), exp, pv)
+			agent := shortImage(s.AgentVersion)
+			if s.DesiredVersion != "" {
+				agent += " → " + shortImage(s.DesiredVersion)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Status, s.IP, s.Instance,
+				agent, s.EnvVersion, time.Since(s.LastActivity).Round(time.Second), exp, pv)
 		}
 		tw.Flush()
 		if cur := hdr.Get("X-Next-Cursor"); cur != "" {
@@ -318,6 +327,53 @@ func (c *cli) run(cmd string, args []string) error {
 			return err
 		}
 		printJSON(out)
+	case "version":
+		var out map[string]any
+		if err := c.do("GET", "/v1/version", nil, &out); err != nil {
+			return err
+		}
+		printJSON(out)
+	case "rollout":
+		req := map[string]any{}
+		version := fs.String("version", "", "target agent version (name or, as admin, image reference)")
+		sandbox := fs.String("sandbox", "", "one sandbox id")
+		instance := fs.Int("instance", 0, "one agent by its identity number")
+		slug := fs.String("slug", "", "every sandbox of this slug")
+		all := fs.Bool("all", false, "every sandbox (of your tenant; everything as admin)")
+		percent := fs.Int("percent", 0, "canary: only this share of the selection (deterministic)")
+		force := fs.Bool("force", false, "interrupt runs in progress and re-queue them as resume runs")
+		fs.Func("resume", "true | false: queue a resume run for each interrupted run (default true)", func(v string) error {
+			b, err := strconv.ParseBool(v)
+			req["resume"] = b
+			return err
+		})
+		_ = fs.Parse(flags)
+		req["version"], req["sandbox"], req["instance"], req["slug"], req["all"], req["percent"], req["force"] =
+			*version, *sandbox, *instance, *slug, *all, *percent, *force
+		var out struct {
+			Version  string `json:"version"`
+			Selected int    `json:"selected"`
+			Targeted int    `json:"targeted"`
+			Items    []struct {
+				Sandbox  string `json:"sandbox"`
+				Slug     string `json:"slug"`
+				From     string `json:"from"`
+				Mode     string `json:"mode"`
+				Reason   string `json:"reason"`
+				RunID    string `json:"run_id"`
+				ResumeID string `json:"resume_id"`
+			} `json:"items"`
+		}
+		if err := c.do("POST", "/v1/rollouts", req, &out); err != nil {
+			return err
+		}
+		fmt.Printf("rollout to %s: %d selected, %d targeted\n", out.Version, out.Selected, out.Targeted)
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "SANDBOX\tSLUG\tFROM\tMODE\tRUN\tRESUME\tNOTE")
+		for _, it := range out.Items {
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", it.Sandbox, it.Slug, shortImage(it.From), it.Mode, it.RunID, it.ResumeID, it.Reason)
+		}
+		tw.Flush()
 	case "watch":
 		runID := fs.String("run", "", "only this run")
 		after := fs.Int64("after", 0, "replay from event id")
@@ -418,6 +474,14 @@ func (c *cli) run(cmd string, args []string) error {
 		return fmt.Errorf("unknown command %q", cmd)
 	}
 	return nil
+}
+
+// shortImage trims a registry path to the last component (name:tag) for tables.
+func shortImage(ref string) string {
+	if i := strings.LastIndex(ref, "/"); i >= 0 {
+		return ref[i+1:]
+	}
+	return ref
 }
 
 func need(pos []string, i int, what string) string {

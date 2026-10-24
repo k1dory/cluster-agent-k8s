@@ -18,12 +18,57 @@ data:
     api_token: "${SANDBOXD_API_TOKEN}"
     database_url: "${DATABASE_URL}"
     policies_dir: /etc/sandbox/policies
+    policies_strict: {{ .Values.sandboxd.policiesStrict }}
+    {{- if .Values.sandboxd.oidc.issuer }}
+    oidc:
+      issuer: {{ .Values.sandboxd.oidc.issuer | quote }}
+      client_id: {{ .Values.sandboxd.oidc.clientId | quote }}
+      tenant_claim: {{ .Values.sandboxd.oidc.tenantClaim | quote }}
+      tenant_prefix: {{ .Values.sandboxd.oidc.tenantPrefix | quote }}
+      admin_claim: {{ .Values.sandboxd.oidc.adminClaim | quote }}
+      admin_value: {{ .Values.sandboxd.oidc.adminValue | quote }}
+      ttl_from_token: {{ .Values.sandboxd.oidc.ttlFromToken }}
+    {{- end }}
     {{- if .Values.tenantSecretsSecret }}
     secrets_dir: /etc/sandbox/secrets
     {{- end }}
+    {{- $sec := .Values.sandboxd.secrets }}
+    {{- if ne $sec.provider "file" }}
+    secrets:
+      provider: {{ $sec.provider }}
+      cache_ttl: {{ $sec.cacheTtl }}
+      {{- if eq $sec.provider "vault" }}
+      vault:
+        addr: {{ $sec.vault.addr | quote }}
+        token: "${VAULT_TOKEN}"
+        kubernetes_role: {{ $sec.vault.kubernetesRole | quote }}
+        kubernetes_mount: {{ $sec.vault.kubernetesMount | quote }}
+        mount: {{ $sec.vault.mount | quote }}
+        tenant_path: {{ $sec.vault.tenantPath | quote }}
+        shared_path: {{ $sec.vault.sharedPath | quote }}
+        namespace: {{ $sec.vault.namespace | quote }}
+      {{- end }}
+      {{- if eq $sec.provider "infisical" }}
+      infisical:
+        site_url: {{ $sec.infisical.siteUrl | quote }}
+        client_id: "${INFISICAL_CLIENT_ID}"
+        client_secret: "${INFISICAL_CLIENT_SECRET}"
+        project_id: {{ $sec.infisical.projectId | quote }}
+        environment: {{ $sec.infisical.environment | quote }}
+        tenant_path: {{ $sec.infisical.tenantPath | quote }}
+        shared_path: {{ $sec.infisical.sharedPath | quote }}
+      {{- end }}
+    {{- end }}
     ca:
       dir: /var/lib/sandboxd/ca
+      source: {{ .Values.sandboxd.ca.source }}
       cert_ttl: {{ .Values.sandboxd.certTtl }}
+    agent:
+      default: {{ .Values.agent.defaultVersion | quote }}
+      versions:
+        {{- range $k, $v := .Values.agent.versions }}
+        {{ $k }}: {{ $v | quote }}
+        {{- end }}
     gateway:
       ip: {{ .Values.gateway.ip }}
       caddy_admin: http://127.0.0.1:2019
@@ -47,6 +92,8 @@ data:
       memory_request: {{ .Values.agent.resources.memoryRequest | quote }}
       memory_limit: {{ .Values.agent.resources.memoryLimit | quote }}
       harness_command: {{ .Values.agent.harnessCommand | quote }}
+      harness_resume_command: {{ .Values.agent.harnessResumeCommand | quote }}
+      resume_prompt: {{ .Values.agent.resumePrompt | quote }}
       termination_seconds: {{ .Values.agent.terminationSeconds }}
       env:
         {{- range $k, $v := .Values.agent.env }}

@@ -6,6 +6,9 @@
 package policy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -44,10 +47,29 @@ type Meta struct {
 }
 
 // Policy is the egress policy of one slug. Slug "default" applies to slugs without a file.
+//
+// Tenants is the ownership list: which tenants may create sandboxes (and roll out agents) with
+// this slug. "*" means every tenant. An empty list means the slug is open in permissive mode
+// and admin-only in strict mode (see Set.Strict). The admin token is never restricted.
 type Policy struct {
-	Slug  string `yaml:"slug" json:"slug"`
-	Meta  Meta   `yaml:"meta,omitempty" json:"meta,omitempty"`
-	Allow []Rule `yaml:"allow" json:"allow"`
+	Slug    string   `yaml:"slug" json:"slug"`
+	Meta    Meta     `yaml:"meta,omitempty" json:"meta,omitempty"`
+	Tenants []string `yaml:"tenants,omitempty" json:"tenants,omitempty"`
+	Allow   []Rule   `yaml:"allow" json:"allow"`
+}
+
+// OwnedBy reports whether tenant may use this policy. strict decides what an absent tenants
+// list means: open (false) or admin-only (true).
+func (p *Policy) OwnedBy(tenant string, strict bool) bool {
+	if len(p.Tenants) == 0 {
+		return !strict
+	}
+	for _, t := range p.Tenants {
+		if t == "*" || t == tenant {
+			return true
+		}
+	}
+	return false
 }
 
 // Host is one external name the gateway must serve, with its upstream.
@@ -61,10 +83,50 @@ type Host struct {
 
 // Set is the loaded collection of policies with hot reload.
 type Set struct {
-	dir    string
+	dir string
+	// Strict makes a slug without a tenants list admin-only and refuses slugs that have no
+	// policy file of their own (no silent fallback to "default" for tenants).
+	Strict bool
 	mu     sync.RWMutex
 	bySlug map[string]*Policy
+	raw    map[string][]byte // slug → file content, for environment versioning
 	stamp  string
+}
+
+// AllowedFor reports whether a tenant may create sandboxes with slug. The policy that would
+// apply (the slug's own, else "default") decides; in strict mode the fallback is not offered.
+func (s *Set) AllowedFor(slug, tenant string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.bySlug[slug]
+	if !ok {
+		if s.Strict {
+			return false
+		}
+		if p, ok = s.bySlug["default"]; !ok {
+			return false
+		}
+	}
+	return p.OwnedBy(tenant, s.Strict)
+}
+
+// ContentHash identifies the policy content that applies to slug (own file or default), so a
+// sandbox can carry the version of the rules it was started under. Empty when none applies.
+func (s *Set) ContentHash(slug string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.bySlug[slug]
+	if !ok {
+		if p, ok = s.bySlug["default"]; !ok {
+			return ""
+		}
+	}
+	raw, ok := s.raw[p.Slug]
+	if !ok {
+		raw, _ = json.Marshal(p) // FromPolicies: no file, hash the structure
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:6])
 }
 
 // Load reads every *.yaml in dir.
@@ -78,7 +140,7 @@ func Load(dir string) (*Set, error) {
 
 // FromPolicies builds a Set without files (tests).
 func FromPolicies(ps ...*Policy) *Set {
-	s := &Set{bySlug: map[string]*Policy{}}
+	s := &Set{bySlug: map[string]*Policy{}, raw: map[string][]byte{}}
 	for _, p := range ps {
 		s.bySlug[p.Slug] = p
 		s.stamp += p.Slug + ";"
@@ -93,6 +155,7 @@ func (s *Set) reload() error {
 	}
 	sort.Strings(files)
 	bySlug := map[string]*Policy{}
+	rawBySlug := map[string][]byte{}
 	var stamp strings.Builder
 	for _, f := range files {
 		if !isPolicyFile(f) {
@@ -118,12 +181,14 @@ func (s *Set) reload() error {
 			return fmt.Errorf("%s: %w", f, err)
 		}
 		bySlug[p.Slug] = &p
+		rawBySlug[p.Slug] = raw
 	}
 	if _, err := hostsOf(bySlug); err != nil {
 		return err
 	}
 	s.mu.Lock()
 	s.bySlug = bySlug
+	s.raw = rawBySlug
 	s.stamp = stamp.String()
 	s.mu.Unlock()
 	return nil
@@ -131,6 +196,11 @@ func (s *Set) reload() error {
 
 // Validate checks that every rule is well formed.
 func (p *Policy) Validate() error {
+	for i, t := range p.Tenants {
+		if t == "" || strings.ContainsAny(t, " \t") {
+			return fmt.Errorf("tenants[%d]: %q is not a tenant name", i, t)
+		}
+	}
 	for i, r := range p.Allow {
 		if r.Host == "" {
 			return fmt.Errorf("allow[%d]: host is required", i)

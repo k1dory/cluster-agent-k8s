@@ -2,7 +2,7 @@ BIN ?= bin
 REGISTRY ?= registry.example.com/agent-sandbox
 TAG ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 
-.PHONY: build test vet dev images helm-lint policy-test policy-render manifests clean
+.PHONY: build test vet dev images helm-lint policy-test policy-render manifests clean integration
 
 build:
 	mkdir -p $(BIN)
@@ -13,6 +13,11 @@ build:
 
 test:
 	go test ./...
+
+# The gateway path on a real Caddy (needs caddy on PATH or CADDY_BIN=/path/to/caddy); CI runs it
+# for Caddy 2.8, 2.9 and 2.10.
+integration:
+	go test ./internal/integration/ -count=1 -v
 
 vet:
 	go vet ./... && gofmt -l . | (! grep .)

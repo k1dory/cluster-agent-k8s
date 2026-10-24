@@ -17,6 +17,8 @@ type Memory struct {
 	events    []*model.Event
 	instances map[int]*model.Instance
 	idem      map[string]*Idempotent
+	blobs     map[string][]byte
+	tenants   map[string]*sync.Mutex
 	nextInst  int
 	nextEvent int64
 }
@@ -28,7 +30,45 @@ func NewMemory() *Memory {
 		runs:      map[string]*model.Run{},
 		instances: map[int]*model.Instance{},
 		idem:      map[string]*Idempotent{},
+		blobs:     map[string][]byte{},
+		tenants:   map[string]*sync.Mutex{},
 	}
+}
+
+// WithTenantLock serialises per tenant within this process (one process is all a memory store has).
+func (m *Memory) WithTenantLock(ctx context.Context, tenant string, fn func(ctx context.Context) error) error {
+	m.mu.Lock()
+	l, ok := m.tenants[tenant]
+	if !ok {
+		l = &sync.Mutex{}
+		m.tenants[tenant] = l
+	}
+	m.mu.Unlock()
+	l.Lock()
+	defer l.Unlock()
+	return fn(ctx)
+}
+
+type memLease struct{}
+
+func (memLease) Ping(context.Context) error { return nil }
+func (memLease) Release()                   {}
+
+// TryLead always succeeds: a memory store never has a second replica.
+func (m *Memory) TryLead(context.Context, string) (Lease, bool, error) { return memLease{}, true, nil }
+
+func (m *Memory) GetOrCreateBlob(_ context.Context, name string, create func() ([]byte, error)) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if b, ok := m.blobs[name]; ok {
+		return append([]byte(nil), b...), nil
+	}
+	b, err := create()
+	if err != nil {
+		return nil, err
+	}
+	m.blobs[name] = append([]byte(nil), b...)
+	return b, nil
 }
 
 func cloneSandbox(s *model.Sandbox) *model.Sandbox {
@@ -43,6 +83,7 @@ func cloneSandbox(s *model.Sandbox) *model.Sandbox {
 func (m *Memory) CreateSandbox(_ context.Context, s *model.Sandbox) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	s.Revision = 1
 	m.sandboxes[s.ID] = cloneSandbox(s)
 	return nil
 }
@@ -71,10 +112,33 @@ func (m *Memory) ListSandboxes(_ context.Context) ([]*model.Sandbox, error) {
 func (m *Memory) UpdateSandbox(_ context.Context, s *model.Sandbox) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.sandboxes[s.ID]; !ok {
+	cur, ok := m.sandboxes[s.ID]
+	if !ok {
 		return ErrNotFound
 	}
-	m.sandboxes[s.ID] = cloneSandbox(s)
+	if cur.Revision != s.Revision {
+		return ErrConflict
+	}
+	s.Revision++
+	c := cloneSandbox(s)
+	// Like Postgres (GREATEST): a Touch that landed after the caller's read is not rolled back.
+	if cur.LastActivity.After(c.LastActivity) {
+		c.LastActivity = cur.LastActivity
+	}
+	m.sandboxes[s.ID] = c
+	return nil
+}
+
+func (m *Memory) TouchSandbox(_ context.Context, id string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.sandboxes[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if at.After(cur.LastActivity) {
+		cur.LastActivity = at
+	}
 	return nil
 }
 
@@ -310,7 +374,8 @@ func (m *Memory) QuerySandboxes(_ context.Context, f SandboxFilter) ([]*model.Sa
 	var all []*model.Sandbox
 	for _, s := range m.sandboxes {
 		if f.Tenant != "" && s.Tenant != f.Tenant || f.Owner != "" && s.Owner != f.Owner ||
-			f.Slug != "" && s.Slug != f.Slug || f.Status != "" && string(s.Status) != f.Status {
+			f.Slug != "" && s.Slug != f.Slug || f.Status != "" && string(s.Status) != f.Status ||
+			f.Instance != 0 && s.Instance != f.Instance {
 			continue
 		}
 		all = append(all, s)
