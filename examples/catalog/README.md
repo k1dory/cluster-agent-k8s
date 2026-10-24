@@ -7,8 +7,8 @@ applied in order). Unknown fields are errors, every apply appends a revision,
 revision numbers: a recreated `python-dev` continues at the next number, never as `python-dev@1`.
 
 ```sh
-sandboxctl apply -f examples/catalog/environment-python.yaml     # revision 1 of python-dev
-sandboxctl apply -f examples/catalog/agent-backend.yaml          # revision 1 of backend
+sandboxctl plan -f examples/catalog/bundle.yaml                  # what would change, nothing written
+sandboxctl apply -f examples/catalog/bundle.yaml                 # plan, then apply: one transaction per step
 sandboxctl create -name shop -owner alice -agent backend         # sandbox: backend@1 on python-dev@1
 sandboxctl run sb_1234 "add integration tests for the checkout flow"
 sandboxctl get agent backend                                     # current revision

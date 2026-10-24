@@ -284,6 +284,23 @@ matches is a conflict. The plan is deterministic for the same documents and stat
 changes in apply order, and carries a `bundle` fingerprint of the documents. `internal/plan` runs the same validators the API runs on a
 write, over a read-only overlay of the store. See `examples/catalog/bundle.yaml`.
 
+### Apply: one transaction per step, continued by key
+
+`sandboxctl apply -f bundle.yaml` plans the bundle and applies it through the controller
+(`POST /v1/apply` with the plan's fingerprint). The fingerprint binds the plan to the state
+(scope, actions, expected and next revisions): a bundle whose plan no longer matches is refused
+with 409 and nothing is written. Each step writes its item revision and its own completion in one
+transaction, guarded by the apply record's version, so a step is either applied and recorded or
+neither, and two replicas cannot both commit it. The apply is created once per idempotency key
+(`-key`, the `Idempotency-Key` header, else the fingerprint) and continued, never redone: the
+same key with the same bundle returns the same apply and finishes it; another bundle under the
+key is a conflict. A replica continuing an unfinished apply takes a lease first. Continuation
+(`sandboxctl apply -resume <id>`, `POST /v1/applies/{id}/resume`) re-plans the stored documents
+under the stored scope with its current rights: a pending step must still find the revision the
+plan expected (noop steps too), an applied step must still be the latest revision, every document
+must still validate; otherwise the apply stops with status `conflict` and says why, its steps
+showing exactly what was applied. `sandboxctl applies` lists them. See `internal/apply`.
+
 ### Agent versions and rollouts
 
 Every sandbox reports `agent_version` (the agent image its pod runs), `env_version` (a fingerprint

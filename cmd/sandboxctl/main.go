@@ -33,8 +33,9 @@ const usage = `sandboxctl <command> [flags]
   create   -name shop (-slug backend-dev | -agent backend[@3]) -owner alice [-tenant t] [-repo url] [-idle 3600]
            [-ttl 86400] [-wake-on-preview=false] [-version stable] [-key idempotency-key]
   plan     -f file.yaml [-tenant t] [-json]         validate a bundle (--- separated documents) and show what apply would change; writes nothing
-  apply    -f file.yaml [-tenant t] [-expected 3]   put AgentDefinitions / EnvironmentProfiles / Connections /
-           PolicyBindings / TenantSettings (new revisions; --- separates documents, applied in order)
+  apply    -f file.yaml [-tenant t] [-key k] [-json]  plan the bundle, then apply it through the controller: one
+           transaction per step, continued by key after any failure (apply -resume <id> continues a stopped one)
+  applies  [-tenant t] [-json]              applies of the scope, newest first; applies <id> shows one
   get      agent|environment|connection|binding <name> [-revision N] [-tenant t]
   list     agents|environments|connections|bindings [-tenant t]
   revisions agent|environment|connection|binding <name> [-tenant t]
@@ -301,92 +302,93 @@ func (c *cli) run(cmd string, args []string) error {
 		}
 		printJSON(sb)
 	case "apply":
-		file := fs.String("f", "", "YAML file: one document, or several separated by ---, applied in order")
-		tenant := fs.String("tenant", "", "scope (admin: tenant or empty for shared)")
-		expected := fs.Int("expected", -1, "expected current revision (0 = must not exist yet); single document only")
-		_ = fs.Parse(flags)
-		if *file == "" {
-			return errors.New("apply: -f is required")
-		}
-		raw, err := os.ReadFile(*file)
-		if err != nil {
-			return err
-		}
-		docs, err := catalog.ParseYAMLAll(raw)
-		if err != nil {
-			return err
-		}
-		if len(docs) == 0 {
-			return errors.New("apply: no document in " + *file)
-		}
-		if *expected >= 0 && len(docs) > 1 {
-			return errors.New("apply: -expected applies to a single document")
-		}
-		q := ""
-		if *tenant != "" {
-			q = "?tenant=" + url.QueryEscape(*tenant)
-		}
-		for i, doc := range docs {
-			if *expected >= 0 {
-				doc.ExpectedRevision = expected
-			}
-			target := ""
-			switch doc.Kind {
-			case model.KindTenantSettings:
-				// Settings live under the tenant: -tenant or the document's tenant names it.
-				t := *tenant
-				if doc.Tenant != nil {
-					t = *doc.Tenant
-				}
-				if t == "" {
-					return fmt.Errorf("apply: document %d: TenantSettings need -tenant or a tenant field", i+1)
-				}
-				target = "/v1/tenants/" + url.PathEscape(t) + "/settings"
-			default:
-				path := kindPath(doc.Kind)
-				if path == "" {
-					return fmt.Errorf("apply: document %d: unknown kind %q", i+1, doc.Kind)
-				}
-				target = "/v1/" + path + "/" + doc.Name + q
-			}
-			var out model.CatalogItem
-			if err := c.do("PUT", target, doc, &out); err != nil {
-				return fmt.Errorf("document %d (%s %s): %w", i+1, doc.Kind, doc.Name, err)
-			}
-			fmt.Printf("%s %s/%s: revision %d\n", out.Kind, out.Tenant, out.Name, out.Revision)
-		}
-	case "plan":
 		file := fs.String("f", "", "YAML file: one document, or several separated by ---")
 		tenant := fs.String("tenant", "", "default scope for documents without a tenant (admin)")
-		asJSON := fs.Bool("json", false, "print the plan as JSON")
+		key := fs.String("key", "", "idempotency key (default: the plan fingerprint)")
+		resume := fs.String("resume", "", "continue the apply with this id instead of submitting a bundle")
+		asJSON := fs.Bool("json", false, "print the apply as JSON")
 		_ = fs.Parse(flags)
-		if *file == "" {
-			return errors.New("plan: -f is required")
+		q := ""
+		if *tenant != "" {
+			q = "?tenant=" + url.QueryEscape(*tenant)
 		}
-		raw, err := os.ReadFile(*file)
-		if err != nil {
-			return err
+		var a model.Apply
+		if *resume != "" {
+			if err := c.do("POST", "/v1/applies/"+url.PathEscape(*resume)+"/resume", nil, &a); err != nil {
+				return err
+			}
+		} else {
+			if *file == "" {
+				return errors.New("apply: -f is required")
+			}
+			raw, err := os.ReadFile(*file)
+			if err != nil {
+				return err
+			}
+			docs, err := catalog.ParseYAMLAll(raw)
+			if err != nil {
+				return err
+			}
+			var p plan.Plan
+			if err := c.do("POST", "/v1/plan"+q, map[string]any{"documents": docs}, &p); err != nil {
+				return err
+			}
+			if !p.Valid {
+				printPlan(p)
+				os.Exit(2)
+			}
+			if err := c.do("POST", "/v1/apply"+q, map[string]any{"documents": docs, "plan": p.Fingerprint, "key": *key}, &a); err != nil {
+				return err
+			}
 		}
-		docs, err := catalog.ParseYAMLAll(raw)
-		if err != nil {
-			return err
+		if *asJSON {
+			printJSON(a)
+		} else {
+			printApply(a)
+		}
+		if a.Status != model.ApplyDone {
+			os.Exit(3)
+		}
+	case "applies":
+		tenant := fs.String("tenant", "", "scope (admin)")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(flags)
+		if len(pos) > 0 {
+			var a model.Apply
+			if err := c.do("GET", "/v1/applies/"+url.PathEscape(pos[0]), nil, &a); err != nil {
+				return err
+			}
+			if *asJSON {
+				printJSON(a)
+			} else {
+				printApply(a)
+			}
+			return nil
 		}
 		q := ""
 		if *tenant != "" {
 			q = "?tenant=" + url.QueryEscape(*tenant)
 		}
-		var out plan.Plan
-		if err := c.do("POST", "/v1/plan"+q, map[string]any{"documents": docs}, &out); err != nil {
+		var list []model.Apply
+		if err := c.do("GET", "/v1/applies"+q, nil, &list); err != nil {
 			return err
 		}
 		if *asJSON {
-			printJSON(out)
-		} else {
-			printPlan(out)
+			printJSON(list)
+			return nil
 		}
-		if !out.Valid {
-			os.Exit(2)
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "ID\tSTATUS\tSTEPS\tCREATED\tBY\tERROR")
+		for _, a := range list {
+			done := 0
+			for _, st := range a.Steps {
+				if st.Status == model.StepDone || st.Status == model.StepSkipped {
+					done++
+				}
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%d/%d\t%s\t%s\t%s\n", a.ID, a.Status, done, len(a.Steps), a.CreatedAt.Local().Format(time.RFC3339), a.Subject, a.Error)
 		}
+		tw.Flush()
 	case "settings":
 		revisions := fs.Bool("revisions", false, "show the history")
 		reset := fs.Bool("reset", false, "return the tenant to the server defaults (admin)")
@@ -800,6 +802,27 @@ func printPlan(p plan.Plan) {
 		fmt.Println("bundle:", e)
 	}
 	fmt.Printf("bundle %s: %d to create, %d to update, %d unchanged, %d invalid\n", p.Bundle, p.Summary.Create, p.Summary.Update, p.Summary.Noop, p.Summary.Invalid)
+}
+
+func printApply(a model.Apply) {
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "STEP\tKIND\tTENANT\tNAME\tACTION\tSTATUS\tREVISION\tERROR")
+	for i, st := range a.Steps {
+		rev := ""
+		if st.Revision > 0 {
+			rev = fmt.Sprint(st.Revision)
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", i+1, st.Kind, st.Tenant, st.Name, st.Action, st.Status, rev, st.Error)
+	}
+	tw.Flush()
+	fmt.Printf("apply %s: %s", a.ID, a.Status)
+	if a.Error != "" {
+		fmt.Printf(" (%s)", a.Error)
+	}
+	fmt.Println()
+	if a.Status != model.ApplyDone {
+		fmt.Printf("continue with: sandboxctl apply -resume %s\n", a.ID)
+	}
 }
 
 func printRevisions(revs []model.CatalogItem) {

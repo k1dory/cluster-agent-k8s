@@ -741,6 +741,69 @@ paths:
         "200": { description: The plan, content: { application/json: { schema: { $ref: "#/components/schemas/Plan" } } } }
         "400": { description: "Unparsable input (unknown field, trailing data)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "403": { description: "Another tenant's scope", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/apply:
+    post:
+      tags: [apply]
+      summary: Apply a planned bundle (one transaction per step, continued by key)
+      description: |
+        The body is as for `/v1/plan` plus the plan fingerprint: `plan` in the JSON wrapper, or
+        `?plan=` for YAML. The bundle is planned again and refused with 409 when the fingerprint no
+        longer matches (the state moved since the plan). Each step writes its item revision and its
+        own completion in one transaction, guarded by the apply's version, so a step is either
+        applied and recorded or neither and two replicas cannot both commit it. The idempotency key
+        (`key`, `?key=`, the `Idempotency-Key` header, else the plan fingerprint) identifies the
+        apply in the scope: the same key with the same bundle returns the same apply and finishes it
+        if needed; another bundle under the key is 409 with the existing apply. Continuation re-plans
+        the stored documents under the stored scope with its current rights: a pending step must
+        still find the revision the plan expected (noop steps too), an applied step must still be the
+        latest revision, every document must still validate; otherwise the apply stops with status
+        `conflict` and the reason, the steps showing exactly what was applied.
+      parameters:
+        - { $ref: "#/components/parameters/scope" }
+        - { name: plan, in: query, schema: { type: string } }
+        - { name: key, in: query, schema: { type: string } }
+        - { $ref: "#/components/parameters/idempotencyKey" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                documents: { type: array, items: { $ref: "#/components/schemas/Document" } }
+                plan: { type: string }
+                key: { type: string }
+          application/yaml:
+            schema: { type: string }
+      responses:
+        "200": { description: "The apply (status done, failed, conflict or running when another replica holds it)", content: { application/json: { schema: { $ref: "#/components/schemas/Apply" } } } }
+        "409": { description: "Plan does not match the state, or the key was used for another bundle (the existing apply is included)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "The bundle is not valid; the plan is included", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/applies:
+    get:
+      tags: [apply]
+      summary: Applies of the scope, newest first
+      parameters: [{ $ref: "#/components/parameters/scope" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Apply" } } } } }
+  /v1/applies/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+    get:
+      tags: [apply]
+      summary: One apply (a tenant sees its own)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Apply" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/applies/{id}/resume:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+    post:
+      tags: [apply]
+      summary: Continue a stopped apply (failed, conflict, or left by another replica) after re-verifying state and rights
+      responses:
+        "200": { description: The apply, content: { application/json: { schema: { $ref: "#/components/schemas/Apply" } } } }
+        "403": { description: "A tenant cannot resume the admin's apply", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { $ref: "#/components/responses/Error" }
   /v1/whoami:
     get:
       tags: [sandboxes]
@@ -1399,6 +1462,7 @@ components:
       type: object
       properties:
         bundle: { type: string, description: "Fingerprint of the canonical documents (same files, same value)" }
+        plan: { type: string, description: "Fingerprint of the plan: documents, scope, every change's action, expected and next revision. Apply takes it" }
         valid: { type: boolean }
         summary:
           type: object
@@ -1447,6 +1511,39 @@ components:
         type: { type: string, enum: [file, dir, symlink, other] }
         size: { type: integer, format: int64 }
         mod_time: { type: string, format: date-time }
+    Apply:
+      type: object
+      description: One application of a bundle, continued by key
+      properties:
+        id: { type: string }
+        key: { type: string }
+        tenant: { type: string }
+        admin: { type: boolean }
+        subject: { type: string }
+        bundle: { type: string }
+        plan: { type: string }
+        status: { type: string, enum: [running, done, failed, conflict] }
+        error: { type: string, description: "Why it stopped" }
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string }
+              tenant: { type: string }
+              name: { type: string }
+              action: { type: string, enum: [create, update, noop] }
+              expected_revision: { type: integer }
+              next_revision: { type: integer }
+              status: { type: string, enum: [pending, done, skipped, failed] }
+              revision: { type: integer, description: "Written (done) or confirmed (skipped)" }
+              error: { type: string }
+        documents: { type: array, items: { $ref: "#/components/schemas/Document" } }
+        lease_owner: { type: string }
+        lease_until: { type: string, format: date-time }
+        version: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
     Usage:
       type: object
       description: |

@@ -8,7 +8,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
+	"agent-sandbox/internal/apply"
 	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/connections"
@@ -27,6 +29,7 @@ type Deps struct {
 	Secrets  secrets.Provider
 	Orch     *orchestrator.Orchestrator
 	Log      *slog.Logger
+	Replica  string // this replica's name (lease owner for applies)
 }
 
 // Services is the assembled set. Guard is what every ownership decision goes through.
@@ -36,7 +39,8 @@ type Services struct {
 	Tenants     *tenants.Service
 	Connections *connections.Service
 	Catalog     *catalog.Service
-	Planner     plan.Deps // validates bundles against the same store, policies, images and secrets
+	Planner     plan.Deps         // validates bundles against the same store, policies, images and secrets
+	Applier     *apply.Controller // applies planned bundles, one step per transaction, continued by key
 }
 
 // Wire builds the services, loads their snapshots and installs the guard and the quotas on the
@@ -57,10 +61,17 @@ func Wire(ctx context.Context, d Deps) (*Services, error) {
 	guard := &bindings.Guard{Set: d.Policies, Bindings: bind, Headers: conns}
 	d.Orch.Policies = guard
 	d.Orch.Quotas = limits{tenants: tset, bindings: bind}
+	planner := plan.Deps{Store: d.Store, Policies: d.Policies, Images: d.Orch.Cfg, Secrets: d.Secrets, Defaults: defaults}
+	replica := d.Replica
+	if replica == "" {
+		replica = fmt.Sprintf("replica-%d", time.Now().UnixNano())
+	}
 	return &Services{
 		Guard: guard, Bindings: bind, Tenants: tset, Connections: conns,
 		Catalog: &catalog.Service{Store: d.Store, Images: d.Orch.Cfg, Policies: guard, Connections: conns, Tenants: tset},
-		Planner: plan.Deps{Store: d.Store, Policies: d.Policies, Images: d.Orch.Cfg, Secrets: d.Secrets, Defaults: defaults},
+		Planner: planner,
+		Applier: &apply.Controller{Store: d.Store, Planner: planner, Replica: replica, Log: d.Log,
+			Refresh: []func(context.Context) error{bind.Refresh, tset.Refresh, conns.Refresh}},
 	}, nil
 }
 
@@ -73,13 +84,13 @@ func (s *Services) Watch(ctx context.Context, log *slog.Logger) {
 
 // API is what the services are installed on (httpapi.Platform).
 type API interface {
-	SetServices(cat *catalog.Service, conns *connections.Service, bind *bindings.Service, tset *tenants.Service, planner *plan.Deps)
+	SetServices(cat *catalog.Service, conns *connections.Service, bind *bindings.Service, tset *tenants.Service, planner *plan.Deps, applier *apply.Controller)
 }
 
 // Install mounts the services on the API.
 func (s *Services) Install(p API) {
 	planner := s.Planner
-	p.SetServices(s.Catalog, s.Connections, s.Bindings, s.Tenants, &planner)
+	p.SetServices(s.Catalog, s.Connections, s.Bindings, s.Tenants, &planner, s.Applier)
 }
 
 // limits composes the orchestrator's quotas from tenant settings and policy bindings.

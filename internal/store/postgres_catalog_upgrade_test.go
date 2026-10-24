@@ -166,3 +166,75 @@ func TestReviewPostgresRunModeAndBlobs(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Applies on a real PostgreSQL: unique keys, the step transaction, version guards.
+func TestReviewPostgresApplies(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
+	ctx := t.Context()
+	a := &model.Apply{ID: "apply_1", Key: "k1", Tenant: "acme", Status: model.ApplyRunning, Documents: json.RawMessage(`[]`),
+		Steps: []model.ApplyStep{
+			{Kind: model.KindEnvironment, Tenant: "acme", Name: "py", Action: "create", Status: model.StepPending},
+			{Kind: model.KindAgent, Tenant: "acme", Name: "backend", Action: "create", Status: model.StepPending},
+		}}
+	if err := p.CreateApply(ctx, a); err != nil || a.Version != 1 {
+		t.Fatalf("create: %v %+v", err, a)
+	}
+	if err := p.CreateApply(ctx, &model.Apply{ID: "apply_2", Key: "k1", Tenant: "acme", Status: model.ApplyRunning, Documents: json.RawMessage(`[]`)}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate key in the tenant: %v", err)
+	}
+	if err := p.CreateApply(ctx, &model.Apply{ID: "apply_3", Key: "k1", Tenant: "other", Status: model.ApplyRunning, Documents: json.RawMessage(`[]`)}); err != nil {
+		t.Fatalf("same key in another tenant: %v", err)
+	}
+	got, err := p.GetApplyByKey(ctx, "acme", "k1")
+	if err != nil || got.ID != "apply_1" || len(got.Steps) != 2 {
+		t.Fatalf("by key: %v %+v", err, got)
+	}
+	// A step writes its item and its completion together.
+	it := &model.CatalogItem{Kind: model.KindEnvironment, Tenant: "acme", Name: "py", Spec: json.RawMessage(`{"image":"stable"}`)}
+	a.Steps[0].Status = model.StepDone
+	if err := p.ApplyStep(ctx, a, 0, it, 0); err != nil || it.Revision != 1 || a.Steps[0].Revision != 1 || a.Version != 2 {
+		t.Fatalf("step: %v item=%+v apply=%+v", err, it, a)
+	}
+	stored, _ := p.GetApply(ctx, a.ID)
+	if stored.Version != 2 || stored.Steps[0].Status != model.StepDone || stored.Steps[0].Revision != 1 {
+		t.Fatalf("stored after step: %+v", stored)
+	}
+	// A stale record cannot commit a step, and a stale write leaves the item untouched too.
+	stale := *stored
+	stale.Version = 1
+	stale.Steps = append([]model.ApplyStep(nil), stored.Steps...)
+	stale.Steps[1].Status = model.StepDone
+	it2 := &model.CatalogItem{Kind: model.KindAgent, Tenant: "acme", Name: "backend", Spec: json.RawMessage(`{"policy":"p","environment":"py"}`)}
+	if err := p.ApplyStep(ctx, &stale, 1, it2, 0); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale apply: %v", err)
+	}
+	if _, err := p.GetItem(ctx, model.KindAgent, "acme", "backend", 0); !errors.Is(err, ErrNotFound) {
+		t.Fatal("the item write must roll back with the refused step")
+	}
+	// An item that moved refuses the step, and the progress is not recorded either.
+	fresh, _ := p.GetApply(ctx, a.ID)
+	fresh.Steps[1].Status = model.StepDone
+	if err := p.ApplyStep(ctx, fresh, 1, it2, 5); !errors.Is(err, ErrConflict) {
+		t.Fatalf("wrong expected revision: %v", err)
+	}
+	if again, _ := p.GetApply(ctx, a.ID); again.Steps[1].Status != model.StepPending || again.Version != 2 {
+		t.Fatalf("progress recorded despite the refused write: %+v", again)
+	}
+	// A noop step records progress without an item.
+	fresh, _ = p.GetApply(ctx, a.ID)
+	fresh.Steps[1].Status, fresh.Steps[1].Revision = model.StepSkipped, 0
+	if err := p.ApplyStep(ctx, fresh, 1, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	fresh.Status = model.ApplyDone
+	if err := p.UpdateApply(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	list, err := p.ListApplies(ctx, "acme", 10)
+	if err != nil || len(list) != 1 || list[0].Status != model.ApplyDone || list[0].Version != 4 {
+		t.Fatalf("list: %v %+v", err, list)
+	}
+	if all, _ := p.ListApplies(ctx, "", 10); len(all) != 2 {
+		t.Fatalf("all tenants: %d", len(all))
+	}
+}

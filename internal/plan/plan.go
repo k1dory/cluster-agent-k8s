@@ -86,12 +86,15 @@ type Change struct {
 // Plan is the result for a bundle: deterministic for the same documents and the same state.
 type Plan struct {
 	// Bundle fingerprints the canonical documents (not the state): the same files give the same
-	// value, whatever the current revisions.
-	Bundle  string   `json:"bundle"`
-	Valid   bool     `json:"valid"`
-	Changes []Change `json:"changes"`
-	Errors  []string `json:"errors,omitempty"` // bundle-level: duplicates, unknown kinds
-	Summary Summary  `json:"summary"`
+	// value, whatever the current revisions. Fingerprint binds the plan to the state as well:
+	// scope, every change's action, expected and next revision. Apply takes it and refuses a
+	// bundle whose plan no longer matches what it finds.
+	Bundle      string   `json:"bundle"`
+	Fingerprint string   `json:"plan"`
+	Valid       bool     `json:"valid"`
+	Changes     []Change `json:"changes"`
+	Errors      []string `json:"errors,omitempty"` // bundle-level: duplicates, unknown kinds
+	Summary     Summary  `json:"summary"`
 }
 
 // Summary counts the actions.
@@ -121,6 +124,13 @@ type entry struct {
 
 // Plan validates docs as one bundle under scope and reports the changes. Nothing is written.
 func (d Deps) Plan(ctx context.Context, docs []*res.Document, scope Scope) (*Plan, error) {
+	p, _, err := d.PlanItems(ctx, docs, scope)
+	return p, err
+}
+
+// PlanItems is Plan plus the validated items of the valid changes, in the plan's order (nil
+// for an invalid change): what apply writes.
+func (d Deps) PlanItems(ctx context.Context, docs []*res.Document, scope Scope) (*Plan, []*model.CatalogItem, error) {
 	now := d.Now
 	if now == nil {
 		now = time.Now
@@ -211,7 +221,7 @@ func (d Deps) Plan(ctx context.Context, docs []*res.Document, scope Scope) (*Pla
 		return nil
 	}
 	if err := validate(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Compare each candidate with the live state and decide the action; the overlay then
 	// presents the revision apply will really produce (a noop keeps the current one, the rest
@@ -264,15 +274,15 @@ func (d Deps) Plan(ctx context.Context, docs []*res.Document, scope Scope) (*Pla
 		return nil
 	}
 	if err := decide(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Second pass: references pinned to a revision the first pass promised but apply will not
 	// produce (an item that turns out unchanged) are refused now, not at apply time.
 	if err := validate(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := decide(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	sort.SliceStable(entries, func(i, j int) bool {
 		a, b := entries[i], entries[j]
@@ -285,8 +295,17 @@ func (d Deps) Plan(ctx context.Context, docs []*res.Document, scope Scope) (*Pla
 		return a.doc.Name < b.doc.Name
 	})
 	h := sha256.New()
+	fp := sha256.New()
+	fmt.Fprintf(fp, "scope %s admin=%v\n", scope.Tenant, scope.Admin)
+	var items []*model.CatalogItem
 	for _, e := range entries {
 		p.Changes = append(p.Changes, *e.change)
+		if e.change.Action == ActionInvalid {
+			items = append(items, nil)
+		} else {
+			items = append(items, e.item)
+		}
+		fmt.Fprintf(fp, "%s|%s|%s %s %d %d\n", e.doc.Kind, e.tenant, e.doc.Name, e.change.Action, e.change.ExpectedRevision, e.change.NextRevision)
 		switch e.change.Action {
 		case ActionCreate:
 			p.Summary.Create++
@@ -304,8 +323,10 @@ func (d Deps) Plan(ctx context.Context, docs []*res.Document, scope Scope) (*Pla
 		fmt.Fprintf(h, "%s|%s|%s\n%s\n%s\n", e.doc.Kind, e.tenant, e.doc.Name, e.doc.Description, spec)
 	}
 	p.Bundle = hex.EncodeToString(h.Sum(nil))[:16]
+	fmt.Fprintf(fp, "bundle %s\n", p.Bundle)
+	p.Fingerprint = hex.EncodeToString(fp.Sum(nil))[:16]
 	p.Valid = len(p.Errors) == 0 && p.Summary.Invalid == 0
-	return p, nil
+	return p, items, nil
 }
 
 func appendOnce(xs []string, x string) []string {
