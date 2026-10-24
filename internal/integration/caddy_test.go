@@ -31,6 +31,7 @@ import (
 	"agent-sandbox/internal/events"
 	"agent-sandbox/internal/gateway"
 	"agent-sandbox/internal/httpapi"
+	"agent-sandbox/internal/mcpproxy"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/orchestrator"
 	"agent-sandbox/internal/policy"
@@ -153,11 +154,11 @@ func TestRealCaddyGateway(t *testing.T) {
 	pols := policy.FromPolicies(&policy.Policy{Slug: "backend-dev", Allow: []policy.Rule{
 		{Host: "git.example.com", Upstream: up.URL, Paths: []string{"/*/*/info/refs", "/*/*/git-upload-pack"},
 			Inject: map[string]string{"Authorization": "Basic secret:forgejo"}},
-		{Host: "mcp.example.com", Upstream: up.URL, Paths: []string{"/mcp", "/mcp/**"}, MCP: &policy.MCPRule{ReadOnly: true}},
+		{Host: "mcp.example.com", Upstream: up.URL, Paths: []string{"/mcp", "/mcp/**"}, MCP: &policy.MCPRule{ReadOnly: true, Tools: []string{"get_*"}}},
 	}})
 	az := &authz.Handler{Policies: pols, Secrets: secrets.Static{"shared/forgejo": "forgejo-injected"}, Checker: reg, Toucher: orch, Recorder: orch,
 		Quiet: map[string]bool{"api.sandbox.internal": true}}
-	gw := httptest.NewServer((&httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az}).Routes())
+	gw := httptest.NewServer((&httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, MCP: &mcpproxy.Handler{Authz: az}}).Routes())
 	defer gw.Close()
 	sandboxdAddr := strings.TrimPrefix(gw.URL, "http://")
 
@@ -293,10 +294,36 @@ func TestRealCaddyGateway(t *testing.T) {
 		t.Fatalf("unknown host must not be served: %d", resp.StatusCode)
 	}
 
-	// --- MCP host without injection: the agent's own Authorization passes, read-only is marked -------
-	code, seen, raw = get(agent, "POST", "https://mcp.example.com/mcp", map[string]string{"Authorization": "Bearer my-own-mcp-token"})
-	if code != 200 || seen["h:Authorization"] != "Bearer my-own-mcp-token" || seen["h:X-Agent-Access"] != "read-only" {
-		t.Fatalf("mcp: %d %s", code, raw)
+	// --- MCP host: proxied through sandboxd, which reads the JSON-RPC body. The agent's own
+	// Authorization passes, read-only is marked, forbidden tool calls never reach the upstream.
+	post := func(url, body string, hdr map[string]string) (int, map[string]string, string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		resp, err := agent.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v\n%s", url, err, proc.out.String())
+		}
+		defer resp.Body.Close()
+		raw, _ := io.ReadAll(resp.Body)
+		var m map[string]string
+		_ = json.Unmarshal(raw, &m)
+		return resp.StatusCode, m, string(raw)
+	}
+	code, seen, raw = post("https://mcp.example.com/mcp", `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_item","arguments":{}}}`,
+		map[string]string{"Authorization": "Bearer my-own-mcp-token", "X-Sandbox-Mcp-Upstream": "https://evil.example.com"})
+	if code != 200 || seen["h:Authorization"] != "Bearer my-own-mcp-token" || seen["h:X-Agent-Access"] != "read-only" ||
+		seen["h:X-Agent-Slug"] != "backend-dev" || seen["h:X-Sandbox-Mcp-Upstream"] != "" || seen["h:X-Agent-Cert"] != "" || seen["host"] != "mcp.example.com" {
+		t.Fatalf("mcp allowed call: %d %s", code, raw)
+	}
+	if code, _, raw := post("https://mcp.example.com/mcp", `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_item"}}`, nil); code != 403 || !strings.Contains(raw, "not allowed") {
+		t.Fatalf("mcp forbidden tool must be refused by the proxy: %d %s", code, raw)
+	}
+	if code, _, _ := post("https://mcp.example.com/mcp", `{"jsonrpc":"2.0","id":3,"method":"tools/list"}`, nil); code != 200 {
+		t.Fatalf("mcp tools/list must pass: %d", code)
 	}
 
 	// --- control plane API through the gateway: identity from the certificate ------------------
@@ -311,8 +338,8 @@ func TestRealCaddyGateway(t *testing.T) {
 	if code != 200 || got["id"] != run.ID {
 		t.Fatalf("agent API must hand out the queued run: %d %s", code, raw)
 	}
-	post, _ := http.NewRequest(http.MethodPost, "https://api.sandbox.internal/agent/runs/"+run.ID+"/events", strings.NewReader("hello\n"))
-	if resp, err := agent.Do(post); err != nil || resp.StatusCode != 200 {
+	evReq, _ := http.NewRequest(http.MethodPost, "https://api.sandbox.internal/agent/runs/"+run.ID+"/events", strings.NewReader("hello\n"))
+	if resp, err := agent.Do(evReq); err != nil || resp.StatusCode != 200 {
 		t.Fatalf("agent output through the gateway: %v %v", err, resp)
 	}
 	// A forged certificate header on the API host is dropped: the real certificate wins.
@@ -330,7 +357,7 @@ func TestRealCaddyGateway(t *testing.T) {
 			deny++
 		}
 	}
-	if allow != 2 || deny != 1 {
+	if allow != 4 || deny != 2 {
 		t.Fatalf("egress trace: allow=%d deny=%d", allow, deny)
 	}
 

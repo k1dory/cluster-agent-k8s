@@ -1,4 +1,11 @@
 # Requires Multus and whereabouts to be installed on the cluster.
+#
+# Isolation: macvlan "private" keeps pods on one node from seeing each other, but pods on
+# different nodes share the VLAN and could reach each other directly, bypassing the gateway.
+# Two layers close that: the pod firewall sandboxd installs in every pod (agent.podFirewall,
+# egress only to the gateway) and, where the switch supports it, an isolated private VLAN with
+# the gateway port as the only promiscuous port. Preview traffic never enters the VLAN from the
+# outside: it reaches sandboxd on the gateway, which proxies to the pod.
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
 metadata:

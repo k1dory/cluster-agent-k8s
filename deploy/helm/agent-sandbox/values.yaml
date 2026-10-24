@@ -106,6 +106,15 @@ agent:
   env:
     ANTHROPIC_BASE_URL: https://api.anthropic.com
   terminationSeconds: 30
+  # Pod-level egress firewall: an init container with NET_ADMIN installs nftables rules in the
+  # pod's network namespace (egress only to the gateway on 53/443/8443). This is what isolates
+  # pods on different nodes: macvlan "private" only separates pods sharing one node's interface.
+  # Keep it on unless your switch ports are configured as an isolated private VLAN with the
+  # gateway as the only promiscuous port.
+  podFirewall: true
+  # ConfigMap (in the agent namespace) where sandboxd publishes the gateway root so the init
+  # container can trust the registrar; "" disables the mount.
+  gatewayCaConfigMap: agent-sandbox-gateway-ca
   # Version catalogue: names tenants may pass as agent_version (create) or version (rollout).
   # The admin may also pass any image reference. default: the image used when none is named
   # (empty = agentImage above).

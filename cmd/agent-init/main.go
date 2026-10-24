@@ -5,6 +5,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -51,9 +53,22 @@ func run() error {
 	}
 	body, _ := json.Marshal(registrar.BootstrapRequest{CSR: string(csrPEM)})
 
-	// The bootstrap endpoint sits behind the gateway's internal CA, which we do not know yet:
-	// trust a pinned root from the image if present, otherwise the pod's system store.
+	// The bootstrap endpoint sits behind the gateway's internal CA. sandboxd publishes that root
+	// into a ConfigMap mounted at $GATEWAY_CA_FILE (and the compose/VM layout can bake it into the
+	// image at $GATEWAY_CA_FILE too); without it only the system store is trusted, which fails
+	// against an internal CA, and the error says so.
 	client := &http.Client{Timeout: 30 * time.Second}
+	if caFile := env("GATEWAY_CA_FILE", "/etc/sandbox/gateway-ca/gateway-ca.crt"); caFile != "" {
+		if pemBytes, err := os.ReadFile(caFile); err == nil && len(bytes.TrimSpace(pemBytes)) > 0 {
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pemBytes) {
+				return fmt.Errorf("%s is not a PEM certificate", caFile)
+			}
+			client.Transport = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}}
+		} else {
+			fmt.Fprintln(os.Stderr, "agent-init: no gateway root at", caFile, "(GATEWAY_CA_FILE); bootstrap will trust the system store only")
+		}
+	}
 	var res registrar.BootstrapResponse
 	var lastErr error
 	for attempt := 1; attempt <= 10; attempt++ {
@@ -117,7 +132,10 @@ export CURL_CA_BUNDLE=%s
 export NODE_EXTRA_CA_CERTS=%s
 export SANDBOX_CLIENT_CERT=%s
 export SANDBOX_CLIENT_KEY=%s
-`, res.Slug, res.Instance, res.Instance, crt, key, gw, gw, gw, gw, gw, crt, key)
+# Claude Code's own mTLS settings (https://code.claude.com/docs/en/network-config#mtls-authentication)
+export CLAUDE_CODE_CLIENT_CERT=%s
+export CLAUDE_CODE_CLIENT_KEY=%s
+`, res.Slug, res.Instance, res.Instance, crt, key, gw, gw, gw, gw, gw, crt, key, crt, key)
 	if err := os.WriteFile(filepath.Join(certDir, "env.sh"), []byte(envSh), 0o644); err != nil {
 		return err
 	}

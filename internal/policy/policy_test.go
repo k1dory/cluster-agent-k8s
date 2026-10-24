@@ -1,6 +1,11 @@
 package policy
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestPathMatch(t *testing.T) {
 	cases := []struct {
@@ -125,5 +130,28 @@ func TestTenantOwnership(t *testing.T) {
 	p := &Policy{Slug: "x", Tenants: []string{"a b"}, Allow: []Rule{{Host: "h.example.com", Paths: []string{"/"}}}}
 	if err := p.Validate(); err == nil {
 		t.Fatal("tenant names with spaces must be rejected")
+	}
+}
+
+func TestStrictParseAndDuplicates(t *testing.T) {
+	if _, err := Parse([]byte("slug: x\nallow:\n  - host: a.example.com\n    paths: [\"/\"]\n    methdos: [GET]\n")); err == nil {
+		t.Fatal("a misspelled field must be an error, not a wider rule")
+	}
+	p, err := Parse([]byte("slug: x\nallow:\n  - host: a.example.com\n    paths: [\"/\"]\n    methods: [GET]\n    mcp: { read_only: true, tools: [\"get_*\", \"search\"] }\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := p.Allow[0].MCP
+	if !m.ToolAllowed("get_user") || !m.ToolAllowed("search") || m.ToolAllowed("delete_user") {
+		t.Fatal("tools allowlist")
+	}
+	if (&MCPRule{ReadOnly: true}).ToolAllowed("anything") || !(&MCPRule{}).ToolAllowed("anything") {
+		t.Fatal("read_only without tools denies every call; read-write allows all")
+	}
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "a.yaml"), []byte("slug: same\nallow:\n  - host: a.example.com\n    paths: [\"/\"]\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "b.yaml"), []byte("slug: same\nallow:\n  - host: b.example.com\n    paths: [\"/\"]\n"), 0o644)
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "already defined") {
+		t.Fatalf("duplicate slugs across files must be refused: %v", err)
 	}
 }

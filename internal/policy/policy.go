@@ -6,6 +6,7 @@
 package policy
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -22,10 +23,26 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// MCPRule marks an MCP endpoint; read_only is forwarded to the MCP server as a header,
-// because the gateway cannot see the JSON-RPC body in forward_auth.
+// MCPRule marks an MCP endpoint. Requests to such hosts go through sandboxd's MCP proxy, which
+// reads the JSON-RPC body: with read_only, `tools/call` is allowed only for tools matching the
+// Tools globs (none listed = no tool calls at all); initialize, ping, tools/list, resources/read
+// and prompts/get always pass. The verdict is also sent upstream as X-Agent-Access: read-only.
 type MCPRule struct {
-	ReadOnly bool `yaml:"read_only" json:"read_only"`
+	ReadOnly bool     `yaml:"read_only" json:"read_only"`
+	Tools    []string `yaml:"tools,omitempty" json:"tools,omitempty"` // globs, e.g. ["get_*", "list_*", "search"]
+}
+
+// ToolAllowed reports whether a tools/call for name passes this rule.
+func (m *MCPRule) ToolAllowed(name string) bool {
+	if m == nil || !m.ReadOnly {
+		return true
+	}
+	for _, g := range m.Tools {
+		if ok, _ := path.Match(g, name); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // Rule allows one host (and a set of paths) for the slug.
@@ -79,6 +96,9 @@ type Host struct {
 	// Injected header names across all slugs: the gateway strips them from incoming requests
 	// so an agent cannot supply its own.
 	Injected []string
+	// MCP: some rule marks this host as an MCP endpoint, so the gateway routes it through
+	// sandboxd's MCP proxy (JSON-RPC inspection) instead of straight to the upstream.
+	MCP bool
 }
 
 // Set is the loaded collection of policies with hot reload.
@@ -108,6 +128,22 @@ func (s *Set) AllowedFor(slug, tenant string) bool {
 		}
 	}
 	return p.OwnedBy(tenant, s.Strict)
+}
+
+// Revoked reports that the policy applying to slug names tenants explicitly and tenant is not
+// among them: an agent already running under the slug loses its access (the gateway refuses,
+// the reconciler stops the pod). A policy without a tenants list never revokes, so admin-only
+// policies in strict mode keep working for the sandboxes the admin created.
+func (s *Set) Revoked(slug, tenant string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.bySlug[slug]
+	if !ok {
+		if p, ok = s.bySlug["default"]; !ok {
+			return false
+		}
+	}
+	return len(p.Tenants) > 0 && !p.OwnedBy(tenant, false)
 }
 
 // ContentHash identifies the policy content that applies to slug (own file or default), so a
@@ -156,6 +192,7 @@ func (s *Set) reload() error {
 	sort.Strings(files)
 	bySlug := map[string]*Policy{}
 	rawBySlug := map[string][]byte{}
+	owners := map[string]string{} // slug → file, to refuse two files for one slug
 	var stamp strings.Builder
 	for _, f := range files {
 		if !isPolicyFile(f) {
@@ -170,8 +207,8 @@ func (s *Set) reload() error {
 		if err != nil {
 			return err
 		}
-		var p Policy
-		if err := yaml.Unmarshal(raw, &p); err != nil {
+		p, err := Parse(raw)
+		if err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}
 		if p.Slug == "" {
@@ -180,7 +217,11 @@ func (s *Set) reload() error {
 		if err := p.Validate(); err != nil {
 			return fmt.Errorf("%s: %w", f, err)
 		}
-		bySlug[p.Slug] = &p
+		if other, dup := owners[p.Slug]; dup {
+			return fmt.Errorf("%s: slug %q is already defined in %s", f, p.Slug, other)
+		}
+		owners[p.Slug] = f
+		bySlug[p.Slug] = p
 		rawBySlug[p.Slug] = raw
 	}
 	if _, err := hostsOf(bySlug); err != nil {
@@ -192,6 +233,18 @@ func (s *Set) reload() error {
 	s.stamp = stamp.String()
 	s.mu.Unlock()
 	return nil
+}
+
+// Parse decodes one policy file strictly: an unknown field (a typo such as `methdos`) is an
+// error, never silently ignored, because a dropped `methods` list widens the rule.
+func Parse(raw []byte) (*Policy, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	var p Policy
+	if err := dec.Decode(&p); err != nil {
+		return nil, err
+	}
+	return &p, nil
 }
 
 // Validate checks that every rule is well formed.
@@ -408,6 +461,9 @@ func hostsOf(bySlug map[string]*Policy) ([]Host, error) {
 			}
 			for hdr := range r.Inject {
 				h.Injected = appendUnique(h.Injected, http.CanonicalHeaderKey(hdr))
+			}
+			if r.MCP != nil {
+				h.MCP = true
 			}
 		}
 	}

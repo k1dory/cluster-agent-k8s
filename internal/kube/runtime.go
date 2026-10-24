@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -55,6 +56,32 @@ type PodConfig struct {
 	Env                  map[string]string
 	PriorityClassName    string
 	TerminationSeconds   int64
+	// PodFirewall adds an init container (NET_ADMIN, dropped afterwards) that installs nftables
+	// rules inside the pod's network namespace: egress only to the gateway on 53/443/8443. It is
+	// what keeps pods on different nodes of the shared VLAN from reaching each other directly.
+	PodFirewall bool
+	// GatewayCAConfigMap names the ConfigMap (key gateway-ca.crt) sandboxd keeps up to date with
+	// the gateway's root certificate, mounted into pods so the init container can trust the
+	// registrar before it has bootstrapped. "" disables the mount.
+	GatewayCAConfigMap string
+}
+
+// GatewayCAKey is the key of the gateway root inside GatewayCAConfigMap.
+const GatewayCAKey = "gateway-ca.crt"
+
+// PublishGatewayCA writes the gateway root into the ConfigMap pods mount (created if missing).
+func (r *Runtime) PublishGatewayCA(ctx context.Context, pemBytes []byte) error {
+	if r.Cfg.GatewayCAConfigMap == "" {
+		return nil
+	}
+	cms := r.Client.CoreV1().ConfigMaps(r.Cfg.Namespace)
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: r.Cfg.GatewayCAConfigMap, Namespace: r.Cfg.Namespace,
+		Labels: map[string]string{"app.kubernetes.io/name": "agent-sandbox"}}, Data: map[string]string{GatewayCAKey: string(pemBytes)}}
+	_, err := cms.Create(ctx, cm, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		_, err = cms.Update(ctx, cm, metav1.UpdateOptions{})
+	}
+	return err
 }
 
 // ImageFor is the agent image a sandbox's pod runs: its AgentVersion (an image reference set
@@ -152,6 +179,7 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 		{Name: "API_URL", Value: c.APIURL},
 		{Name: "CERT_DIR", Value: "/certs"},
 		{Name: "HOME", Value: "/workspace/home"},
+		{Name: "GATEWAY_IP", Value: c.GatewayIP},
 		{Name: "HARNESS_CMD", Value: c.HarnessCommand},
 		{Name: "HARNESS_RESUME_CMD", Value: c.HarnessResumeCommand},
 		{Name: "SANDBOX_RESUME_PROMPT", Value: c.ResumePrompt},
@@ -177,6 +205,10 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 		{Name: "certs", MountPath: "/certs"},
 		{Name: "tmp", MountPath: "/tmp"},
 		{Name: "bootstrap-token", MountPath: "/var/run/secrets/tokens", ReadOnly: true},
+	}
+	if c.GatewayCAConfigMap != "" {
+		mounts = append(mounts, corev1.VolumeMount{Name: "gateway-ca", MountPath: "/etc/sandbox/gateway-ca", ReadOnly: true})
+		env = append(env, corev1.EnvVar{Name: "GATEWAY_CA_FILE", Value: "/etc/sandbox/gateway-ca/" + GatewayCAKey})
 	}
 	audience := c.TokenAudience
 	if audience == "" {
@@ -212,11 +244,7 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 				FSGroup: ptr.To[int64](1000), RunAsNonRoot: ptr.To(true),
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
-			InitContainers: []corev1.Container{{
-				Name: "agent-init", Image: image, ImagePullPolicy: pullPolicy,
-				Command: []string{"/usr/local/bin/agent-init"}, Env: env,
-				VolumeMounts: mounts, SecurityContext: secCtx,
-			}},
+			InitContainers: initContainers(c, image, pullPolicy, env, mounts, secCtx),
 			Containers: []corev1.Container{{
 				Name: "agent", Image: image, ImagePullPolicy: pullPolicy,
 				Command: []string{"/usr/local/bin/agent-runner"}, Env: env,
@@ -235,6 +263,10 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 			},
 		},
 	}
+	if c.GatewayCAConfigMap != "" {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{Name: "gateway-ca", VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: c.GatewayCAConfigMap}, Optional: ptr.To(true)}}})
+	}
 	if c.RuntimeClassName != "" {
 		pod.Spec.RuntimeClassName = ptr.To(c.RuntimeClassName)
 	}
@@ -243,14 +275,68 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 	}
 	created, err := r.Client.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if apierrors.IsAlreadyExists(err) {
-		// Leftover from a crash: remove and let the caller retry.
-		_ = r.Client.CoreV1().Pods(c.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-		return "", fmt.Errorf("pod %s still exists, deleting; retry wake", pod.Name)
+		// The previous incarnation is still terminating (graceful deletion is asynchronous) or
+		// was left behind by a crash: make sure it is being deleted, wait for it to go, create.
+		if err := r.deleteAndWait(ctx, pod.Name); err != nil {
+			return "", fmt.Errorf("previous pod %s: %w", pod.Name, err)
+		}
+		created, err = r.Client.CoreV1().Pods(c.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	}
 	if err != nil {
 		return "", err
 	}
 	return created.Name, nil
+}
+
+// initContainers builds the pod's init sequence: the optional network lock (needs NET_ADMIN,
+// which the main container does not have, so the agent cannot undo it), then agent-init.
+func initContainers(c PodConfig, image string, pull corev1.PullPolicy, env []corev1.EnvVar, mounts []corev1.VolumeMount, secCtx *corev1.SecurityContext) []corev1.Container {
+	var out []corev1.Container
+	if c.PodFirewall {
+		fw := *secCtx
+		fw.Capabilities = &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}, Add: []corev1.Capability{"NET_ADMIN", "NET_RAW"}}
+		fw.RunAsNonRoot, fw.RunAsUser, fw.RunAsGroup = ptr.To(false), ptr.To[int64](0), ptr.To[int64](0)
+		out = append(out, corev1.Container{
+			Name: "netlock", Image: image, ImagePullPolicy: pull,
+			Command: []string{"/usr/local/bin/netlock.sh"}, Env: env, SecurityContext: &fw,
+		})
+	}
+	out = append(out, corev1.Container{
+		Name: "agent-init", Image: image, ImagePullPolicy: pull,
+		Command: []string{"/usr/local/bin/agent-init"}, Env: env,
+		VolumeMounts: mounts, SecurityContext: secCtx,
+	})
+	return out
+}
+
+// deleteAndWait asks for the pod's deletion (idempotent) and blocks until the API server no
+// longer knows it, bounded by ctx and twice the grace period plus a margin.
+func (r *Runtime) deleteAndWait(ctx context.Context, name string) error {
+	pods := r.Client.CoreV1().Pods(r.Cfg.Namespace)
+	err := pods.Delete(ctx, name, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	grace := r.Cfg.TerminationSeconds
+	if grace == 0 {
+		grace = 30
+	}
+	wctx, cancel := context.WithTimeout(ctx, time.Duration(2*grace+30)*time.Second)
+	defer cancel()
+	for {
+		_, err := pods.Get(wctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		select {
+		case <-wctx.Done():
+			return fmt.Errorf("pod %s still terminating after %ds", name, 2*grace+30)
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 // PodStatus reports readiness and IP. Multus publishes the default-network IP as pod.Status.PodIP.
@@ -301,18 +387,15 @@ func ipFromNetworkStatus(raw string) string {
 	return ""
 }
 
-// DeletePod removes the pod (grace period from config) and waits for nothing: the orchestrator
-// treats the identity as retired immediately.
+// DeletePod removes the pod and waits until it is gone, so a pod created right after under the
+// same name (sleep → wake, rollout) does not collide with the terminating one. The identity is
+// retired by the orchestrator regardless.
 func (r *Runtime) DeletePod(ctx context.Context, sb *model.Sandbox) error {
 	name := sb.PodName
 	if name == "" {
 		name = podName(sb)
 	}
-	err := r.Client.CoreV1().Pods(r.Cfg.Namespace).Delete(ctx, name, metav1.DeleteOptions{})
-	if apierrors.IsNotFound(err) {
-		return nil
-	}
-	return err
+	return r.deleteAndWait(ctx, name)
 }
 
 // DeleteVolume removes the workspace PVC.

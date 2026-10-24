@@ -204,8 +204,8 @@ func SafeNext(next string) string {
 // token is confined to its tenant's sandboxes, runs, events, usage and trace.
 func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if p.Token == "" && len(p.Tenants) == 0 {
-			writeErr(w, http.StatusServiceUnavailable, errors.New("API tokens not configured"))
+		if p.Token == "" && len(p.Tenants) == 0 && p.Verifier == nil {
+			writeErr(w, http.StatusServiceUnavailable, errors.New("no API tokens and no OIDC configured"))
 			return
 		}
 		got := []byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))

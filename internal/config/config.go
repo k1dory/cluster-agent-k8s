@@ -108,6 +108,12 @@ type Config struct {
 		Env                  map[string]string `yaml:"env"`
 		PriorityClassName    string            `yaml:"priority_class"`
 		TerminationSeconds   int64             `yaml:"termination_seconds"`
+		// PodFirewall (default true): an init container locks the pod's egress to the gateway with
+		// nftables, which is what isolates pods on different nodes of the shared VLAN.
+		PodFirewall *bool `yaml:"pod_firewall"`
+		// GatewayCAConfigMap (default agent-sandbox-gateway-ca): sandboxd publishes the gateway root
+		// here; pods mount it so the init container trusts the registrar. "" disables.
+		GatewayCAConfigMap *string `yaml:"gateway_ca_configmap"`
 	} `yaml:"kube"`
 	BootstrapTokensFile string `yaml:"bootstrap_tokens_file"` // fake runtime: static token → pod table
 	Sandbox             struct {
@@ -189,6 +195,14 @@ func Load(path string) (*Config, error) {
 	}
 	if c.Kube.Image == "" {
 		c.Kube.Image = c.Agent.Default
+	}
+	if c.Kube.PodFirewall == nil {
+		t := true
+		c.Kube.PodFirewall = &t
+	}
+	if c.Kube.GatewayCAConfigMap == nil {
+		n := "agent-sandbox-gateway-ca"
+		c.Kube.GatewayCAConfigMap = &n
 	}
 	if c.Kube.HarnessResumeCommand == "" {
 		c.Kube.HarnessResumeCommand = `claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose`

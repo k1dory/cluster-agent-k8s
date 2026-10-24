@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -87,15 +88,18 @@ func TestLifecycle(t *testing.T) {
 	}
 }
 
-type allowAll struct{}
-
-func (allowAll) AllowedFor(string, string) bool { return true }
-
 type onlyAcme struct{}
 
 func (onlyAcme) AllowedFor(slug, tenant string) bool {
 	return slug != "backend-dev" || tenant == "acme"
 }
+func (onlyAcme) Revoked(string, string) bool { return false }
+
+// revokeAll stands for a policy repository that dropped every tenant from the slug.
+type revokeAll struct{}
+
+func (revokeAll) AllowedFor(string, string) bool { return false }
+func (revokeAll) Revoked(string, string) bool    { return true }
 
 func TestVersionsAndRollouts(t *testing.T) {
 	ctx := context.Background()
@@ -256,4 +260,73 @@ func errorsIs(err, target error) bool {
 		e = u.Unwrap()
 	}
 	return false
+}
+
+// TestRecovery covers the reconciler's handling of lost pods, orphaned runs, lost /finish
+// acknowledgements, revoked ownership and slow (graceful) pod deletion.
+func TestRecovery(t *testing.T) {
+	ctx := context.Background()
+	rt := NewFakeRuntime()
+	o := New(store.NewMemory(), rt, nil, events.New(), Config{PreviewDomain: "preview.test", IdleCheckEvery: 10 * time.Millisecond}, nil)
+	o.leading.Store(true)
+	sb, err := o.Create(ctx, CreateRequest{Name: "r", Slug: "backend-dev", Owner: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, o, sb.ID, model.StatusRunning)
+	run, _ := o.CreateRun(ctx, sb.ID, "job")
+	if _, err := o.NextRun(ctx, sb.ID, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	// /finish twice (a lost acknowledgement, retried): the second is a no-op.
+	if err := o.FinishRun(ctx, sb.ID, run.ID, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.FinishRun(ctx, sb.ID, run.ID, 7, nil); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := o.Store.GetRun(ctx, run.ID); r.Status != model.RunDone || r.ExitCode != 0 {
+		t.Fatalf("retried finish must not change the result: %+v", r)
+	}
+	// The pod vanishes (eviction) while a run executes: the run fails, the sandbox reports it.
+	run2, _ := o.CreateRun(ctx, sb.ID, "job2")
+	if _, err := o.NextRun(ctx, sb.ID, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	rt.LosePod(sb.ID)
+	o.Reconcile(ctx)
+	sb, _ = o.Get(ctx, sb.ID)
+	r2, _ := o.Store.GetRun(ctx, run2.ID)
+	if sb.Status != model.StatusError || !strings.Contains(sb.Error, "disappeared") || r2.Status != model.RunFailed || r2.FinishedAt == nil {
+		t.Fatalf("lost pod: sandbox=%+v run=%+v", sb, r2)
+	}
+	evs, _ := o.Store.QueryEvents(ctx, store.Filter{SandboxID: sb.ID, RunID: run2.ID, Types: []string{model.EventRunDone}})
+	if len(evs) != 1 {
+		t.Fatal("watchers must see the run end")
+	}
+	// Wake again, then the policy repository drops the tenant: the reconciler stops the pod.
+	if _, err := o.Wake(ctx, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, o, sb.ID, model.StatusRunning)
+	o.Policies = revokeAll{}
+	o.Reconcile(ctx)
+	if sb, _ = o.Get(ctx, sb.ID); sb.Status != model.StatusSleeping {
+		t.Fatalf("revoked slug must stop the sandbox, got %s", sb.Status)
+	}
+	// Graceful (slow) pod deletion must not break a restart: the runtime waits, then creates.
+	o.Policies = nil
+	rt.DeleteDelay = 300 * time.Millisecond
+	o.Cfg.Versions = map[string]string{"v2": "img:2"}
+	if _, err := o.Wake(ctx, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, o, sb.ID, model.StatusRunning)
+	res, err := o.Rollout(ctx, RolloutRequest{Version: "v2", Sandbox: sb.ID, Admin: true})
+	if err != nil || res.Items[0].Mode != model.RolloutNow || res.Items[0].Reason != "" {
+		t.Fatalf("rollout over a slow delete: %v %+v", err, res)
+	}
+	if sb = waitStatus(t, o, sb.ID, model.StatusRunning); sb.AgentVersion != "img:2" {
+		t.Fatalf("after slow-delete rollout: %+v", sb)
+	}
 }

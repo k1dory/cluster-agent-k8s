@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"agent-sandbox/internal/model"
 )
@@ -16,6 +17,17 @@ type FakeRuntime struct {
 	next    int
 	// FailDelete, when set, makes DeletePod fail (tests of the delete retry path).
 	FailDelete error
+	// DeleteDelay makes DeletePod take this long, like Kubernetes' graceful termination.
+	DeleteDelay time.Duration
+	// Lost pods: PodStatus answers ErrPodNotFound for them although nobody deleted them.
+	lost map[string]bool
+}
+
+// LosePod makes the runtime forget a pod (eviction, node loss) without DeletePod being called.
+func (f *FakeRuntime) LosePod(sandboxID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.pods, sandboxID)
 }
 
 // SetFailDelete toggles DeletePod failures.
@@ -63,6 +75,11 @@ func (f *FakeRuntime) DeletePod(_ context.Context, sb *model.Sandbox) error {
 	defer f.mu.Unlock()
 	if f.FailDelete != nil {
 		return f.FailDelete
+	}
+	if f.DeleteDelay > 0 {
+		f.mu.Unlock()
+		time.Sleep(f.DeleteDelay)
+		f.mu.Lock()
 	}
 	delete(f.pods, sb.ID)
 	return nil

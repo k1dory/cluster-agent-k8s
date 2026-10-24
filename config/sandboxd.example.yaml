@@ -87,6 +87,8 @@ kube:
   harness_resume_command: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose'
   # Codex: 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'
   resume_prompt: ""
+  pod_firewall: true                 # init container with NET_ADMIN locks egress to the gateway (cross-node isolation)
+  gateway_ca_configmap: agent-sandbox-gateway-ca   # where the gateway root is published for the pods
   env:
     ANTHROPIC_BASE_URL: https://api.anthropic.com   # the gateway injects the real key
 sandbox:

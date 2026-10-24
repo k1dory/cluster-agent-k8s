@@ -90,6 +90,8 @@ data:
       harness_resume_command: "claude -p \"$SANDBOX_RESUME_PROMPT\" --resume \"$SANDBOX_SESSION\" --output-format stream-json --verbose"
       resume_prompt: ""
       termination_seconds: 30
+      pod_firewall: true
+      gateway_ca_configmap: "agent-sandbox-gateway-ca"
       env:
         ANTHROPIC_BASE_URL: "https://api.anthropic.com"
     sandbox:
@@ -251,6 +253,10 @@ rules:
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "create", "delete"]
+  # the gateway root published for the pods' init container
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -316,7 +322,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: agent-sandbox-0.1.0
       annotations:
-        checksum/config: d8d1d668b9baca671716a6b18a81eca08580b70721e0fd26d811c78556b16c08
+        checksum/config: b76f4375519e453586c208bf6f857144de119ae75653fe36ed17635a5f25f5a8
     spec:
       serviceAccountName: agent-sandbox-sandboxd
       hostNetwork: true
@@ -372,6 +378,13 @@ spec:
           emptyDir: {}
 ---
 # Requires Multus and whereabouts to be installed on the cluster.
+#
+# Isolation: macvlan "private" keeps pods on one node from seeing each other, but pods on
+# different nodes share the VLAN and could reach each other directly, bypassing the gateway.
+# Two layers close that: the pod firewall sandboxd installs in every pod (agent.podFirewall,
+# egress only to the gateway) and, where the switch supports it, an isolated private VLAN with
+# the gateway port as the only promiscuous port. Preview traffic never enters the VLAN from the
+# outside: it reaches sandboxd on the gateway, which proxies to the pod.
 apiVersion: k8s.cni.cncf.io/v1
 kind: NetworkAttachmentDefinition
 metadata:

@@ -54,8 +54,11 @@ type Retirer interface {
 }
 
 // PolicyGuard decides which tenant may use which slug (the policy set's tenants lists).
+// AllowedFor gates creation; Revoked says an existing sandbox lost its slug (explicit tenants
+// list that no longer includes the tenant) and must be stopped.
 type PolicyGuard interface {
 	AllowedFor(slug, tenant string) bool
+	Revoked(slug, tenant string) bool
 }
 
 // Quota bounds what one tenant may hold. Zero means unlimited.
@@ -125,10 +128,10 @@ type Orchestrator struct {
 	ListenerPublishes bool
 
 	mu       sync.Mutex
-	waking   map[string]bool   // sandboxes this replica is watching to readiness
-	meta     map[string]sbMeta // sandbox id → tenant/slug, for stamping events
-	running  map[string]string // sandbox id → running run id ("" = none), for egress attribution
-	sessions map[string]string // run id → last harness session id stored, to skip repeated writes
+	waking   map[string]bool     // sandboxes this replica is watching to readiness
+	meta     map[string]sbMeta   // sandbox id → tenant/slug, for stamping events
+	running  map[string]runCache // sandbox id → running run id ("" = none), for egress attribution
+	sessions map[string]string   // run id → last harness session id stored, to skip repeated writes
 	leading  atomic.Bool
 }
 
@@ -136,6 +139,15 @@ type Orchestrator struct {
 func (o *Orchestrator) Leading() bool { return o.leading.Load() }
 
 type sbMeta struct{ tenant, slug string }
+
+// runCache is a short-lived answer to "which run executes in this sandbox": another replica may
+// have claimed or finished a run, so the cache expires quickly.
+type runCache struct {
+	id string
+	at time.Time
+}
+
+const runCacheTTL = 2 * time.Second
 
 // New wires an orchestrator.
 func New(st store.Store, rt Runtime, ret Retirer, hub *events.Hub, cfg Config, log *slog.Logger) *Orchestrator {
@@ -152,7 +164,7 @@ func New(st store.Store, rt Runtime, ret Retirer, hub *events.Hub, cfg Config, l
 		log = slog.Default()
 	}
 	return &Orchestrator{Store: st, Runtime: rt, Retirer: ret, Hub: hub, Cfg: cfg, Log: log,
-		waking: map[string]bool{}, meta: map[string]sbMeta{}, running: map[string]string{}, sessions: map[string]string{}}
+		waking: map[string]bool{}, meta: map[string]sbMeta{}, running: map[string]runCache{}, sessions: map[string]string{}}
 }
 
 // Errors surfaced to the API.
@@ -509,19 +521,21 @@ func (o *Orchestrator) metaOf(ctx context.Context, id string) sbMeta {
 // setRunning records which run is executing in a sandbox (for attributing egress).
 func (o *Orchestrator) setRunning(sandboxID, runID string) {
 	o.mu.Lock()
-	o.running[sandboxID] = runID
+	o.running[sandboxID] = runCache{id: runID, at: time.Now()}
 	o.mu.Unlock()
 }
 
-// runningRunID returns the executing run of a sandbox, or "" if none.
+// runningRunID returns the executing run of a sandbox, or "" if none. Cached for runCacheTTL so
+// the egress hot path costs one store read every few seconds, not one per request, while a run
+// claimed or finished on another replica is attributed correctly soon after.
 func (o *Orchestrator) runningRunID(ctx context.Context, sandboxID string) string {
 	o.mu.Lock()
-	id, ok := o.running[sandboxID]
+	c, ok := o.running[sandboxID]
 	o.mu.Unlock()
-	if ok {
-		return id
+	if ok && time.Since(c.at) < runCacheTTL {
+		return c.id
 	}
-	id = ""
+	id := ""
 	if r, err := o.Store.RunningRun(ctx, sandboxID); err == nil {
 		id = r.ID
 	}
@@ -862,8 +876,9 @@ func (o *Orchestrator) FinishRun(ctx context.Context, sandboxID, runID string, e
 		return store.ErrNotFound
 	}
 	o.setRunning(sandboxID, "")
-	if r.Status == model.RunCancelled {
-		return nil
+	switch r.Status {
+	case model.RunCancelled, model.RunDone, model.RunFailed:
+		return nil // already settled: a retried /finish after a lost acknowledgement is a no-op
 	}
 	now := time.Now()
 	r.FinishedAt, r.ExitCode = &now, exitCode
@@ -1198,6 +1213,20 @@ func (o *Orchestrator) lead(ctx context.Context, lease store.Lease) {
 	}
 }
 
+// failRun settles a run whose executor is gone: status failed, the reason in the output, the
+// usual run.finished event. Clients watching the run see it end instead of hanging forever.
+func (o *Orchestrator) failRun(ctx context.Context, sandboxID string, r *model.Run, reason string) {
+	now := time.Now()
+	r.Status, r.FinishedAt, r.ExitCode = model.RunFailed, &now, -1
+	if err := o.Store.UpdateRun(ctx, r); err != nil {
+		o.Log.Error("fail run", "run", r.ID, "err", err)
+		return
+	}
+	o.setRunning(sandboxID, "")
+	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunOutput, Data: "[control plane] run lost: " + reason})
+	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunDone, Data: string(model.RunFailed)})
+}
+
 // IdleLoop is the single-replica form of Run, kept for callers that manage leadership themselves.
 func (o *Orchestrator) IdleLoop(ctx context.Context) {
 	o.leading.Store(true)
@@ -1252,6 +1281,39 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			continue
 		}
 		if sb.Status != model.StatusRunning {
+			// A run marked running while the sandbox has no pod is a leftover of a lost pod or a
+			// crashed replica: nobody will ever finish it.
+			if r, err := o.Store.RunningRun(ctx, sb.ID); err == nil {
+				o.failRun(ctx, sb.ID, r, "sandbox is "+string(sb.Status)+" while the run was executing")
+			}
+			continue
+		}
+		// The pod must still exist and be alive; Kubernetes may have evicted or killed it.
+		if _, _, err := o.Runtime.PodStatus(ctx, sb); err != nil {
+			reason := "pod disappeared"
+			if !errors.Is(err, ErrPodNotFound) {
+				reason = "pod failed: " + err.Error()
+			}
+			o.Log.Warn("running sandbox lost its pod", "id", sb.ID, "pod", sb.PodName, "reason", reason)
+			if r, err := o.Store.RunningRun(ctx, sb.ID); err == nil {
+				o.failRun(ctx, sb.ID, r, reason)
+			}
+			if o.Retirer != nil {
+				_ = o.Retirer.RetireSandbox(ctx, sb.ID)
+			}
+			_, _ = o.setStatusFrom(ctx, sb.ID, []model.SandboxStatus{model.StatusRunning}, model.StatusError, func(s *model.Sandbox) {
+				s.Error = reason + "; wake to start a new pod"
+				s.PodName, s.IP = "", ""
+			})
+			continue
+		}
+		if o.Policies != nil && o.Policies.Revoked(sb.Slug, sb.Tenant) {
+			// The policy repository revoked the slug from this tenant: the gateway already refuses
+			// every request; take the pod down too so nothing keeps running under rights it lost.
+			o.Log.Warn("tenant lost its slug, stopping sandbox", "id", sb.ID, "slug", sb.Slug, "tenant", sb.Tenant)
+			if _, err := o.Sleep(ctx, sb.ID, true); err != nil {
+				o.Log.Error("stop after revocation", "id", sb.ID, "err", err)
+			}
 			continue
 		}
 		if sb.DesiredVersion != "" {

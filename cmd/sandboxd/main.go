@@ -34,6 +34,7 @@ import (
 	"agent-sandbox/internal/httpapi"
 	"agent-sandbox/internal/ingress"
 	"agent-sandbox/internal/kube"
+	"agent-sandbox/internal/mcpproxy"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/oidc"
 	"agent-sandbox/internal/orchestrator"
@@ -147,11 +148,13 @@ func serve(cfgPath string, log *slog.Logger) error {
 		syncer := &gateway.Syncer{Cfg: gwCfg, Policies: pols, AgentCA: agentCA.PEM(), Log: log.With("log", "gateway")}
 		go syncer.Run(ctx, cfg.Gateway.SyncEvery)
 	}
+	gatewayRoot := make(chan []byte, 1) // delivered once the root is known; published to pods below
 	switch {
 	case cfg.CA.GatewayCAFile != "":
 		if reg.GatewayCA, err = os.ReadFile(cfg.CA.GatewayCAFile); err != nil {
 			return fmt.Errorf("gateway ca: %w", err)
 		}
+		gatewayRoot <- reg.GatewayCA
 	case cfg.Gateway.CaddyAdmin != "":
 		go func() {
 			for attempt := 1; ctx.Err() == nil; attempt++ {
@@ -159,6 +162,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 				if err == nil {
 					reg.SetGatewayCA(root)
 					log.Info("gateway root certificate fetched from caddy")
+					gatewayRoot <- root
 					return
 				}
 				log.Warn("gateway root not available yet", "attempt", attempt, "err", err)
@@ -186,6 +190,9 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 
 	var rt orchestrator.Runtime
+	// publishCA hands the gateway root to the pods (a ConfigMap in the agent namespace) so the
+	// init container can trust the registrar before it holds any certificate.
+	publishCA := func(context.Context, []byte) error { return nil }
 	switch cfg.Runtime {
 	case "kube":
 		client, err := kube.NewClient(cfg.Kube.Kubeconfig)
@@ -200,9 +207,10 @@ func serve(cfgPath string, log *slog.Logger) error {
 			VolumeSize: k.VolumeSize, CPURequest: k.CPURequest, CPULimit: k.CPULimit, MemoryRequest: k.MemoryRequest,
 			MemoryLimit: k.MemoryLimit, HarnessCommand: k.HarnessCommand, HarnessResumeCommand: k.HarnessResumeCommand,
 			ResumePrompt: k.ResumePrompt, Env: k.Env, PriorityClassName: k.PriorityClassName,
-			TerminationSeconds: k.TerminationSeconds,
+			TerminationSeconds: k.TerminationSeconds, PodFirewall: *k.PodFirewall, GatewayCAConfigMap: *k.GatewayCAConfigMap,
 		}}
 		reg.Resolver = &kube.Resolver{Client: client, Namespace: k.Namespace, Audience: k.TokenAudience}
+		publishCA = rt.(*kube.Runtime).PublishGatewayCA
 	case "fake":
 		log.Warn("runtime fake: no pods are created")
 		rt = orchestrator.NewFakeRuntime()
@@ -220,6 +228,25 @@ func serve(cfgPath string, log *slog.Logger) error {
 	default:
 		return fmt.Errorf("unknown runtime %q", cfg.Runtime)
 	}
+
+	go func() {
+		select {
+		case <-ctx.Done():
+		case root := <-gatewayRoot:
+			for attempt := 1; ctx.Err() == nil; attempt++ {
+				err := publishCA(ctx, root)
+				if err == nil {
+					log.Info("gateway root published to the agent namespace")
+					return
+				}
+				log.Warn("publish gateway root", "attempt", attempt, "err", err)
+				select {
+				case <-ctx.Done():
+				case <-time.After(time.Duration(min(attempt, 12)) * 5 * time.Second):
+				}
+			}
+		}
+	}()
 
 	hub := events.New()
 	// Events appended by any replica (this one included) reach the SSE clients through the store,
@@ -300,7 +327,8 @@ func serve(cfgPath string, log *slog.Logger) error {
 	if cfg.APIToken == "" && len(tenants) == 0 && cfg.OIDC == nil {
 		return errors.New("no api_token, api_tokens or oidc configured: nobody could call the API")
 	}
-	gw := &httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, Log: log.With("log", "gateway-api")}
+	gw := &httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, Log: log.With("log", "gateway-api"),
+		MCP: &mcpproxy.Handler{Authz: az, Log: log.With("log", "mcp")}}
 
 	servers := []*http.Server{
 		{Addr: cfg.Listen.API, Handler: platform.Routes(), ReadHeaderTimeout: 10 * time.Second},
