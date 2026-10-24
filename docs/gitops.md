@@ -112,6 +112,9 @@ Three things follow from "a new plan under the caller's current rights":
 
 ## The loop a CI pipeline runs
 
+Ready-made jobs for GitHub Actions and GitLab CI, and the scenario of one settings change as one
+pull request, are in [git-adapters.md](git-adapters.md). The bare commands:
+
 ```sh
 sandboxctl plan  -f bundles/acme.yaml || exit 1          # on the pull request: valid, and what changes
 sandboxctl apply -f bundles/acme.yaml                    # on merge: the commit SHA lands in every revision

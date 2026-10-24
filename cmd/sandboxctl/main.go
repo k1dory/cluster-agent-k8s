@@ -34,13 +34,14 @@ const usage = `sandboxctl <command> [flags]
 
   create   -name shop (-slug backend-dev | -agent backend[@3]) -owner alice [-tenant t] [-repo url] [-idle 3600]
            [-ttl 86400] [-wake-on-preview=false] [-version stable] [-key idempotency-key]
-  plan     -f file.yaml [-tenant t] [-json]         validate a bundle (--- separated documents) and show what apply would change; writes nothing
-  apply    -f file.yaml [-tenant t] [-key k] [-json]  plan the bundle, then apply it through the controller: one
+  plan     -f file.yaml [-tenant t] [-json|-markdown]   validate a bundle (--- separated documents) and show what apply
+           would change; writes nothing (-markdown: a pull request comment; see docs/git-adapters.md)
+  apply    -f file.yaml [-tenant t] [-key k] [-json|-markdown]  plan the bundle, then apply it through the controller: one
            transaction per step, continued by key after any failure (apply -resume <id> continues a stopped one)
            apply records where the bundle came from: the Git commit the file matches is detected (-repo,
            -ref, -commit, -path override it; -no-git records nothing); a dirty file is applied without a SHA
   applies  [-tenant t] [-json]              applies of the scope, newest first; applies <id> shows one
-  drift    [-tenant t] [-json]              items changed or deleted outside apply since an apply wrote them;
+  drift    [-tenant t] [-json|-markdown]    items changed or deleted outside apply since an apply wrote them;
            drift -f bundle.yaml shows what the bundle would change (Git versus the platform), writing nothing
   rollback (-apply <id> | agent|environment|connection <name> [-to N]) [-tenant t] [-plan] [-key k] [-json]
            restore what an apply wrote (to the revisions it replaced) or one item to a revision, as a new
@@ -320,6 +321,7 @@ func (c *cli) run(cmd string, args []string) error {
 		file := fs.String("f", "", "YAML file: one document, or several separated by ---")
 		tenant := fs.String("tenant", "", "default scope for documents without a tenant (admin)")
 		asJSON := fs.Bool("json", false, "print the plan as JSON")
+		asMarkdown := fs.Bool("markdown", false, "print the plan as Markdown (a pull request comment)")
 		_ = fs.Parse(flags)
 		if *file == "" {
 			return errors.New("plan: -f is required")
@@ -340,9 +342,12 @@ func (c *cli) run(cmd string, args []string) error {
 		if err := c.do("POST", "/v1/plan"+q, map[string]any{"documents": docs}, &out); err != nil {
 			return err
 		}
-		if *asJSON {
+		switch {
+		case *asJSON:
 			printJSON(out)
-		} else {
+		case *asMarkdown:
+			markdownPlan(os.Stdout, out, *file)
+		default:
 			printPlan(out)
 		}
 		if !out.Valid {
@@ -354,6 +359,7 @@ func (c *cli) run(cmd string, args []string) error {
 		key := fs.String("key", "", "idempotency key (default: the plan fingerprint)")
 		resume := fs.String("resume", "", "continue the apply with this id instead of submitting a bundle")
 		asJSON := fs.Bool("json", false, "print the apply as JSON")
+		asMarkdown := fs.Bool("markdown", false, "print the apply as Markdown (a job summary)")
 		var src bundleSource
 		fs.StringVar(&src.Repo, "repo", "", "source: Git remote the bundle comes from (default: detected)")
 		fs.StringVar(&src.Ref, "ref", "", "source: branch or tag (default: detected)")
@@ -415,9 +421,12 @@ func (c *cli) run(cmd string, args []string) error {
 				return err
 			}
 		}
-		if *asJSON {
+		switch {
+		case *asJSON:
 			printJSON(a)
-		} else {
+		case *asMarkdown:
+			markdownApply(os.Stdout, a)
+		default:
 			printApply(a)
 		}
 		if a.Status != model.ApplyDone {
@@ -546,6 +555,7 @@ func (c *cli) run(cmd string, args []string) error {
 		tenant := fs.String("tenant", "", "scope (admin)")
 		file := fs.String("f", "", "bundle to compare the platform with (what apply would change); without it, the store-side report")
 		asJSON := fs.Bool("json", false, "print JSON")
+		asMarkdown := fs.Bool("markdown", false, "print Markdown (an alert or a pull request comment)")
 		_ = fs.Parse(flags)
 		q := ""
 		if *tenant != "" {
@@ -564,9 +574,12 @@ func (c *cli) run(cmd string, args []string) error {
 			if err := c.do("POST", "/v1/plan"+q, map[string]any{"documents": docs}, &p); err != nil {
 				return err
 			}
-			if *asJSON {
+			switch {
+			case *asJSON:
 				printJSON(p)
-			} else {
+			case *asMarkdown:
+				markdownPlan(os.Stdout, p, *file)
+			default:
 				printPlan(p)
 			}
 			if code := planExitCode(p); code != 0 {
@@ -578,9 +591,12 @@ func (c *cli) run(cmd string, args []string) error {
 		if err := c.do("GET", "/v1/drift"+q, nil, &rep); err != nil {
 			return err
 		}
-		if *asJSON {
+		switch {
+		case *asJSON:
 			printJSON(rep)
-		} else {
+		case *asMarkdown:
+			markdownDrift(os.Stdout, rep)
+		default:
 			printDrift(rep)
 		}
 		if len(rep.Drifted) > 0 {

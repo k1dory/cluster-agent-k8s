@@ -1,0 +1,104 @@
+# Git adapter for GitHub: a configuration repository (bundles of AgentDefinition, EnvironmentProfile,
+# Connection; the admin's bundles also PolicyBinding and TenantSettings) changes the platform
+# through pull requests alone. Copy to .github/workflows/sandbox-config.yml of that repository.
+#
+#   pull request  → plan every bundle, post or update one comment per bundle with the plan; a bundle
+#                   that is invalid fails the check, so it cannot be merged
+#   push to main  → apply every bundle; the merge commit's SHA lands in every new revision; the job
+#                   summary shows what was written; a stopped apply fails the job and names the id
+#   schedule      → drift: items changed or deleted by hand since an apply wrote them fail the job
+#
+# Secrets: SANDBOXD_URL (variable) and SANDBOXD_TOKEN (a tenant key sbk_… for a tenant's repository,
+# the admin token for the platform's). sandboxctl runs from the sandboxctl image (built from the
+# platform repository with `make images`, target sandboxctl), so the job needs no Go toolchain.
+name: sandbox-config
+on:
+  pull_request:
+    paths: ["bundles/**"]
+  push:
+    branches: [main]
+    paths: ["bundles/**"]
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+env:
+  SANDBOXD_URL: ${{ vars.SANDBOXD_URL }}
+  SANDBOXD_TOKEN: ${{ secrets.SANDBOXD_TOKEN }}
+  SANDBOXCTL_IMAGE: ${{ vars.SANDBOXCTL_IMAGE || 'registry.example.com/agent-sandbox/sandboxctl:latest' }}
+  # Documents without a tenant go to this scope (admin repositories only; leave empty for a tenant key).
+  SANDBOX_TENANT: ${{ vars.SANDBOX_TENANT }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: plan every bundle
+        id: plan
+        run: |
+          set +e
+          rc=0
+          : > plans.md
+          for f in bundles/*.yaml; do
+            docker run --rm -e SANDBOXD_URL -e SANDBOXD_TOKEN -v "$PWD:/w" -w /w "$SANDBOXCTL_IMAGE" \
+              plan -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown >> plans.md
+            code=$?
+            echo >> plans.md
+            [ "$code" -eq 2 ] && rc=2          # invalid: the check fails, the comment says why
+            [ "$code" -eq 1 ] && rc=1          # the platform could not be reached or refused the token
+          done
+          cat plans.md >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+      - name: post or update the plan comment
+        if: always() && steps.plan.outcome != 'skipped'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('plans.md', 'utf8');
+            const marker = '<!-- agent-sandbox -->';
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number });
+            const mine = comments.find(c => c.body && c.body.startsWith(marker) && c.user.type === 'Bot');
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  apply:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    concurrency: sandbox-apply   # one apply at a time per repository; each is continued by key anyway
+    steps:
+      - uses: actions/checkout@v4
+      - name: apply every bundle with this commit as the source
+        run: |
+          set +e
+          rc=0
+          for f in bundles/*.yaml; do
+            # The checkout is a detached HEAD: name the branch; the commit and the path are detected
+            # from the work tree (the SHA is recorded only when the file equals its committed bytes).
+            docker run --rm -e SANDBOXD_URL -e SANDBOXD_TOKEN -v "$PWD:/w" -w /w "$SANDBOXCTL_IMAGE" \
+              apply -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -ref "$GITHUB_REF_NAME" -repo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" -markdown >> "$GITHUB_STEP_SUMMARY"
+            code=$?
+            [ "$code" -ne 0 ] && rc=$code      # 2 invalid, 3 stopped (conflict/failed: resume once fixed), 1 unreachable
+          done
+          exit $rc
+
+  drift:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: what moved outside apply
+        run: |
+          docker run --rm -e SANDBOXD_URL -e SANDBOXD_TOKEN "$SANDBOXCTL_IMAGE" \
+            drift ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown | tee -a "$GITHUB_STEP_SUMMARY"
+          # exit 3 when anything drifted: wire the job's failure to your paging

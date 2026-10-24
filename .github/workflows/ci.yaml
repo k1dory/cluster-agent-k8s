@@ -93,6 +93,11 @@ jobs:
         run: docker build -f images/agent/Dockerfile -t agent-sandbox/agent:ci .
       - name: build the control plane image
         run: docker build -f images/sandboxd/Dockerfile -t agent-sandbox/sandboxd:ci .
+      - name: build the sandboxctl image for CI jobs (the Git adapters) and run it once
+        run: |
+          docker build -f images/sandboxd/Dockerfile --target sandboxctl -t agent-sandbox/sandboxctl:ci .
+          docker run --rm agent-sandbox/sandboxctl:ci 2>&1 | head -3
+          docker run --rm --entrypoint sh agent-sandbox/sandboxctl:ci -c 'command -v curl jq git >/dev/null && echo tools-present'
       - name: smoke test the shipped agent image (user, tools, netlock, agent-init, agent-runner)
         run: hack/smoke-image.sh agent-sandbox/agent:ci
       - name: network lock on an isolated Docker network (pod ↔ pod denied, gateway ↔ pod allowed both ways)
