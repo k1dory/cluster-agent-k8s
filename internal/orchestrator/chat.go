@@ -27,25 +27,30 @@ func (o *Orchestrator) Say(ctx context.Context, sandboxID, text string) (run *mo
 	}
 	// Choosing the run that carries the message and recording it happen under one lock per
 	// sandbox, shared by every replica: two messages sent at once cannot both see "no run in
-	// progress" and start two conversations.
+	// progress" and start two conversations. Waking the sandbox needs the tenant lock, so it
+	// happens after this one is released: locks are a bounded resource shared by every caller.
+	wake := false
 	err = o.Store.WithTenantLock(ctx, "sandbox:"+sandboxID, func(ctx context.Context) error {
-		run, how, err = o.say(ctx, sandboxID, text)
+		run, how, wake, err = o.say(ctx, sandboxID, text)
 		return err
 	})
+	if err == nil && wake {
+		o.wakeForRun(ctx, sandboxID, run.ID)
+	}
 	return run, how, err
 }
 
-func (o *Orchestrator) say(ctx context.Context, sandboxID, text string) (*model.Run, string, error) {
+func (o *Orchestrator) say(ctx context.Context, sandboxID, text string) (*model.Run, string, bool, error) {
 	sb, err := o.Store.GetSandbox(ctx, sandboxID)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 	if sb.Status == model.StatusDeleting {
-		return nil, "", fmt.Errorf("%w: sandbox is being deleted", ErrConflict)
+		return nil, "", false, fmt.Errorf("%w: sandbox is being deleted", ErrConflict)
 	}
 	runs, err := o.Store.ListRuns(ctx, sandboxID)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
 	var active, last *model.Run
 	for _, r := range runs {
@@ -66,22 +71,22 @@ func (o *Orchestrator) say(ctx context.Context, sandboxID, text string) (*model.
 	}
 	if active != nil {
 		if err := o.Input(ctx, sandboxID, active.ID, text); err != nil {
-			return nil, "", err
+			return nil, "", false, err
 		}
-		return active, DeliveredInput, nil
+		return active, DeliveredInput, false, nil
 	}
 	if last != nil {
-		r, err := o.queueRun(ctx, sandboxID, &model.Run{Task: text, ResumeOf: last.ID, Session: last.Session, Mode: model.RunMessage})
+		r, wake, err := o.enqueue(ctx, sandboxID, &model.Run{Task: text, ResumeOf: last.ID, Session: last.Session, Mode: model.RunMessage})
 		if err != nil {
-			return nil, "", err
+			return nil, "", false, err
 		}
-		return r, DeliveredResumed, nil
+		return r, DeliveredResumed, wake, nil
 	}
-	r, err := o.CreateRun(ctx, sandboxID, text)
+	r, wake, err := o.enqueue(ctx, sandboxID, &model.Run{Task: text})
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
-	return r, DeliveredNew, nil
+	return r, DeliveredNew, wake, nil
 }
 
 // CloseRun asks the runner to close the harness's input: an open conversation ends, the run
