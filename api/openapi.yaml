@@ -18,11 +18,19 @@ info:
       agents) with that slug; a slug outside the list answers 403.
     * **Catalogue.** `AgentDefinition`s (`/v1/agents`) and `EnvironmentProfile`s (`/v1/environments`)
       are versioned configuration per tenant (the admin also keeps shared ones, tenant ""). Every PUT
-      appends a revision, `expected_revision` makes it conditional (409). `POST /v1/sandboxes` with
-      `agent_ref` ("name" or "name@N") takes the policy, repository, lifecycle defaults and the
-      environment's launch parameters from the catalogue; the sandbox records `agent_revision`,
+      appends a revision, `expected_revision` makes it conditional (409). Revision numbers are never
+      reused: DELETE marks an item deleted and keeps its history at `/revisions`; a later PUT under
+      the same name continues the numbering. References are "name", "name@N" (pinned) or
+      "shared/name[@N]"; a bare name is resolved in the caller's scope first, then among the shared
+      items, and stored in the form it resolved to, so the scope of a dependency is fixed when the
+      document is written. `POST /v1/sandboxes` with `agent_ref` takes the policy, repository,
+      lifecycle defaults and the environment's launch parameters from the catalogue; the sandbox
+      records `agent_ref` / `environment_ref` (with the scope), `agent_revision`,
       `environment_revision` and the rendered `launch`, and every run records the revisions it ran
-      under. The same documents are accepted as YAML files by `sandboxctl apply`.
+      under. A profile's `env` reaches the agent container only and cannot set platform names
+      (`SANDBOX_*`, `GATEWAY_IP`, `REGISTRAR_URL`, `API_URL`, `CERT_DIR`, `HOME`, `HARNESS_CMD`,
+      `HARNESS_RESUME_CMD`, `GATEWAY_CA_FILE`: 422). The same documents are accepted as YAML files
+      by `sandboxctl apply` (several, separated by `---`, apply in order).
     * **Versions.** Every sandbox carries `agent_version` (the agent image its pod runs),
       `desired_version` (a rollout not yet applied) and `env_version` (fingerprint of policy content,
       harness command, image and pod environment the pod was started under). `GET /v1/version`
@@ -373,10 +381,10 @@ paths:
         "200": { description: New revision, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
         "403": { description: "The tenant does not own the policy, or wrote into another scope", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "409": { description: "expected_revision is not the latest", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "422": { description: "Invalid document (unknown field, unknown environment or policy, bad quantity)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Invalid document (unknown field, trailing data after the document, unknown environment or policy)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
     delete:
       tags: [catalogue]
-      summary: Delete an AgentDefinition with its history (existing sandboxes keep their launch)
+      summary: Delete an AgentDefinition (its revisions stay as history, marked deleted_at, and can no longer be referenced; existing sandboxes keep their launch; a later PUT continues the numbering)
       responses:
         "204": { description: Deleted }
         "404": { $ref: "#/components/responses/Error" }
@@ -384,7 +392,7 @@ paths:
     parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
     get:
       tags: [catalogue]
-      summary: History of an AgentDefinition, oldest first
+      summary: History of an AgentDefinition, oldest first, deleted revisions included
       responses:
         "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
   /v1/environments:
@@ -415,10 +423,10 @@ paths:
         "201": { description: Created (revision 1), content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
         "200": { description: New revision, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
         "409": { description: "expected_revision is not the latest", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "422": { description: "Invalid document (unknown field, image not in the catalogue for a tenant, bad quantity)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Invalid document (unknown field, trailing data, image not in the catalogue for a tenant, non-positive quantity, request above limit, platform variable in env)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
     delete:
       tags: [catalogue]
-      summary: Delete an EnvironmentProfile with its history
+      summary: Delete an EnvironmentProfile (revisions stay as history, marked deleted_at; agents pinned to them stop resolving; a later PUT continues the numbering)
       responses:
         "204": { description: Deleted }
         "404": { $ref: "#/components/responses/Error" }
@@ -426,7 +434,7 @@ paths:
     parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
     get:
       tags: [catalogue]
-      summary: History of an EnvironmentProfile, oldest first
+      summary: History of an EnvironmentProfile, oldest first, deleted revisions included
       responses:
         "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
   /v1/whoami:
@@ -836,7 +844,7 @@ components:
         wake_on_preview: { type: boolean, default: true }
         ttl: { type: integer, description: "Seconds until the sandbox is deleted (pod, volume; runs and events stay); absent/0 = keep. Capped at the token's expiry when oidc.ttl_from_token is on" }
         agent_version: { type: string, description: "Version name from the catalogue (tenants) or an image reference (admin); absent = default" }
-        agent_ref: { type: string, description: "AgentDefinition reference, name or name@revision. Supplies slug, repo, lifecycle defaults and the environment's launch; slug must then be absent or equal to the agent's policy" }
+        agent_ref: { type: string, description: "AgentDefinition reference: name, name@N, or shared/name[@N]. Supplies slug, repo, lifecycle defaults and the environment's launch; slug must then be absent or equal to the agent's policy" }
     UpdateSandbox:
       type: object
       description: Only the fields present are changed
@@ -861,7 +869,7 @@ components:
         instance: { type: integer, description: "Current identity number; grows on every wake" }
         pod_name: { type: string }
         agent_version: { type: string, description: "Agent image the current (or last) pod runs" }
-        agent_ref: { type: string, description: "AgentDefinition the sandbox was created from (absent for bare-slug sandboxes)" }
+        agent_ref: { type: string, description: "AgentDefinition the sandbox was created from, with its scope: name, or shared/name (absent for bare-slug sandboxes)" }
         agent_revision: { type: integer }
         environment_ref: { type: string }
         environment_revision: { type: integer }
@@ -933,6 +941,7 @@ components:
             - { $ref: "#/components/schemas/EnvironmentSpec" }
         created_by: { type: string }
         created_at: { type: string, format: date-time }
+        deleted_at: { type: string, format: date-time, description: "Set once the item was deleted; the revision stays as history and cannot be referenced" }
     EnvironmentSpec:
       type: object
       required: [image]
@@ -950,11 +959,12 @@ components:
           type: object
           additionalProperties: false
           properties:
-            name: { type: string }
-            env: { type: object, additionalProperties: { type: string } }
+            name: { type: string, description: "Exported by the platform as SANDBOX_MODEL and ANTHROPIC_MODEL" }
+            env: { type: object, additionalProperties: { type: string }, description: "Client settings such as ANTHROPIC_BASE_URL; platform names are refused" }
         resources:
           type: object
           additionalProperties: false
+          description: "Kubernetes quantities, positive; a request must not exceed its limit. A request above the server's default limit raises that limit."
           properties:
             cpu_request: { type: string }
             cpu_limit: { type: string }
@@ -969,14 +979,14 @@ components:
             ttl: { type: integer, minimum: 0 }
             wake_on_preview: { type: boolean }
         runtime_class: { type: string }
-        env: { type: object, additionalProperties: { type: string } }
+        env: { type: object, additionalProperties: { type: string }, description: "Agent container only; never shadows a platform or operator variable; platform names (SANDBOX_*, GATEWAY_IP, REGISTRAR_URL, API_URL, CERT_DIR, HOME, HARNESS_CMD, HARNESS_RESUME_CMD, GATEWAY_CA_FILE) are refused" }
     AgentSpec:
       type: object
       required: [policy, environment]
       additionalProperties: false
       properties:
         policy: { type: string, description: "Policy slug; the tenant must own it (admin may override)" }
-        environment: { type: string, description: "EnvironmentProfile name, or name@revision to pin; own scope first, then shared" }
+        environment: { type: string, description: "EnvironmentProfile reference: name, name@N to pin, shared/name[@N] for a shared profile. A bare name is resolved (own scope, then shared) when the agent is written and stored in the resolved form, so a tenant profile created later under the same name does not capture it" }
         repo: { type: string }
         instructions: { type: string }
         connections: { type: array, items: { type: string }, description: "Reserved: connection names (step 4)" }

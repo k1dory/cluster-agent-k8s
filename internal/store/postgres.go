@@ -722,11 +722,11 @@ func (p *Postgres) ListInstances(ctx context.Context, sandboxID string) ([]*mode
 
 // --- catalogue -------------------------------------------------------------------------
 
-const itemCols = `kind, tenant, name, revision, description, spec, created_by, created_at`
+const itemCols = `kind, tenant, name, revision, description, spec, created_by, created_at, deleted_at`
 
 func scanItem(row pgx.Row) (*model.CatalogItem, error) {
 	var it model.CatalogItem
-	err := row.Scan(&it.Kind, &it.Tenant, &it.Name, &it.Revision, &it.Description, &it.Spec, &it.CreatedBy, &it.CreatedAt)
+	err := row.Scan(&it.Kind, &it.Tenant, &it.Name, &it.Revision, &it.Description, &it.Spec, &it.CreatedBy, &it.CreatedAt, &it.DeletedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -746,16 +746,20 @@ func (p *Postgres) PutItem(ctx context.Context, it *model.CatalogItem, expected 
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "catalog:"+it.Kind+"|"+it.Tenant+"|"+it.Name); err != nil {
 		return err
 	}
-	var latest int
-	if err := tx.QueryRow(ctx, `SELECT COALESCE(max(revision), 0) FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3`,
-		it.Kind, it.Tenant, it.Name).Scan(&latest); err != nil {
+	// latest: the highest number ever used (deleted included), so a number is never reused;
+	// current: the latest live revision, what a conditional write compares against.
+	var latest, current int
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(max(revision), 0), COALESCE(max(revision) FILTER (WHERE deleted_at IS NULL), 0)
+		FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3`, it.Kind, it.Tenant, it.Name).Scan(&latest, &current); err != nil {
 		return err
 	}
-	if expected >= 0 && expected != latest {
-		return fmt.Errorf("%w: latest revision is %d, expected %d", ErrConflict, latest, expected)
+	if expected >= 0 && expected != current {
+		return fmt.Errorf("%w: latest revision is %d, expected %d", ErrConflict, current, expected)
 	}
 	it.Revision = latest + 1
-	if err := tx.QueryRow(ctx, `INSERT INTO catalog_items (`+itemCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,now()) RETURNING created_at`,
+	it.DeletedAt = nil
+	if err := tx.QueryRow(ctx, `INSERT INTO catalog_items (kind, tenant, name, revision, description, spec, created_by, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,now()) RETURNING created_at`,
 		it.Kind, it.Tenant, it.Name, it.Revision, it.Description, it.Spec, it.CreatedBy).Scan(&it.CreatedAt); err != nil {
 		return err
 	}
@@ -764,9 +768,14 @@ func (p *Postgres) PutItem(ctx context.Context, it *model.CatalogItem, expected 
 
 func (p *Postgres) GetItem(ctx context.Context, kind, tenant, name string, revision int) (*model.CatalogItem, error) {
 	if revision == 0 {
-		return scanItem(p.pool.QueryRow(ctx, `SELECT `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3 ORDER BY revision DESC LIMIT 1`, kind, tenant, name))
+		// The latest row decides: once an item is deleted, its last row is deleted too.
+		it, err := scanItem(p.pool.QueryRow(ctx, `SELECT `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3 ORDER BY revision DESC LIMIT 1`, kind, tenant, name))
+		if err == nil && it.DeletedAt != nil {
+			return nil, ErrNotFound
+		}
+		return it, err
 	}
-	return scanItem(p.pool.QueryRow(ctx, `SELECT `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3 AND revision=$4`, kind, tenant, name, revision))
+	return scanItem(p.pool.QueryRow(ctx, `SELECT `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3 AND revision=$4 AND deleted_at IS NULL`, kind, tenant, name, revision))
 }
 
 func (p *Postgres) queryItems(ctx context.Context, q string, args ...any) ([]*model.CatalogItem, error) {
@@ -787,7 +796,9 @@ func (p *Postgres) queryItems(ctx context.Context, q string, args ...any) ([]*mo
 }
 
 func (p *Postgres) ListItems(ctx context.Context, kind, tenant string) ([]*model.CatalogItem, error) {
-	return p.queryItems(ctx, `SELECT DISTINCT ON (name) `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 ORDER BY name, revision DESC`, kind, tenant)
+	// Latest row per name, then only the live ones: a deleted item's latest row is deleted.
+	return p.queryItems(ctx, `SELECT `+itemCols+` FROM (SELECT DISTINCT ON (name) `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 ORDER BY name, revision DESC) latest
+		WHERE deleted_at IS NULL ORDER BY name`, kind, tenant)
 }
 
 func (p *Postgres) ListRevisions(ctx context.Context, kind, tenant, name string) ([]*model.CatalogItem, error) {
@@ -799,7 +810,7 @@ func (p *Postgres) ListRevisions(ctx context.Context, kind, tenant, name string)
 }
 
 func (p *Postgres) DeleteItem(ctx context.Context, kind, tenant, name string) error {
-	tag, err := p.pool.Exec(ctx, `DELETE FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3`, kind, tenant, name)
+	tag, err := p.pool.Exec(ctx, `UPDATE catalog_items SET deleted_at = now() WHERE kind=$1 AND tenant=$2 AND name=$3 AND deleted_at IS NULL`, kind, tenant, name)
 	if err != nil {
 		return err
 	}

@@ -99,7 +99,7 @@ func TestCatalogAcceptance(t *testing.T) {
 	_ = json.Unmarshal(body, &sb1)
 	if resp.StatusCode != 201 || sb1.Slug != "backend-dev" || sb1.Repo != "https://git.example.com/org/shop.git" || sb1.IdleTimeout != 120 || sb1.ExpiresAt == nil ||
 		sb1.AgentRef != "backend" || sb1.AgentRevision != 1 || sb1.EnvironmentRef != "py" || sb1.EnvironmentRevision != 1 ||
-		sb1.AgentVersion != "reg/agent-py:2.0" || sb1.Launch == nil || sb1.Launch.CPULimit != "3" || sb1.Launch.Env["SANDBOX_INSTRUCTIONS"] != "Be brief." {
+		sb1.AgentVersion != "reg/agent-py:2.0" || sb1.Launch == nil || sb1.Launch.CPULimit != "3" || sb1.Launch.Instructions != "Be brief." {
 		t.Fatalf("sandbox from agent_ref: %d %+v", resp.StatusCode, sb1)
 	}
 	resp, body = call(t, "POST", api+"/v1/sandboxes", "alice-tok", map[string]any{"name": "lean", "owner": "alice", "agent_ref": "lean", "idle_timeout": 5}, nil)
@@ -142,7 +142,7 @@ func TestCatalogAcceptance(t *testing.T) {
 	}
 	_, body = call(t, "GET", api+"/v1/sandboxes/"+sb1.ID, "alice-tok", nil, nil)
 	_ = json.Unmarshal(body, &sb1)
-	if sb1.AgentRevision != 1 || sb1.EnvironmentRevision != 1 || sb1.Launch.CPULimit != "3" || sb1.Launch.Env["SANDBOX_INSTRUCTIONS"] != "Be brief." {
+	if sb1.AgentRevision != 1 || sb1.EnvironmentRevision != 1 || sb1.Launch.CPULimit != "3" || sb1.Launch.Instructions != "Be brief." {
 		t.Fatalf("the sandbox keeps the revisions it was built from: %+v", sb1)
 	}
 	// A new sandbox from the same reference gets the new revisions.

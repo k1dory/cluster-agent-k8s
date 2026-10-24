@@ -117,19 +117,22 @@ var ErrNotFound = errors.New("not found")
 var ErrConflict = errors.New("changed concurrently")
 
 // Catalog is the narrow interface the configuration catalogue needs: append-only revisions
-// of named items per tenant. Memory and Postgres implement it next to Store.
+// of named items per (kind, tenant), with a compare-and-append on the latest revision.
+// Revision numbers are never reused: DeleteItem marks the live revisions deleted and keeps
+// them, and the next PutItem under the same name continues from the highest number ever used.
 type Catalog interface {
 	// PutItem appends a revision. expected: -1 accepts any current state, 0 requires that the
-	// item does not exist, N requires the latest revision to be N (ErrConflict otherwise).
-	// The stored revision and time are written back into it.
+	// item does not exist (or is deleted), N requires that the latest live revision is N.
+	// On success it fills Revision and CreatedAt; on a mismatch it returns ErrConflict.
 	PutItem(ctx context.Context, it *model.CatalogItem, expected int) error
-	// GetItem returns revision n (0 = latest) of an item; ErrNotFound when absent.
+	// GetItem returns live revision n (0 = latest) of an item; ErrNotFound when absent or deleted.
 	GetItem(ctx context.Context, kind, tenant, name string, revision int) (*model.CatalogItem, error)
-	// ListItems returns the latest revision of every item of kind in tenant (tenant "" = shared).
+	// ListItems returns the latest live revision of every item of kind in tenant (tenant "" = shared).
 	ListItems(ctx context.Context, kind, tenant string) ([]*model.CatalogItem, error)
-	// ListRevisions returns every revision of an item, oldest first.
+	// ListRevisions returns every revision of an item in order, deleted ones included (they
+	// carry DeletedAt); ErrNotFound when the name was never written.
 	ListRevisions(ctx context.Context, kind, tenant, name string) ([]*model.CatalogItem, error)
-	// DeleteItem removes every revision of an item.
+	// DeleteItem marks every live revision of an item deleted; ErrNotFound when none is live.
 	DeleteItem(ctx context.Context, kind, tenant, name string) error
 }
 

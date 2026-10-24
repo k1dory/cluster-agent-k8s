@@ -137,6 +137,8 @@ CREATE TABLE IF NOT EXISTS catalog_items (
     created_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (kind, tenant, name, revision)
 );
+-- Deletion keeps history: revisions are marked, never removed, and numbers are never reused.
+ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
 ALTER TABLE sandboxes
     ADD COLUMN IF NOT EXISTS agent_ref text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS agent_revision integer NOT NULL DEFAULT 0,
