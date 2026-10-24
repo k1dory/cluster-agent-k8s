@@ -13,11 +13,14 @@ CREATE TABLE IF NOT EXISTS sandboxes (
     pod_name        text NOT NULL DEFAULT '',
     last_activity   timestamptz NOT NULL,
     created_at      timestamptz NOT NULL,
+    expires_at      timestamptz,
     preview_port    integer,
     preview_access  text,
     preview_host    text,
     error           text NOT NULL DEFAULT ''
 );
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS expires_at timestamptz;
+CREATE INDEX IF NOT EXISTS sandboxes_tenant ON sandboxes (tenant, created_at, id);
 CREATE UNIQUE INDEX IF NOT EXISTS sandboxes_preview_host ON sandboxes (preview_host) WHERE preview_host IS NOT NULL;
 
 -- Runs and events are the accounting record: no foreign key to sandboxes, so deleting a
@@ -70,6 +73,7 @@ ALTER TABLE events
     ADD COLUMN IF NOT EXISTS tenant text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS slug text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS events_sandbox ON events (sandbox_id, id);
+CREATE INDEX IF NOT EXISTS events_sandbox_type ON events (sandbox_id, type, id);
 CREATE INDEX IF NOT EXISTS events_tenant ON events (tenant, id);
 CREATE INDEX IF NOT EXISTS events_type_at ON events (type, at);
 
@@ -88,3 +92,12 @@ CREATE TABLE IF NOT EXISTS instances (
     retired_at  timestamptz
 );
 CREATE INDEX IF NOT EXISTS instances_sandbox ON instances (sandbox_id);
+
+-- Stored responses for Idempotency-Key replays (24h).
+CREATE TABLE IF NOT EXISTS idempotency (
+    key        text PRIMARY KEY,
+    status     integer NOT NULL,
+    body       bytea NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency (created_at);

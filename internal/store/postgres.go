@@ -38,14 +38,14 @@ func OpenPostgres(ctx context.Context, url string) (*Postgres, error) {
 func (p *Postgres) Close() error { p.pool.Close(); return nil }
 
 const sandboxCols = `id, name, slug, owner, tenant, repo, idle_timeout, wake_on_preview, status, ip, instance,
-	pod_name, last_activity, created_at, preview_port, preview_access, preview_host, error`
+	pod_name, last_activity, created_at, expires_at, preview_port, preview_access, preview_host, error`
 
 func scanSandbox(row pgx.Row) (*model.Sandbox, error) {
 	var s model.Sandbox
 	var pPort *int
 	var pAccess, pHost *string
 	err := row.Scan(&s.ID, &s.Name, &s.Slug, &s.Owner, &s.Tenant, &s.Repo, &s.IdleTimeout, &s.WakeOnPreview,
-		&s.Status, &s.IP, &s.Instance, &s.PodName, &s.LastActivity, &s.CreatedAt, &pPort, &pAccess, &pHost, &s.Error)
+		&s.Status, &s.IP, &s.Instance, &s.PodName, &s.LastActivity, &s.CreatedAt, &s.ExpiresAt, &pPort, &pAccess, &pHost, &s.Error)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -74,9 +74,9 @@ func previewCols(s *model.Sandbox) (*int, *string, *string) {
 func (p *Postgres) CreateSandbox(ctx context.Context, s *model.Sandbox) error {
 	port, access, host := previewCols(s)
 	_, err := p.pool.Exec(ctx, `INSERT INTO sandboxes (`+sandboxCols+`)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
-		s.PodName, s.LastActivity, s.CreatedAt, port, access, host, s.Error)
+		s.PodName, s.LastActivity, s.CreatedAt, s.ExpiresAt, port, access, host, s.Error)
 	return err
 }
 
@@ -105,13 +105,55 @@ func (p *Postgres) ListSandboxes(ctx context.Context) ([]*model.Sandbox, error) 
 	return out, rows.Err()
 }
 
+func (p *Postgres) QuerySandboxes(ctx context.Context, f SandboxFilter) ([]*model.Sandbox, error) {
+	var conds []string
+	var args []any
+	add := func(c string, v any) {
+		args = append(args, v)
+		conds = append(conds, fmt.Sprintf(c, len(args)))
+	}
+	if f.Tenant != "" {
+		add("tenant=$%d", f.Tenant)
+	}
+	if f.Owner != "" {
+		add("owner=$%d", f.Owner)
+	}
+	if f.Slug != "" {
+		add("slug=$%d", f.Slug)
+	}
+	if f.Status != "" {
+		add("status=$%d", f.Status)
+	}
+	if f.Cursor != "" {
+		add("(created_at, id) > (SELECT created_at, id FROM sandboxes WHERE id=$%d)", f.Cursor)
+	}
+	q := `SELECT ` + sandboxCols + ` FROM sandboxes`
+	if len(conds) > 0 {
+		q += " WHERE " + strings.Join(conds, " AND ")
+	}
+	rows, err := p.pool.Query(ctx, q+` ORDER BY created_at, id`+limitClause(f.Limit, 1000), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.Sandbox
+	for rows.Next() {
+		s, err := scanSandbox(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 func (p *Postgres) UpdateSandbox(ctx context.Context, s *model.Sandbox) error {
 	port, access, host := previewCols(s)
 	tag, err := p.pool.Exec(ctx, `UPDATE sandboxes SET name=$2, slug=$3, owner=$4, tenant=$5, repo=$6, idle_timeout=$7,
-		wake_on_preview=$8, status=$9, ip=$10, instance=$11, pod_name=$12, last_activity=$13,
-		preview_port=$14, preview_access=$15, preview_host=$16, error=$17 WHERE id=$1`,
+		wake_on_preview=$8, status=$9, ip=$10, instance=$11, pod_name=$12, last_activity=$13, expires_at=$14,
+		preview_port=$15, preview_access=$16, preview_host=$17, error=$18 WHERE id=$1`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
-		s.PodName, s.LastActivity, port, access, host, s.Error)
+		s.PodName, s.LastActivity, s.ExpiresAt, port, access, host, s.Error)
 	if err != nil {
 		return err
 	}
@@ -264,6 +306,14 @@ func (f Filter) where(idCol, timeCol string, events bool) (string, []any) {
 			add("id=$%d", f.RunID)
 		}
 	}
+	if !events {
+		if f.Status != "" {
+			add("status=$%d", f.Status)
+		}
+		if f.Cursor != "" {
+			add("(created_at, id) > (SELECT created_at, id FROM runs WHERE id=$%d)", f.Cursor)
+		}
+	}
 	if !f.From.IsZero() {
 		add(timeCol+">=$%d", f.From)
 	}
@@ -293,7 +343,7 @@ func limitClause(n, def int) string {
 
 func (p *Postgres) QueryRuns(ctx context.Context, f Filter) ([]*model.Run, error) {
 	w, args := f.where("id", "created_at", false)
-	return p.queryRuns(ctx, `SELECT `+runCols+` FROM runs`+w+` ORDER BY created_at`+limitClause(f.Limit, 100000), args...)
+	return p.queryRuns(ctx, `SELECT `+runCols+` FROM runs`+w+` ORDER BY created_at, id`+limitClause(f.Limit, 100000), args...)
 }
 
 func (p *Postgres) QueryEvents(ctx context.Context, f Filter) ([]*model.Event, error) {
@@ -319,6 +369,30 @@ func (p *Postgres) CountEvents(ctx context.Context, f Filter) ([]EventCount, err
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+func (p *Postgres) PutIdempotent(ctx context.Context, rec *Idempotent) error {
+	if rec.CreatedAt.IsZero() {
+		rec.CreatedAt = time.Now()
+	}
+	_, _ = p.pool.Exec(ctx, `DELETE FROM idempotency WHERE created_at < now() - $1::interval`, IdempotencyTTL.String())
+	_, err := p.pool.Exec(ctx, `INSERT INTO idempotency (key, status, body, created_at) VALUES ($1,$2,$3,$4)
+		ON CONFLICT (key) DO UPDATE SET status=EXCLUDED.status, body=EXCLUDED.body, created_at=EXCLUDED.created_at`,
+		rec.Key, rec.Status, rec.Body, rec.CreatedAt)
+	return err
+}
+
+func (p *Postgres) GetIdempotent(ctx context.Context, key string) (*Idempotent, error) {
+	var rec Idempotent
+	err := p.pool.QueryRow(ctx, `SELECT key, status, body, created_at FROM idempotency WHERE key=$1 AND created_at >= now() - $2::interval`,
+		key, IdempotencyTTL.String()).Scan(&rec.Key, &rec.Status, &rec.Body, &rec.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
 }
 
 func (p *Postgres) NextInstance(ctx context.Context) (int, error) {

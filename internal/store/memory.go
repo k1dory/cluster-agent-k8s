@@ -16,6 +16,7 @@ type Memory struct {
 	runs      map[string]*model.Run
 	events    []*model.Event
 	instances map[int]*model.Instance
+	idem      map[string]*Idempotent
 	nextInst  int
 	nextEvent int64
 }
@@ -26,6 +27,7 @@ func NewMemory() *Memory {
 		sandboxes: map[string]*model.Sandbox{},
 		runs:      map[string]*model.Run{},
 		instances: map[int]*model.Instance{},
+		idem:      map[string]*Idempotent{},
 	}
 }
 
@@ -251,10 +253,75 @@ func (m *Memory) ListInstances(_ context.Context, sandboxID string) ([]*model.In
 	return out, nil
 }
 
+func (m *Memory) PutIdempotent(_ context.Context, rec *Idempotent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cutoff := time.Now().Add(-IdempotencyTTL)
+	for k, v := range m.idem {
+		if v.CreatedAt.Before(cutoff) {
+			delete(m.idem, k)
+		}
+	}
+	c := *rec
+	if c.CreatedAt.IsZero() {
+		c.CreatedAt = time.Now()
+	}
+	m.idem[rec.Key] = &c
+	return nil
+}
+
+func (m *Memory) GetIdempotent(_ context.Context, key string) (*Idempotent, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.idem[key]
+	if !ok || v.CreatedAt.Before(time.Now().Add(-IdempotencyTTL)) {
+		return nil, ErrNotFound
+	}
+	c := *v
+	return &c, nil
+}
+
 func (m *Memory) Close() error { return nil }
+
+func (m *Memory) QuerySandboxes(_ context.Context, f SandboxFilter) ([]*model.Sandbox, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var all []*model.Sandbox
+	for _, s := range m.sandboxes {
+		if f.Tenant != "" && s.Tenant != f.Tenant || f.Owner != "" && s.Owner != f.Owner ||
+			f.Slug != "" && s.Slug != f.Slug || f.Status != "" && string(s.Status) != f.Status {
+			continue
+		}
+		all = append(all, s)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].CreatedAt.Equal(all[j].CreatedAt) {
+			return all[i].ID < all[j].ID
+		}
+		return all[i].CreatedAt.Before(all[j].CreatedAt)
+	})
+	var out []*model.Sandbox
+	skip := f.Cursor != ""
+	for _, s := range all {
+		if skip {
+			if s.ID == f.Cursor {
+				skip = false
+			}
+			continue
+		}
+		out = append(out, cloneSandbox(s))
+		if f.Limit > 0 && len(out) >= f.Limit {
+			break
+		}
+	}
+	return out, nil
+}
 
 func (f Filter) matchRun(r *model.Run) bool {
 	if f.Tenant != "" && r.Tenant != f.Tenant {
+		return false
+	}
+	if f.Status != "" && string(r.Status) != f.Status {
 		return false
 	}
 	if f.Slug != "" && r.Slug != f.Slug {
@@ -315,16 +382,32 @@ func (f Filter) matchEvent(e *model.Event) bool {
 func (m *Memory) QueryRuns(_ context.Context, f Filter) ([]*model.Run, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	var out []*model.Run
+	var all []*model.Run
 	for _, r := range m.runs {
 		if f.matchRun(r) {
-			c := *r
-			out = append(out, &c)
+			all = append(all, r)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
-	if f.Limit > 0 && len(out) > f.Limit {
-		out = out[:f.Limit]
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].CreatedAt.Equal(all[j].CreatedAt) {
+			return all[i].ID < all[j].ID
+		}
+		return all[i].CreatedAt.Before(all[j].CreatedAt)
+	})
+	var out []*model.Run
+	skip := f.Cursor != ""
+	for _, r := range all {
+		if skip {
+			if r.ID == f.Cursor {
+				skip = false
+			}
+			continue
+		}
+		c := *r
+		out = append(out, &c)
+		if f.Limit > 0 && len(out) >= f.Limit {
+			break
+		}
 	}
 	return out, nil
 }

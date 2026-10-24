@@ -4,6 +4,14 @@ listen:
   gateway: "127.0.0.1:8081" # Caddy → sandboxd, never exposed
   ingress: "127.0.0.1:8082" # Caddy preview site → sandboxd
 api_token: "${SANDBOXD_API_TOKEN}"
+# Tenant-scoped tokens: each sees only its own sandboxes, runs, events, usage and trace.
+# api_tokens:
+#   - { token: "${ACME_TOKEN}", tenant: acme }
+# Quotas per tenant (0 = unlimited); `default` covers tenants not listed.
+quotas:
+  default: { max_sandboxes: 0, max_awake: 0 }
+  # tenants:
+  #   acme: { max_sandboxes: 20, max_awake: 5 }
 database_url: "${DATABASE_URL}"
 policies_dir: /etc/sandbox/policies
 secrets_dir: /etc/sandbox/secrets

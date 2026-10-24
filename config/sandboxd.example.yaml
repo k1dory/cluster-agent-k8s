@@ -4,6 +4,14 @@ listen:
   gateway: "127.0.0.1:8081" # Caddy only: /authz, /bootstrap, /agent/*
   ingress: ":8082"          # preview proxy; Caddy *.preview.<domain> → here
 api_token: "${SANDBOXD_API_TOKEN}"
+# Tenant-scoped tokens: each sees only its own sandboxes, runs, events, usage and trace.
+# api_tokens:
+#   - { token: "${ACME_TOKEN}", tenant: acme }
+# Quotas per tenant (0 = unlimited); `default` covers tenants not listed.
+quotas:
+  default: { max_sandboxes: 0, max_awake: 0 }
+  # tenants:
+  #   acme: { max_sandboxes: 20, max_awake: 5 }
 database_url: "${DATABASE_URL}"   # empty = in-memory (dev only)
 policies_dir: policies
 secrets_dir: /etc/sandbox/secrets  # tenants/<tenant>/<name>, shared/<name>

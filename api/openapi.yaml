@@ -7,10 +7,23 @@ info:
     Kubernetes, the gateway and identities are hidden behind it.
 
     Two audiences:
-    * **Platform API** (`/v1/...`, port 8080): bearer token, used by your client.
+    * **Platform API** (`/v1/...`, port 8080): bearer token, used by your client. The admin token
+      (`api_token`) sees every tenant; a tenant token (`api_tokens[]`) is confined to its tenant:
+      creation forces the tenant, foreign sandboxes answer 403, lists, usage and trace are filtered.
     * **Agent API** (`/agent/...`, port 8081): reached by the agent pod through the mTLS gateway;
       identity comes from the client certificate that Caddy forwards in `X-Agent-Cert`.
       `/authz` and `/bootstrap` on the same port are called by Caddy and the init container.
+
+    Contract notes:
+    * **Errors** are always `{error, code, request_id}`; `code` is stable
+      (`bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `too_large`,
+      `quota_exceeded`, `upstream_failed`, `internal`, `unavailable`). `request_id` also comes back
+      as the `X-Request-Id` header and is in the server log; send your own `X-Request-Id` to correlate.
+    * **Malformed query parameters are 400**, never silently defaulted.
+    * **Paging**: list endpoints take `limit` and `after` (cursor = id of the last item). When a page
+      is full the response carries `X-Next-Cursor`; no header means the end.
+    * **Idempotency**: `POST /v1/sandboxes` and `POST .../runs` honour `Idempotency-Key`; a repeat
+      within 24h (same tenant, route and key) replays the stored response with `Idempotency-Replayed: true`.
 servers:
   - url: http://localhost:8080
     description: platform API
@@ -29,6 +42,13 @@ paths:
     get:
       tags: [sandboxes]
       summary: List sandboxes
+      parameters:
+        - { name: tenant, in: query, schema: { type: string }, description: "Admin only; tenant tokens are scoped already" }
+        - { name: owner, in: query, schema: { type: string } }
+        - { name: slug, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string, enum: [creating, waking, running, stopping, sleeping, deleting, error] } }
+        - { $ref: "#/components/parameters/limit" }
+        - { $ref: "#/components/parameters/after" }
       responses:
         "200":
           description: OK
@@ -40,6 +60,11 @@ paths:
     post:
       tags: [sandboxes]
       summary: Create a sandbox and start its first pod
+      description: |
+        The record is created first; if the cluster then refuses the volume or pod, you still get
+        201 with `status: error` and the reason in `error`. The sandbox is yours to wake again or
+        delete. Supports `Idempotency-Key`. A tenant token forces its tenant (403 for another).
+      parameters: [{ $ref: "#/components/parameters/idempotencyKey" }]
       requestBody:
         required: true
         content:
@@ -47,11 +72,13 @@ paths:
             schema: { $ref: "#/components/schemas/CreateSandbox" }
       responses:
         "201":
-          description: Created (status is `waking` until the pod is ready)
+          description: Created (status is `waking` until the pod is ready, `error` if the cluster refused)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Sandbox" }
         "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
   /v1/sandboxes/{id}:
     parameters: [{ $ref: "#/components/parameters/id" }]
     get:
@@ -63,13 +90,35 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Sandbox" }
+        "403": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [sandboxes]
+      summary: Change settings of a sandbox
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateSandbox" }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Sandbox" }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { $ref: "#/components/responses/Error" }
     delete:
       tags: [sandboxes]
       summary: Delete a sandbox, its pod and its volume
+      description: |
+        204 means pod, volume and record are gone. If the cluster refuses, the answer is 502 and
+        the record stays with `status: deleting` and the reason in `error`; the server retries on
+        its sweep and a repeated DELETE retries at once. Runs and events are kept for accounting.
       responses:
         "204": { description: Deleted }
         "404": { $ref: "#/components/responses/Error" }
+        "502": { $ref: "#/components/responses/Error" }
   /v1/sandboxes/{id}/sleep:
     parameters: [{ $ref: "#/components/parameters/id" }]
     post:
@@ -110,6 +159,10 @@ paths:
     get:
       tags: [runs]
       summary: List runs
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [queued, running, done, failed, cancelled] } }
+        - { $ref: "#/components/parameters/limit" }
+        - { $ref: "#/components/parameters/after" }
       responses:
         "200":
           description: OK
@@ -121,6 +174,11 @@ paths:
     post:
       tags: [runs]
       summary: Queue a task for the agent; wakes a sleeping sandbox
+      description: |
+        The run is stored first. If waking the sandbox fails you still get 202: the run stays
+        queued and starts on the next successful wake; the sandbox shows the failure. Supports
+        `Idempotency-Key`.
+      parameters: [{ $ref: "#/components/parameters/idempotencyKey" }]
       requestBody:
         required: true
         content:
@@ -136,6 +194,8 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Run" }
+        "409": { $ref: "#/components/responses/Error" }
+        "429": { $ref: "#/components/responses/Error" }
   /v1/sandboxes/{id}/runs/{run}:
     parameters:
       - { $ref: "#/components/parameters/id" }
@@ -169,7 +229,7 @@ paths:
       - { name: run, in: path, required: true, schema: { type: string } }
     post:
       tags: [runs]
-      summary: Send a user message to a run in progress
+      summary: Send a user message to a queued or running run
       requestBody:
         required: true
         content:
@@ -178,9 +238,12 @@ paths:
               type: object
               required: [text]
               properties:
-                text: { type: string }
+                text: { type: string, description: "Non-empty; written to the harness stdin" }
       responses:
         "204": { description: Delivered to the event stream }
+        "400": { $ref: "#/components/responses/Error" }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: "Run already finished", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/sandboxes/{id}/events:
     parameters: [{ $ref: "#/components/parameters/id" }]
     get:
@@ -189,7 +252,8 @@ paths:
       description: |
         Default: `text/event-stream`, each message is `id: <event id>`, `event: <type>`, `data: <Event JSON>`.
         Pass `after` (or the `Last-Event-ID` header) to replay from the persisted log, `run` to see one run only.
-        With `stream=false` the same filter returns a JSON array (up to `limit`, default 1000) and closes.
+        With `stream=false` the same filter returns a JSON array (up to `limit`, default 1000) and closes;
+        a full page carries `X-Next-Cursor` (the last event id) for the next `after`.
       parameters:
         - { name: after, in: query, schema: { type: integer, format: int64, default: 0 } }
         - { name: run, in: query, schema: { type: string } }
@@ -240,9 +304,10 @@ paths:
               required: [user]
               properties:
                 user: { type: string }
+                next: { type: string, description: "Path to open after sign-in; must start with /, default /" }
       responses:
         "200":
-          description: Ticket and the callback URL to redirect the browser to
+          description: Ticket and the callback URL to redirect the browser to (ticket and next are URL-escaped)
           content:
             application/json:
               schema:
@@ -250,6 +315,31 @@ paths:
                 properties:
                   ticket: { type: string }
                   redirect: { type: string, format: uri }
+        "409": { description: "Sandbox has no preview", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/whoami:
+    get:
+      tags: [sandboxes]
+      summary: Who the token is
+      responses:
+        "200":
+          description: Principal
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  admin: { type: boolean }
+                  tenant: { type: string, description: "Empty for the admin token" }
+  /openapi.yaml:
+    get:
+      security: []
+      summary: This specification
+      responses: { "200": { description: OpenAPI 3.1 YAML } }
+  /docs:
+    get:
+      security: []
+      summary: Swagger UI for this specification
+      responses: { "200": { description: HTML } }
   /v1/policies:
     get:
       tags: [sandboxes]
@@ -350,19 +440,35 @@ paths:
     post:
       tags: [agent]
       security: [{ mtls: [] }]
-      summary: Append output (one event per line of the body, or a JSON event)
+      summary: Append output (one event per line of the body)
+      description: |
+        Limits: 4 MiB per request, 1 MiB per line. Lines up to the first violation are stored and
+        the 413 message says how many (`stored N lines`), so a retry resumes after them. Lines
+        that carry usage (Claude Code's `result`, generic `{"type":"usage"}`) update the run's accounting.
       requestBody:
         content:
           text/plain:
             schema: { type: string }
       responses:
-        "204": { description: Appended }
+        "200":
+          description: Acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accepted: { type: integer, description: "Lines stored" }
+        "413": { $ref: "#/components/responses/Error" }
   /agent/runs/{run}/input:
     parameters: [{ name: run, in: path, required: true, schema: { type: string } }]
     get:
       tags: [agent]
       security: [{ mtls: [] }]
       summary: Long-poll for user input events addressed to this run
+      description: |
+        Returns `input` and `run.cancel` events with id > `after`, filtered in the store, so a
+        run producing a lot of output cannot push them out of reach. Keep `after` at the id of the
+        last event you received.
       parameters:
         - { name: after, in: query, schema: { type: integer, format: int64 } }
         - { name: wait, in: query, schema: { type: string, default: 30s } }
@@ -465,16 +571,38 @@ components:
       in: path
       required: true
       schema: { type: string }
+    limit:
+      name: limit
+      in: query
+      schema: { type: integer, default: 100, minimum: 1, maximum: 1000 }
+    after:
+      name: after
+      in: query
+      schema: { type: string }
+      description: Cursor from the previous page's `X-Next-Cursor` (the id of its last item)
+    idempotencyKey:
+      name: Idempotency-Key
+      in: header
+      schema: { type: string, maxLength: 200 }
+      description: Repeating the request with the same key within 24h replays the stored 2xx response
   responses:
     Error:
       description: Error
+      headers:
+        X-Request-Id: { schema: { type: string } }
       content:
         application/json:
-          schema:
-            type: object
-            properties:
-              error: { type: string }
+          schema: { $ref: "#/components/schemas/Error" }
   schemas:
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error: { type: string, description: Human-readable message }
+        code:
+          type: string
+          enum: [bad_request, unauthorized, forbidden, not_found, conflict, too_large, quota_exceeded, upstream_failed, internal, unavailable]
+        request_id: { type: string }
     CreateSandbox:
       type: object
       required: [name, slug, owner]
@@ -486,6 +614,15 @@ components:
         repo: { type: string, description: "Repository URL the agent works on" }
         idle_timeout: { type: integer, description: "Seconds without user activity before sleep; 0 = never", default: 3600 }
         wake_on_preview: { type: boolean, default: true }
+        ttl: { type: integer, description: "Seconds until the sandbox is deleted (pod, volume; runs and events stay); absent/0 = keep" }
+    UpdateSandbox:
+      type: object
+      description: Only the fields present are changed
+      properties:
+        repo: { type: string }
+        idle_timeout: { type: integer }
+        wake_on_preview: { type: boolean }
+        ttl: { type: integer, description: "Seconds from now; 0 removes the expiry" }
     Sandbox:
       type: object
       properties:
@@ -497,12 +634,13 @@ components:
         repo: { type: string }
         idle_timeout: { type: integer }
         wake_on_preview: { type: boolean }
-        status: { type: string, enum: [creating, waking, running, stopping, sleeping, error] }
+        status: { type: string, enum: [creating, waking, running, stopping, sleeping, deleting, error] }
         ip: { type: string }
         instance: { type: integer, description: "Current identity number; grows on every wake" }
         pod_name: { type: string }
         last_activity: { type: string, format: date-time }
         created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time, nullable: true, description: "Deleted after this time when set" }
         preview:
           type: object
           nullable: true

@@ -4,6 +4,8 @@ listen:
   gateway: "127.0.0.1:8081"
   ingress: "127.0.0.1:8082"
 api_token: "dev-token"
+api_tokens:
+  - { token: "alice-token", tenant: alice }
 policies_dir: policies
 secrets_dir: var/secrets
 ca:

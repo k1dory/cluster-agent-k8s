@@ -14,6 +14,15 @@ type FakeRuntime struct {
 	pods    map[string]string // sandbox id → ip
 	volumes map[string]bool
 	next    int
+	// FailDelete, when set, makes DeletePod fail (tests of the delete retry path).
+	FailDelete error
+}
+
+// SetFailDelete toggles DeletePod failures.
+func (f *FakeRuntime) SetFailDelete(err error) {
+	f.mu.Lock()
+	f.FailDelete = err
+	f.mu.Unlock()
 }
 
 // NewFakeRuntime returns an empty fake.
@@ -49,6 +58,9 @@ func (f *FakeRuntime) PodStatus(_ context.Context, sb *model.Sandbox) (bool, str
 func (f *FakeRuntime) DeletePod(_ context.Context, sb *model.Sandbox) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.FailDelete != nil {
+		return f.FailDelete
+	}
 	delete(f.pods, sb.ID)
 	return nil
 }

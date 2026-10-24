@@ -86,6 +86,21 @@ sandboxctl preview sb_1234 -port 3000    # https://shop-alice.preview.example.co
 sandboxctl sleep sb_1234                 # or wait an hour of silence
 ```
 
+### API contract in short
+
+- **Tokens.** `api_token` is the admin; `api_tokens[]` are tenant-scoped: creation forces the tenant,
+  foreign sandboxes are 403, lists, usage and trace are filtered. `GET /v1/whoami` tells which you hold.
+- **Errors** are `{error, code, request_id}` with a stable `code`; `X-Request-Id` is echoed and logged.
+  Malformed query parameters are 400, never silently defaulted.
+- **Paging.** `limit` + `after` on lists; a full page returns `X-Next-Cursor`, no header means the end.
+- **Idempotency.** `Idempotency-Key` on `POST /v1/sandboxes` and `POST .../runs` replays the stored
+  response for 24h, so a CI retry after a timeout never creates a second sandbox or run.
+- **Lifecycle.** `ttl` on create or `PATCH` sets `expires_at`; the sweeper deletes expired sandboxes.
+  `PATCH` also changes `idle_timeout`, `wake_on_preview`, `repo`. Per-tenant `quotas` cap
+  `max_sandboxes` and `max_awake` (429 `quota_exceeded`).
+- **Delete** is honest: 204 only when the cluster confirmed; otherwise 502 and the record stays
+  `deleting` with the reason, retried by the sweeper or by your next DELETE.
+
 ## Accounting and trace
 
 Every run keeps what the harness reported (tokens, cost, turns), every gateway decision lands in

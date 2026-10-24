@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -132,20 +133,42 @@ func (g *Gateway) appendOutput(w http.ResponseWriter, r *http.Request, id *ident
 		writeOrchErr(w, err)
 		return
 	}
-	sc := bufio.NewScanner(io.LimitReader(r.Body, 4<<20))
-	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	// Limits: MaxBodyBytes per request, MaxLineBytes per line. Exceeding either is a 413 and
+	// nothing after the offending point is stored; lines before it are, and are acknowledged.
+	sc := bufio.NewScanner(http.MaxBytesReader(w, r.Body, MaxBodyBytes))
+	sc.Buffer(make([]byte, 0, 64<<10), MaxLineBytes)
 	n := 0
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" {
 			continue
 		}
-		g.Orch.Output(r.Context(), id.SandboxID, run.ID, line)
+		if err := g.Orch.Output(r.Context(), id.SandboxID, run.ID, line); err != nil {
+			writeErr(w, http.StatusInternalServerError, fmt.Errorf("stored %d lines, then: %w", n, err))
+			return
+		}
 		n++
 	}
-	w.Header().Set("X-Events", strconv.Itoa(n))
-	w.WriteHeader(http.StatusNoContent)
+	if err := sc.Err(); err != nil {
+		var mbe *http.MaxBytesError
+		switch {
+		case errors.As(err, &mbe):
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("body exceeds %d bytes (stored %d lines)", MaxBodyBytes, n))
+		case errors.Is(err, bufio.ErrTooLong):
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("line exceeds %d bytes (stored %d lines)", MaxLineBytes, n))
+		default:
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("read body (stored %d lines): %w", n, err))
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"accepted": n})
 }
+
+// Output stream limits for POST /agent/runs/{run}/events.
+const (
+	MaxBodyBytes = 4 << 20
+	MaxLineBytes = 1 << 20
+)
 
 func (g *Gateway) pollInput(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
 	run, err := g.ownRun(r, id)
@@ -153,17 +176,24 @@ func (g *Gateway) pollInput(w http.ResponseWriter, r *http.Request, id *identity
 		writeOrchErr(w, err)
 		return
 	}
-	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	if r.URL.Query().Get("after") != "" && err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("after must be an integer event id"))
+		return
+	}
 	deadline := time.Now().Add(waitParam(r))
 	for {
-		evs, err := g.Orch.Store.ListEvents(r.Context(), id.SandboxID, after, 0)
+		// Filter by type in the store, so a run that writes a lot of output cannot push a
+		// message or a cancel beyond the page the poll reads.
+		evs, err := g.Orch.Store.QueryEvents(r.Context(), store.Filter{SandboxID: id.SandboxID, AfterID: after,
+			Types: []string{model.EventInput, model.EventRunCancel}, Limit: 200})
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
 		out := []*model.Event{}
 		for _, e := range evs {
-			if (e.Type == model.EventInput || e.Type == model.EventRunCancel) && (e.RunID == "" || e.RunID == run.ID) {
+			if e.RunID == "" || e.RunID == run.ID {
 				out = append(out, e)
 			}
 		}

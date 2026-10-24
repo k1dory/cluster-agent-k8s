@@ -195,16 +195,65 @@ func streamOutput(c *client, runID string, r io.Reader) {
 	}
 }
 
+// post ships a batch of output lines and insists on an acknowledgement: transient failures
+// are retried, a 413 splits the batch, a single oversized line is dropped with a notice
+// (the control plane keeps lines before it, so a retry never duplicates them).
 func (c *client) post(runID string, lines []string) {
 	body := []byte(strings.Join(lines, "\n") + "\n")
-	req, _ := http.NewRequest(http.MethodPost, c.base+"/agent/runs/"+runID+"/events", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "text/plain")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "agent-runner: post output:", err)
-		return
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<attempt) * 500 * time.Millisecond)
+		}
+		req, _ := http.NewRequest(http.MethodPost, c.base+"/agent/runs/"+runID+"/events", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "text/plain")
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		switch {
+		case resp.StatusCode < 300:
+			return
+		case resp.StatusCode == http.StatusRequestEntityTooLarge:
+			var ack struct {
+				Error string `json:"error"`
+			}
+			_ = json.Unmarshal(data, &ack)
+			stored := storedCount(ack.Error)
+			rest := lines[min(stored, len(lines)):]
+			if len(rest) == len(lines) && len(lines) == 1 {
+				fmt.Fprintf(os.Stderr, "agent-runner: dropping a %d-byte output line: %s\n", len(lines[0]), ack.Error)
+				return
+			}
+			if len(rest) == len(lines) {
+				c.post(runID, rest[:len(rest)/2])
+				c.post(runID, rest[len(rest)/2:])
+				return
+			}
+			c.post(runID, rest)
+			return
+		case resp.StatusCode == http.StatusForbidden, resp.StatusCode == http.StatusNotFound:
+			fmt.Fprintf(os.Stderr, "agent-runner: post output: %s: %s\n", resp.Status, strings.TrimSpace(string(data)))
+			return
+		default:
+			lastErr = fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(data)))
+		}
 	}
-	resp.Body.Close()
+	fmt.Fprintln(os.Stderr, "agent-runner: post output gave up:", lastErr)
+}
+
+// storedCount pulls "stored N lines" out of a 413 message, so a retry resumes after them.
+func storedCount(msg string) int {
+	i := strings.Index(msg, "stored ")
+	if i < 0 {
+		return 0
+	}
+	var n int
+	_, _ = fmt.Sscanf(msg[i:], "stored %d", &n)
+	return n
 }
 
 func forwardInput(ctx context.Context, c *client, runID string, w io.WriteCloser, cancelRun context.CancelFunc) {

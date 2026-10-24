@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -25,19 +27,25 @@ import (
 
 const usage = `sandboxctl <command> [flags]
 
-  create   -name shop -slug backend-dev -owner alice [-tenant t] [-repo url] [-idle 3600]
-  list
+  create   -name shop -slug backend-dev -owner alice [-tenant t] [-repo url] [-idle 3600] [-ttl 86400]
+           [-wake-on-preview=false] [-key idempotency-key]
+  list     [-tenant t] [-owner o] [-slug s] [-status running] [-n 100] [-after cursor]
   get      <sandbox>
-  run      <sandbox> "task text"          queue a task (wakes the sandbox)
-  runs     <sandbox>                      list runs
-  watch    <sandbox> [-run id] [-after n] follow the event stream (SSE)
-  say      <sandbox> <run> "message"      send input to a running agent
+  update   <sandbox> [-idle 600] [-ttl 0] [-wake-on-preview=true] [-repo url]
+  run      <sandbox> "task text" [-key k]  queue a task (wakes the sandbox)
+  runs     <sandbox> [run] [-status queued] [-n 100] [-after cursor]
+  watch    <sandbox> [-run id] [-after n]  follow the event stream (SSE)
+  events   <sandbox> [-run id] [-after n] [-n 1000] [-json]   one JSON page of the log
+  say      <sandbox> <run> "message"       send input to a queued or running agent
   cancel   <sandbox> <run>
   sleep    <sandbox> [-force]
   wake     <sandbox>
+  touch    <sandbox>                       count as user activity (postpones sleep)
   preview  <sandbox> -port 3000 [-access link|sso|members]   (-port 0 removes)
+  ticket   <sandbox> -user alice [-next /path]                sign-in link for a members/sso preview
   delete   <sandbox>
   policies
+  whoami
   usage    [-tenant t] [-slug s] [-sandbox id] [-run id] [-since 720h | -from DATE -to DATE] [-by tenant|slug|sandbox|run|day] [-json]
   trace    [-tenant t] [-slug s] [-sandbox id] [-run id] [-since 24h] [-type egress.deny,run.finished|all] [-n 500] [-f] [-json]
 
@@ -69,6 +77,12 @@ func env(k, def string) string {
 }
 
 func (c *cli) do(method, path string, body any, out any) error {
+	_, err := c.doH(method, path, body, out, nil)
+	return err
+}
+
+// doH is do with extra request headers; it returns the response headers (paging cursors).
+func (c *cli) doH(method, path string, body any, out any, hdr map[string]string) (http.Header, error) {
 	var rd io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -76,30 +90,47 @@ func (c *cli) do(method, path string, body any, out any) error {
 	}
 	req, err := http.NewRequest(method, c.base+path, rd)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	for k, v := range hdr {
+		if v != "" {
+			req.Header.Set(k, v)
+		}
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		var e struct{ Error string }
+		var e struct {
+			Error     string `json:"error"`
+			Code      string `json:"code"`
+			RequestID string `json:"request_id"`
+		}
 		_ = json.Unmarshal(data, &e)
 		if e.Error == "" {
 			e.Error = strings.TrimSpace(string(data))
 		}
-		return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, e.Error)
+		msg := fmt.Sprintf("%s %s: %s: %s", method, path, resp.Status, e.Error)
+		if e.Code != "" {
+			msg += " [" + e.Code
+			if e.RequestID != "" {
+				msg += " rid=" + e.RequestID
+			}
+			msg += "]"
+		}
+		return resp.Header, errors.New(msg)
 	}
 	if out != nil && len(data) > 0 {
-		return json.Unmarshal(data, out)
+		return resp.Header, json.Unmarshal(data, out)
 	}
-	return nil
+	return resp.Header, nil
 }
 
 func printJSON(v any) {
@@ -132,32 +163,65 @@ func (c *cli) run(cmd string, args []string) error {
 		tenant := fs.String("tenant", "", "tenant (defaults to owner)")
 		repo := fs.String("repo", "", "repository URL")
 		idle := fs.Int("idle", -1, "idle timeout seconds (default server-side 3600, 0 = never)")
+		ttl := fs.Int("ttl", 0, "delete the sandbox after this many seconds (0 = keep)")
+		wop := fs.Bool("wake-on-preview", true, "wake a sleeping sandbox when its preview is opened")
+		key := fs.String("key", "", "Idempotency-Key: a repeat with the same key returns the same sandbox")
 		_ = fs.Parse(flags)
-		req := map[string]any{"name": *name, "slug": *slug, "owner": *owner, "tenant": *tenant, "repo": *repo}
+		req := map[string]any{"name": *name, "slug": *slug, "owner": *owner, "tenant": *tenant, "repo": *repo, "wake_on_preview": *wop}
 		if *idle >= 0 {
 			req["idle_timeout"] = *idle
 		}
+		if *ttl > 0 {
+			req["ttl"] = *ttl
+		}
 		var sb model.Sandbox
-		if err := c.do("POST", "/v1/sandboxes", req, &sb); err != nil {
+		if _, err := c.doH("POST", "/v1/sandboxes", req, &sb, map[string]string{"Idempotency-Key": *key}); err != nil {
 			return err
 		}
 		printJSON(sb)
 	case "list":
+		q := url.Values{}
+		for _, name := range []string{"tenant", "owner", "slug", "status", "after"} {
+			name := name
+			fs.Func(name, "filter: "+name, func(v string) error { q.Set(name, v); return nil })
+		}
+		n := fs.Int("n", 100, "page size")
+		_ = fs.Parse(flags)
+		q.Set("limit", fmt.Sprint(*n))
 		var sbs []model.Sandbox
-		if err := c.do("GET", "/v1/sandboxes", nil, &sbs); err != nil {
+		hdr, err := c.doH("GET", "/v1/sandboxes?"+q.Encode(), nil, &sbs, nil)
+		if err != nil {
 			return err
 		}
 		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "ID\tNAME\tSLUG\tOWNER\tSTATUS\tIP\tN\tIDLE\tPREVIEW")
+		fmt.Fprintln(tw, "ID\tNAME\tSLUG\tOWNER\tTENANT\tSTATUS\tIP\tN\tIDLE\tEXPIRES\tPREVIEW")
 		for _, s := range sbs {
-			pv := ""
+			pv, exp := "", ""
 			if s.Preview != nil {
 				pv = fmt.Sprintf("%s:%d (%s)", s.Preview.Host, s.Preview.Port, s.Preview.Access)
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", s.ID, s.Name, s.Slug, s.Owner, s.Status, s.IP, s.Instance,
-				time.Since(s.LastActivity).Round(time.Second), pv)
+			if s.ExpiresAt != nil {
+				exp = time.Until(*s.ExpiresAt).Round(time.Minute).String()
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\t%s\n", s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Status, s.IP, s.Instance,
+				time.Since(s.LastActivity).Round(time.Second), exp, pv)
 		}
 		tw.Flush()
+		if cur := hdr.Get("X-Next-Cursor"); cur != "" {
+			fmt.Fprintf(os.Stderr, "more: -after %s\n", cur)
+		}
+	case "update":
+		req := map[string]any{}
+		fs.Func("idle", "idle timeout seconds (0 = never)", func(v string) error { n, err := strconv.Atoi(v); req["idle_timeout"] = n; return err })
+		fs.Func("ttl", "seconds from now until deletion (0 removes the expiry)", func(v string) error { n, err := strconv.Atoi(v); req["ttl"] = n; return err })
+		fs.Func("wake-on-preview", "true | false", func(v string) error { b, err := strconv.ParseBool(v); req["wake_on_preview"] = b; return err })
+		fs.Func("repo", "repository URL", func(v string) error { req["repo"] = v; return nil })
+		_ = fs.Parse(flags)
+		var sb model.Sandbox
+		if err := c.do("PATCH", "/v1/sandboxes/"+need(pos, 0, "sandbox"), req, &sb); err != nil {
+			return err
+		}
+		printJSON(sb)
 	case "get":
 		_ = fs.Parse(flags)
 		var sb model.Sandbox
@@ -166,29 +230,94 @@ func (c *cli) run(cmd string, args []string) error {
 		}
 		printJSON(sb)
 	case "run":
+		key := fs.String("key", "", "Idempotency-Key: a repeat with the same key returns the same run")
 		_ = fs.Parse(flags)
 		id, task := need(pos, 0, "sandbox"), need(pos, 1, "task")
 		var r model.Run
-		if err := c.do("POST", "/v1/sandboxes/"+id+"/runs", map[string]string{"task": task}, &r); err != nil {
+		if _, err := c.doH("POST", "/v1/sandboxes/"+id+"/runs", map[string]string{"task": task}, &r, map[string]string{"Idempotency-Key": *key}); err != nil {
 			return err
 		}
 		printJSON(r)
 	case "runs":
+		q := url.Values{}
+		for _, name := range []string{"status", "after"} {
+			name := name
+			fs.Func(name, "filter: "+name, func(v string) error { q.Set(name, v); return nil })
+		}
+		n := fs.Int("n", 100, "page size")
 		_ = fs.Parse(flags)
+		if len(pos) > 1 {
+			var r model.Run
+			if err := c.do("GET", "/v1/sandboxes/"+pos[0]+"/runs/"+pos[1], nil, &r); err != nil {
+				return err
+			}
+			printJSON(r)
+			return nil
+		}
+		q.Set("limit", fmt.Sprint(*n))
 		var rs []model.Run
-		if err := c.do("GET", "/v1/sandboxes/"+need(pos, 0, "sandbox")+"/runs", nil, &rs); err != nil {
+		hdr, err := c.doH("GET", "/v1/sandboxes/"+need(pos, 0, "sandbox")+"/runs?"+q.Encode(), nil, &rs, nil)
+		if err != nil {
 			return err
 		}
 		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "RUN\tSTATUS\tEXIT\tCREATED\tTASK")
+		fmt.Fprintln(tw, "RUN\tSTATUS\tEXIT\tCOST $\tTOKENS IN/OUT\tCREATED\tTASK")
 		for _, r := range rs {
 			t := strings.ReplaceAll(r.Task, "\n", " ")
 			if len(t) > 60 {
 				t = t[:60] + "…"
 			}
-			fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\n", r.ID, r.Status, r.ExitCode, r.CreatedAt.Format(time.RFC3339), t)
+			fmt.Fprintf(tw, "%s\t%s\t%d\t%.4f\t%d/%d\t%s\t%s\n", r.ID, r.Status, r.ExitCode, r.Usage.CostUSD, r.Usage.InputTokens, r.Usage.OutputTokens,
+				r.CreatedAt.Format(time.RFC3339), t)
 		}
 		tw.Flush()
+		if cur := hdr.Get("X-Next-Cursor"); cur != "" {
+			fmt.Fprintf(os.Stderr, "more: -after %s\n", cur)
+		}
+	case "events":
+		runID := fs.String("run", "", "only this run")
+		after := fs.Int64("after", 0, "events after this id")
+		n := fs.Int("n", 1000, "page size")
+		raw := fs.Bool("json", false, "print raw event JSON")
+		_ = fs.Parse(flags)
+		path := fmt.Sprintf("/v1/sandboxes/%s/events?stream=false&after=%d&limit=%d", need(pos, 0, "sandbox"), *after, *n)
+		if *runID != "" {
+			path += "&run=" + url.QueryEscape(*runID)
+		}
+		var evs []model.Event
+		hdr, err := c.doH("GET", path, nil, &evs, nil)
+		if err != nil {
+			return err
+		}
+		for _, e := range evs {
+			if *raw {
+				b, _ := json.Marshal(e)
+				fmt.Println(string(b))
+			} else {
+				printTrace(e)
+			}
+		}
+		if cur := hdr.Get("X-Next-Cursor"); cur != "" {
+			fmt.Fprintf(os.Stderr, "more: -after %s\n", cur)
+		}
+	case "touch":
+		_ = fs.Parse(flags)
+		return c.do("POST", "/v1/sandboxes/"+need(pos, 0, "sandbox")+"/touch", nil, nil)
+	case "ticket":
+		user := fs.String("user", "", "user the ticket is issued to")
+		next := fs.String("next", "/", "path to open after sign-in")
+		_ = fs.Parse(flags)
+		var out map[string]string
+		if err := c.do("POST", "/v1/sandboxes/"+need(pos, 0, "sandbox")+"/preview/ticket", map[string]string{"user": *user, "next": *next}, &out); err != nil {
+			return err
+		}
+		fmt.Println(out["redirect"])
+	case "whoami":
+		var out map[string]any
+		if err := c.do("GET", "/v1/whoami", nil, &out); err != nil {
+			return err
+		}
+		printJSON(out)
 	case "watch":
 		runID := fs.String("run", "", "only this run")
 		after := fs.Int64("after", 0, "replay from event id")

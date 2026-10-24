@@ -16,10 +16,27 @@ type Filter struct {
 	Slug      string
 	SandboxID string
 	RunID     string
+	Status    string   // runs only
 	Types     []string // events only
 	From, To  time.Time
-	AfterID   int64 // events only: pagination cursor
+	AfterID   int64  // events only: pagination cursor
+	Cursor    string // runs only: id of the last run of the previous page
 	Limit     int
+}
+
+// SandboxFilter selects sandboxes for a list page.
+type SandboxFilter struct {
+	Tenant, Owner, Slug, Status string
+	Cursor                      string // id of the last sandbox of the previous page
+	Limit                       int
+}
+
+// Idempotent is a stored response, replayed when a client repeats a request with the same key.
+type Idempotent struct {
+	Key       string
+	Status    int
+	Body      []byte
+	CreatedAt time.Time
 }
 
 // EventCount is one row of a GROUP BY over events.
@@ -38,6 +55,8 @@ type Store interface {
 	CreateSandbox(ctx context.Context, s *model.Sandbox) error
 	GetSandbox(ctx context.Context, id string) (*model.Sandbox, error)
 	ListSandboxes(ctx context.Context) ([]*model.Sandbox, error)
+	// QuerySandboxes returns one page matching f, ordered by creation.
+	QuerySandboxes(ctx context.Context, f SandboxFilter) ([]*model.Sandbox, error)
 	UpdateSandbox(ctx context.Context, s *model.Sandbox) error
 	DeleteSandbox(ctx context.Context, id string) error
 	SandboxByPreviewHost(ctx context.Context, host string) (*model.Sandbox, error)
@@ -65,5 +84,12 @@ type Store interface {
 	RetireInstance(ctx context.Context, n int) error
 	ListInstances(ctx context.Context, sandboxID string) ([]*model.Instance, error)
 
+	// PutIdempotent stores a response under key; GetIdempotent returns ErrNotFound when unknown or expired.
+	PutIdempotent(ctx context.Context, rec *Idempotent) error
+	GetIdempotent(ctx context.Context, key string) (*Idempotent, error)
+
 	Close() error
 }
+
+// IdempotencyTTL is how long a stored response is replayed.
+const IdempotencyTTL = 24 * time.Hour

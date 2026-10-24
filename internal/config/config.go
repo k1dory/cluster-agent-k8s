@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"agent-sandbox/internal/orchestrator"
 )
 
 // Config is the whole sandboxd configuration. Secrets (API token, DB URL) are referenced
@@ -18,7 +20,17 @@ type Config struct {
 		Gateway string `yaml:"gateway"` // Caddy-facing, default 127.0.0.1:8081
 		Ingress string `yaml:"ingress"` // preview proxy, default :8082 ("" disables)
 	} `yaml:"listen"`
-	APIToken    string `yaml:"api_token"`
+	APIToken string `yaml:"api_token"` // admin token: every tenant
+	// Tenant-scoped tokens: a client holding one sees and creates only that tenant's sandboxes.
+	APITokens []struct {
+		Token  string `yaml:"token"`
+		Tenant string `yaml:"tenant"`
+	} `yaml:"api_tokens"`
+	// Quotas per tenant; `default` applies to tenants not listed. Zero = unlimited.
+	Quotas struct {
+		Default orchestrator.Quota            `yaml:"default"`
+		Tenants map[string]orchestrator.Quota `yaml:"tenants"`
+	} `yaml:"quotas"`
 	DatabaseURL string `yaml:"database_url"` // empty → in-memory store
 	PoliciesDir string `yaml:"policies_dir"`
 	SecretsDir  string `yaml:"secrets_dir"`
@@ -123,6 +135,14 @@ func Load(path string) (*Config, error) {
 	}
 	if c.Preview.Domain == "" {
 		c.Preview.Domain = "preview.localhost"
+	}
+	for i, t := range c.APITokens {
+		if t.Token == "" || t.Tenant == "" {
+			return nil, fmt.Errorf("%s: api_tokens[%d]: token and tenant are required", path, i)
+		}
+		if t.Token == c.APIToken {
+			return nil, fmt.Errorf("%s: api_tokens[%d]: same value as api_token", path, i)
+		}
 	}
 	switch c.Accounting.EgressTrace {
 	case "":

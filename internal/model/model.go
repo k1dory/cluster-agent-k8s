@@ -12,6 +12,7 @@ const (
 	StatusSleeping SandboxStatus = "sleeping"
 	StatusWaking   SandboxStatus = "waking"
 	StatusStopping SandboxStatus = "stopping"
+	StatusDeleting SandboxStatus = "deleting" // delete requested; pod/volume removal pending or failed (see Error)
 	StatusError    SandboxStatus = "error"
 )
 
@@ -45,6 +46,7 @@ type Sandbox struct {
 	PodName       string        `json:"pod_name,omitempty"`
 	LastActivity  time.Time     `json:"last_activity"`
 	CreatedAt     time.Time     `json:"created_at"`
+	ExpiresAt     *time.Time    `json:"expires_at,omitempty"` // when set, the sandbox is deleted after this time
 	Preview       *Preview      `json:"preview,omitempty"`
 	Error         string        `json:"error,omitempty"`
 }

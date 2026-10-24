@@ -3,13 +3,17 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -31,8 +35,21 @@ type Platform struct {
 	Policies *policy.Set
 	Ingress  *ingress.Handler
 	Pricing  usage.Pricing
-	Token    string
+	Token    string            // admin token: every tenant, every sandbox
+	Tenants  map[string]string // tenant-scoped tokens: token → tenant
 	Log      *slog.Logger
+}
+
+// principal is who is calling: the admin (tenant "") or one tenant.
+type principal struct{ tenant string }
+
+func (pr principal) admin() bool { return pr.tenant == "" }
+
+type principalKey struct{}
+
+func principalOf(r *http.Request) principal {
+	pr, _ := r.Context().Value(principalKey{}).(principal)
+	return pr
 }
 
 // Routes builds the platform mux.
@@ -46,14 +63,15 @@ func (p *Platform) Routes() http.Handler {
 	mux.HandleFunc("GET /docs", swaggerUI)
 
 	mux.HandleFunc("GET /v1/sandboxes", p.auth(p.list))
-	mux.HandleFunc("POST /v1/sandboxes", p.auth(p.create))
+	mux.HandleFunc("POST /v1/sandboxes", p.auth(p.idempotent(p.create)))
 	mux.HandleFunc("GET /v1/sandboxes/{id}", p.auth(p.get))
+	mux.HandleFunc("PATCH /v1/sandboxes/{id}", p.auth(p.update))
 	mux.HandleFunc("DELETE /v1/sandboxes/{id}", p.auth(p.delete))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/sleep", p.auth(p.sleep))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/wake", p.auth(p.wake))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/touch", p.auth(p.touch))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/runs", p.auth(p.listRuns))
-	mux.HandleFunc("POST /v1/sandboxes/{id}/runs", p.auth(p.createRun))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/runs", p.auth(p.idempotent(p.createRun)))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/runs/{run}", p.auth(p.getRun))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/runs/{run}/cancel", p.auth(p.cancelRun))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/runs/{run}/input", p.auth(p.input))
@@ -65,57 +83,490 @@ func (p *Platform) Routes() http.Handler {
 	}))
 	mux.HandleFunc("GET /v1/usage", p.auth(p.usage))
 	mux.HandleFunc("GET /v1/trace", p.auth(p.trace))
+	mux.HandleFunc("GET /v1/whoami", p.auth(func(w http.ResponseWriter, r *http.Request) {
+		pr := principalOf(r)
+		writeJSON(w, http.StatusOK, map[string]any{"admin": pr.admin(), "tenant": pr.tenant})
+	}))
 	return logRequests(p.Log, mux)
 }
 
-// window reads from/to (RFC 3339 or YYYY-MM-DD) and since (duration back from now).
-func window(r *http.Request, now time.Time) (from, to time.Time, err error) {
-	parse := func(v string) (time.Time, error) {
-		if t, err := time.Parse(time.RFC3339, v); err == nil {
-			return t, nil
+// auth resolves the bearer token to a principal: the admin token sees everything, a tenant
+// token is confined to its tenant's sandboxes, runs, events, usage and trace.
+func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if p.Token == "" && len(p.Tenants) == 0 {
+			writeErr(w, http.StatusServiceUnavailable, errors.New("API tokens not configured"))
+			return
 		}
-		return time.Parse("2006-01-02", v)
+		got := []byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		var pr *principal
+		if p.Token != "" && subtle.ConstantTimeCompare(got, []byte(p.Token)) == 1 {
+			pr = &principal{}
+		}
+		for tok, tenant := range p.Tenants { // no early exit: timing stays independent of the match position
+			if subtle.ConstantTimeCompare(got, []byte(tok)) == 1 && pr == nil {
+				pr = &principal{tenant: tenant}
+			}
+		}
+		if pr == nil {
+			writeErr(w, http.StatusUnauthorized, errors.New("bad token"))
+			return
+		}
+		next(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, *pr)))
 	}
-	q := r.URL.Query()
-	if v := q.Get("from"); v != "" {
-		if from, err = parse(v); err != nil {
-			return from, to, fmt.Errorf("from: %w", err)
+}
+
+// sandbox loads the sandbox of the request and enforces tenant ownership.
+func (p *Platform) sandbox(w http.ResponseWriter, r *http.Request) (*model.Sandbox, bool) {
+	sb, err := p.Orch.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeOrchErr(w, err)
+		return nil, false
+	}
+	if pr := principalOf(r); !pr.admin() && sb.Tenant != pr.tenant {
+		writeErr(w, http.StatusForbidden, errors.New("sandbox belongs to another tenant"))
+		return nil, false
+	}
+	return sb, true
+}
+
+// tenantScope narrows a requested tenant filter to what the caller may see.
+func tenantScope(w http.ResponseWriter, r *http.Request, requested string) (string, bool) {
+	pr := principalOf(r)
+	if pr.admin() {
+		return requested, true
+	}
+	if requested != "" && requested != pr.tenant {
+		writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.tenant))
+		return "", false
+	}
+	return pr.tenant, true
+}
+
+// idempotent replays the stored response when the client repeats a request with the same
+// Idempotency-Key (per tenant and route, 24h). Only 2xx responses are stored.
+func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		key := r.Header.Get("Idempotency-Key")
+		if key == "" {
+			next(w, r)
+			return
+		}
+		if len(key) > 200 {
+			writeErr(w, http.StatusBadRequest, errors.New("Idempotency-Key longer than 200 bytes"))
+			return
+		}
+		full := principalOf(r).tenant + "|" + r.Method + " " + r.URL.Path + "|" + key
+		if rec, err := p.Orch.Store.GetIdempotent(r.Context(), full); err == nil {
+			w.Header().Set("Idempotency-Replayed", "true")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(rec.Status)
+			w.Write(rec.Body)
+			return
+		}
+		rec := &recorder{ResponseWriter: w, code: 200}
+		next(rec, r)
+		if rec.code >= 200 && rec.code < 300 {
+			if err := p.Orch.Store.PutIdempotent(r.Context(), &store.Idempotent{Key: full, Status: rec.code, Body: rec.body.Bytes()}); err != nil {
+				p.Log.Warn("store idempotent response", "err", err)
+			}
 		}
 	}
-	if v := q.Get("to"); v != "" {
-		if to, err = parse(v); err != nil {
-			return from, to, fmt.Errorf("to: %w", err)
-		}
+}
+
+type recorder struct {
+	http.ResponseWriter
+	code int
+	body bytes.Buffer
+}
+
+func (rc *recorder) WriteHeader(c int) { rc.code = c; rc.ResponseWriter.WriteHeader(c) }
+func (rc *recorder) Write(b []byte) (int, error) {
+	rc.body.Write(b)
+	return rc.ResponseWriter.Write(b)
+}
+
+func (p *Platform) list(w http.ResponseWriter, r *http.Request) {
+	q := &query{r: r}
+	f := store.SandboxFilter{Owner: q.str("owner"), Slug: q.str("slug"), Cursor: q.str("after"),
+		Status: q.oneOf("status", "", "creating", "waking", "running", "stopping", "sleeping", "deleting", "error"),
+		Limit:  q.limit(100, 1000)}
+	if q.err != nil {
+		writeErr(w, http.StatusBadRequest, q.err)
+		return
 	}
-	if v := q.Get("since"); v != "" {
-		d, err := time.ParseDuration(v)
+	tenant, ok := tenantScope(w, r, q.str("tenant"))
+	if !ok {
+		return
+	}
+	f.Tenant = tenant
+	sbs, err := p.Orch.Store.QuerySandboxes(r.Context(), f)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if sbs == nil {
+		sbs = []*model.Sandbox{}
+	}
+	if len(sbs) == f.Limit {
+		w.Header().Set("X-Next-Cursor", sbs[len(sbs)-1].ID)
+	}
+	writeJSON(w, http.StatusOK, sbs)
+}
+
+func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
+	var req orchestrator.CreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if pr := principalOf(r); !pr.admin() {
+		if req.Tenant != "" && req.Tenant != pr.tenant {
+			writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.tenant))
+			return
+		}
+		req.Tenant = pr.tenant
+	}
+	sb, err := p.Orch.Create(r.Context(), req)
+	if err != nil && sb == nil {
+		writeOrchErr(w, err)
+		return
+	}
+	// A runtime failure after the record exists is reported through the sandbox itself
+	// (status error, error text); the client owns the record and can wake or delete it.
+	writeJSON(w, http.StatusCreated, sb)
+}
+
+func (p *Platform) get(w http.ResponseWriter, r *http.Request) {
+	if sb, ok := p.sandbox(w, r); ok {
+		writeJSON(w, http.StatusOK, sb)
+	}
+}
+
+func (p *Platform) update(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	var req orchestrator.UpdateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	sb, err := p.Orch.Update(r.Context(), r.PathValue("id"), req)
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sb)
+}
+
+// delete removes the sandbox. 204 means pod, volume and record are gone; 502 means the
+// cluster refused and the record stays in status `deleting` for a retry (ours or yours).
+func (p *Platform) delete(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	if err := p.Orch.Delete(r.Context(), r.PathValue("id")); err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (p *Platform) sleep(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	q := &query{r: r}
+	force := q.boolean("force", false)
+	if q.err != nil {
+		writeErr(w, http.StatusBadRequest, q.err)
+		return
+	}
+	sb, err := p.Orch.Sleep(r.Context(), r.PathValue("id"), force)
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sb)
+}
+
+func (p *Platform) wake(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	sb, err := p.Orch.Wake(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sb)
+}
+
+func (p *Platform) touch(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	p.Orch.Touch(r.Context(), r.PathValue("id"))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (p *Platform) listRuns(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	q := &query{r: r}
+	f := store.Filter{SandboxID: r.PathValue("id"), Cursor: q.str("after"), Limit: q.limit(100, 1000),
+		Status: q.oneOf("status", "", "queued", "running", "done", "failed", "cancelled")}
+	if q.err != nil {
+		writeErr(w, http.StatusBadRequest, q.err)
+		return
+	}
+	runs, err := p.Orch.Store.QueryRuns(r.Context(), f)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if runs == nil {
+		runs = []*model.Run{}
+	}
+	if len(runs) == f.Limit {
+		w.Header().Set("X-Next-Cursor", runs[len(runs)-1].ID)
+	}
+	writeJSON(w, http.StatusOK, runs)
+}
+
+func (p *Platform) createRun(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	var req struct {
+		Task string `json:"task"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	run, err := p.Orch.CreateRun(r.Context(), r.PathValue("id"), req.Task)
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, run)
+}
+
+func (p *Platform) ownRun(w http.ResponseWriter, r *http.Request) (*model.Run, bool) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return nil, false
+	}
+	run, err := p.Orch.Store.GetRun(r.Context(), r.PathValue("run"))
+	if err != nil || run.SandboxID != r.PathValue("id") {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("run %s: %w", r.PathValue("run"), store.ErrNotFound))
+		return nil, false
+	}
+	return run, true
+}
+
+func (p *Platform) getRun(w http.ResponseWriter, r *http.Request) {
+	if run, ok := p.ownRun(w, r); ok {
+		writeJSON(w, http.StatusOK, run)
+	}
+}
+
+func (p *Platform) cancelRun(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.ownRun(w, r); !ok {
+		return
+	}
+	run, err := p.Orch.CancelRun(r.Context(), r.PathValue("id"), r.PathValue("run"))
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+func (p *Platform) input(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := p.Orch.Input(r.Context(), r.PathValue("id"), r.PathValue("run"), req.Text); err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// events streams persisted events after ?after (or Last-Event-ID) and then live ones.
+// With stream=false it returns one JSON page; X-Next-Cursor is set when the page is full.
+func (p *Platform) events(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	id := r.PathValue("id")
+	q := &query{r: r}
+	f := store.Filter{SandboxID: id, RunID: q.str("run"), AfterID: q.int64("after", 0)}
+	if v := r.Header.Get("Last-Event-ID"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
 		if err != nil {
-			return from, to, fmt.Errorf("since: %w", err)
+			writeErr(w, http.StatusBadRequest, errors.New("Last-Event-ID must be an integer"))
+			return
 		}
-		from = now.Add(-d)
+		f.AfterID = n
 	}
-	return from, to, nil
+	stream := q.boolean("stream", true)
+	limit := q.limit(1000, 5000)
+	if q.err != nil {
+		writeErr(w, http.StatusBadRequest, q.err)
+		return
+	}
+	if !stream {
+		f.Limit = limit
+		evs, err := p.Orch.Store.QueryEvents(r.Context(), f)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		if evs == nil {
+			evs = []*model.Event{}
+		}
+		if len(evs) == limit {
+			w.Header().Set("X-Next-Cursor", strconv.FormatInt(evs[len(evs)-1].ID, 10))
+		}
+		writeJSON(w, http.StatusOK, evs)
+		return
+	}
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+
+	ch, cancel := p.Hub.Subscribe(id)
+	defer cancel()
+	send := func(e model.Event) {
+		b, _ := json.Marshal(e)
+		fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Type, b)
+		fl.Flush()
+	}
+	// Replay, then live. Events published during replay are buffered in the channel.
+	for {
+		f.Limit = 500
+		evs, err := p.Orch.Store.QueryEvents(r.Context(), f)
+		if err != nil || len(evs) == 0 {
+			break
+		}
+		for _, e := range evs {
+			send(*e)
+			f.AfterID = e.ID
+		}
+	}
+	after := f.AfterID
+	keepalive := time.NewTicker(20 * time.Second)
+	defer keepalive.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case e := <-ch:
+			if e.ID > after {
+				if f.RunID == "" || e.RunID == f.RunID {
+					send(e)
+				}
+				after = e.ID
+			}
+		case <-keepalive.C:
+			fmt.Fprint(w, ": keepalive\n\n")
+			fl.Flush()
+		}
+	}
+}
+
+func (p *Platform) setPreview(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	var req struct {
+		Port   int    `json:"port"`
+		Access string `json:"access"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	sb, err := p.Orch.SetPreview(r.Context(), r.PathValue("id"), req.Port, req.Access)
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, sb)
+}
+
+func (p *Platform) previewTicket(w http.ResponseWriter, r *http.Request) {
+	sb, ok := p.sandbox(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		User string `json:"user"`
+		Next string `json:"next"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if sb.Preview == nil {
+		writeErr(w, http.StatusConflict, errors.New("sandbox has no preview"))
+		return
+	}
+	if p.Ingress == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("ingress disabled"))
+		return
+	}
+	next := req.Next
+	if next == "" || !strings.HasPrefix(next, "/") {
+		next = "/"
+	}
+	t := p.Ingress.SignTicket(sb.Preview.Host, req.User, time.Minute)
+	writeJSON(w, http.StatusOK, map[string]string{
+		"ticket":   t,
+		"redirect": fmt.Sprintf("https://%s/__sandbox/auth?ticket=%s&next=%s", sb.Preview.Host, url.QueryEscape(t), url.QueryEscape(next)),
+	})
 }
 
 // usage answers GET /v1/usage: cost and consumption per tenant / slug / sandbox / run / day.
 func (p *Platform) usage(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
-	from, to, err := window(r, now)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	q := &query{r: r}
+	from, to := q.when("from"), q.when("to")
+	if d := q.duration("since"); d > 0 {
+		from = now.Add(-d)
+	}
+	groupBy := q.oneOf("group_by", "", usage.ByTenant, usage.BySlug, usage.BySandbox, usage.ByRun, usage.ByDay)
+	if q.err != nil {
+		writeErr(w, http.StatusBadRequest, q.err)
 		return
 	}
-	q := r.URL.Query()
+	tenant, ok := tenantScope(w, r, q.str("tenant"))
+	if !ok {
+		return
+	}
 	rep, err := usage.Build(r.Context(), p.Orch.Store, usage.Query{
-		Tenant: q.Get("tenant"), Slug: q.Get("slug"), SandboxID: q.Get("sandbox"), RunID: q.Get("run"),
-		From: from, To: to, GroupBy: q.Get("group_by"),
+		Tenant: tenant, Slug: q.str("slug"), SandboxID: q.str("sandbox"), RunID: q.str("run"),
+		From: from, To: to, GroupBy: groupBy,
 	}, p.Pricing, now)
 	if err != nil {
-		code := http.StatusInternalServerError
-		if strings.HasPrefix(err.Error(), "group_by") {
-			code = http.StatusBadRequest
-		}
-		writeErr(w, code, err)
+		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
 	if rep.Rows == nil {
@@ -125,27 +576,37 @@ func (p *Platform) usage(w http.ResponseWriter, r *http.Request) {
 }
 
 // trace answers GET /v1/trace: the event log across sandboxes, filtered by tenant / slug /
-// sandbox / run / type. JSON page by default; stream=true follows live over SSE.
+// sandbox / run / type. JSON page by default (X-Next-Cursor when full); stream=true follows live over SSE.
 func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
-	from, to, err := window(r, now)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	q := &query{r: r}
+	from, to := q.when("from"), q.when("to")
+	if d := q.duration("since"); d > 0 {
+		from = now.Add(-d)
+	}
+	after := q.int64("after", 0)
+	if v := r.Header.Get("Last-Event-ID"); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, errors.New("Last-Event-ID must be an integer"))
+			return
+		}
+		after = n
+	}
+	limit := q.limit(500, 5000)
+	stream := q.boolean("stream", false)
+	if q.err != nil {
+		writeErr(w, http.StatusBadRequest, q.err)
 		return
 	}
-	q := r.URL.Query()
-	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
-	if v := r.Header.Get("Last-Event-ID"); v != "" {
-		after, _ = strconv.ParseInt(v, 10, 64)
+	tenant, ok := tenantScope(w, r, q.str("tenant"))
+	if !ok {
+		return
 	}
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	if limit <= 0 || limit > 5000 {
-		limit = 500
-	}
-	f := store.Filter{Tenant: q.Get("tenant"), Slug: q.Get("slug"), SandboxID: q.Get("sandbox"), RunID: q.Get("run"),
+	f := store.Filter{Tenant: tenant, Slug: q.str("slug"), SandboxID: q.str("sandbox"), RunID: q.str("run"),
 		From: from, To: to, AfterID: after, Limit: limit}
 	// Agent output is the bulk of the log; a trace is about what happened, so it is opt-in.
-	switch t := q.Get("type"); t {
+	switch t := q.str("type"); t {
 	case "":
 		f.Types = []string{model.EventStatus, model.EventRunQueued, model.EventRunStart, model.EventRunDone,
 			model.EventRunCancel, model.EventInput, model.EventEgressOK, model.EventEgressDen}
@@ -153,7 +614,6 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 	default:
 		f.Types = strings.Split(t, ",")
 	}
-	stream, _ := strconv.ParseBool(q.Get("stream"))
 	if !stream {
 		evs, err := p.Orch.Store.QueryEvents(r.Context(), f)
 		if err != nil {
@@ -162,6 +622,9 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		}
 		if evs == nil {
 			evs = []*model.Event{}
+		}
+		if len(evs) == limit {
+			w.Header().Set("X-Next-Cursor", strconv.FormatInt(evs[len(evs)-1].ID, 10))
 		}
 		writeJSON(w, http.StatusOK, evs)
 		return
@@ -237,294 +700,60 @@ func matches(f store.Filter, e *model.Event) bool {
 	return false
 }
 
-func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if p.Token == "" {
-			writeErr(w, http.StatusServiceUnavailable, errors.New("API token not configured"))
-			return
-		}
-		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if subtle.ConstantTimeCompare([]byte(got), []byte(p.Token)) != 1 {
-			writeErr(w, http.StatusUnauthorized, errors.New("bad token"))
-			return
-		}
-		next(w, r)
-	}
-}
-
-func (p *Platform) list(w http.ResponseWriter, r *http.Request) {
-	sbs, err := p.Orch.List(r.Context())
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	if sbs == nil {
-		sbs = []*model.Sandbox{}
-	}
-	writeJSON(w, http.StatusOK, sbs)
-}
-
-func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
-	var req orchestrator.CreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	sb, err := p.Orch.Create(r.Context(), req)
-	if err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	writeJSON(w, http.StatusCreated, sb)
-}
-
-func (p *Platform) get(w http.ResponseWriter, r *http.Request) {
-	sb, err := p.Orch.Get(r.Context(), r.PathValue("id"))
-	if err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, sb)
-}
-
-func (p *Platform) delete(w http.ResponseWriter, r *http.Request) {
-	if err := p.Orch.Delete(r.Context(), r.PathValue("id")); err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (p *Platform) sleep(w http.ResponseWriter, r *http.Request) {
-	force, _ := strconv.ParseBool(r.URL.Query().Get("force"))
-	sb, err := p.Orch.Sleep(r.Context(), r.PathValue("id"), force)
-	if err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, sb)
-}
-
-func (p *Platform) wake(w http.ResponseWriter, r *http.Request) {
-	sb, err := p.Orch.Wake(r.Context(), r.PathValue("id"))
-	if err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, sb)
-}
-
-func (p *Platform) touch(w http.ResponseWriter, r *http.Request) {
-	if _, err := p.Orch.Get(r.Context(), r.PathValue("id")); err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	p.Orch.Touch(r.Context(), r.PathValue("id"))
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (p *Platform) listRuns(w http.ResponseWriter, r *http.Request) {
-	runs, err := p.Orch.Store.ListRuns(r.Context(), r.PathValue("id"))
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
-	if runs == nil {
-		runs = []*model.Run{}
-	}
-	writeJSON(w, http.StatusOK, runs)
-}
-
-func (p *Platform) createRun(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Task string `json:"task"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	run, err := p.Orch.CreateRun(r.Context(), r.PathValue("id"), req.Task)
-	if err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, run)
-}
-
-func (p *Platform) getRun(w http.ResponseWriter, r *http.Request) {
-	run, err := p.Orch.Store.GetRun(r.Context(), r.PathValue("run"))
-	if err != nil || run.SandboxID != r.PathValue("id") {
-		writeErr(w, http.StatusNotFound, store.ErrNotFound)
-		return
-	}
-	writeJSON(w, http.StatusOK, run)
-}
-
-func (p *Platform) cancelRun(w http.ResponseWriter, r *http.Request) {
-	run, err := p.Orch.CancelRun(r.Context(), r.PathValue("id"), r.PathValue("run"))
-	if err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, run)
-}
-
-func (p *Platform) input(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Text string `json:"text"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := p.Orch.Input(r.Context(), r.PathValue("id"), r.PathValue("run"), req.Text); err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// events streams persisted events after ?after (or Last-Event-ID) and then live ones.
-func (p *Platform) events(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if _, err := p.Orch.Get(r.Context(), id); err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
-	if v := r.Header.Get("Last-Event-ID"); v != "" {
-		after, _ = strconv.ParseInt(v, 10, 64)
-	}
-	runFilter := r.URL.Query().Get("run")
-	want := func(e model.Event) bool { return runFilter == "" || e.RunID == runFilter }
-	if stream, _ := strconv.ParseBool(r.URL.Query().Get("stream")); r.URL.Query().Has("stream") && !stream {
-		// Plain JSON page of the log, for clients that do not speak SSE.
-		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-		if limit <= 0 || limit > 5000 {
-			limit = 1000
-		}
-		evs, err := p.Orch.Store.ListEvents(r.Context(), id, after, limit)
-		if err != nil {
-			writeErr(w, http.StatusInternalServerError, err)
-			return
-		}
-		out := []*model.Event{}
-		for _, e := range evs {
-			if want(*e) {
-				out = append(out, e)
-			}
-		}
-		writeJSON(w, http.StatusOK, out)
-		return
-	}
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-
-	ch, cancel := p.Hub.Subscribe(id)
-	defer cancel()
-	send := func(e model.Event) {
-		b, _ := json.Marshal(e)
-		fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Type, b)
-		fl.Flush()
-	}
-	// Replay, then live. Events published during replay are buffered in the channel.
-	for {
-		evs, err := p.Orch.Store.ListEvents(r.Context(), id, after, 500)
-		if err != nil || len(evs) == 0 {
-			break
-		}
-		for _, e := range evs {
-			if want(*e) {
-				send(*e)
-			}
-			after = e.ID
-		}
-	}
-	keepalive := time.NewTicker(20 * time.Second)
-	defer keepalive.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case e := <-ch:
-			if e.ID > after {
-				if want(e) {
-					send(e)
-				}
-				after = e.ID
-			}
-		case <-keepalive.C:
-			fmt.Fprint(w, ": keepalive\n\n")
-			fl.Flush()
-		}
-	}
-}
-
-func (p *Platform) setPreview(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		Port   int    `json:"port"`
-		Access string `json:"access"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	sb, err := p.Orch.SetPreview(r.Context(), r.PathValue("id"), req.Port, req.Access)
-	if err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, sb)
-}
-
-func (p *Platform) previewTicket(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		User string `json:"user"`
-		Next string `json:"next"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
-		return
-	}
-	sb, err := p.Orch.Get(r.Context(), r.PathValue("id"))
-	if err != nil {
-		writeOrchErr(w, err)
-		return
-	}
-	if sb.Preview == nil {
-		writeErr(w, http.StatusConflict, errors.New("sandbox has no preview"))
-		return
-	}
-	if p.Ingress == nil {
-		writeErr(w, http.StatusServiceUnavailable, errors.New("ingress disabled"))
-		return
-	}
-	t := p.Ingress.SignTicket(sb.Preview.Host, req.User, time.Minute)
-	next := req.Next
-	if next == "" {
-		next = "/"
-	}
-	writeJSON(w, http.StatusOK, map[string]string{
-		"ticket":   t,
-		"redirect": fmt.Sprintf("https://%s/__sandbox/auth?ticket=%s&next=%s", sb.Preview.Host, t, next),
-	})
-}
-
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// ErrorBody is the JSON every error response carries. `error` stays for older clients;
+// `code` is the stable machine-readable class, `request_id` matches the server log line.
+type ErrorBody struct {
+	Error     string `json:"error"`
+	Code      string `json:"code"`
+	RequestID string `json:"request_id,omitempty"`
+}
+
+// Stable error codes (see openapi.yaml → Error).
+const (
+	CodeBadRequest   = "bad_request"
+	CodeUnauthorized = "unauthorized"
+	CodeForbidden    = "forbidden"
+	CodeNotFound     = "not_found"
+	CodeConflict     = "conflict"
+	CodeTooLarge     = "too_large"
+	CodeQuota        = "quota_exceeded"
+	CodeUpstream     = "upstream_failed"
+	CodeInternal     = "internal"
+	CodeUnavailable  = "unavailable"
+)
+
+func codeFor(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return CodeBadRequest
+	case http.StatusUnauthorized:
+		return CodeUnauthorized
+	case http.StatusForbidden:
+		return CodeForbidden
+	case http.StatusNotFound:
+		return CodeNotFound
+	case http.StatusConflict:
+		return CodeConflict
+	case http.StatusRequestEntityTooLarge:
+		return CodeTooLarge
+	case http.StatusTooManyRequests:
+		return CodeQuota
+	case http.StatusBadGateway:
+		return CodeUpstream
+	case http.StatusServiceUnavailable:
+		return CodeUnavailable
+	}
+	return CodeInternal
+}
+
 func writeErr(w http.ResponseWriter, code int, err error) {
-	writeJSON(w, code, map[string]string{"error": err.Error()})
+	writeJSON(w, code, ErrorBody{Error: err.Error(), Code: codeFor(code), RequestID: w.Header().Get("X-Request-Id")})
 }
 
 func writeOrchErr(w http.ResponseWriter, err error) {
@@ -535,9 +764,107 @@ func writeOrchErr(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusBadRequest, err)
 	case errors.Is(err, orchestrator.ErrConflict):
 		writeErr(w, http.StatusConflict, err)
+	case errors.Is(err, orchestrator.ErrQuota):
+		writeErr(w, http.StatusTooManyRequests, err)
+	case errors.Is(err, orchestrator.ErrRuntime):
+		writeErr(w, http.StatusBadGateway, err)
 	default:
 		writeErr(w, http.StatusInternalServerError, err)
 	}
+}
+
+// query parses parameters strictly: a malformed value is a 400, never a silent default.
+type query struct {
+	r   *http.Request
+	err error
+}
+
+func (q *query) str(name string) string { return q.r.URL.Query().Get(name) }
+
+func (q *query) has(name string) bool { return q.r.URL.Query().Has(name) }
+
+func (q *query) fail(name string, err error) {
+	if q.err == nil {
+		q.err = fmt.Errorf("%s: %w", name, err)
+	}
+}
+
+func (q *query) int64(name string, def int64) int64 {
+	v := q.str(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		q.fail(name, errors.New("must be a non-negative integer"))
+		return def
+	}
+	return n
+}
+
+// limit returns ?limit bounded to (0, max], or def when absent.
+func (q *query) limit(def, max int) int {
+	n := int(q.int64("limit", int64(def)))
+	if n <= 0 || n > max {
+		q.fail("limit", fmt.Errorf("must be between 1 and %d", max))
+		return def
+	}
+	return n
+}
+
+func (q *query) boolean(name string, def bool) bool {
+	v := q.str(name)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		q.fail(name, errors.New("must be true or false"))
+		return def
+	}
+	return b
+}
+
+func (q *query) duration(name string) time.Duration {
+	v := q.str(name)
+	if v == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		q.fail(name, errors.New("must be a positive duration such as 24h"))
+		return 0
+	}
+	return d
+}
+
+func (q *query) when(name string) time.Time {
+	v := q.str(name)
+	if v == "" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t
+	}
+	t, err := time.Parse("2006-01-02", v)
+	if err != nil {
+		q.fail(name, errors.New("must be RFC 3339 or YYYY-MM-DD"))
+	}
+	return t
+}
+
+func (q *query) oneOf(name, def string, allowed ...string) string {
+	v := q.str(name)
+	if v == "" {
+		return def
+	}
+	for _, a := range allowed {
+		if v == a {
+			return v
+		}
+	}
+	q.fail(name, fmt.Errorf("must be one of %s", strings.Join(allowed, ", ")))
+	return def
 }
 
 type statusWriter struct {
@@ -552,15 +879,28 @@ func (s *statusWriter) Flush() {
 	}
 }
 
+func newRequestID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// logRequests assigns every request an id (or keeps the client's X-Request-Id), echoes it in
+// the response and logs the outcome under it.
 func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rid := r.Header.Get("X-Request-Id")
+		if rid == "" || len(rid) > 64 {
+			rid = newRequestID()
+		}
+		w.Header().Set("X-Request-Id", rid)
 		sw := &statusWriter{ResponseWriter: w, code: 200}
 		start := time.Now()
 		next.ServeHTTP(sw, r)
-		log.Info("http", "method", r.Method, "path", r.URL.Path, "code", sw.code, "took_ms", time.Since(start).Milliseconds())
+		log.Info("http", "rid", rid, "method", r.Method, "path", r.URL.Path, "code", sw.code, "took_ms", time.Since(start).Milliseconds())
 	})
 }
 

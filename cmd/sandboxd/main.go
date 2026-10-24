@@ -183,6 +183,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 	orch := orchestrator.New(st, rt, reg, hub, orchestrator.Config{
 		DefaultIdleTimeout: cfg.Sandbox.DefaultIdleTimeout, PreviewDomain: cfg.Preview.Domain,
 		ReadyTimeout: cfg.Sandbox.ReadyTimeout, IdleCheckEvery: cfg.Sandbox.IdleCheckEvery,
+		DefaultQuota: cfg.Quotas.Default, Quotas: cfg.Quotas.Tenants,
 	}, log)
 	go orch.IdleLoop(ctx)
 
@@ -199,7 +200,11 @@ func serve(cfgPath string, log *slog.Logger) error {
 			CookieTTL: cfg.Preview.CookieTTL, HitsAsActivity: cfg.Preview.HitsAsActivity, Log: log}
 	}
 
-	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken,
+	tenants := map[string]string{}
+	for _, t := range cfg.APITokens {
+		tenants[t.Token] = t.Tenant
+	}
+	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken, Tenants: tenants,
 		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Log: log.With("log", "api")}
 	gw := &httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, Log: log.With("log", "gateway-api")}
 
