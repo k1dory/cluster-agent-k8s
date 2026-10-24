@@ -14,6 +14,7 @@ import (
 	"agent-sandbox/internal/policy"
 	res "agent-sandbox/internal/resource"
 	"agent-sandbox/internal/secrets"
+	"agent-sandbox/internal/services"
 	"agent-sandbox/internal/store"
 )
 
@@ -278,5 +279,43 @@ func TestOverlayNumbersPendingRevisions(t *testing.T) {
 	}
 	if err := ov.PutItem(ctx, it, -1); err == nil {
 		t.Fatal("overlay must be read-only")
+	}
+}
+
+// A bundle is checked by the same validators a PUT runs: a self-service MCP connection with
+// upstream, paths and mcp is valid when the tenant's settings allow the host (even when the
+// settings arrive in the same bundle), and a plain connection for a host nobody delegated is
+// refused, exactly as the API refuses it.
+func TestPlanValidatesConnectionsLikeThePUT(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+	d := deps(st)
+	mcp := "kind: Connection\nname: tools\nspec: {type: mcp, host: mcp.tools.example.com, upstream: \"https://10.0.0.5:8443\", paths: [\"/mcp\"], mcp: {read_only: true, tools: [\"get_*\"]}}\n"
+	// Not delegated: both the self-service connection and a plain one for that host are invalid.
+	p, err := d.Plan(ctx, docs(t, mcp), Scope{Tenant: "acme"})
+	if err != nil || p.Valid || !strings.Contains(strings.Join(p.Changes[0].Errors, ";"), "neither served by the policy repository nor listed") {
+		t.Fatalf("undelegated self-service host: %v %+v", err, p.Changes)
+	}
+	plain := "kind: Connection\nname: tools\nspec: {type: mcp, host: mcp.tools.example.com}\n"
+	if p, _ := d.Plan(ctx, docs(t, plain), Scope{Tenant: "acme"}); p.Valid {
+		t.Fatalf("a plain connection for an undelegated host passed the plan: %+v", p.Changes)
+	}
+	// A repository host takes headers only, in a bundle as in a PUT.
+	if p, _ := d.Plan(ctx, docs(t, "kind: Connection\nname: gh\nspec: {type: http, host: api.github.com, upstream: \"https://evil\"}\n"), Scope{Tenant: "acme"}); p.Valid {
+		t.Fatalf("upstream on a repository host passed the plan: %+v", p.Changes)
+	}
+	// Delegated in the same bundle (admin scope): the connection is valid.
+	both := "kind: TenantSettings\ntenant: acme\nspec: {hosts: [mcp.tools.example.com]}\n---\nkind: Connection\ntenant: acme\nname: tools\nspec: {type: mcp, host: mcp.tools.example.com, upstream: \"https://10.0.0.5:8443\", paths: [\"/mcp\"], mcp: {read_only: true}}\n"
+	p, err = d.Plan(ctx, docs(t, both), Scope{Admin: true})
+	if err != nil || !p.Valid {
+		t.Fatalf("settings and connection in one bundle: %v %+v", err, p.Changes)
+	}
+	// Delegated already in the store: the tenant's own bundle is valid.
+	tset := services.Assemble(st, services.Options{Policies: d.Policies}).Tenants
+	if _, err := tset.Put(ctx, "acme", &res.Document{Spec: json.RawMessage(`{"hosts":["mcp.tools.example.com"]}`)}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := d.Plan(ctx, docs(t, mcp), Scope{Tenant: "acme"}); err != nil || !p.Valid {
+		t.Fatalf("delegated self-service host: %v %+v", err, p.Changes)
 	}
 }

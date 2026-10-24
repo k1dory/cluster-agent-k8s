@@ -263,3 +263,41 @@ func TestSelfServiceHostsAreTheConnection(t *testing.T) {
 		t.Fatalf("self-service without a host policy: %v", err)
 	}
 }
+
+func TestWithdrawingAHostFromTheTenantRevokesItsConnections(t *testing.T) {
+	ctx := context.Background()
+	sbs := sandboxes{"sb": {ID: "sb", Tenant: "acme", Connections: []string{"tools", "shared/vendor"}}}
+	s := New(store.NewMemory(), secrets.Static{}, sbs)
+	hosts := &repoHosts{repo: map[string]policy.Host{}, allowed: map[string][]string{"acme": {"tools.acme.example.com"}}}
+	s.Hosts = hosts
+	if _, err := s.Put(ctx, "acme", doc("tools", `{"type":"mcp","host":"tools.acme.example.com"}`), false, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Put(ctx, "", doc("vendor", `{"type":"mcp","host":"mcp.vendor.example.com"}`), true, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := s.RuleFor(ctx, "sb", "acme", "tools.acme.example.com", "POST", "/mcp"); !ok {
+		t.Fatal("delegated host before withdrawal")
+	}
+	if own, _ := s.OwnHosts(); len(own) != 2 {
+		t.Fatalf("own hosts before withdrawal: %+v", own)
+	}
+	// The admin removes the host from the tenant's settings: the connection still exists, but
+	// grants nothing, and the gateway stops serving the host; the shared connection is untouched.
+	hosts.allowed["acme"] = nil
+	if _, ok, _ := s.RuleFor(ctx, "sb", "acme", "tools.acme.example.com", "POST", "/mcp"); ok {
+		t.Fatal("withdrawn host still granted by an existing connection")
+	}
+	if _, ok, _ := s.RuleFor(ctx, "sb", "acme", "mcp.vendor.example.com", "POST", "/mcp"); !ok {
+		t.Fatal("the admin's shared connection is not delegated and must stay")
+	}
+	own, _ := s.OwnHosts()
+	if len(own) != 1 || own[0].Name != "mcp.vendor.example.com" {
+		t.Fatalf("own hosts after withdrawal: %+v", own)
+	}
+	// Granting it again restores the connection without rewriting it.
+	hosts.allowed["acme"] = []string{"tools.acme.example.com"}
+	if _, ok, _ := s.RuleFor(ctx, "sb", "acme", "tools.acme.example.com", "POST", "/mcp"); !ok {
+		t.Fatal("re-granted host")
+	}
+}

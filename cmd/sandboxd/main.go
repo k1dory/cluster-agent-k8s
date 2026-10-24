@@ -32,6 +32,7 @@ import (
 	"agent-sandbox/internal/authz"
 	"agent-sandbox/internal/ca"
 	"agent-sandbox/internal/config"
+	"agent-sandbox/internal/credentials"
 	"agent-sandbox/internal/events"
 	"agent-sandbox/internal/gateway"
 	"agent-sandbox/internal/httpapi"
@@ -317,6 +318,19 @@ func serve(cfgPath string, log *slog.Logger) error {
 		log.Warn("no secrets provider configured: secret: references in policies cannot be resolved")
 	}
 	log.Info("secrets provider", "provider", cfg.Secrets.Provider)
+	// Credentials tenants bring through the API resolve first, the operator's provider second.
+	var creds *credentials.Service
+	if key, err := credentials.ParseKey(cfg.Credentials.Key); err != nil {
+		return fmt.Errorf("credentials: %w", err)
+	} else if key != nil {
+		if creds, err = credentials.New(st, key); err != nil {
+			return fmt.Errorf("credentials: %w", err)
+		}
+		secretProvider = secrets.Chain{credentials.Resolver{Service: creds}, secretProvider}
+		log.Info("tenant credentials enabled (BYOK): secret: references resolve from the API's store first")
+	} else {
+		log.Warn("no credentials.key: tenants cannot bring their own secrets through the API")
+	}
 	// The configuration services: ownership guard, quotas, connections, catalogue (one wiring
 	// for sandboxd and the integration tests, see internal/app).
 	services, err := app.Wire(ctx, app.Deps{Store: st, Policies: pols, Secrets: secretProvider, Orch: orch, Log: log})
@@ -346,7 +360,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 		tokenTenants[t.Token] = t.Tenant
 	}
 	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken, Tenants: tokenTenants,
-		Keys:    &apikeys.Service{Store: st, MaxTTL: cfg.APIKeys.MaxTTL},
+		Keys: &apikeys.Service{Store: st, MaxTTL: cfg.APIKeys.MaxTTL}, Credentials: creds,
 		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Log: log.With("log", "api")}
 	services.Install(platform)
 	if cfg.OIDC != nil {

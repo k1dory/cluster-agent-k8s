@@ -26,6 +26,7 @@ type Memory struct {
 	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
 	applies   map[string]*model.Apply
 	apiKeys   map[string]*model.APIKey
+	creds     map[string]*memCredential // tenant|name
 	nextInst  int
 	nextEvent int64
 }
@@ -43,6 +44,7 @@ func NewMemory() *Memory {
 		catalog:   map[string][]*model.CatalogItem{},
 		applies:   map[string]*model.Apply{},
 		apiKeys:   map[string]*model.APIKey{},
+		creds:     map[string]*memCredential{},
 	}
 }
 
@@ -925,16 +927,51 @@ func (m *Memory) GetAPIKey(_ context.Context, id string) (*model.APIKey, error) 
 	return cloneKey(k), nil
 }
 
-func (m *Memory) UpdateAPIKey(_ context.Context, k *model.APIKey) error {
+func (m *Memory) TouchAPIKey(_ context.Context, id string, at time.Time) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cur, ok := m.apiKeys[k.ID]
+	k, ok := m.apiKeys[id]
 	if !ok {
 		return ErrNotFound
 	}
-	c := cloneKey(k)
-	c.Tenant, c.Hash, c.CreatedAt, c.CreatedBy = cur.Tenant, cur.Hash, cur.CreatedAt, cur.CreatedBy
-	m.apiKeys[k.ID] = c
+	t := at
+	k.LastUsedAt = &t
+	return nil
+}
+
+func (m *Memory) RevokeAPIKey(_ context.Context, id string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.apiKeys[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if k.RevokedAt == nil {
+		t := at
+		k.RevokedAt = &t
+	}
+	return nil
+}
+
+func (m *Memory) RetireAPIKey(_ context.Context, id, rotatedTo string, at time.Time, grace time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.apiKeys[id]
+	if !ok {
+		return ErrNotFound
+	}
+	k.RotatedTo = rotatedTo
+	if grace <= 0 {
+		if k.RevokedAt == nil {
+			t := at
+			k.RevokedAt = &t
+		}
+		return nil
+	}
+	end := at.Add(grace)
+	if k.ExpiresAt == nil || end.Before(*k.ExpiresAt) {
+		k.ExpiresAt = &end
+	}
 	return nil
 }
 
@@ -954,4 +991,62 @@ func (m *Memory) ListAPIKeys(_ context.Context, tenant string) ([]*model.APIKey,
 		return out[i].ID < out[j].ID
 	})
 	return out, nil
+}
+
+// --- credentials ------------------------------------------------------------------------
+
+type memCredential struct {
+	meta       model.Credential
+	ciphertext []byte
+}
+
+func (m *Memory) PutCredential(_ context.Context, c *model.Credential, ciphertext []byte) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := c.Tenant + "|" + c.Name
+	now := time.Now()
+	cur, ok := m.creds[key]
+	if ok {
+		c.Version, c.CreatedAt, c.CreatedBy, c.UpdatedAt = cur.meta.Version+1, cur.meta.CreatedAt, cur.meta.CreatedBy, now
+	} else {
+		c.Version, c.CreatedAt, c.UpdatedAt = 1, now, now
+	}
+	m.creds[key] = &memCredential{meta: *c, ciphertext: append([]byte(nil), ciphertext...)}
+	return !ok, nil
+}
+
+func (m *Memory) GetCredential(_ context.Context, tenant, name string) (*model.Credential, []byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.creds[tenant+"|"+name]
+	if !ok {
+		return nil, nil, ErrNotFound
+	}
+	meta := cur.meta
+	return &meta, append([]byte(nil), cur.ciphertext...), nil
+}
+
+func (m *Memory) ListCredentials(_ context.Context, tenant string) ([]*model.Credential, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.Credential
+	for _, c := range m.creds {
+		if c.meta.Tenant == tenant {
+			meta := c.meta
+			out = append(out, &meta)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *Memory) DeleteCredential(_ context.Context, tenant, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := tenant + "|" + name
+	if _, ok := m.creds[key]; !ok {
+		return ErrNotFound
+	}
+	delete(m.creds, key)
+	return nil
 }

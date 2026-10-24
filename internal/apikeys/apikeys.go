@@ -102,35 +102,19 @@ func (s *Service) Rotate(ctx context.Context, id string, ttl, grace time.Duratio
 	if err != nil {
 		return nil, "", err
 	}
-	old.RotatedTo = next.ID
-	if grace == 0 {
-		old.RevokedAt = &now
-	} else {
-		end := now.Add(grace)
-		if old.ExpiresAt == nil || end.Before(*old.ExpiresAt) {
-			old.ExpiresAt = &end
-		}
-	}
-	if err := s.Store.UpdateAPIKey(ctx, old); err != nil {
+	// One atomic store operation; a revocation that landed meanwhile stands.
+	if err := s.Store.RetireAPIKey(ctx, old.ID, next.ID, now, grace); err != nil {
 		return nil, "", err
 	}
 	return next, secret, nil
 }
 
-// Revoke ends a key now. Revoking an already revoked key is fine.
+// Revoke ends a key now. Revoking an already revoked key is fine (the earlier time stands).
 func (s *Service) Revoke(ctx context.Context, id string) (*model.APIKey, error) {
-	k, err := s.Store.GetAPIKey(ctx, id)
-	if err != nil {
+	if err := s.Store.RevokeAPIKey(ctx, id, s.now()); err != nil {
 		return nil, err
 	}
-	if k.RevokedAt == nil {
-		now := s.now()
-		k.RevokedAt = &now
-		if err := s.Store.UpdateAPIKey(ctx, k); err != nil {
-			return nil, err
-		}
-	}
-	return k, nil
+	return s.Store.GetAPIKey(ctx, id)
 }
 
 // Get returns one key (never its hash: the model hides it).
@@ -174,8 +158,11 @@ func (s *Service) Authenticate(ctx context.Context, token string) (*model.APIKey
 		every = time.Minute
 	}
 	if k.LastUsedAt == nil || now.Sub(*k.LastUsedAt) >= every {
-		k.LastUsedAt = &now
-		_ = s.Store.UpdateAPIKey(ctx, k) // best effort: a lost touch is not an authentication failure
+		// Only the use is recorded, never the record we read: a revocation that landed between
+		// our read and this write is not undone. A lost touch is not an authentication failure.
+		if err := s.Store.TouchAPIKey(ctx, k.ID, now); err == nil {
+			k.LastUsedAt = &now
+		}
 	}
 	return k, nil
 }

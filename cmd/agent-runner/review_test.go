@@ -117,3 +117,43 @@ func TestMCPServersBecomeAHarnessConfig(t *testing.T) {
 		t.Fatalf("mode: %v", info.Mode())
 	}
 }
+
+// The chart ships explicit harness commands (run and resume); both must load the MCP
+// configuration like the built-in default does, and a command that is not claude must be
+// left alone.
+func TestEveryClaudeCommandLoadsTheMCPConfig(t *testing.T) {
+	values, err := os.ReadFile("../../deploy/helm/agent-sandbox/values.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fromChart []string
+	for _, line := range strings.Split(string(values), "\n") {
+		line = strings.TrimSpace(line)
+		for _, key := range []string{"harnessCommand:", "harnessResumeCommand:"} {
+			if strings.HasPrefix(line, key) {
+				v := strings.TrimSpace(strings.TrimPrefix(line, key))
+				fromChart = append(fromChart, strings.Trim(v, `'"`))
+			}
+		}
+	}
+	if len(fromChart) != 2 {
+		t.Fatalf("values.yaml harness commands: %q", fromChart)
+	}
+	for _, cmd := range append(fromChart, `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose`, `ANTHROPIC_LOG=debug claude -p "$SANDBOX_TASK"`, `/usr/local/bin/claude -p "$SANDBOX_TASK"`) {
+		got := withMCPConfig(cmd)
+		if !strings.HasSuffix(got, ` --mcp-config "$SANDBOX_MCP_CONFIG"`) || !strings.HasPrefix(got, cmd) {
+			t.Errorf("%q → %q", cmd, got)
+		}
+	}
+	for _, cmd := range []string{
+		`claude -p "$SANDBOX_TASK" --mcp-config /etc/mcp.json`,
+		`claude -p "$SANDBOX_TASK" --mcp-config "$SANDBOX_MCP_CONFIG"`,
+		`my-harness --task "$SANDBOX_TASK"`,
+		`python3 agent.py`,
+		``,
+	} {
+		if got := withMCPConfig(cmd); got != cmd {
+			t.Errorf("%q must be left alone, got %q", cmd, got)
+		}
+	}
+}

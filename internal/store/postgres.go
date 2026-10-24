@@ -1063,9 +1063,25 @@ func (p *Postgres) GetAPIKey(ctx context.Context, id string) (*model.APIKey, err
 	return scanKey(p.pool.QueryRow(ctx, `SELECT `+keyCols+` FROM api_keys WHERE id=$1`, id))
 }
 
-func (p *Postgres) UpdateAPIKey(ctx context.Context, k *model.APIKey) error {
-	tag, err := p.pool.Exec(ctx, `UPDATE api_keys SET name=$2, expires_at=$3, revoked_at=$4, rotated_to=$5, last_used_at=$6 WHERE id=$1`,
-		k.ID, k.Name, k.ExpiresAt, k.RevokedAt, k.RotatedTo, k.LastUsedAt)
+func (p *Postgres) TouchAPIKey(ctx context.Context, id string, at time.Time) error {
+	return p.keyExec(ctx, `UPDATE api_keys SET last_used_at=$2 WHERE id=$1`, id, at)
+}
+
+func (p *Postgres) RevokeAPIKey(ctx context.Context, id string, at time.Time) error {
+	// COALESCE: an earlier revocation stands whatever this call carries.
+	return p.keyExec(ctx, `UPDATE api_keys SET revoked_at=COALESCE(revoked_at, $2) WHERE id=$1`, id, at)
+}
+
+func (p *Postgres) RetireAPIKey(ctx context.Context, id, rotatedTo string, at time.Time, grace time.Duration) error {
+	if grace <= 0 {
+		return p.keyExec(ctx, `UPDATE api_keys SET rotated_to=$2, revoked_at=COALESCE(revoked_at, $3) WHERE id=$1`, id, rotatedTo, at)
+	}
+	return p.keyExec(ctx, `UPDATE api_keys SET rotated_to=$2, expires_at=LEAST(COALESCE(expires_at, $3::timestamptz), $3::timestamptz) WHERE id=$1`, id, rotatedTo, at.Add(grace))
+}
+
+// keyExec runs one UPDATE of api_keys and reports a missing row as ErrNotFound.
+func (p *Postgres) keyExec(ctx context.Context, q string, args ...any) error {
+	tag, err := p.pool.Exec(ctx, q, args...)
 	if err != nil {
 		return err
 	}
@@ -1090,4 +1106,74 @@ func (p *Postgres) ListAPIKeys(ctx context.Context, tenant string) ([]*model.API
 		out = append(out, k)
 	}
 	return out, rows.Err()
+}
+
+// --- credentials ------------------------------------------------------------------------
+
+const credCols = `tenant, name, version, fingerprint, created_by, created_at, updated_at`
+
+func scanCredential(row pgx.Row) (*model.Credential, error) {
+	var c model.Credential
+	err := row.Scan(&c.Tenant, &c.Name, &c.Version, &c.Fingerprint, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (p *Postgres) PutCredential(ctx context.Context, c *model.Credential, ciphertext []byte) (bool, error) {
+	// One statement: an insert, or on conflict a replacement that bumps the version and keeps
+	// who created it and when. xmax = 0 tells an insert from an update.
+	var created bool
+	err := p.pool.QueryRow(ctx, `INSERT INTO credentials (tenant, name, version, fingerprint, ciphertext, created_by, created_at, updated_at)
+		VALUES ($1,$2,1,$3,$4,$5,now(),now())
+		ON CONFLICT (tenant, name) DO UPDATE SET version=credentials.version+1, fingerprint=EXCLUDED.fingerprint, ciphertext=EXCLUDED.ciphertext, updated_at=now()
+		RETURNING version, created_by, created_at, updated_at, (xmax = 0)`,
+		c.Tenant, c.Name, c.Fingerprint, ciphertext, c.CreatedBy).Scan(&c.Version, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &created)
+	return created, err
+}
+
+func (p *Postgres) GetCredential(ctx context.Context, tenant, name string) (*model.Credential, []byte, error) {
+	var c model.Credential
+	var ciphertext []byte
+	err := p.pool.QueryRow(ctx, `SELECT `+credCols+`, ciphertext FROM credentials WHERE tenant=$1 AND name=$2`, tenant, name).
+		Scan(&c.Tenant, &c.Name, &c.Version, &c.Fingerprint, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &ciphertext)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return &c, ciphertext, nil
+}
+
+func (p *Postgres) ListCredentials(ctx context.Context, tenant string) ([]*model.Credential, error) {
+	rows, err := p.pool.Query(ctx, `SELECT `+credCols+` FROM credentials WHERE tenant=$1 ORDER BY name`, tenant)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.Credential
+	for rows.Next() {
+		c, err := scanCredential(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) DeleteCredential(ctx context.Context, tenant, name string) error {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM credentials WHERE tenant=$1 AND name=$2`, tenant, name)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

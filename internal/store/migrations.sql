@@ -185,3 +185,16 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS api_keys_tenant ON api_keys (tenant, created_at DESC);
+
+-- Tenant-brought credentials (BYOK): ciphertext only; the server key never touches the database.
+CREATE TABLE IF NOT EXISTS credentials (
+    tenant      text NOT NULL DEFAULT '',
+    name        text NOT NULL,
+    version     integer NOT NULL DEFAULT 1,
+    fingerprint text NOT NULL DEFAULT '',
+    ciphertext  bytea NOT NULL,
+    created_by  text NOT NULL DEFAULT '',
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant, name)
+);

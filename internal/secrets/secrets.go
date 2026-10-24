@@ -69,6 +69,27 @@ func (f FileProvider) Get(_ context.Context, tenant, name string) (string, error
 	return "", ErrNotFound
 }
 
+// Chain asks each provider in turn and answers with the first that has the secret; the
+// tenant's own credentials (brought through the API) come before the operator's provider, so
+// a tenant can replace what the operator configured for it without asking anyone.
+type Chain []Provider
+
+func (c Chain) Get(ctx context.Context, tenant, name string) (string, error) {
+	for _, p := range c {
+		if p == nil {
+			continue
+		}
+		v, err := p.Get(ctx, tenant, name)
+		if err == nil {
+			return v, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return "", err
+		}
+	}
+	return "", ErrNotFound
+}
+
 // Static is an in-memory provider for tests: key "tenant/name" or "shared/name".
 type Static map[string]string
 

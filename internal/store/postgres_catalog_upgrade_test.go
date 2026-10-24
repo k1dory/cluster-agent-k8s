@@ -358,17 +358,56 @@ func TestReviewPostgresAPIKeys(t *testing.T) {
 	if err != nil || got.Tenant != "acme" || got.Hash != "h1" || got.ExpiresAt == nil || !got.ExpiresAt.Equal(exp) || got.RevokedAt != nil || got.LastUsedAt != nil {
 		t.Fatalf("get: %v %+v", err, got)
 	}
+	// Narrow, atomic changes: a use touches last_used_at only; a revocation keeps the earliest
+	// time; a retirement never clears a revocation.
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	got.RevokedAt, got.RotatedTo, got.LastUsedAt, got.Hash = &now, "key_2", &now, "tampered"
-	if err := p.UpdateAPIKey(ctx, got); err != nil {
+	if err := p.TouchAPIKey(ctx, "key_1", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RevokeAPIKey(ctx, "key_1", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RevokeAPIKey(ctx, "key_1", now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
 	again, _ := p.GetAPIKey(ctx, "key_1")
-	if again.RevokedAt == nil || !again.RevokedAt.Equal(now) || again.RotatedTo != "key_2" || again.LastUsedAt == nil || again.Hash != "h1" {
-		t.Fatalf("update: %+v", again)
+	if again.RevokedAt == nil || !again.RevokedAt.Equal(now) || again.LastUsedAt == nil || !again.LastUsedAt.Equal(now) || again.Hash != "h1" || !again.ExpiresAt.Equal(exp) {
+		t.Fatalf("after touch and revoke: %+v", again)
 	}
-	if err := p.UpdateAPIKey(ctx, &model.APIKey{ID: "key_none"}); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("update of a missing key: %v", err)
+	if err := p.RetireAPIKey(ctx, "key_1", "key_2", now.Add(2*time.Hour), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	retired, _ := p.GetAPIKey(ctx, "key_1")
+	if retired.RotatedTo != "key_2" || !retired.RevokedAt.Equal(now) || !retired.ExpiresAt.Equal(exp) {
+		t.Fatalf("retire after revoke: %+v", retired)
+	}
+	// Retirement with grace shortens the expiry (never lengthens it); without grace it revokes.
+	if err := p.CreateAPIKey(ctx, &model.APIKey{ID: "key_g", Tenant: "acme", Name: "g", Hash: "hg", ExpiresAt: &exp}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.RetireAPIKey(ctx, "key_g", "key_h", now, 10*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	g, _ := p.GetAPIKey(ctx, "key_g")
+	if g.RevokedAt != nil || !g.ExpiresAt.Equal(now.Add(10*time.Minute)) || g.RotatedTo != "key_h" {
+		t.Fatalf("retire with grace: %+v", g)
+	}
+	if err := p.RetireAPIKey(ctx, "key_g", "key_h", now, 5*time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ = p.GetAPIKey(ctx, "key_g"); !g.ExpiresAt.Equal(now.Add(10 * time.Minute)) {
+		t.Fatalf("a longer grace lengthened the expiry: %+v", g)
+	}
+	if err := p.RetireAPIKey(ctx, "key_g", "key_h", now, 0); err != nil {
+		t.Fatal(err)
+	}
+	if g, _ = p.GetAPIKey(ctx, "key_g"); g.RevokedAt == nil || !g.RevokedAt.Equal(now) {
+		t.Fatalf("retire without grace: %+v", g)
+	}
+	for _, err := range []error{p.TouchAPIKey(ctx, "key_none", now), p.RevokeAPIKey(ctx, "key_none", now), p.RetireAPIKey(ctx, "key_none", "x", now, 0)} {
+		if !errors.Is(err, ErrNotFound) {
+			t.Fatalf("missing key: %v", err)
+		}
 	}
 	if _, err := p.GetAPIKey(ctx, "key_none"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("missing key: %v", err)
@@ -380,10 +419,57 @@ func TestReviewPostgresAPIKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	list, err := p.ListAPIKeys(ctx, "acme")
-	if err != nil || len(list) != 2 || list[0].ID != "key_2" || list[1].ID != "key_1" {
+	if err != nil || len(list) != 3 || list[0].ID != "key_2" || list[2].ID != "key_1" {
 		t.Fatalf("list: %v %+v", err, list)
 	}
-	if all, _ := p.ListAPIKeys(ctx, ""); len(all) != 3 {
+	if all, _ := p.ListAPIKeys(ctx, ""); len(all) != 4 {
 		t.Fatalf("every tenant: %d", len(all))
+	}
+}
+
+// Tenant credentials on a real PostgreSQL: insert versus replace in one statement, the
+// creation record kept, ciphertext round trip, per-scope listing and deletion.
+func TestReviewPostgresCredentials(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
+	ctx := t.Context()
+	c := &model.Credential{Tenant: "acme", Name: "anthropic", Fingerprint: "f1", CreatedBy: "key:k1"}
+	created, err := p.PutCredential(ctx, c, []byte("ct1"))
+	if err != nil || !created || c.Version != 1 || c.CreatedAt.IsZero() || !c.UpdatedAt.Equal(c.CreatedAt) {
+		t.Fatalf("insert: %v %v %+v", err, created, c)
+	}
+	first := c.CreatedAt
+	c2 := &model.Credential{Tenant: "acme", Name: "anthropic", Fingerprint: "f2", CreatedBy: "key:k2"}
+	created, err = p.PutCredential(ctx, c2, []byte("ct2"))
+	if err != nil || created || c2.Version != 2 || c2.CreatedBy != "key:k1" || !c2.CreatedAt.Equal(first) || c2.UpdatedAt.Before(first) {
+		t.Fatalf("replace: %v %v %+v", err, created, c2)
+	}
+	got, ct, err := p.GetCredential(ctx, "acme", "anthropic")
+	if err != nil || got.Version != 2 || got.Fingerprint != "f2" || string(ct) != "ct2" {
+		t.Fatalf("get: %v %+v %q", err, got, ct)
+	}
+	if _, _, err := p.GetCredential(ctx, "other", "anthropic"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("another scope: %v", err)
+	}
+	if _, err := p.PutCredential(ctx, &model.Credential{Tenant: "", Name: "anthropic", Fingerprint: "s"}, []byte("shared")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.PutCredential(ctx, &model.Credential{Tenant: "acme", Name: "github", Fingerprint: "g"}, []byte("gh")); err != nil {
+		t.Fatal(err)
+	}
+	list, err := p.ListCredentials(ctx, "acme")
+	if err != nil || len(list) != 2 || list[0].Name != "anthropic" || list[1].Name != "github" {
+		t.Fatalf("list: %v %+v", err, list)
+	}
+	if shared, _ := p.ListCredentials(ctx, ""); len(shared) != 1 {
+		t.Fatalf("shared scope: %+v", shared)
+	}
+	if err := p.DeleteCredential(ctx, "acme", "anthropic"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.DeleteCredential(ctx, "acme", "anthropic"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("delete twice: %v", err)
+	}
+	if _, _, err := p.GetCredential(ctx, "", "anthropic"); err != nil {
+		t.Fatalf("the shared one stays: %v", err)
 	}
 }

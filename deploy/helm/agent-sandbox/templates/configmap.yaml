@@ -18,6 +18,8 @@ data:
     api_token: "${SANDBOXD_API_TOKEN}"
     api_keys:
       max_ttl: {{ .Values.sandboxd.apiKeys.maxTTL | quote }}
+    credentials:
+      key: "${CREDENTIALS_KEY}"
     database_url: "${DATABASE_URL}"
     policies_dir: /etc/sandbox/policies
     policies_strict: {{ .Values.sandboxd.policiesStrict }}

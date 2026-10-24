@@ -139,14 +139,37 @@ type Applies interface {
 	ListApplies(ctx context.Context, tenant string, limit int) ([]*Apply, error)
 }
 
-// APIKeys persists tenant API keys. Only the hash of a secret is ever stored.
+// APIKeys persists tenant API keys. Only the hash of a secret is ever stored. Every change
+// is one narrow, atomic operation: a key is never written back from a copy, so a revocation
+// cannot be undone by a concurrent use or rotation that read the key before it.
 type APIKeys interface {
 	CreateAPIKey(ctx context.Context, k *model.APIKey) error
 	GetAPIKey(ctx context.Context, id string) (*model.APIKey, error)
-	// UpdateAPIKey rewrites the mutable fields (expiry, revocation, rotation, last use).
-	UpdateAPIKey(ctx context.Context, k *model.APIKey) error
+	// TouchAPIKey records a use (last_used_at only).
+	TouchAPIKey(ctx context.Context, id string, at time.Time) error
+	// RevokeAPIKey ends the key at `at` unless it was revoked earlier (an earlier revocation
+	// stands). ErrNotFound for an unknown key.
+	RevokeAPIKey(ctx context.Context, id string, at time.Time) error
+	// RetireAPIKey marks the key replaced by rotatedTo: revoked at `at` when grace is 0, else
+	// expiring at `at`+grace (sooner if it already expires sooner). A revocation already
+	// recorded stands. ErrNotFound for an unknown key.
+	RetireAPIKey(ctx context.Context, id, rotatedTo string, at time.Time, grace time.Duration) error
 	// ListAPIKeys returns a tenant's keys, newest first ("" = every tenant).
 	ListAPIKeys(ctx context.Context, tenant string) ([]*model.APIKey, error)
+}
+
+// Credentials persists tenant-brought secrets, encrypted by the caller: the store sees
+// ciphertext and metadata only.
+type Credentials interface {
+	// PutCredential adds or replaces (tenant, name): a replacement bumps Version and keeps
+	// CreatedAt and CreatedBy; c comes back with the stored metadata. created reports an add.
+	PutCredential(ctx context.Context, c *model.Credential, ciphertext []byte) (created bool, err error)
+	// GetCredential returns the metadata and the ciphertext; ErrNotFound when absent.
+	GetCredential(ctx context.Context, tenant, name string) (*model.Credential, []byte, error)
+	// ListCredentials returns a scope's metadata, by name.
+	ListCredentials(ctx context.Context, tenant string) ([]*model.Credential, error)
+	// DeleteCredential removes one; ErrNotFound when absent.
+	DeleteCredential(ctx context.Context, tenant, name string) error
 }
 
 // Apply is model.Apply (aliased so the store's doc reads on its own).
@@ -267,6 +290,7 @@ type Store interface {
 	Catalog
 	Applies
 	APIKeys
+	Credentials
 
 	Close() error
 }

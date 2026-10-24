@@ -18,6 +18,7 @@ import (
 	"agent-sandbox/internal/plan"
 	"agent-sandbox/internal/policy"
 	"agent-sandbox/internal/secrets"
+	"agent-sandbox/internal/services"
 	"agent-sandbox/internal/store"
 	"agent-sandbox/internal/tenants"
 )
@@ -50,16 +51,13 @@ func Wire(ctx context.Context, d Deps) (*Services, error) {
 		q := d.Orch.Cfg.QuotaFor(t)
 		return tenants.Quota{MaxSandboxes: q.MaxSandboxes, MaxAwake: q.MaxAwake}
 	}
-	bind := bindings.New(d.Store, d.Policies)
-	tset := tenants.New(d.Store, defaults)
-	conns := connections.New(d.Store, d.Secrets, d.Store)
-	conns.Hosts = hostPolicy{set: d.Policies, tenants: tset}
+	svc := services.Assemble(d.Store, services.Options{Policies: d.Policies, Images: d.Orch.Cfg, Secrets: d.Secrets, Defaults: defaults, Sandboxes: d.Store})
+	bind, tset, conns, guard := svc.Bindings, svc.Tenants, svc.Connections, svc.Guard
 	for name, r := range map[string]interface{ Refresh(context.Context) error }{"bindings": bind, "tenant settings": tset, "connections": conns} {
 		if err := r.Refresh(ctx); err != nil {
 			return nil, fmt.Errorf("load %s: %w", name, err)
 		}
 	}
-	guard := &bindings.Guard{Set: d.Policies, Bindings: bind, Headers: conns}
 	d.Orch.Policies = guard
 	d.Orch.Quotas = limits{tenants: tset, bindings: bind}
 	planner := plan.Deps{Store: d.Store, Policies: d.Policies, Images: d.Orch.Cfg, Secrets: d.Secrets, Defaults: defaults}
@@ -69,7 +67,7 @@ func Wire(ctx context.Context, d Deps) (*Services, error) {
 	}
 	return &Services{
 		Guard: guard, Bindings: bind, Tenants: tset, Connections: conns,
-		Catalog: &catalog.Service{Store: d.Store, Images: d.Orch.Cfg, Policies: guard, Connections: conns, Tenants: tset},
+		Catalog: svc.Catalog,
 		Planner: planner,
 		Applier: &apply.Controller{Store: d.Store, Planner: planner, Replica: replica, Log: d.Log,
 			Refresh: []func(context.Context) error{bind.Refresh, tset.Refresh, conns.Refresh}},
@@ -111,14 +109,3 @@ func (l limits) SlugQuota(slug, tenant string) orchestrator.Quota {
 	}
 	return orchestrator.Quota{}
 }
-
-// hostPolicy answers which hosts a connection may serve on its own: the repository's hosts are
-// the repository's (a connection adds headers only); any other host needs the tenant's
-// settings to list it.
-type hostPolicy struct {
-	set     *policy.Set
-	tenants *tenants.Service
-}
-
-func (h hostPolicy) HostInfo(name string) (policy.Host, bool) { return h.set.HostInfo(name) }
-func (h hostPolicy) HostAllowed(tenant, host string) bool     { return h.tenants.HostAllowed(tenant, host) }
