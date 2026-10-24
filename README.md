@@ -77,6 +77,25 @@ sandboxd policy render -config sandboxd.yaml           # the Caddyfile that will
 touches `policies/`. After merge, `helm upgrade` (or a `git pull` of the policies directory on the
 VM) is enough: sandboxd reloads, re-renders and pushes the gateway configuration within seconds.
 
+### Network isolation
+
+The sandbox VLAN is shared by every pod and node, and macvlan `private` only separates pods on
+the same node. Two layers keep pods from talking to each other across nodes: an init container
+with `NET_ADMIN` installs nftables rules inside every pod (`kube.pod_firewall`, on by default)
+that allow egress to the gateway on 53, 443 and 8443 and nothing else, and the main container,
+which has no capabilities, cannot undo them; where the switch supports it, configure the VLAN as
+an isolated private VLAN with the gateway port as the only promiscuous port. The gateway host's
+own nftables rules protect the gateway, not pod-to-pod traffic.
+
+### MCP: enforced, not advisory
+
+A rule with `mcp:` sends the host through sandboxd's MCP proxy instead of straight to the
+upstream. The proxy reads the JSON-RPC body (single calls and batches): with `read_only: true`,
+`tools/call` passes only for tools matching the `tools` globs (`["get_*", "search"]`), and
+`initialize`, `ping`, `tools/list`, `resources/read`, `prompts/get` always pass; everything else
+is a 403 before the request leaves the gateway. `X-Agent-Access: read-only` is still sent
+upstream as a hint, but the policy no longer depends on the server honouring it.
+
 ### Ownership: which tenant may run which agent
 
 ```yaml
@@ -86,7 +105,9 @@ allow: ...
 ```
 
 `POST /v1/sandboxes` with a slug the tenant does not own is 403, so are rollouts by that slug. The
-admin token is never restricted. `policies_strict: true` turns the default around: a policy without
+admin token is never restricted at creation. Revocation is immediate: when a merged policy drops a
+tenant from an explicit `tenants` list, the gateway refuses that tenant's running agents on their
+next request and the reconciler stops their pods. `policies_strict: true` turns the default around: a policy without
 a `tenants` list is admin-only and a slug without a policy file is refused instead of falling back
 to `default`.
 
@@ -115,6 +136,28 @@ sandboxctl sleep sb_1234                 # or wait an hour of silence
 sandboxctl version                       # control plane build, agent versions, env version per slug
 sandboxctl rollout -version canary -slug backend-dev -percent 10
 ```
+
+### What happens when things break
+
+The reconciler (leader replica, every `idle_check_every`) checks that every running sandbox still
+has a live pod. A pod that was evicted, killed or crashed makes its run `failed` with the reason in
+the run output and a `run.finished` event, retires the identity and puts the sandbox in `error`
+with the reason; `wake` starts a fresh pod. A run marked running while its sandbox has no pod is
+failed the same way. The runner retries `/finish` with backoff until the control plane
+acknowledges it (the endpoint is idempotent), so a lost acknowledgement never leaves a run
+running. Pod deletion is synchronous: sleep, wake and rollouts wait for Kubernetes to finish the
+graceful termination before creating the next pod under the same name.
+
+### The agent image
+
+`images/agent/Dockerfile` ships Claude Code, git, nftables and the sandbox binaries; user 1000 is
+`agent` (the base image's `node` user is removed). At pod start the `netlock` init container locks
+the network, then `agent-init` bootstraps the identity: it trusts the gateway root that sandboxd
+publishes into the `agent-sandbox-gateway-ca` ConfigMap (mounted into every pod), obtains the
+certificate and writes the mTLS settings every tool reads (`GIT_SSL_*`, `CURL_HOME`,
+`NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_CLIENT_CERT` / `CLAUDE_CODE_CLIENT_KEY`). `agent-runner` clones
+`repo` into `/workspace/repo` once (the volume persists) and starts the harness inside it.
+`make smoke-image` runs the shipped image's pieces in Docker; CI builds both images on every PR.
 
 ### Agent versions and rollouts
 

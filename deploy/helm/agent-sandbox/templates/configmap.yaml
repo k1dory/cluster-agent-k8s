@@ -95,6 +95,8 @@ data:
       harness_resume_command: {{ .Values.agent.harnessResumeCommand | quote }}
       resume_prompt: {{ .Values.agent.resumePrompt | quote }}
       termination_seconds: {{ .Values.agent.terminationSeconds }}
+      pod_firewall: {{ .Values.agent.podFirewall }}
+      gateway_ca_configmap: {{ .Values.agent.gatewayCaConfigMap | quote }}
       env:
         {{- range $k, $v := .Values.agent.env }}
         {{ $k }}: {{ $v | quote }}

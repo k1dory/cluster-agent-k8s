@@ -26,7 +26,9 @@ type Gateway struct {
 	Orch      *orchestrator.Orchestrator
 	Registrar *registrar.Registrar
 	Authz     *authz.Handler
-	Log       *slog.Logger
+	// MCP handles requests Caddy routes through the MCP proxy (policy hosts with an mcp rule).
+	MCP http.Handler
+	Log *slog.Logger
 }
 
 // Routes builds the gateway mux.
@@ -41,6 +43,9 @@ func (g *Gateway) Routes() http.Handler {
 	mux.HandleFunc("POST /agent/runs/{run}/events", g.agent(g.appendOutput))
 	mux.HandleFunc("GET /agent/runs/{run}/input", g.agent(g.pollInput))
 	mux.HandleFunc("POST /agent/runs/{run}/finish", g.agent(g.finish))
+	if g.MCP != nil {
+		mux.Handle("/", g.MCP) // everything else is an MCP host proxied by Caddy (see gateway template)
+	}
 	return logRequests(g.Log, mux)
 }
 

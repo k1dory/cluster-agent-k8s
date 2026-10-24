@@ -3,6 +3,7 @@ package authz
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"agent-sandbox/internal/identity"
@@ -54,5 +55,41 @@ func TestAuthz(t *testing.T) {
 	h.ServeHTTP(w, req("", "api.anthropic.com", "POST", "/v1/messages"))
 	if w.Code != 403 {
 		t.Fatalf("no identity must be denied, got %d", w.Code)
+	}
+}
+
+// TestPartialSecretsLeakNothing: a rule injecting two secrets of which the second is missing
+// must answer 502 without the first one on the response.
+func TestPartialSecretsLeakNothing(t *testing.T) {
+	h := &Handler{
+		Policies: policy.FromPolicies(&policy.Policy{Slug: "s", Allow: []policy.Rule{
+			{Host: "two.example.com", Paths: []string{"/**"}, Inject: map[string]string{"Authorization": "Bearer secret:present", "X-Second": "secret:missing"}},
+		}}),
+		Secrets: secrets.Static{"shared/present": "LEAK-IF-SEEN"},
+	}
+	san := "spiffe://sandbox/agent/s/1,spiffe://sandbox/tenant/u1,spiffe://sandbox/sandbox/sb1"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req(san, "two.example.com", "GET", "/"))
+	if w.Code != 502 {
+		t.Fatalf("missing secret must be 502, got %d", w.Code)
+	}
+	for name := range w.Header() {
+		if name == "Authorization" || name == "X-Second" || name == HeaderSlug {
+			t.Fatalf("denied response must carry no verdict headers, got %v", w.Header())
+		}
+	}
+}
+
+// TestOwnershipRevoked: once a policy's tenants list excludes the tenant, a running agent is
+// refused on the next request even though its certificate and the host rule are fine.
+func TestOwnershipRevoked(t *testing.T) {
+	h := &Handler{Policies: policy.FromPolicies(&policy.Policy{Slug: "s", Tenants: []string{"other"}, Allow: []policy.Rule{
+		{Host: "git.example.com", Paths: []string{"/**"}},
+	}})}
+	san := "spiffe://sandbox/agent/s/1,spiffe://sandbox/tenant/u1,spiffe://sandbox/sandbox/sb1"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req(san, "git.example.com", "GET", "/x"))
+	if w.Code != 403 || !strings.Contains(w.Body.String(), "no longer owns") {
+		t.Fatalf("revoked ownership must be denied: %d %s", w.Code, w.Body.String())
 	}
 }

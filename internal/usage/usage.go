@@ -213,13 +213,22 @@ type span struct {
 }
 
 // podSeconds sums the intervals during which each sandbox had a pod, clipped to the window.
-// A pod is up from the `waking` status until `stopping`, `sleeping` or `error`.
+// A pod is up from the `waking` status until `stopping`, `sleeping`, `error` or `deleting`.
 func podSeconds(ctx context.Context, st store.Store, f store.Filter, now time.Time) map[dims][]span {
 	// Status events before the window matter: a pod that woke yesterday is still up today.
-	sf := store.Filter{Tenant: f.Tenant, Slug: f.Slug, SandboxID: f.SandboxID, Types: []string{model.EventStatus}, To: f.To}
-	evs, err := st.QueryEvents(ctx, sf)
-	if err != nil {
-		return nil
+	// The store caps a page (Postgres: 1000 rows), so the log is walked page by page.
+	sf := store.Filter{Tenant: f.Tenant, Slug: f.Slug, SandboxID: f.SandboxID, Types: []string{model.EventStatus}, To: f.To, Limit: 1000}
+	var evs []*model.Event
+	for {
+		page, err := st.QueryEvents(ctx, sf)
+		if err != nil {
+			return nil
+		}
+		evs = append(evs, page...)
+		if len(page) < sf.Limit {
+			break
+		}
+		sf.AfterID = page[len(page)-1].ID
 	}
 	open := map[dims]time.Time{}
 	out := map[dims][]span{}
@@ -241,7 +250,7 @@ func podSeconds(ctx context.Context, st store.Store, f store.Filter, now time.Ti
 			if _, up := open[d]; !up {
 				open[d] = e.At
 			}
-		case model.StatusStopping, model.StatusSleeping, model.StatusError:
+		case model.StatusStopping, model.StatusSleeping, model.StatusError, model.StatusDeleting:
 			if start, up := open[d]; up {
 				clip(d, start, e.At)
 				delete(open, d)

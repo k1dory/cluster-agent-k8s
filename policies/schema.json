@@ -32,7 +32,8 @@
           "paths": { "type": "array", "minItems": 1, "items": { "type": "string", "pattern": "^/" }, "description": "Globs: * one segment, ** any segments." },
           "methods": { "type": "array", "items": { "type": "string", "enum": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] } },
           "inject": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Header → value; `secret:NAME` is resolved per tenant at the gateway." },
-          "mcp": { "type": "object", "additionalProperties": false, "properties": { "read_only": { "type": "boolean" } } },
+          "mcp": { "type": "object", "additionalProperties": false, "properties": { "read_only": { "type": "boolean"  },
+              "tools": { "type": "array", "items": { "type": "string" }, "description": "read_only: globs of tool names tools/call may name (none = no tool calls). Enforced by sandboxd's MCP proxy on the JSON-RPC body." } } },
           "upstream": { "type": "string", "pattern": "^https?://" }
         }
       }

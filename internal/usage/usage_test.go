@@ -55,4 +55,21 @@ func TestPodSecondsAndGrouping(t *testing.T) {
 	if _, err := Build(ctx, st, Query{GroupBy: "week"}, Pricing{}, now); err == nil {
 		t.Fatal("bad group_by must fail")
 	}
+	// Deleting a sandbox closes its compute interval: no pod time accrues after `deleting`.
+	ev("sb3", "carol", "netops", model.EventStatus, "waking", t0)
+	ev("sb3", "carol", "netops", model.EventStatus, "deleting", t0.Add(10*time.Second))
+	rep, _ = Build(ctx, st, Query{Tenant: "carol", From: t0, To: now}, Pricing{}, now)
+	if math.Abs(rep.Total.PodSeconds-10) > 0.01 {
+		t.Fatalf("deleted sandbox must stop accruing: %+v", rep.Total)
+	}
+	// More status events than one store page: the walk is paginated.
+	for i := 0; i < 2500; i++ {
+		ev("sb4", "dave", "netops", model.EventStatus, "waking", t0.Add(time.Duration(i)*time.Second))
+		ev("sb4", "dave", "netops", model.EventStatus, "sleeping", t0.Add(time.Duration(i)*time.Second+500*time.Millisecond))
+	}
+	rep, _ = Build(ctx, st, Query{Tenant: "dave", From: t0, To: now}, Pricing{}, now)
+	// 1200 pairs fall inside the 20-minute window (2400 status events, three store pages).
+	if math.Abs(rep.Total.PodSeconds-600) > 0.01 {
+		t.Fatalf("paginated status walk: %+v", rep.Total)
+	}
 }

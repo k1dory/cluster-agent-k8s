@@ -2,7 +2,7 @@ BIN ?= bin
 REGISTRY ?= registry.example.com/agent-sandbox
 TAG ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 
-.PHONY: build test vet dev images helm-lint policy-test policy-render manifests clean integration
+.PHONY: build test vet dev images smoke-image helm-lint policy-test policy-render manifests clean integration
 
 build:
 	mkdir -p $(BIN)
@@ -31,6 +31,11 @@ images:
 	docker build -f images/sandboxd/Dockerfile -t $(REGISTRY)/sandboxd:$(TAG) .
 	docker build -f images/agent/Dockerfile -t $(REGISTRY)/agent:$(TAG) .
 
+# Checks inside the built agent image: user 1000 is `agent`, tools present, netlock installs its
+# rules, agent-init and agent-runner start and complain about the right things.
+smoke-image: images
+	hack/smoke-image.sh $(REGISTRY)/agent:$(TAG)
+
 helm-lint:
 	cp policies/*.yaml deploy/helm/agent-sandbox/policies/ && rm -f deploy/helm/agent-sandbox/policies/tests.yaml
 	helm lint deploy/helm/agent-sandbox
@@ -40,9 +45,9 @@ helm-lint:
 manifests:
 	cp policies/*.yaml deploy/helm/agent-sandbox/policies/ && rm -f deploy/helm/agent-sandbox/policies/tests.yaml
 	helm template agent-sandbox deploy/helm/agent-sandbox -n agent-sandbox --set createNamespace=true \
-	  | sed '/^# Source:/d' > deploy/k8s/gateway-on-node.yaml
+	  | sed '/^# Source:/d' | awk -f hack/normalize-yaml.awk > deploy/k8s/gateway-on-node.yaml
 	helm template agent-sandbox deploy/helm/agent-sandbox -n agent-sandbox --set createNamespace=true --set gateway.mode=external \
-	  | sed '/^# Source:/d' > deploy/k8s/cluster-only.yaml
+	  | sed '/^# Source:/d' | awk -f hack/normalize-yaml.awk > deploy/k8s/cluster-only.yaml
 
 # Policy-as-Code gate, same as CI.
 policy-test: build

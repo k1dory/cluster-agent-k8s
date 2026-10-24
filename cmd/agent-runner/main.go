@@ -88,6 +88,9 @@ func main() {
 		fmt.Fprintln(os.Stderr, "agent-runner:", err)
 		os.Exit(1)
 	}
+	if err := ensureRepo(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "agent-runner: repository:", err)
+	}
 	fmt.Println("agent-runner: waiting for runs")
 	for ctx.Err() == nil {
 		var run model.Run
@@ -104,11 +107,57 @@ func main() {
 			continue
 		}
 		exit := execute(ctx, c, &run)
-		body, _ := json.Marshal(map[string]int{"exit_code": exit})
-		if _, err := c.do(context.Background(), http.MethodPost, "/agent/runs/"+run.ID+"/finish", body, nil); err != nil {
-			fmt.Fprintln(os.Stderr, "agent-runner: finish:", err)
-		}
+		c.finish(run.ID, exit)
 	}
+}
+
+// finish reports the result and insists on an acknowledgement: the control plane's /finish is
+// idempotent, so a lost response is retried (with backoff, for several minutes) rather than
+// leaving the run `running` forever. 4xx means the run is gone or not ours: stop.
+func (c *client) finish(runID string, exit int) {
+	body, _ := json.Marshal(map[string]int{"exit_code": exit})
+	var lastErr error
+	for attempt := 0; attempt < 12; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(min(1<<attempt, 60)) * time.Second)
+		}
+		code, err := c.do(context.Background(), http.MethodPost, "/agent/runs/"+runID+"/finish", body, nil)
+		if err == nil {
+			return
+		}
+		lastErr = err
+		if code >= 400 && code < 500 {
+			break
+		}
+		fmt.Fprintln(os.Stderr, "agent-runner: finish (will retry):", err)
+	}
+	fmt.Fprintln(os.Stderr, "agent-runner: finish gave up:", lastErr)
+}
+
+// ensureRepo clones $SANDBOX_REPO into /workspace/repo once (the workspace volume persists
+// across pods) so a run starts inside a checkout. Git goes through the gateway with the
+// identity agent-init configured; the policy decides whether the clone is allowed.
+func ensureRepo(ctx context.Context) error {
+	repo := os.Getenv("SANDBOX_REPO")
+	if repo == "" {
+		return nil
+	}
+	dir := repoDir()
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+		return nil
+	}
+	fmt.Println("agent-runner: cloning", repo, "into", dir)
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-lc", `git clone -- "$SANDBOX_REPO" "$SANDBOX_REPO_DIR"`)
+	cmd.Env = append(os.Environ(), "SANDBOX_REPO_DIR="+dir)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	return cmd.Run()
+}
+
+func repoDir() string {
+	if d := os.Getenv("SANDBOX_REPO_DIR"); d != "" {
+		return d
+	}
+	return "/workspace/repo"
 }
 
 // execute runs the harness for one task. Output lines are batched to the control plane;
@@ -144,6 +193,9 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	cmd.WaitDelay = 20 * time.Second
 	cmd.Env = env
 	cmd.Dir = os.Getenv("PWD")
+	if _, err := os.Stat(filepath.Join(repoDir(), ".git")); err == nil {
+		cmd.Dir = repoDir() // the harness starts inside the checkout
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return 1

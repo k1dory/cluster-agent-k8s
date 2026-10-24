@@ -53,6 +53,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
       - run: make helm-lint
       - name: rendered manifests are up to date
         run: make manifests && git diff --exit-code deploy/k8s
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the agent image
+        run: docker build -f images/agent/Dockerfile -t agent-sandbox/agent:ci .
+      - name: build the control plane image
+        run: docker build -f images/sandboxd/Dockerfile -t agent-sandbox/sandboxd:ci .
+      - name: smoke test the shipped agent image (user, tools, netlock, agent-init, agent-runner)
+        run: hack/smoke-image.sh agent-sandbox/agent:ci

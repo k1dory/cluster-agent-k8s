@@ -59,6 +59,66 @@ const (
 	HeaderAccess   = "X-Agent-Access"
 )
 
+// Decision is the outcome of one policy evaluation, shared by the forward_auth endpoint and
+// the MCP proxy.
+type Decision struct {
+	Identity *identity.Identity
+	Rule     *policy.Rule
+	Headers  map[string]string // everything the gateway adds upstream: identity + injected secrets
+	Code     int               // on deny
+	Reason   string            // on deny
+}
+
+// Allowed reports a positive decision.
+func (d *Decision) Allowed() bool { return d.Rule != nil }
+
+// Decide evaluates method+host+path for the identity in the request headers. Secrets are
+// resolved before anything is decided, so a denial never carries a partially injected set.
+func (h *Handler) Decide(ctx context.Context, r *http.Request, host, method, p string) *Decision {
+	id, err := identity.FromRequest(r)
+	if err != nil {
+		return &Decision{Code: http.StatusForbidden, Reason: "no agent identity: " + err.Error()}
+	}
+	d := &Decision{Identity: id}
+	if h.Checker != nil {
+		if _, err := h.Checker.Check(ctx, id); err != nil {
+			d.Code, d.Reason = http.StatusForbidden, "identity rejected: "+err.Error()
+			return d
+		}
+	}
+	// Ownership is re-checked on every request: when a policy's tenants list changes in git,
+	// agents that already run under the slug lose their access at once, not at their next wake.
+	if h.Policies.Revoked(id.Slug, id.Tenant) {
+		d.Code, d.Reason = http.StatusForbidden, "policy: tenant "+id.Tenant+" no longer owns slug "+id.Slug
+		return d
+	}
+	rule, ok := h.Policies.Match(id.Slug, host, method, p)
+	if !ok {
+		d.Code, d.Reason = http.StatusForbidden, "policy: no rule for "+method+" "+host+p
+		return d
+	}
+	headers := map[string]string{}
+	for name, tpl := range rule.Inject {
+		v, err := secrets.Expand(ctx, h.Secrets, id.Tenant, tpl)
+		if err != nil {
+			// A missing tenant secret is a configuration problem, not an agent fault; 502 keeps it
+			// distinguishable. Nothing resolved so far leaves this function.
+			d.Code, d.Reason = http.StatusBadGateway, "secret: "+err.Error()
+			return d
+		}
+		headers[http.CanonicalHeaderKey(name)] = v
+	}
+	headers[HeaderSlug] = id.Slug
+	headers[HeaderInstance] = strconv.Itoa(id.Instance)
+	headers[HeaderTenant] = id.Tenant
+	headers[HeaderSandbox] = id.SandboxID
+	if rule.MCP != nil && rule.MCP.ReadOnly {
+		headers[HeaderAccess] = "read-only"
+	}
+	d.Rule, d.Headers = rule, headers
+	return d
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	host := r.Header.Get("X-Forwarded-Host")
@@ -76,59 +136,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if u, err := url.ParseRequestURI(uri); err == nil {
 		p = u.Path
 	}
-	record := func(id *identity.Identity, allowed bool, code int, reason string) {
-		if h.Recorder == nil || id == nil || h.Trace == TraceOff || h.Quiet[host] || (allowed && h.Trace == TraceDenied) {
-			return
-		}
-		h.Recorder.RecordEgress(r.Context(), id.SandboxID, allowed, model.Egress{Host: host, Method: method, Path: p, Code: code, Reason: reason})
-	}
-	deny := func(code int, reason string, id *identity.Identity) {
-		attrs := []any{"verdict", "deny", "reason", reason, "host", host, "method", method, "uri", uri, "src", src, "code", code}
-		if id != nil {
-			attrs = append(attrs, "agent", id.String(), "tenant", id.Tenant, "sandbox", id.SandboxID)
+	d := h.Decide(r.Context(), r, host, method, p)
+	h.Record(r.Context(), d, host, method, p)
+	if !d.Allowed() {
+		attrs := []any{"verdict", "deny", "reason", d.Reason, "host", host, "method", method, "uri", uri, "src", src, "code", d.Code}
+		if d.Identity != nil {
+			attrs = append(attrs, "agent", d.Identity.String(), "tenant", d.Identity.Tenant, "sandbox", d.Identity.SandboxID)
 		}
 		log.Warn("egress", attrs...)
-		record(id, false, code, reason)
-		http.Error(w, reason, code)
-	}
-
-	id, err := identity.FromRequest(r)
-	if err != nil {
-		deny(http.StatusForbidden, "no agent identity: "+err.Error(), nil)
+		// The response carries no verdict headers: forward_auth copies headers only on 2xx, and
+		// even so nothing secret was put on w.
+		http.Error(w, d.Reason, d.Code)
 		return
 	}
-	if h.Checker != nil {
-		if _, err := h.Checker.Check(r.Context(), id); err != nil {
-			deny(http.StatusForbidden, "identity rejected: "+err.Error(), id)
-			return
-		}
-	}
-	rule, ok := h.Policies.Match(id.Slug, host, method, p)
-	if !ok {
-		deny(http.StatusForbidden, "policy: no rule for "+method+" "+host+p, id)
-		return
-	}
-	for name, tpl := range rule.Inject {
-		v, err := secrets.Expand(r.Context(), h.Secrets, id.Tenant, tpl)
-		if err != nil {
-			// A missing tenant secret is a configuration problem, not an agent fault; 502 keeps it distinguishable.
-			deny(http.StatusBadGateway, "secret: "+err.Error(), id)
-			return
-		}
+	for name, v := range d.Headers {
 		w.Header().Set(name, v)
 	}
-	w.Header().Set(HeaderSlug, id.Slug)
-	w.Header().Set(HeaderInstance, strconv.Itoa(id.Instance))
-	w.Header().Set(HeaderTenant, id.Tenant)
-	w.Header().Set(HeaderSandbox, id.SandboxID)
-	if rule.MCP != nil && rule.MCP.ReadOnly {
-		w.Header().Set(HeaderAccess, "read-only")
+	if h.Toucher != nil && d.Identity.SandboxID != "" {
+		h.Toucher.Touch(r.Context(), d.Identity.SandboxID)
 	}
-	if h.Toucher != nil && id.SandboxID != "" {
-		h.Toucher.Touch(r.Context(), id.SandboxID)
-	}
-	record(id, true, 0, "")
-	log.Info("egress", "verdict", "allow", "agent", id.String(), "tenant", id.Tenant, "sandbox", id.SandboxID,
+	log.Info("egress", "verdict", "allow", "agent", d.Identity.String(), "tenant", d.Identity.Tenant, "sandbox", d.Identity.SandboxID,
 		"host", host, "method", method, "uri", uri, "src", src, "took_us", time.Since(start).Microseconds())
 	w.WriteHeader(http.StatusOK)
+}
+
+// Record writes the decision into the trace according to the trace level.
+func (h *Handler) Record(ctx context.Context, d *Decision, host, method, p string) {
+	if h.Recorder == nil || d.Identity == nil || h.Trace == TraceOff || h.Quiet[host] || (d.Allowed() && h.Trace == TraceDenied) {
+		return
+	}
+	h.Recorder.RecordEgress(ctx, d.Identity.SandboxID, d.Allowed(), model.Egress{Host: host, Method: method, Path: p, Code: d.Code, Reason: d.Reason})
 }

@@ -54,6 +54,8 @@ kube:
   network_attachment: "${NETWORK_ATTACHMENT}"
   volume_size: 10Gi
   harness_command: '${HARNESS_CMD}'
+  pod_firewall: true                       # nftables inside every pod: egress to the gateway only
+  gateway_ca_configmap: agent-sandbox-gateway-ca   # the gateway root pods trust at bootstrap
   # harness_resume_command: continues a run interrupted by a forced rollout; default is Claude Code's --resume.
   # Codex: 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'
 sandbox:
