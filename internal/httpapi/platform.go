@@ -26,6 +26,7 @@ import (
 	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/connections"
+	"agent-sandbox/internal/credentials"
 	"agent-sandbox/internal/events"
 	"agent-sandbox/internal/ingress"
 	"agent-sandbox/internal/model"
@@ -56,6 +57,8 @@ type Platform struct {
 	Tenants        map[string]string // tenant-scoped tokens: token → tenant
 	// Keys authenticates tenant API keys issued through the API (sbk_…); nil disables them.
 	Keys *apikeys.Service
+	// Credentials are the secrets tenants bring through the API (BYOK); nil disables the routes.
+	Credentials *credentials.Service
 	// Verifier checks bearer tokens that are not static ones (OIDC JWTs). nil disables.
 	Verifier TokenVerifier
 	// TTLFromToken caps the lifetime of sandboxes created with a short-lived token (and so
@@ -138,6 +141,7 @@ func (p *Platform) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/rollouts", p.auth(p.rollout))
 	mux.HandleFunc("GET /v1/version", p.auth(p.version))
 	p.keyRoutes(mux)
+	p.credentialRoutes(mux)
 	mux.HandleFunc("GET /v1/whoami", p.auth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, principalOf(r))
 	}))

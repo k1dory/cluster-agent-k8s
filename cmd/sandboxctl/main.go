@@ -50,6 +50,9 @@ const usage = `sandboxctl <command> [flags]
   revisions agent|environment|connection|binding <name> [-tenant t]
   remove   agent|environment|connection|binding <name> [-tenant t]
   settings <tenant> [-revisions | -reset]     a tenant's quotas and allowed environments (admin writes with apply)
+  credentials list [-tenant t] | set <name> [-file f] [-tenant t] | remove <name> [-tenant t]
+           your own secrets for secret:NAME references (LLM key, MCP token): the value is read from -file or
+           stdin, never from the command line, and never shown again; set replaces, remove revokes
   keys     list [-tenant t] | create -tenant t -name n [-ttl 720h] | rotate <id> [-tenant t] [-grace 1h] [-ttl d]
            | revoke <id> [-tenant t]        tenant API keys (sbk_…): the secret is printed once; a tenant key
                                            manages its own tenant's keys, the admin every tenant's
@@ -419,6 +422,66 @@ func (c *cli) run(cmd string, args []string) error {
 		}
 		if a.Status != model.ApplyDone {
 			os.Exit(3)
+		}
+	case "credentials":
+		sub := need(pos, 0, "list|set|remove")
+		tenant := fs.String("tenant", "", "scope (admin): a tenant, or empty for the shared scope")
+		file := fs.String("file", "", "set: read the value from this file (default: stdin)")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(flags)
+		q := ""
+		if *tenant != "" {
+			q = "?tenant=" + url.QueryEscape(*tenant)
+		}
+		switch sub {
+		case "list":
+			var list []model.Credential
+			if err := c.do("GET", "/v1/credentials"+q, nil, &list); err != nil {
+				return err
+			}
+			if *asJSON {
+				printJSON(list)
+				return nil
+			}
+			tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(tw, "NAME\tVERSION\tFINGERPRINT\tUPDATED\tBY")
+			for _, cr := range list {
+				fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\n", cr.Name, cr.Version, cr.Fingerprint, cr.UpdatedAt.Format(time.RFC3339), cr.CreatedBy)
+			}
+			tw.Flush()
+		case "set":
+			name := need(pos, 1, "name")
+			var raw []byte
+			var err error
+			if *file != "" {
+				raw, err = os.ReadFile(*file)
+			} else {
+				if info, err := os.Stdin.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
+					fmt.Fprintln(os.Stderr, "reading the value from stdin (end with Ctrl-D):")
+				}
+				raw, err = io.ReadAll(os.Stdin)
+			}
+			if err != nil {
+				return err
+			}
+			value := strings.TrimRight(string(raw), "\r\n")
+			var cr model.Credential
+			if err := c.do("PUT", "/v1/credentials/"+url.PathEscape(name)+q, map[string]any{"value": value}, &cr); err != nil {
+				return err
+			}
+			if *asJSON {
+				printJSON(cr)
+				return nil
+			}
+			fmt.Printf("credential %s: version %d, fingerprint %s\n", cr.Name, cr.Version, cr.Fingerprint)
+		case "remove":
+			name := need(pos, 1, "name")
+			if err := c.do("DELETE", "/v1/credentials/"+url.PathEscape(name)+q, nil, nil); err != nil {
+				return err
+			}
+			fmt.Println("removed", name)
+		default:
+			return fmt.Errorf("credentials: unknown subcommand %q", sub)
 		}
 	case "keys":
 		sub := need(pos, 0, "list|create|rotate|revoke")

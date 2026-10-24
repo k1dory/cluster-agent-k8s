@@ -867,6 +867,56 @@ paths:
         "404": { description: "Unknown apply, item or revision", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "409": { description: "The state moved since the plan", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "422": { description: "invalid_plan (a document no longer validates under the caller's rights) or nothing_to_roll_back; the rollback is included", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/credentials:
+    get:
+      tags: [tenancy]
+      summary: The scope's own credentials (metadata only)
+      description: |
+        Secrets a tenant brought through the API (BYOK): an LLM key, an MCP token, a Git
+        credential. The value is encrypted at rest under the server's `credentials.key` and
+        never returned; `fingerprint` (first 12 hex of its SHA-256) tells which value is loaded.
+        `secret:NAME` references resolve from these first, then from the operator's provider.
+        A tenant works in its own scope, the admin in a tenant's (`?tenant=`) or the shared one.
+      parameters: [{ $ref: "#/components/parameters/scope" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Credential" } } } } }
+        "503": { description: "credentials.key is not configured", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/credentials/{name}:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string } }
+      - { $ref: "#/components/parameters/scope" }
+    get:
+      tags: [tenancy]
+      summary: One credential's metadata
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [tenancy]
+      summary: Add or replace the credential (the value goes in here and never comes out)
+      description: A replacement bumps `version`; the next gateway request that references the name uses the new value.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [value]
+              properties:
+                value: { type: string, maxLength: 65536 }
+      responses:
+        "200": { description: Replaced, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
+        "201": { description: Added, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "422": { description: "Bad name or empty / oversized value", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: [tenancy]
+      summary: Revoke the credential
+      description: The next request that needs it fails at the gateway (502, nothing partial is sent); the operator's provider, if it has the name, shows through again.
+      responses:
+        "204": { description: Revoked }
+        "404": { $ref: "#/components/responses/Error" }
   /v1/tenants/{tenant}/keys:
     parameters: [{ name: tenant, in: path, required: true, schema: { type: string } }]
     get:
@@ -1457,6 +1507,17 @@ components:
         created_at: { type: string, format: date-time }
         deleted_at: { type: string, format: date-time, description: "Set once the item was deleted; the revision stays as history and cannot be referenced" }
         source: { $ref: "#/components/schemas/Source" }
+    Credential:
+      type: object
+      description: Metadata of a secret a tenant brought through the API; the value is never part of it
+      properties:
+        tenant: { type: string, description: "Empty for the shared scope" }
+        name: { type: string }
+        version: { type: integer, description: "Bumped by every replacement" }
+        fingerprint: { type: string, description: "First 12 hex of sha256(value)" }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
     APIKey:
       type: object
       description: A tenant API key; the secret is never part of it

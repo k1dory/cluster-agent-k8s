@@ -26,6 +26,26 @@ The store keeps a key's id and the SHA-256 of its secret; every request looks th
 revocation holds on every replica at once and never waits for a cache. `api_keys.max_ttl` in the
 server configuration caps how long a key may live. See the README, "Authentication".
 
+## 1b. The tenant brings its own keys
+
+An LLM key, an MCP token or a Git credential used to be something the operator placed in the
+secrets provider for the tenant. Now the tenant puts it in itself, through the same API, and
+replaces or revokes it without asking:
+
+```sh
+printf '%s' "$ANTHROPIC_API_KEY" | sandboxctl credentials set anthropic   # the value: stdin or -file, never argv
+sandboxctl credentials list                                               # name, version, fingerprint, who, when
+sandboxctl credentials set anthropic -file ./new-key.txt                 # replace: version 2 on the next request
+sandboxctl credentials remove anthropic                                   # revoke: the next request fails at the gateway
+```
+
+`PUT /v1/credentials/{name}` with `{"value": …}`, `GET` (metadata only, a `fingerprint` of the
+value to tell which one is loaded), `DELETE`. The value is encrypted at rest under the server's
+`credentials.key` and exists in clear only inside the gateway's decision for that tenant.
+`secret:NAME` references in connections and policies resolve from these credentials first, then
+from the operator's provider, so a tenant may override what the operator configured under the
+same name, and the operator's provider keeps serving everything the tenant did not bring.
+
 ## 2. The admin decides what the tenant may reach
 
 Two admin-written resources, both through the API (`sandboxctl apply`, a PUT, or a bundle from
@@ -104,8 +124,10 @@ configuration only tells the harness where the servers are.
 
 - The policy repository: the slugs and the network rules reviewed as code, their `tenants:`
   lists, the hosts they serve. A connection never overrides a repository host.
-- The secrets provider: a connection references `secret:NAME`; the value lives in the file
-  directory, Vault/OpenBao or Infisical the operator configured, under the tenant's path.
+- The secrets provider and `credentials.key`: a connection references `secret:NAME`; the value
+  is what the tenant brought through the API (encrypted under the server key the operator holds)
+  or, failing that, what the operator placed in the file directory, Vault/OpenBao or Infisical
+  under the tenant's path.
 - `TenantSettings.hosts` and `PolicyBinding`: what each tenant may reach and run. Both are API
   resources with history, so widening and revoking are one apply each, and the drift report shows
   when somebody changed them by hand.
@@ -113,7 +135,8 @@ configuration only tells the harness where the servers are.
 ## Where to read the state
 
 ```sh
-sandboxctl keys list -tenant acme                 # credentials and when they were last used
+sandboxctl keys list -tenant acme                 # API keys and when they were last used
+sandboxctl credentials list                       # the tenant's own secrets: versions and fingerprints, never values
 sandboxctl settings acme                          # hosts and environments the tenant may use
 sandboxctl list connections                       # what the tenant declared
 sandboxctl get sandbox sb_1234                    # connections and launch (mcp_servers) of a sandbox

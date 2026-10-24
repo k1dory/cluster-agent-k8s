@@ -381,6 +381,19 @@ type APIKey struct {
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
 }
 
+// Credential is the metadata of a secret a tenant brought through the API (its own LLM key,
+// MCP token or Git credential): what `secret:NAME` references resolve to first. The value is
+// encrypted at rest and never leaves the gateway's decision; the API returns this record only.
+type Credential struct {
+	Tenant      string    `json:"tenant"` // "" = shared, written by the admin
+	Name        string    `json:"name"`
+	Version     int       `json:"version"`     // bumped by every replacement
+	Fingerprint string    `json:"fingerprint"` // first 12 hex of sha256(value): tells which value is loaded, reveals nothing of it
+	CreatedBy   string    `json:"created_by,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
 // Active reports a key that authenticates at t: not revoked, not expired.
 func (k *APIKey) Active(t time.Time) bool {
 	if k.RevokedAt != nil && !k.RevokedAt.After(t) {

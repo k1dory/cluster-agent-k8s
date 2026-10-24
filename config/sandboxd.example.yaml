@@ -32,6 +32,10 @@ database_url: "${DATABASE_URL}"   # empty = in-memory (dev only); required for m
 policies_dir: policies
 policies_strict: false             # true: a policy without `tenants:` is admin-only, unknown slugs are refused
 secrets_dir: /etc/sandbox/secrets  # file provider: tenants/<tenant>/<name>, shared/<name>
+# Credentials tenants bring through the API (PUT /v1/credentials/{name}): encrypted at rest under
+# this key (openssl rand -hex 32); secret:NAME resolves from them first. Empty disables the API.
+credentials:
+  key: "${CREDENTIALS_KEY}"
 # secrets:                         # external provider instead of the directory
 #   provider: vault                # vault (HashiCorp Vault or OpenBao, KV v2) | infisical | file
 #   cache_ttl: 60s

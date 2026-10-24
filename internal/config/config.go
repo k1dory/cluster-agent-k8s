@@ -34,6 +34,12 @@ type Config struct {
 	APIKeys struct {
 		MaxTTL time.Duration `yaml:"max_ttl"`
 	} `yaml:"api_keys"`
+	// Credentials: secrets tenants bring through the API (PUT /v1/credentials/{name}), encrypted
+	// at rest under key (64 hex characters or the base64 of 32 bytes; `openssl rand -hex 32`).
+	// Empty disables the API; `secret:NAME` then resolves from the secrets provider alone.
+	Credentials struct {
+		Key string `yaml:"key"`
+	} `yaml:"credentials"`
 	// Quotas per tenant; `default` applies to tenants not listed. Zero = unlimited.
 	Quotas struct {
 		Default orchestrator.Quota            `yaml:"default"`

@@ -34,7 +34,9 @@ agentImage:
   pullPolicy: IfNotPresent
 
 # Secrets are referenced, never written here.
-existingSecret: agent-sandbox-secrets   # keys: SANDBOXD_API_TOKEN, DATABASE_URL, PREVIEW_TICKET_KEY
+existingSecret: agent-sandbox-secrets   # keys: SANDBOXD_API_TOKEN, DATABASE_URL, PREVIEW_TICKET_KEY,
+                                        # CREDENTIALS_KEY (optional, `openssl rand -hex 32`: enables tenant-brought
+                                        # secrets through PUT /v1/credentials; absent = that API is off)
 tenantSecretsSecret: ""                 # optional: mounted at /etc/sandbox/secrets (tenants/<t>/<name>, shared/<name>)
 caStorage: 100Mi                        # PVC for the agent CA key; back it up
 

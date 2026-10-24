@@ -413,6 +413,16 @@ session and, with `ttl_from_token`, the sandboxes it creates: their `expires_at`
 token's expiry and the agent certificates issued inside them cannot outlive the sandbox. Static
 `api_token` (the admin) and `api_tokens[]` keep working next to keys and OIDC.
 
+### Bring your own key: tenant credentials through the API
+
+A tenant's LLM key, MCP token or Git credential no longer has to be placed in the secrets
+provider by the operator. `PUT /v1/credentials/{name}` (`sandboxctl credentials set <name>`,
+value from stdin or `-file`) stores it encrypted under the server's `credentials.key`; `GET`
+returns metadata only (version, a fingerprint of the value, who and when); `PUT` again replaces
+it for the next request; `DELETE` revokes it and the next request that needs it fails at the
+gateway. `secret:NAME` resolves from these credentials first, then from the operator's provider.
+Without `credentials.key` the routes answer 503 and the provider alone resolves references.
+
 ### Secrets: directory, Vault/OpenBao or Infisical
 
 `secret:NAME` references in policies are resolved per tenant with a shared fallback, from a mounted
