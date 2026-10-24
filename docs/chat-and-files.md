@@ -34,6 +34,10 @@ multipart with `text` and `file` parts), `GET /v1/sandboxes/{id}/messages` (one 
 A sandbox's conversation is a chain of runs that share one harness session. Three things make
 it continuous:
 
+Choosing the run that carries a message and recording it happen under one lock per sandbox
+shared by every replica (an advisory lock in PostgreSQL), so two messages sent at the same
+moment join the same conversation instead of starting two.
+
 1. **A message reaches a run in progress as input.** `POST /messages` on a sandbox whose run is
    running (or queued) appends an `input` event; the runner hands it to the harness's stdin. For
    Claude Code that is useful only when the harness was started in streaming-input mode:
@@ -112,11 +116,24 @@ client ── GET /files?path=repo ──▶ sandboxd ── fs.request event �
   (`GET /agent/blobs/{name}`) and writes the file atomically, creating parent directories.
   `PUT /files/content` and message attachments (`uploads/<name>`) use it.
 
-Paths are relative to `/workspace` (a leading `/workspace/` is accepted). The runner refuses
-anything that resolves outside the workspace, through `..` or through a symlink. Transfer blob
-names are confined to the sandbox that owns them (`fs/<sandbox>/…`): a pod can neither read
-another sandbox's upload nor answer another sandbox's request, and uncollected blobs are purged
-after an hour.
+Paths are relative to `/workspace` (a leading `/workspace/` is accepted). Every operation is
+performed through `os.Root` opened on the workspace: a path with a `..` segment is refused
+outright, and a symlink that leaves the workspace, whether the file itself or any directory on
+the way, including a parent that does not exist yet for a new file, is refused by the kernel-side
+check at every step. Relative symlinks that stay inside the workspace work; absolute symlinks are
+treated as relative to the workspace root (so a link to `/workspace/x` or to anything outside
+does not resolve). Writing onto a symlink replaces the link with a regular file inside the
+workspace and never touches its target. Transfer blob names are confined to the sandbox that
+owns them (`fs/<sandbox>/…`): a pod can neither read another sandbox's upload nor answer another
+sandbox's request, and uncollected blobs are purged after an hour.
+
+Delivery is at-least-once in both directions. The runner moves its cursor past a request only
+once its answer was acknowledged; an answer lost to a transient failure is retried with
+backoff, and a request still unanswered is served again by the next poll (the control plane
+lists every unanswered request of the last ten minutes, however long the answered history before
+it). The gateway side resolves only the connections of the host being requested, so a secret
+missing for one external service never blocks the agent's calls to the control plane or to
+other services.
 
 A file request on a sleeping sandbox wakes it (pass `?wake=false` to get 409 instead) and waits
 up to three minutes for the pod; on a running sandbox the wait is one minute (504 on timeout).

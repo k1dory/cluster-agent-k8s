@@ -277,9 +277,11 @@ changing anything. Documents may depend on each other (an agent may name the env
 connection the same bundle introduces); each is checked against the caller's authority (a tenant
 plans only in its own scope and the kinds it may write), compared with the current revision into a
 stable field diff (`spec.resources.cpu_limit: 2 -> 3`), and given the `expected_revision` apply must
-find. A document's own `expected_revision` that no longer matches is a conflict. The plan is
-deterministic for the same documents and state, lists changes in apply order, and carries a
-`bundle` fingerprint of the documents. `internal/plan` runs the same validators the API runs on a
+find, and the `next_revision` the item will have afterwards (numbering continues past deleted
+revisions; an unchanged document keeps its revision), so a reference pinned to a revision apply
+will not produce is refused by the plan. A document's own `expected_revision` that no longer
+matches is a conflict. The plan is deterministic for the same documents and state, lists
+changes in apply order, and carries a `bundle` fingerprint of the documents. `internal/plan` runs the same validators the API runs on a
 write, over a read-only overlay of the store. See `examples/catalog/bundle.yaml`.
 
 ### Agent versions and rollouts

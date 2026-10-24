@@ -21,10 +21,21 @@ const (
 // receives it as input; otherwise a new run continues the last finished run's harness session
 // (the message is its prompt), or starts a fresh conversation when none exists. The run that
 // carries the message is returned with how it was delivered.
-func (o *Orchestrator) Say(ctx context.Context, sandboxID, text string) (*model.Run, string, error) {
+func (o *Orchestrator) Say(ctx context.Context, sandboxID, text string) (run *model.Run, how string, err error) {
 	if strings.TrimSpace(text) == "" {
 		return nil, "", fmt.Errorf("%w: text is required", ErrBadRequest)
 	}
+	// Choosing the run that carries the message and recording it happen under one lock per
+	// sandbox, shared by every replica: two messages sent at once cannot both see "no run in
+	// progress" and start two conversations.
+	err = o.Store.WithTenantLock(ctx, "sandbox:"+sandboxID, func(ctx context.Context) error {
+		run, how, err = o.say(ctx, sandboxID, text)
+		return err
+	})
+	return run, how, err
+}
+
+func (o *Orchestrator) say(ctx context.Context, sandboxID, text string) (*model.Run, string, error) {
 	sb, err := o.Store.GetSandbox(ctx, sandboxID)
 	if err != nil {
 		return nil, "", err

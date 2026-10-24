@@ -74,10 +74,13 @@ type Change struct {
 	// CurrentRevision is the live revision the document was compared with (0: none).
 	// ExpectedRevision is what apply must find for this change to be the one planned here: the
 	// current revision (apply refuses the change otherwise).
-	CurrentRevision  int           `json:"current_revision"`
-	ExpectedRevision int           `json:"expected_revision"`
-	Diff             []FieldChange `json:"diff,omitempty"`
-	Errors           []string      `json:"errors,omitempty"`
+	CurrentRevision  int `json:"current_revision"`
+	ExpectedRevision int `json:"expected_revision"`
+	// NextRevision is the revision the item will have after apply: a new number for create and
+	// update (numbering continues past deleted revisions), the current one for noop.
+	NextRevision int           `json:"next_revision"`
+	Diff         []FieldChange `json:"diff,omitempty"`
+	Errors       []string      `json:"errors,omitempty"`
 }
 
 // Plan is the result for a bundle: deterministic for the same documents and the same state.
@@ -162,7 +165,7 @@ func (d Deps) Plan(ctx context.Context, docs []*res.Document, scope Scope) (*Pla
 	// The bundle as the services would see it after apply: every document is visible to the
 	// others' validation, so an agent may name an environment or a connection the same bundle
 	// introduces. Canonical specs replace the raw ones as validation proceeds in apply order.
-	ov := &overlay{base: d.Store, pending: map[string]*model.CatalogItem{}}
+	ov := &overlay{base: d.Store, pending: map[string]*model.CatalogItem{}, fixed: map[string]int{}}
 	for _, e := range entries {
 		if len(e.change.Errors) == 0 {
 			ov.pending[e.key] = &model.CatalogItem{Kind: e.doc.Kind, Tenant: e.tenant, Name: e.doc.Name, Description: e.doc.Description, Spec: e.doc.Spec}
@@ -171,75 +174,105 @@ func (d Deps) Plan(ctx context.Context, docs []*res.Document, scope Scope) (*Pla
 	tset := tenants.New(ov, d.Defaults)
 	bind := bindings.New(ov, d.Policies)
 	bind.Now = now
-	for name, r := range map[string]interface{ Refresh(context.Context) error }{"tenant settings": tset, "bindings": bind} {
-		if err := r.Refresh(ctx); err != nil {
-			return nil, fmt.Errorf("plan: load %s: %w", name, err)
-		}
-	}
 	guard := &bindings.Guard{Set: d.Policies, Bindings: bind}
 	conns := connections.New(ov, d.Secrets, nil)
 	cat := &catalog.Service{Store: ov, Images: d.Images, Policies: guard, Connections: conns, Tenants: tset}
 
 	order := append([]*entry(nil), entries...)
 	sort.SliceStable(order, func(i, j int) bool { return kindRank[order[i].doc.Kind] < kindRank[order[j].doc.Kind] })
-	for _, e := range order {
-		if len(e.change.Errors) > 0 {
-			continue
+	validate := func() error {
+		for name, r := range map[string]interface{ Refresh(context.Context) error }{"tenant settings": tset, "bindings": bind} {
+			if err := r.Refresh(ctx); err != nil {
+				return fmt.Errorf("plan: load %s: %w", name, err)
+			}
 		}
-		var err error
-		switch e.doc.Kind {
-		case model.KindEnvironment, model.KindAgent:
-			e.item, err = cat.Validate(ctx, e.doc.Kind, e.tenant, e.doc, scope.Admin, scope.Subject)
-		case model.KindConnection:
-			e.item, err = conns.Validate(ctx, e.tenant, e.doc, scope.Admin, scope.Subject)
-		case model.KindBinding:
-			e.item, err = bind.Validate(ctx, e.tenant, e.doc, scope.Admin, scope.Subject)
-		case model.KindTenantSettings:
-			e.item, err = tset.Validate(ctx, e.tenant, e.doc, scope.Subject)
+		for _, e := range order {
+			if len(e.change.Errors) > 0 {
+				continue
+			}
+			var err error
+			switch e.doc.Kind {
+			case model.KindEnvironment, model.KindAgent:
+				e.item, err = cat.Validate(ctx, e.doc.Kind, e.tenant, e.doc, scope.Admin, scope.Subject)
+			case model.KindConnection:
+				e.item, err = conns.Validate(ctx, e.tenant, e.doc, scope.Admin, scope.Subject)
+			case model.KindBinding:
+				e.item, err = bind.Validate(ctx, e.tenant, e.doc, scope.Admin, scope.Subject)
+			case model.KindTenantSettings:
+				e.item, err = tset.Validate(ctx, e.tenant, e.doc, scope.Subject)
+			}
+			if err != nil {
+				e.change.Errors = append(e.change.Errors, err.Error())
+				delete(ov.pending, e.key) // an invalid document is not something others may depend on
+				continue
+			}
+			ov.pending[e.key] = e.item
 		}
-		if err != nil {
-			e.change.Errors = append(e.change.Errors, err.Error())
-			delete(ov.pending, e.key) // an invalid document is not something others may depend on
-			continue
-		}
-		ov.pending[e.key] = e.item
+		return nil
 	}
-	// Compare each candidate with the live state.
-	for _, e := range entries {
-		c := e.change
-		if _, known := kindRank[e.doc.Kind]; !known {
-			c.Action = ActionInvalid
-			continue
+	if err := validate(); err != nil {
+		return nil, err
+	}
+	// Compare each candidate with the live state and decide the action; the overlay then
+	// presents the revision apply will really produce (a noop keeps the current one, the rest
+	// get the next number of the history, deleted revisions included).
+	decide := func() error {
+		for _, e := range entries {
+			c := e.change
+			if _, known := kindRank[e.doc.Kind]; !known {
+				c.Action = ActionInvalid
+				continue
+			}
+			cur, err := d.Store.GetItem(ctx, e.doc.Kind, e.tenant, e.doc.Name, 0)
+			if err != nil && !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+			c.CurrentRevision = 0
+			if cur != nil {
+				c.CurrentRevision = cur.Revision
+			}
+			c.ExpectedRevision = c.CurrentRevision
+			if e.doc.ExpectedRevision != nil && *e.doc.ExpectedRevision != c.CurrentRevision {
+				c.Errors = appendOnce(c.Errors, fmt.Sprintf("%s: expected_revision %d, but the current revision is %d", res.ErrConflict, *e.doc.ExpectedRevision, c.CurrentRevision))
+			}
+			if len(c.Errors) > 0 {
+				c.Action, c.NextRevision = ActionInvalid, c.CurrentRevision
+				delete(ov.pending, e.key)
+				continue
+			}
+			var from, to map[string]any
+			if cur != nil {
+				from = flatten(cur.Spec, cur.Description)
+			}
+			to = flatten(e.item.Spec, e.item.Description)
+			c.Diff = diff(from, to)
+			switch {
+			case cur == nil:
+				c.Action = ActionCreate
+			case len(c.Diff) == 0:
+				c.Action = ActionNoop
+			default:
+				c.Action = ActionUpdate
+			}
+			if c.Action == ActionNoop {
+				c.NextRevision = c.CurrentRevision
+			} else if c.NextRevision, err = ov.nextRevision(ctx, e.doc.Kind, e.tenant, e.doc.Name); err != nil {
+				return err
+			}
+			ov.fixed[e.key] = c.NextRevision
 		}
-		cur, err := d.Store.GetItem(ctx, e.doc.Kind, e.tenant, e.doc.Name, 0)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
-			return nil, err
-		}
-		if cur != nil {
-			c.CurrentRevision = cur.Revision
-		}
-		c.ExpectedRevision = c.CurrentRevision
-		if e.doc.ExpectedRevision != nil && *e.doc.ExpectedRevision != c.CurrentRevision {
-			c.Errors = append(c.Errors, fmt.Sprintf("%s: expected_revision %d, but the current revision is %d", res.ErrConflict, *e.doc.ExpectedRevision, c.CurrentRevision))
-		}
-		if len(c.Errors) > 0 {
-			c.Action = ActionInvalid
-			continue
-		}
-		var from, to map[string]any
-		if cur != nil {
-			from = flatten(cur.Spec, cur.Description)
-		}
-		to = flatten(e.item.Spec, e.item.Description)
-		c.Diff = diff(from, to)
-		switch {
-		case cur == nil:
-			c.Action = ActionCreate
-		case len(c.Diff) == 0:
-			c.Action = ActionNoop
-		default:
-			c.Action = ActionUpdate
-		}
+		return nil
+	}
+	if err := decide(); err != nil {
+		return nil, err
+	}
+	// Second pass: references pinned to a revision the first pass promised but apply will not
+	// produce (an item that turns out unchanged) are refused now, not at apply time.
+	if err := validate(); err != nil {
+		return nil, err
+	}
+	if err := decide(); err != nil {
+		return nil, err
 	}
 	sort.SliceStable(entries, func(i, j int) bool {
 		a, b := entries[i], entries[j]
@@ -273,6 +306,15 @@ func (d Deps) Plan(ctx context.Context, docs []*res.Document, scope Scope) (*Pla
 	p.Bundle = hex.EncodeToString(h.Sum(nil))[:16]
 	p.Valid = len(p.Errors) == 0 && p.Summary.Invalid == 0
 	return p, nil
+}
+
+func appendOnce(xs []string, x string) []string {
+	for _, y := range xs {
+		if y == x {
+			return xs
+		}
+	}
+	return append(xs, x)
 }
 
 // canonical renders JSON with sorted keys and no insignificant whitespace.
@@ -352,6 +394,33 @@ func diff(from, to map[string]any) []FieldChange {
 type overlay struct {
 	base    store.Catalog
 	pending map[string]*model.CatalogItem // kind|tenant|name → candidate
+	// fixed names the revision a pending item will really have (set once its action is
+	// known: a noop keeps the current revision); absent: the next number in the history.
+	fixed map[string]int
+}
+
+// nextRevision is the number the next write of an item gets: one past the highest ever
+// used, deleted revisions included (the store never reuses numbers).
+func (o *overlay) nextRevision(ctx context.Context, kind, tenant, name string) (int, error) {
+	revs, err := o.base.ListRevisions(ctx, kind, tenant, name)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return 0, err
+	}
+	max := 0
+	for _, r := range revs {
+		if r.Revision > max {
+			max = r.Revision
+		}
+	}
+	return max + 1, nil
+}
+
+// pendingRevision is the revision a pending item presents.
+func (o *overlay) pendingRevision(ctx context.Context, key string, p *model.CatalogItem) (int, error) {
+	if n, ok := o.fixed[key]; ok {
+		return n, nil
+	}
+	return o.nextRevision(ctx, p.Kind, p.Tenant, p.Name)
 }
 
 var errReadOnly = errors.New("plan: the store is read-only while planning")
@@ -360,14 +429,11 @@ func (o *overlay) PutItem(context.Context, *model.CatalogItem, int) error   { re
 func (o *overlay) DeleteItem(context.Context, string, string, string) error { return errReadOnly }
 
 func (o *overlay) GetItem(ctx context.Context, kind, tenant, name string, revision int) (*model.CatalogItem, error) {
-	if p, ok := o.pending[kind+"|"+tenant+"|"+name]; ok {
-		cur, err := o.base.GetItem(ctx, kind, tenant, name, 0)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
+	key := kind + "|" + tenant + "|" + name
+	if p, ok := o.pending[key]; ok {
+		next, err := o.pendingRevision(ctx, key, p)
+		if err != nil {
 			return nil, err
-		}
-		next := 1
-		if cur != nil {
-			next = cur.Revision + 1
 		}
 		if revision == 0 || revision == next {
 			c := *p
@@ -383,7 +449,7 @@ func (o *overlay) ListItems(ctx context.Context, kind, tenant string) ([]*model.
 	if err != nil {
 		return nil, err
 	}
-	return o.merge(list, func(it *model.CatalogItem) bool { return it.Kind == kind && it.Tenant == tenant }), nil
+	return o.merge(ctx, list, func(it *model.CatalogItem) bool { return it.Kind == kind && it.Tenant == tenant })
 }
 
 func (o *overlay) ListKind(ctx context.Context, kind string) ([]*model.CatalogItem, error) {
@@ -391,14 +457,14 @@ func (o *overlay) ListKind(ctx context.Context, kind string) ([]*model.CatalogIt
 	if err != nil {
 		return nil, err
 	}
-	return o.merge(list, func(it *model.CatalogItem) bool { return it.Kind == kind }), nil
+	return o.merge(ctx, list, func(it *model.CatalogItem) bool { return it.Kind == kind })
 }
 
 func (o *overlay) ListRevisions(ctx context.Context, kind, tenant, name string) ([]*model.CatalogItem, error) {
 	return o.base.ListRevisions(ctx, kind, tenant, name)
 }
 
-func (o *overlay) merge(list []*model.CatalogItem, match func(*model.CatalogItem) bool) []*model.CatalogItem {
+func (o *overlay) merge(ctx context.Context, list []*model.CatalogItem, match func(*model.CatalogItem) bool) ([]*model.CatalogItem, error) {
 	byKey := map[string]*model.CatalogItem{}
 	for _, it := range list {
 		byKey[it.Kind+"|"+it.Tenant+"|"+it.Name] = it
@@ -406,11 +472,11 @@ func (o *overlay) merge(list []*model.CatalogItem, match func(*model.CatalogItem
 	for k, p := range o.pending {
 		if match(p) {
 			c := *p
-			if cur, ok := byKey[k]; ok {
-				c.Revision = cur.Revision + 1
-			} else {
-				c.Revision = 1
+			n, err := o.pendingRevision(ctx, k, p)
+			if err != nil {
+				return nil, err
 			}
+			c.Revision = n
 			byKey[k] = &c
 		}
 	}
@@ -421,5 +487,5 @@ func (o *overlay) merge(list []*model.CatalogItem, match func(*model.CatalogItem
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Tenant < out[j].Tenant || out[i].Tenant == out[j].Tenant && out[i].Name < out[j].Name
 	})
-	return out
+	return out, nil
 }

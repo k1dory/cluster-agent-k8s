@@ -10,7 +10,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
-	"path/filepath"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -33,7 +33,9 @@ func workspaceRoot() string {
 
 // serveFiles long-polls for file operations the control plane asked for and answers them:
 // listings and reads of the workspace, writes of uploaded content. It runs beside the run
-// loop, so files are reachable while the agent works and while it waits.
+// loop, so files are reachable while the agent works and while it waits. The cursor moves
+// past a request only once its answer is acknowledged: an answer lost to a transient failure
+// is retried, and a request still unanswered is delivered again by the next poll.
 func serveFiles(ctx context.Context, c *client, root string) {
 	var after int64
 	for ctx.Err() == nil {
@@ -47,39 +49,74 @@ func serveFiles(ctx context.Context, c *client, root string) {
 			continue
 		}
 		for _, e := range evs {
-			after = e.ID
 			var req model.FSRequest
 			if json.Unmarshal([]byte(e.Data), &req) != nil {
+				after = e.ID
 				continue
 			}
 			res := c.serveFile(ctx, root, req)
-			body, _ := json.Marshal(res)
-			if _, err := c.do(ctx, http.MethodPost, "/agent/fs/results", body, nil); err != nil {
-				fmt.Fprintln(os.Stderr, "agent-runner: file result:", err)
+			if err := c.postResult(ctx, res); err != nil {
+				fmt.Fprintln(os.Stderr, "agent-runner: file result not acknowledged, will retry:", err)
+				break // the cursor stays: the next poll delivers this request again
 			}
+			after = e.ID
 		}
 	}
 }
 
+// postResult delivers an answer and insists on an acknowledgement: transient failures (5xx,
+// network) are retried with backoff; a 4xx means the answer is not wanted.
+func (c *client) postResult(ctx context.Context, res model.FSResult) error {
+	body, _ := json.Marshal(res)
+	var lastErr error
+	for attempt := 0; attempt < 5 && ctx.Err() == nil; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(1<<attempt) * 250 * time.Millisecond):
+			}
+		}
+		code, err := c.do(ctx, http.MethodPost, "/agent/fs/results", body, nil)
+		if err == nil {
+			return nil
+		}
+		if code >= 400 && code < 500 {
+			return nil // refused for good: nothing to retry
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+// serveFile performs one request inside the workspace. Every path is opened relative to the
+// workspace root with os.Root, so neither ".." nor a symlink (of the file or any parent,
+// existing or about to be created) can reach outside it.
 func (c *client) serveFile(ctx context.Context, root string, req model.FSRequest) model.FSResult {
 	res := model.FSResult{Request: req.ID}
-	full, err := resolve(root, req.Path)
+	ws, err := os.OpenRoot(root)
+	if err != nil {
+		res.Error = err.Error()
+		return res
+	}
+	defer ws.Close()
+	rel, err := relPath(req.Path)
 	if err != nil {
 		res.Error = err.Error()
 		return res
 	}
 	switch req.Op {
 	case model.FSList:
-		entries, truncated, err := listDir(root, full, req.Depth)
+		entries, truncated, err := listDir(ws, rel, req.Depth)
 		if err != nil {
-			res.Error = err.Error()
+			res.Error = fsError(err)
 			return res
 		}
 		res.OK, res.Entries, res.Truncated = true, entries, truncated
 	case model.FSRead:
-		data, ct, err := readFile(full)
+		data, ct, err := readFile(ws, rel)
 		if err != nil {
-			res.Error = err.Error()
+			res.Error = fsError(err)
 			return res
 		}
 		var out struct {
@@ -96,8 +133,8 @@ func (c *client) serveFile(ctx context.Context, root string, req model.FSRequest
 			res.Error = "download: " + err.Error()
 			return res
 		}
-		if err := writeFile(full, data); err != nil {
-			res.Error = err.Error()
+		if err := writeFile(ws, rel, data); err != nil {
+			res.Error = fsError(err)
 			return res
 		}
 		res.OK, res.Size = true, int64(len(data))
@@ -107,42 +144,52 @@ func (c *client) serveFile(ctx context.Context, root string, req model.FSRequest
 	return res
 }
 
-// resolve confines a request path to the workspace root (no escape through .. or symlinks
-// that leave the root).
-func resolve(root, p string) (string, error) {
-	clean := filepath.Clean("/" + filepath.FromSlash(p))
-	full := filepath.Join(root, clean)
-	if full != root && !strings.HasPrefix(full, root+string(filepath.Separator)) {
-		return "", errors.New("path escapes the workspace")
-	}
-	if real, err := filepath.EvalSymlinks(full); err == nil {
-		rootReal, _ := filepath.EvalSymlinks(root)
-		if rootReal == "" {
-			rootReal = root
-		}
-		if real != rootReal && !strings.HasPrefix(real, rootReal+string(filepath.Separator)) {
-			return "", errors.New("path escapes the workspace")
+// relPath normalises a request path to a clean relative one ("." for the root). Escapes are
+// refused here as well, though os.Root would refuse them too.
+func relPath(p string) (string, error) {
+	p = strings.TrimPrefix(strings.TrimSpace(p), "/workspace")
+	for _, seg := range strings.Split(p, "/") {
+		if seg == ".." {
+			return "", errors.New(p + ": path escapes the workspace")
 		}
 	}
-	return full, nil
+	clean := path.Clean("/" + p)
+	if clean == "/" {
+		return ".", nil
+	}
+	return strings.TrimPrefix(clean, "/"), nil
 }
 
-func listDir(root, full string, depth int) ([]model.FSEntry, bool, error) {
+// fsError turns os.Root's refusals and OS errors into the messages the API maps to statuses.
+func fsError(err error) string {
+	var pe *os.PathError
+	if errors.As(err, &pe) && strings.Contains(pe.Err.Error(), "escapes from parent") {
+		return pe.Path + ": path escapes the workspace"
+	}
+	return err.Error()
+}
+
+func listDir(ws *os.Root, rel string, depth int) ([]model.FSEntry, bool, error) {
 	if depth < 1 {
 		depth = 1
 	}
-	st, err := os.Stat(full)
+	st, err := ws.Stat(rel)
 	if err != nil {
 		return nil, false, err
 	}
 	if !st.IsDir() {
-		return nil, false, errors.New(full + ": not a directory")
+		return nil, false, errors.New(rel + ": not a directory")
 	}
 	var out []model.FSEntry
 	truncated := false
 	var walk func(dir string, level int) error
 	walk = func(dir string, level int) error {
-		entries, err := os.ReadDir(dir)
+		f, err := ws.Open(dir)
+		if err != nil {
+			return err
+		}
+		entries, err := f.ReadDir(-1)
+		f.Close()
 		if err != nil {
 			return err
 		}
@@ -152,9 +199,11 @@ func listDir(root, full string, depth int) ([]model.FSEntry, bool, error) {
 				truncated = true
 				return nil
 			}
-			p := filepath.Join(dir, de.Name())
-			rel, _ := filepath.Rel(root, p)
-			e := model.FSEntry{Path: filepath.ToSlash(rel)}
+			p := de.Name()
+			if dir != "." {
+				p = dir + "/" + de.Name()
+			}
+			e := model.FSEntry{Path: p}
 			info, err := de.Info()
 			if err == nil {
 				e.ModTime = info.ModTime().UTC()
@@ -181,39 +230,50 @@ func listDir(root, full string, depth int) ([]model.FSEntry, bool, error) {
 		}
 		return nil
 	}
-	if err := walk(full, 1); err != nil {
+	if err := walk(rel, 1); err != nil {
 		return nil, false, err
 	}
 	return out, truncated, nil
 }
 
-func readFile(full string) ([]byte, string, error) {
-	st, err := os.Stat(full)
+func readFile(ws *os.Root, rel string) ([]byte, string, error) {
+	st, err := ws.Stat(rel)
 	if err != nil {
 		return nil, "", err
 	}
 	if st.IsDir() {
-		return nil, "", errors.New(full + ": is a directory")
+		return nil, "", errors.New(rel + ": is a directory")
 	}
 	if st.Size() > maxFileBytes {
-		return nil, "", fmt.Errorf("%s: too large (%d bytes, limit %d)", full, st.Size(), maxFileBytes)
+		return nil, "", fmt.Errorf("%s: too large (%d bytes, limit %d)", rel, st.Size(), maxFileBytes)
 	}
-	data, err := os.ReadFile(full)
+	data, err := ws.ReadFile(rel)
 	if err != nil {
 		return nil, "", err
 	}
 	return data, http.DetectContentType(data), nil
 }
 
-func writeFile(full string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+// writeFile writes atomically (temporary file, then rename) inside the workspace root;
+// parents are created inside it too.
+func writeFile(ws *os.Root, rel string, data []byte) error {
+	if rel == "." {
+		return errors.New("path is required")
+	}
+	if dir := path.Dir(rel); dir != "." {
+		if err := ws.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	tmp := rel + ".agent-runner.tmp"
+	if err := ws.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	tmp := full + ".agent-runner.tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := ws.Rename(tmp, rel); err != nil {
+		_ = ws.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, full)
+	return nil
 }
 
 func (c *client) fetchBlob(ctx context.Context, name string) ([]byte, error) {

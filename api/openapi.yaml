@@ -1420,6 +1420,7 @@ components:
               action: { type: string, enum: [create, update, noop, invalid] }
               current_revision: { type: integer, description: "Live revision compared with (0 = none)" }
               expected_revision: { type: integer, description: "Revision apply must find for this change" }
+              next_revision: { type: integer, description: "Revision the item will have after apply: the next number of its history (deleted revisions included) for create and update, the current one for noop. Pinned references in the bundle are checked against it" }
               diff:
                 type: array
                 description: Leaves of the canonical spec (and description) that differ, in path order
