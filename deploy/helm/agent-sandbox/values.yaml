@@ -54,6 +54,10 @@ sandboxd:
   # policiesStrict: a policy without a tenants list is admin-only and a slug without a policy file
   # is refused for tenants (no fallback to default).
   policiesStrict: false
+  # Tenant API keys are issued through the API (sandboxctl keys create -tenant acme -name ci), so
+  # a new tenant never needs a chart change. maxTTL caps a key's lifetime ("0" = may be permanent).
+  apiKeys:
+    maxTTL: "0"
   # OIDC: accept JWTs from this issuer next to the static tokens. Leave issuer empty to disable.
   oidc:
     issuer: ""                      # https://login.example.com/realms/platform

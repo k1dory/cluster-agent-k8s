@@ -340,3 +340,50 @@ func TestReviewPostgresSourceAndDeletedItems(t *testing.T) {
 		t.Fatalf("another tenant's deleted items: %+v", other)
 	}
 }
+
+// Tenant API keys on a real PostgreSQL: unique ids, round trip of every nullable field, the
+// mutable-field update, per-tenant listing newest first.
+func TestReviewPostgresAPIKeys(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
+	ctx := t.Context()
+	exp := time.Now().Add(time.Hour).UTC().Truncate(time.Microsecond)
+	k := &model.APIKey{ID: "key_1", Tenant: "acme", Name: "ci", Hash: "h1", CreatedBy: "admin-token", ExpiresAt: &exp}
+	if err := p.CreateAPIKey(ctx, k); err != nil || k.CreatedAt.IsZero() {
+		t.Fatalf("create: %v %+v", err, k)
+	}
+	if err := p.CreateAPIKey(ctx, &model.APIKey{ID: "key_1", Tenant: "other", Hash: "h"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate id: %v", err)
+	}
+	got, err := p.GetAPIKey(ctx, "key_1")
+	if err != nil || got.Tenant != "acme" || got.Hash != "h1" || got.ExpiresAt == nil || !got.ExpiresAt.Equal(exp) || got.RevokedAt != nil || got.LastUsedAt != nil {
+		t.Fatalf("get: %v %+v", err, got)
+	}
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	got.RevokedAt, got.RotatedTo, got.LastUsedAt, got.Hash = &now, "key_2", &now, "tampered"
+	if err := p.UpdateAPIKey(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	again, _ := p.GetAPIKey(ctx, "key_1")
+	if again.RevokedAt == nil || !again.RevokedAt.Equal(now) || again.RotatedTo != "key_2" || again.LastUsedAt == nil || again.Hash != "h1" {
+		t.Fatalf("update: %+v", again)
+	}
+	if err := p.UpdateAPIKey(ctx, &model.APIKey{ID: "key_none"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("update of a missing key: %v", err)
+	}
+	if _, err := p.GetAPIKey(ctx, "key_none"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing key: %v", err)
+	}
+	if err := p.CreateAPIKey(ctx, &model.APIKey{ID: "key_2", Tenant: "acme", Name: "deploy", Hash: "h2", CreatedAt: now.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.CreateAPIKey(ctx, &model.APIKey{ID: "key_3", Tenant: "other", Name: "x", Hash: "h3"}); err != nil {
+		t.Fatal(err)
+	}
+	list, err := p.ListAPIKeys(ctx, "acme")
+	if err != nil || len(list) != 2 || list[0].ID != "key_2" || list[1].ID != "key_1" {
+		t.Fatalf("list: %v %+v", err, list)
+	}
+	if all, _ := p.ListAPIKeys(ctx, ""); len(all) != 3 {
+		t.Fatalf("every tenant: %d", len(all))
+	}
+}

@@ -170,3 +170,18 @@ CREATE TABLE IF NOT EXISTS applies (
     updated_at timestamptz NOT NULL DEFAULT now(),
     UNIQUE (tenant, key)
 );
+
+-- Tenant API keys: created, rotated and revoked through the API; only the secret's hash is kept.
+CREATE TABLE IF NOT EXISTS api_keys (
+    id           text PRIMARY KEY,
+    tenant       text NOT NULL,
+    name         text NOT NULL DEFAULT '',
+    hash         text NOT NULL,
+    created_by   text NOT NULL DEFAULT '',
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    expires_at   timestamptz,
+    revoked_at   timestamptz,
+    rotated_to   text NOT NULL DEFAULT '',
+    last_used_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS api_keys_tenant ON api_keys (tenant, created_at DESC);

@@ -1027,3 +1027,67 @@ func (p *Postgres) DeleteItem(ctx context.Context, kind, tenant, name string) er
 	}
 	return nil
 }
+
+// --- api keys ---------------------------------------------------------------------------
+
+const keyCols = `id, tenant, name, hash, created_by, created_at, expires_at, revoked_at, rotated_to, last_used_at`
+
+func scanKey(row pgx.Row) (*model.APIKey, error) {
+	var k model.APIKey
+	err := row.Scan(&k.ID, &k.Tenant, &k.Name, &k.Hash, &k.CreatedBy, &k.CreatedAt, &k.ExpiresAt, &k.RevokedAt, &k.RotatedTo, &k.LastUsedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &k, nil
+}
+
+func (p *Postgres) CreateAPIKey(ctx context.Context, k *model.APIKey) error {
+	if k.CreatedAt.IsZero() {
+		k.CreatedAt = time.Now()
+	}
+	tag, err := p.pool.Exec(ctx, `INSERT INTO api_keys (`+keyCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO NOTHING`,
+		k.ID, k.Tenant, k.Name, k.Hash, k.CreatedBy, k.CreatedAt, k.ExpiresAt, k.RevokedAt, k.RotatedTo, k.LastUsedAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: api key %s exists", ErrConflict, k.ID)
+	}
+	return nil
+}
+
+func (p *Postgres) GetAPIKey(ctx context.Context, id string) (*model.APIKey, error) {
+	return scanKey(p.pool.QueryRow(ctx, `SELECT `+keyCols+` FROM api_keys WHERE id=$1`, id))
+}
+
+func (p *Postgres) UpdateAPIKey(ctx context.Context, k *model.APIKey) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE api_keys SET name=$2, expires_at=$3, revoked_at=$4, rotated_to=$5, last_used_at=$6 WHERE id=$1`,
+		k.ID, k.Name, k.ExpiresAt, k.RevokedAt, k.RotatedTo, k.LastUsedAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) ListAPIKeys(ctx context.Context, tenant string) ([]*model.APIKey, error) {
+	rows, err := p.pool.Query(ctx, `SELECT `+keyCols+` FROM api_keys WHERE ($1 = '' OR tenant=$1) ORDER BY created_at DESC, id`, tenant)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.APIKey
+	for rows.Next() {
+		k, err := scanKey(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}

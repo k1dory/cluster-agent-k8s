@@ -29,6 +29,11 @@ type Config struct {
 		Token  string `yaml:"token"`
 		Tenant string `yaml:"tenant"`
 	} `yaml:"api_tokens"`
+	// APIKeys: tenant keys issued through the API (POST /v1/tenants/{tenant}/keys). max_ttl caps
+	// their lifetime (0 = keys may be permanent).
+	APIKeys struct {
+		MaxTTL time.Duration `yaml:"max_ttl"`
+	} `yaml:"api_keys"`
 	// Quotas per tenant; `default` applies to tenants not listed. Zero = unlimited.
 	Quotas struct {
 		Default orchestrator.Quota            `yaml:"default"`

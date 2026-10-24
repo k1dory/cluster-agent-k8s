@@ -361,7 +361,25 @@ the SSE clients of the others through `LISTEN/NOTIFY`. Each replica drives its o
 so in the node layout you label several gateway nodes and put a VIP or DNS round-robin in front
 (`gateway.replicas` in the chart, which refuses more than one replica without `ca.source: db`).
 
-### Authentication: static tokens or OIDC
+### Authentication: tenant API keys, static tokens or OIDC
+
+A tenant gets its credentials from the API, not from the server's configuration or a cluster
+manifest. The admin issues the first key; from then on the tenant manages its own keys (a key
+per pipeline, rotation on a schedule, immediate revocation of a leaked one):
+
+```sh
+sandboxctl keys create -tenant acme -name ci -ttl 720h   # admin: the secret (sbk_…) is printed once
+sandboxctl keys list                                     # as acme: its keys, never their secrets
+sandboxctl keys rotate key_3f2a9c1e7b04 -grace 1h        # a new secret now; the old one works for 1h more
+sandboxctl keys revoke key_3f2a9c1e7b04                  # refused on the very next request, every replica
+```
+
+`POST/GET /v1/tenants/{tenant}/keys`, `GET/DELETE /v1/tenants/{tenant}/keys/{id}`,
+`POST .../keys/{id}/rotate`. The store keeps the key's id and the SHA-256 of its secret; every
+request looks the key up, so revocation needs no restart and no cache to expire. `api_keys.max_ttl`
+caps the lifetime a key may be issued with; an expiring key bounds the sandboxes it creates like an
+expiring OIDC token does. `GET /v1/whoami` shows `subject: key:<id>`.
+
 
 ```yaml
 oidc:
@@ -378,7 +396,7 @@ A JWT from the issuer is verified against its JWKS (signature, issuer, audience,
 to a tenant or the admin role; `GET /v1/whoami` shows the result. The token's expiry bounds the API
 session and, with `ttl_from_token`, the sandboxes it creates: their `expires_at` is capped at the
 token's expiry and the agent certificates issued inside them cannot outlive the sandbox. Static
-`api_token` / `api_tokens[]` keep working next to it.
+`api_token` (the admin) and `api_tokens[]` keep working next to keys and OIDC.
 
 ### Secrets: directory, Vault/OpenBao or Infisical
 

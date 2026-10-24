@@ -139,6 +139,16 @@ type Applies interface {
 	ListApplies(ctx context.Context, tenant string, limit int) ([]*Apply, error)
 }
 
+// APIKeys persists tenant API keys. Only the hash of a secret is ever stored.
+type APIKeys interface {
+	CreateAPIKey(ctx context.Context, k *model.APIKey) error
+	GetAPIKey(ctx context.Context, id string) (*model.APIKey, error)
+	// UpdateAPIKey rewrites the mutable fields (expiry, revocation, rotation, last use).
+	UpdateAPIKey(ctx context.Context, k *model.APIKey) error
+	// ListAPIKeys returns a tenant's keys, newest first ("" = every tenant).
+	ListAPIKeys(ctx context.Context, tenant string) ([]*model.APIKey, error)
+}
+
 // Apply is model.Apply (aliased so the store's doc reads on its own).
 type Apply = model.Apply
 
@@ -256,6 +266,7 @@ type Store interface {
 	// The catalogue uses only this part (see Catalog); the full Store embeds it for wiring.
 	Catalog
 	Applies
+	APIKeys
 
 	Close() error
 }

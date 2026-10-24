@@ -4,7 +4,11 @@ listen:
   gateway: "127.0.0.1:8081" # Caddy only: /authz, /bootstrap, /agent/*
   ingress: ":8082"          # preview proxy; Caddy *.preview.<domain> → here
 api_token: "${SANDBOXD_API_TOKEN}"
-# Tenant-scoped tokens: each sees only its own sandboxes, runs, events, usage and trace.
+# Tenant API keys are issued through the API (sandboxctl keys create -tenant acme -name ci);
+# max_ttl caps their lifetime (0 = keys may be permanent).
+api_keys:
+  max_ttl: 0s
+# Static tenant-scoped tokens (optional, next to the keys): each sees only its own sandboxes.
 # api_tokens:
 #   - { token: "${ACME_TOKEN}", tenant: acme }
 # OIDC: JWTs from this issuer are accepted next to the static tokens. The tenant comes from
