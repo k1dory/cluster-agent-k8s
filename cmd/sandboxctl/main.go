@@ -30,7 +30,7 @@ const usage = `sandboxctl <command> [flags]
 
   create   -name shop (-slug backend-dev | -agent backend[@3]) -owner alice [-tenant t] [-repo url] [-idle 3600]
            [-ttl 86400] [-wake-on-preview=false] [-version stable] [-key idempotency-key]
-  apply    -f file.yaml [-tenant t] [-expected 3]   put an AgentDefinition / EnvironmentProfile (a new revision)
+  apply    -f file.yaml [-tenant t] [-expected 3]   put AgentDefinitions / EnvironmentProfiles (new revisions; --- separates documents)
   get      agent|environment <name> [-revision N] [-tenant t]
   list     agents|environments [-tenant t]
   revisions agent|environment <name> [-tenant t]
@@ -290,9 +290,9 @@ func (c *cli) run(cmd string, args []string) error {
 		}
 		printJSON(sb)
 	case "apply":
-		file := fs.String("f", "", "YAML document (kind, name, description, spec)")
+		file := fs.String("f", "", "YAML file: one document, or several separated by ---, applied in order")
 		tenant := fs.String("tenant", "", "scope (admin: tenant or empty for shared)")
-		expected := fs.Int("expected", -1, "expected current revision (0 = must not exist yet)")
+		expected := fs.Int("expected", -1, "expected current revision (0 = must not exist yet); single document only")
 		_ = fs.Parse(flags)
 		if *file == "" {
 			return errors.New("apply: -f is required")
@@ -301,26 +301,34 @@ func (c *cli) run(cmd string, args []string) error {
 		if err != nil {
 			return err
 		}
-		doc, err := catalog.ParseYAML(raw)
+		docs, err := catalog.ParseYAMLAll(raw)
 		if err != nil {
 			return err
 		}
-		if *expected >= 0 {
-			doc.ExpectedRevision = expected
+		if len(docs) == 0 {
+			return errors.New("apply: no document in " + *file)
 		}
-		path, ok := map[string]string{model.KindAgent: "agents", model.KindEnvironment: "environments"}[doc.Kind]
-		if !ok {
-			return fmt.Errorf("apply: kind must be %s or %s, got %q", model.KindAgent, model.KindEnvironment, doc.Kind)
+		if *expected >= 0 && len(docs) > 1 {
+			return errors.New("apply: -expected applies to a single document")
 		}
 		q := ""
 		if *tenant != "" {
 			q = "?tenant=" + url.QueryEscape(*tenant)
 		}
-		var out model.CatalogItem
-		if err := c.do("PUT", "/v1/"+path+"/"+doc.Name+q, doc, &out); err != nil {
-			return err
+		for i, doc := range docs {
+			if *expected >= 0 {
+				doc.ExpectedRevision = expected
+			}
+			path, ok := map[string]string{model.KindAgent: "agents", model.KindEnvironment: "environments"}[doc.Kind]
+			if !ok {
+				return fmt.Errorf("apply: document %d: kind must be %s or %s, got %q", i+1, model.KindAgent, model.KindEnvironment, doc.Kind)
+			}
+			var out model.CatalogItem
+			if err := c.do("PUT", "/v1/"+path+"/"+doc.Name+q, doc, &out); err != nil {
+				return fmt.Errorf("document %d (%s %s): %w", i+1, doc.Kind, doc.Name, err)
+			}
+			fmt.Printf("%s %s: revision %d\n", out.Kind, out.Name, out.Revision)
 		}
-		fmt.Printf("%s %s: revision %d\n", out.Kind, out.Name, out.Revision)
 	case "revisions", "remove":
 		tenant := fs.String("tenant", "", "scope (admin: tenant or empty for shared)")
 		_ = fs.Parse(flags)

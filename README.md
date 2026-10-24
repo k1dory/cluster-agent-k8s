@@ -185,16 +185,32 @@ Two catalogue resources describe what runs, per tenant (the admin also keeps sha
 - **AgentDefinition**: the policy slug (ownership is checked), the environment (`name`, or
   `name@N` to pin a revision), the repository, the instructions, and connection names for step 4.
 
-The same document is a YAML file for `sandboxctl apply -f` and a JSON body for
-`PUT /v1/environments/{name}` and `PUT /v1/agents/{name}`; unknown fields are errors. Every write
-appends a revision, `expected_revision` makes it conditional (409 on a stale base), history is at
-`/revisions`. A sandbox is created with `agent_ref` instead of a slug: it takes the policy,
-repository and lifecycle defaults from the agent, the environment is rendered into a `launch`
-that stays on the sandbox, and `agent_revision` / `environment_revision` say what it was built
-from. Every run records the revisions it was claimed under. Changing a definition changes
-nothing that already exists: new sandboxes get the new revisions, running ones keep theirs.
-Tenants see their own items and the shared ones; another tenant's are not found. See
-`examples/catalog/` for a working pair of documents.
+The same document is a YAML file for `sandboxctl apply -f` (one document, or several separated
+by `---`, applied in order; anything after a single JSON document is an error) and a JSON body
+for `PUT /v1/environments/{name}` and `PUT /v1/agents/{name}`; unknown fields are errors. Every
+write appends a revision, `expected_revision` makes it conditional (409 on a stale base), history
+is at `/revisions`. Revision numbers are never reused: `DELETE` marks the item deleted and keeps
+its revisions as history (`deleted_at`), pinned references to them stop resolving, and a later
+write under the same name continues the numbering, so `name@1` names one configuration forever.
+A sandbox is created with `agent_ref` instead of a slug: it takes the policy, repository and
+lifecycle defaults from the agent, the environment is rendered into a `launch` that stays on the
+sandbox, and `agent_revision` / `environment_revision` say what it was built from. Every run
+records the revisions it was claimed under. Changing a definition changes nothing that already
+exists: new sandboxes get the new revisions, running ones keep theirs.
+
+References are `name`, `name@N` or `shared/name[@N]`. Tenants see their own items and the shared
+ones; another tenant's are not found. A bare name is resolved in the writer's scope first, then
+among the shared items, and the agent stores it in the form it resolved to (`shared/base@1`), so
+a tenant creating its own `base` later does not capture agents that meant the shared one. The
+sandbox and its runs record `agent_ref` / `environment_ref` the same way.
+
+A profile's `env` (and `model.env`) is the agent container's only: it never reaches the init
+containers that lock the network and bootstrap the identity, and it cannot set a platform name
+(`SANDBOX_*`, `GATEWAY_IP`, `REGISTRAR_URL`, `API_URL`, `CERT_DIR`, `HOME`, `HARNESS_CMD`,
+`HARNESS_RESUME_CMD`, `GATEWAY_CA_FILE`: refused with 422) or shadow the operator's `agent.env`.
+The model name and the instructions are exported by the platform (`SANDBOX_MODEL`,
+`ANTHROPIC_MODEL`, `SANDBOX_INSTRUCTIONS`). Resources are Kubernetes quantities, positive, with
+requests within limits. See `examples/catalog/` for a working pair of documents.
 
 ```sh
 sandboxctl apply -f examples/catalog/environment-python.yaml

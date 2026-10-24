@@ -43,6 +43,10 @@ func catalogKey(kind, tenant, name string) string { return kind + "|" + tenant +
 func cloneItem(it *model.CatalogItem) *model.CatalogItem {
 	c := *it
 	c.Spec = append([]byte(nil), it.Spec...)
+	if it.DeletedAt != nil {
+		d := *it.DeletedAt
+		c.DeletedAt = &d
+	}
 	return &c
 }
 
@@ -51,15 +55,20 @@ func (m *Memory) PutItem(_ context.Context, it *model.CatalogItem, expected int)
 	defer m.mu.Unlock()
 	k := catalogKey(it.Kind, it.Tenant, it.Name)
 	revs := m.catalog[k]
-	latest := 0
+	latest, current := 0, 0 // highest number ever used; latest live revision (0 when deleted)
 	if len(revs) > 0 {
-		latest = revs[len(revs)-1].Revision
+		last := revs[len(revs)-1]
+		latest = last.Revision
+		if last.DeletedAt == nil {
+			current = last.Revision
+		}
 	}
-	if expected >= 0 && expected != latest {
-		return fmt.Errorf("%w: latest revision is %d, expected %d", ErrConflict, latest, expected)
+	if expected >= 0 && expected != current {
+		return fmt.Errorf("%w: latest revision is %d, expected %d", ErrConflict, current, expected)
 	}
 	it.Revision = latest + 1
 	it.CreatedAt = time.Now()
+	it.DeletedAt = nil
 	m.catalog[k] = append(revs, cloneItem(it))
 	return nil
 }
@@ -72,10 +81,13 @@ func (m *Memory) GetItem(_ context.Context, kind, tenant, name string, revision 
 		return nil, ErrNotFound
 	}
 	if revision == 0 {
-		return cloneItem(revs[len(revs)-1]), nil
+		if last := revs[len(revs)-1]; last.DeletedAt == nil {
+			return cloneItem(last), nil
+		}
+		return nil, ErrNotFound
 	}
 	for _, r := range revs {
-		if r.Revision == revision {
+		if r.Revision == revision && r.DeletedAt == nil {
 			return cloneItem(r), nil
 		}
 	}
@@ -87,7 +99,7 @@ func (m *Memory) ListItems(_ context.Context, kind, tenant string) ([]*model.Cat
 	defer m.mu.Unlock()
 	var out []*model.CatalogItem
 	for _, revs := range m.catalog {
-		if len(revs) == 0 || revs[0].Kind != kind || revs[0].Tenant != tenant {
+		if len(revs) == 0 || revs[0].Kind != kind || revs[0].Tenant != tenant || revs[len(revs)-1].DeletedAt != nil {
 			continue
 		}
 		out = append(out, cloneItem(revs[len(revs)-1]))
@@ -113,11 +125,17 @@ func (m *Memory) ListRevisions(_ context.Context, kind, tenant, name string) ([]
 func (m *Memory) DeleteItem(_ context.Context, kind, tenant, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	k := catalogKey(kind, tenant, name)
-	if len(m.catalog[k]) == 0 {
+	now := time.Now()
+	deleted := 0
+	for _, r := range m.catalog[catalogKey(kind, tenant, name)] {
+		if r.DeletedAt == nil {
+			r.DeletedAt = &now
+			deleted++
+		}
+	}
+	if deleted == 0 {
 		return ErrNotFound
 	}
-	delete(m.catalog, k)
 	return nil
 }
 

@@ -3,6 +3,7 @@ package model
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 )
 
@@ -37,24 +38,44 @@ type Preview struct {
 // profile's revision rendered at creation time and kept on the sandbox, so every wake and
 // rollout of this sandbox uses the same configuration whatever the catalogue says later.
 type Launch struct {
-	Image                string            `json:"image"`
-	HarnessCommand       string            `json:"harness_command,omitempty"`
-	HarnessResumeCommand string            `json:"harness_resume_command,omitempty"`
-	ResumePrompt         string            `json:"resume_prompt,omitempty"`
-	Model                string            `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
-	Instructions         string            `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
-	Env                  map[string]string `json:"env,omitempty"`
-	CPURequest           string            `json:"cpu_request,omitempty"`
-	CPULimit             string            `json:"cpu_limit,omitempty"`
-	MemoryRequest        string            `json:"memory_request,omitempty"`
-	MemoryLimit          string            `json:"memory_limit,omitempty"`
-	VolumeSize           string            `json:"volume_size,omitempty"`
-	RuntimeClass         string            `json:"runtime_class,omitempty"`
+	Image                string `json:"image"`
+	HarnessCommand       string `json:"harness_command,omitempty"`
+	HarnessResumeCommand string `json:"harness_resume_command,omitempty"`
+	ResumePrompt         string `json:"resume_prompt,omitempty"`
+	Model                string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
+	Instructions         string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
+	// Env is the profile's own variables for the agent container. They never reach the init
+	// containers and never shadow a platform variable (see PlatformEnv).
+	Env           map[string]string `json:"env,omitempty"`
+	CPURequest    string            `json:"cpu_request,omitempty"`
+	CPULimit      string            `json:"cpu_limit,omitempty"`
+	MemoryRequest string            `json:"memory_request,omitempty"`
+	MemoryLimit   string            `json:"memory_limit,omitempty"`
+	VolumeSize    string            `json:"volume_size,omitempty"`
+	RuntimeClass  string            `json:"runtime_class,omitempty"`
+}
+
+// PlatformEnv reports whether an environment variable name belongs to the platform: the
+// variables sandboxd sets on every pod to wire the agent to the gateway, the registrar and
+// the API, and everything under SANDBOX_. A profile cannot set them; the runtime never lets a
+// profile value replace one.
+func PlatformEnv(name string) bool {
+	if strings.HasPrefix(name, "SANDBOX_") {
+		return true
+	}
+	switch name {
+	case "GATEWAY_IP", "GATEWAY_CA_FILE", "REGISTRAR_URL", "API_URL", "CERT_DIR", "HOME",
+		"HARNESS_CMD", "HARNESS_RESUME_CMD":
+		return true
+	}
+	return false
 }
 
 // CatalogItem is one revision of a catalogue resource: an AgentDefinition or an
-// EnvironmentProfile. Revisions are append-only; the latest is the current one. Tenant "" is
-// a shared item the admin manages and every tenant may reference.
+// EnvironmentProfile. Revisions are append-only and their numbers are never reused: deleting
+// an item marks its revisions deleted (DeletedAt) and keeps them as history; a later write
+// under the same name continues the numbering. Tenant "" is a shared item the admin manages
+// and every tenant may reference.
 type CatalogItem struct {
 	Kind        string          `json:"kind"`
 	Tenant      string          `json:"tenant"`
@@ -64,6 +85,7 @@ type CatalogItem struct {
 	Spec        json.RawMessage `json:"spec"`
 	CreatedBy   string          `json:"created_by,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
+	DeletedAt   *time.Time      `json:"deleted_at,omitempty"`
 }
 
 // Catalogue kinds.
@@ -95,7 +117,8 @@ type Sandbox struct {
 	// lives in the agent certificate and in policy.Set.Revoked; see there for what ends it.
 	AdminGrant bool `json:"admin_grant,omitempty"`
 	// Catalogue references resolved at creation: which AgentDefinition and EnvironmentProfile
-	// revisions this sandbox was built from, and the Launch rendered from them. Empty for
+	// revisions this sandbox was built from ("name", or "shared/name" for a shared item, so
+	// the scope is part of the record), and the Launch rendered from them. Empty for
 	// sandboxes created with a bare slug.
 	AgentRef            string     `json:"agent_ref,omitempty"`
 	AgentRevision       int        `json:"agent_revision,omitempty"`

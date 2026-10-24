@@ -219,9 +219,9 @@ func (p *Platform) resolveAgentRef(r *http.Request, req *orchestrator.CreateRequ
 	// The image was resolved under the environment author's rights; the orchestrator takes it
 	// as is when a launch is attached (policy ownership is still checked there for the caller).
 	req.AgentVersion = res.Image
-	req.AgentRef = res.Agent.Name
+	req.AgentRef = res.AgentRef // "name" or "shared/name": the scope is part of the record
 	req.AgentRevision = res.Agent.Revision
-	req.EnvironmentRef = res.Environment.Name
+	req.EnvironmentRef = res.EnvironmentRef
 	req.EnvironmentRevision = res.Environment.Revision
 	launch := res.Launch
 	req.Launch = &launch

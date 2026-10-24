@@ -14,7 +14,7 @@ spec:
     name: claude-opus-5-5           # exported to the pod as SANDBOX_MODEL and ANTHROPIC_MODEL
     env:
       ANTHROPIC_BASE_URL: https://api.anthropic.com
-  resources:
+  resources:                        # positive quantities; a request may not exceed its limit
     cpu_request: 500m
     cpu_limit: "2"
     memory_request: 2Gi
@@ -24,5 +24,5 @@ spec:
     idle_timeout: 1800              # seconds without activity before the pod sleeps (0 = never)
     ttl: 0                          # seconds until the sandbox is deleted (0 = keep)
     wake_on_preview: true
-  env:
+  env:                              # agent container only; SANDBOX_*, GATEWAY_IP, API_URL... are the platform's
     PIP_INDEX_URL: https://pypi.example.com/simple

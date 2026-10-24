@@ -6,7 +6,8 @@ name: backend
 description: Backend developer for the shop services
 spec:
   policy: backend-dev               # policies/backend-dev.yaml; the tenant must own it (tenants: list)
-  environment: python-dev           # latest revision at creation time; "python-dev@3" pins one
+  environment: python-dev           # latest revision at creation time; "python-dev@3" pins one,
+                                    # "shared/python-dev" names the admin's shared profile
   repo: https://git.example.com/org/shop.git
   instructions: |
     You work on the shop backend. Keep changes small, run the tests before pushing,

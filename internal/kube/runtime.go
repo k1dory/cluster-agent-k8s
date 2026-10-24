@@ -55,9 +55,17 @@ type PodConfig struct {
 	// interrupted run. Empty: the task is simply run again.
 	HarnessResumeCommand string
 	ResumePrompt         string
-	Env                  map[string]string
-	PriorityClassName    string
-	TerminationSeconds   int64
+	// Env is the operator's environment (deployment configuration): trusted, set on every
+	// container of the pod. UserEnv is the sandbox's profile environment: it reaches the agent
+	// container only, and never under a platform name (model.PlatformEnv) or one Env sets.
+	Env     map[string]string
+	UserEnv map[string]string
+	// Model and Instructions come from the sandbox's launch and are exported by the platform
+	// as SANDBOX_MODEL / ANTHROPIC_MODEL and SANDBOX_INSTRUCTIONS.
+	Model              string
+	Instructions       string
+	PriorityClassName  string
+	TerminationSeconds int64
 	// PodFirewall adds an init container (NET_ADMIN, dropped afterwards) that installs nftables
 	// rules inside the pod's network namespace: egress only to the gateway on 53/443/8443. It is
 	// what keeps pods on different nodes of the shared VLAN from reaching each other directly.
@@ -97,9 +105,11 @@ func (c PodConfig) ImageFor(sb *model.Sandbox) string {
 
 // effective merges the sandbox's launch (its environment profile, rendered at creation) over
 // the configured defaults: every launch parameter the profile sets wins, the rest stays global.
+// The profile's variables are kept apart (UserEnv) so they can be confined to the agent container.
 func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 	e := c
 	e.Image = c.ImageFor(sb)
+	e.UserEnv = nil
 	l := sb.Launch
 	if l == nil {
 		return e
@@ -118,16 +128,23 @@ func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 	pick(&e.MemoryLimit, l.MemoryLimit)
 	pick(&e.VolumeSize, l.VolumeSize)
 	pick(&e.RuntimeClassName, l.RuntimeClass)
-	if len(l.Env) > 0 {
-		env := map[string]string{}
-		for k, v := range c.Env {
-			env[k] = v
+	pick(&e.Model, l.Model)
+	pick(&e.Instructions, l.Instructions)
+	e.UserEnv = l.Env
+	// A profile request above the configured limit raises the limit to it: the profile sized the
+	// pod; a request over its limit would be an invalid pod, not a smaller one.
+	raise := func(req, lim *string) {
+		if *req == "" || *lim == "" {
+			return
 		}
-		for k, v := range l.Env {
-			env[k] = v
+		rq, err1 := resource.ParseQuantity(*req)
+		lq, err2 := resource.ParseQuantity(*lim)
+		if err1 == nil && err2 == nil && rq.Cmp(lq) > 0 {
+			*lim = *req
 		}
-		e.Env = env
 	}
+	raise(&e.CPURequest, &e.CPULimit)
+	raise(&e.MemoryRequest, &e.MemoryLimit)
 	return e
 }
 
@@ -228,15 +245,14 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 		{Name: "SANDBOX_ENVIRONMENT_REF", Value: sb.EnvironmentRef},
 		{Name: "SANDBOX_ENVIRONMENT_REVISION", Value: strconv.Itoa(sb.EnvironmentRevision)},
 	}
+	if c.Model != "" {
+		env = append(env, corev1.EnvVar{Name: "SANDBOX_MODEL", Value: c.Model}, corev1.EnvVar{Name: "ANTHROPIC_MODEL", Value: c.Model})
+	}
+	if c.Instructions != "" {
+		env = append(env, corev1.EnvVar{Name: "SANDBOX_INSTRUCTIONS", Value: c.Instructions})
+	}
 	image := c.Image
-	keys := make([]string, 0, len(c.Env))
-	for k := range c.Env {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		env = append(env, corev1.EnvVar{Name: k, Value: c.Env[k]})
-	}
+	env = append(env, sortedEnv(c.Env, nil)...)
 	secCtx := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false),
 		Privileged:               ptr.To(false),
@@ -257,6 +273,10 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 		mounts = append(mounts, corev1.VolumeMount{Name: "gateway-ca", MountPath: "/etc/sandbox/gateway-ca", ReadOnly: true})
 		env = append(env, corev1.EnvVar{Name: "GATEWAY_CA_FILE", Value: "/etc/sandbox/gateway-ca/" + GatewayCAKey})
 	}
+	// env is the platform's: it is all the init containers (network lock, bootstrap) see. The
+	// agent container adds the profile's variables, which can neither shadow a platform name
+	// nor the operator's.
+	agentEnv := append(append([]corev1.EnvVar(nil), env...), sortedEnv(c.UserEnv, env)...)
 	audience := c.TokenAudience
 	if audience == "" {
 		audience = "agent-sandbox"
@@ -294,7 +314,7 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 			InitContainers: initContainers(c, image, pullPolicy, env, mounts, secCtx),
 			Containers: []corev1.Container{{
 				Name: "agent", Image: image, ImagePullPolicy: pullPolicy,
-				Command: []string{"/usr/local/bin/agent-runner"}, Env: env,
+				Command: []string{"/usr/local/bin/agent-runner"}, Env: agentEnv,
 				WorkingDir: "/workspace", VolumeMounts: mounts, SecurityContext: secCtx,
 				Resources: corev1.ResourceRequirements{Requests: requests, Limits: limits},
 			}},
@@ -333,6 +353,27 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 		return "", err
 	}
 	return created.Name, nil
+}
+
+// sortedEnv renders vars in name order, skipping platform names and names already in taken.
+func sortedEnv(vars map[string]string, taken []corev1.EnvVar) []corev1.EnvVar {
+	used := map[string]bool{}
+	for _, e := range taken {
+		used[e.Name] = true
+	}
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		if taken != nil && (used[k] || model.PlatformEnv(k)) {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]corev1.EnvVar, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, corev1.EnvVar{Name: k, Value: vars[k]})
+	}
+	return out
 }
 
 // initContainers builds the pod's init sequence: the optional network lock (needs NET_ADMIN,

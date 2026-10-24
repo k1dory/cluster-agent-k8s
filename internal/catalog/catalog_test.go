@@ -51,6 +51,16 @@ func TestEnvironmentValidationAndRevisions(t *testing.T) {
 		`{"image":"stable","imag":"typo"}`,
 		`{"image":"registry/evil:1"}`,
 		`{"image":"stable","env":{"BAD KEY":"x"}}`,
+		// Platform names are the platform's: not through env, not through model.env.
+		`{"image":"stable","env":{"GATEWAY_IP":"192.0.2.1"}}`,
+		`{"image":"stable","env":{"SANDBOX_TASK":"x"}}`,
+		`{"image":"stable","model":{"env":{"API_URL":"https://evil"}}}`,
+		// Resources: positive quantities, request within limit.
+		`{"image":"stable","resources":{"cpu_limit":"-1"}}`,
+		`{"image":"stable","resources":{"memory_request":"0"}}`,
+		`{"image":"stable","resources":{"volume_size":"0Gi"}}`,
+		`{"image":"stable","resources":{"cpu_request":"4","cpu_limit":"1"}}`,
+		`{"image":"stable","resources":{"memory_request":"8Gi","memory_limit":"4Gi"}}`,
 	} {
 		if _, err := s.Put(ctx, model.KindEnvironment, "acme", doc(t, "py", bad, nil), false, "alice"); err == nil || !errors.Is(err, ErrInvalid) {
 			t.Errorf("must be invalid: %s → %v", bad, err)
@@ -145,8 +155,8 @@ func TestAgentValidationIsolationAndResolve(t *testing.T) {
 	}
 	l := res.Launch
 	if res.Agent.Revision != agent.Revision || res.Environment.Revision != 1 || l.Image != "registry/agent:1.0" || l.Model != "claude-opus-5-5" ||
-		l.Env["ANTHROPIC_MODEL"] != "claude-opus-5-5" || l.Env["PIP_INDEX_URL"] != "https://pypi.example.com" || l.Env["ANTHROPIC_BASE_URL"] == "" ||
-		l.Env["SANDBOX_INSTRUCTIONS"] != "Be brief." || l.CPULimit != "3" || *res.EnvSpec.Lifecycle.IdleTimeout != 600 || res.AgentSpec.Repo == "" {
+		l.Env["PIP_INDEX_URL"] != "https://pypi.example.com" || l.Env["ANTHROPIC_BASE_URL"] == "" || len(l.Env) != 2 ||
+		l.Instructions != "Be brief." || l.CPULimit != "3" || *res.EnvSpec.Lifecycle.IdleTimeout != 600 || res.AgentSpec.Repo == "" {
 		t.Fatalf("resolved launch: %+v env=%+v", l, res.EnvSpec)
 	}
 	// A new environment revision is picked up by an unpinned agent, not by a pinned one.
@@ -175,7 +185,7 @@ func TestAgentValidationIsolationAndResolve(t *testing.T) {
 		t.Fatalf("bad ref: %v", err)
 	}
 	_ = pinned
-	// Delete removes the whole history; shared items are not deletable from a tenant.
+	// Delete hides the item and keeps its history; shared items are not deletable from a tenant.
 	if err := s.Delete(ctx, model.KindAgent, "acme", "generic"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("tenant deleting a shared item: %v", err)
 	}
@@ -184,6 +194,99 @@ func TestAgentValidationIsolationAndResolve(t *testing.T) {
 	}
 	if _, err := s.Get(ctx, model.KindAgent, "acme", "pinned", 0); !errors.Is(err, ErrNotFound) {
 		t.Fatal("deleted item must be gone")
+	}
+	if _, err := s.Get(ctx, model.KindAgent, "acme", "pinned", 1); !errors.Is(err, ErrNotFound) {
+		t.Fatal("a deleted revision is not resolvable")
+	}
+	if err := s.Delete(ctx, model.KindAgent, "acme", "pinned"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("second delete: %v", err)
+	}
+	if revs, err := s.Revisions(ctx, model.KindAgent, "acme", "pinned"); err != nil || len(revs) != 1 || revs[0].DeletedAt == nil {
+		t.Fatalf("history survives deletion, marked: %v %+v", err, revs)
+	}
+	if list, _ := s.List(ctx, model.KindAgent, "acme"); len(list) != 2 { // backend + shared generic
+		t.Fatalf("deleted items are not listed: %+v", list)
+	}
+	// Recreating the name is a create (expected 0 passes) and continues the numbering: "pinned@1"
+	// never names the new content.
+	zero := 0
+	again, err := s.Put(ctx, model.KindAgent, "acme", doc(t, "pinned", `{"policy":"backend-dev","environment":"py"}`, &zero), false, "alice")
+	if err != nil || again.Revision != 2 {
+		t.Fatalf("recreate: %v %+v", err, again)
+	}
+	if _, err := s.Resolve(ctx, "acme", "pinned@1", false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the deleted revision stays unavailable: %v", err)
+	}
+	if res, err := s.Resolve(ctx, "acme", "pinned", false); err != nil || res.Agent.Revision != 2 || res.Environment.Revision != 2 {
+		t.Fatalf("recreated agent: %v %+v", err, res)
+	}
+}
+
+func TestReferencesFixTheirScope(t *testing.T) {
+	s := newService()
+	ctx := context.Background()
+	mustPut := func(kind, tenant, name, spec string, admin bool) *model.CatalogItem {
+		t.Helper()
+		it, err := s.Put(ctx, kind, tenant, doc(t, name, spec, nil), admin, "x")
+		if err != nil {
+			t.Fatalf("%s %s/%s: %v", kind, tenant, name, err)
+		}
+		return it
+	}
+	mustPut(model.KindEnvironment, "", "base", `{"image":"stable"}`, true)
+	// A bare name that resolves to the shared item is stored as shared/name.
+	a := mustPut(model.KindAgent, "acme", "worker", `{"policy":"backend-dev","environment":"base@1"}`, false)
+	var spec AgentSpec
+	_ = json.Unmarshal(a.Spec, &spec)
+	if spec.Environment != "shared/base@1" {
+		t.Fatalf("stored reference must carry the scope: %q", spec.Environment)
+	}
+	// The explicit form is accepted as written; a tenant's own item stays bare.
+	mustPut(model.KindAgent, "acme", "explicit", `{"policy":"backend-dev","environment":"shared/base"}`, false)
+	mustPut(model.KindEnvironment, "acme", "own", `{"image":"canary"}`, false)
+	o := mustPut(model.KindAgent, "acme", "local", `{"policy":"backend-dev","environment":"own"}`, false)
+	_ = json.Unmarshal(o.Spec, &spec)
+	if spec.Environment != "own" {
+		t.Fatalf("own reference: %q", spec.Environment)
+	}
+	// shared/ never finds a tenant item, even one of that name.
+	if _, err := s.Put(ctx, model.KindAgent, "acme", doc(t, "bad", `{"policy":"backend-dev","environment":"shared/own"}`, nil), false, "x"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("shared/own: %v", err)
+	}
+	// The tenant creating its own "base" afterwards does not capture the agents.
+	mustPut(model.KindEnvironment, "acme", "base", `{"image":"canary"}`, false)
+	for _, ref := range []string{"worker", "worker@1", "explicit"} {
+		res, err := s.Resolve(ctx, "acme", ref, false)
+		if err != nil || res.Environment.Tenant != "" || res.Launch.Image != "registry/agent:1.0" || res.EnvironmentRef != "shared/base" || res.AgentRef != ref[:len(res.Agent.Name)] {
+			t.Fatalf("%s must keep the shared environment: %v %+v", ref, err, res)
+		}
+	}
+	// A new agent written now resolves the bare name to the tenant's own item.
+	n := mustPut(model.KindAgent, "acme", "fresh", `{"policy":"backend-dev","environment":"base"}`, false)
+	_ = json.Unmarshal(n.Spec, &spec)
+	if res, err := s.Resolve(ctx, "acme", "fresh", false); spec.Environment != "base" || err != nil || res.Environment.Tenant != "acme" || res.EnvironmentRef != "base" {
+		t.Fatalf("fresh: %q %v %+v", spec.Environment, err, res)
+	}
+	// Shared agents are named shared/... from a tenant, and their sandboxes record that.
+	mustPut(model.KindAgent, "", "generic", `{"policy":"shared-agent","environment":"base"}`, true)
+	if res, err := s.Resolve(ctx, "acme", "shared/generic", false); err != nil || res.AgentRef != "shared/generic" || res.EnvironmentRef != "base" || res.Environment.Tenant != "" {
+		t.Fatalf("shared agent: %v %+v", err, res)
+	}
+	if res, err := s.Resolve(ctx, "acme", "generic", false); err != nil || res.AgentRef != "shared/generic" {
+		t.Fatalf("bare shared agent: %v %+v", err, res)
+	}
+}
+
+func TestYAMLStream(t *testing.T) {
+	docs, err := ParseYAMLAll([]byte("kind: EnvironmentProfile\nname: py\nspec: {image: stable}\n---\n---\nkind: AgentDefinition\nname: a\nspec: {policy: p, environment: py}\n"))
+	if err != nil || len(docs) != 2 || docs[0].Name != "py" || docs[1].Kind != model.KindAgent {
+		t.Fatalf("stream: %v %+v", err, docs)
+	}
+	if _, err := ParseYAMLAll([]byte("kind: EnvironmentProfile\nname: py\nspec: {image: stable}\n---\nkind: AgentDefinition\nname: a\nspec: {policy: p, environment: py}\nextra: 1\n")); err == nil || !strings.Contains(err.Error(), "document 2") {
+		t.Fatalf("second document must be strict too: %v", err)
+	}
+	if _, err := ParseYAML([]byte("---\n")); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("empty: %v", err)
 	}
 }
 
