@@ -78,6 +78,7 @@ tags:
   - name: catalogue
   - name: connections
   - name: tenancy
+  - name: apply
   - name: rollouts
   - name: runs
   - name: events
@@ -573,6 +574,40 @@ paths:
       summary: History of the tenant's settings
       responses:
         "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/plan:
+    post:
+      tags: [apply]
+      summary: Validate a bundle and report what applying it would change. Nothing is written
+      description: |
+        The body is a YAML stream (Content-Type application/yaml) or JSON (an array of documents or
+        `{"documents": [...]}`); documents are strict. The whole bundle is validated at once, so an
+        agent may name an environment or a connection the same bundle introduces. Every document is
+        checked against the caller's authority (a tenant plans only in its own scope and the kinds it
+        may write; PolicyBinding and TenantSettings are the admin's), compared with the current
+        revision into a stable field diff, and given the revision apply must find
+        (`expected_revision`). A document's own `expected_revision` that does not match the current
+        revision is reported as a conflict. The result is deterministic for the same documents and
+        state; `bundle` fingerprints the documents alone. An invalid bundle is still a 200 plan with
+        `valid: false` and the problems per document.
+      parameters: [{ $ref: "#/components/parameters/scope" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: array
+                  items: { $ref: "#/components/schemas/Document" }
+                - type: object
+                  additionalProperties: false
+                  properties:
+                    documents: { type: array, items: { $ref: "#/components/schemas/Document" } }
+          application/yaml:
+            schema: { type: string, description: "--- separated documents" }
+      responses:
+        "200": { description: The plan, content: { application/json: { schema: { $ref: "#/components/schemas/Plan" } } } }
+        "400": { description: "Unparsable input (unknown field, trailing data)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "403": { description: "Another tenant's scope", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/whoami:
     get:
       tags: [sandboxes]
@@ -1212,6 +1247,53 @@ components:
         description: { type: string }
         spec: { $ref: "#/components/schemas/TenantSettingsSpec" }
         expected_revision: { type: integer, minimum: 0 }
+    Document:
+      type: object
+      required: [kind, spec]
+      additionalProperties: false
+      description: Any versioned resource document (the kind decides the spec schema)
+      properties:
+        kind: { type: string, enum: [AgentDefinition, EnvironmentProfile, Connection, PolicyBinding, TenantSettings] }
+        tenant: { type: string }
+        name: { type: string }
+        description: { type: string }
+        spec: { type: object }
+        expected_revision: { type: integer, minimum: 0 }
+    Plan:
+      type: object
+      properties:
+        bundle: { type: string, description: "Fingerprint of the canonical documents (same files, same value)" }
+        valid: { type: boolean }
+        summary:
+          type: object
+          properties:
+            create: { type: integer }
+            update: { type: integer }
+            noop: { type: integer }
+            invalid: { type: integer }
+        errors: { type: array, items: { type: string }, description: "Bundle-level problems (duplicates)" }
+        changes:
+          type: array
+          description: In apply order (environments, connections, settings, bindings, agents), then by tenant and name
+          items:
+            type: object
+            properties:
+              kind: { type: string }
+              tenant: { type: string }
+              name: { type: string }
+              action: { type: string, enum: [create, update, noop, invalid] }
+              current_revision: { type: integer, description: "Live revision compared with (0 = none)" }
+              expected_revision: { type: integer, description: "Revision apply must find for this change" }
+              diff:
+                type: array
+                description: Leaves of the canonical spec (and description) that differ, in path order
+                items:
+                  type: object
+                  properties:
+                    path: { type: string, example: spec.resources.cpu_limit }
+                    from: { description: "Absent when the field is added" }
+                    to: { description: "Absent when the field is removed" }
+              errors: { type: array, items: { type: string } }
     Usage:
       type: object
       description: |

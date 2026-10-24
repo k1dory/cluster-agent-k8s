@@ -47,7 +47,19 @@ func New(st store.Catalog, pols Slugs) *Service {
 
 // Put writes a binding for tenant (the document's name is the policy slug). Admin only; the
 // API enforces that.
-func (s *Service) Put(ctx context.Context, tenant string, d *res.Document, _ bool, who string) (*model.CatalogItem, error) {
+func (s *Service) Put(ctx context.Context, tenant string, d *res.Document, admin bool, who string) (*model.CatalogItem, error) {
+	it, err := s.Validate(ctx, tenant, d, admin, who)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Store.PutItem(ctx, it, d.Expected()); err != nil {
+		return nil, err
+	}
+	return it, s.Refresh(ctx)
+}
+
+// Validate checks a document and returns the item it would become, without writing.
+func (s *Service) Validate(_ context.Context, tenant string, d *res.Document, _ bool, who string) (*model.CatalogItem, error) {
 	if err := res.CheckDocument(d, model.KindBinding); err != nil {
 		return nil, err
 	}
@@ -77,11 +89,7 @@ func (s *Service) Put(ctx context.Context, tenant string, d *res.Document, _ boo
 	if err != nil {
 		return nil, err
 	}
-	it := &model.CatalogItem{Kind: model.KindBinding, Tenant: tenant, Name: d.Name, Description: d.Description, Spec: spec, CreatedBy: who}
-	if err := s.Store.PutItem(ctx, it, d.Expected()); err != nil {
-		return nil, err
-	}
-	return it, s.Refresh(ctx)
+	return &model.CatalogItem{Kind: model.KindBinding, Tenant: tenant, Name: d.Name, Description: d.Description, Spec: spec, CreatedBy: who}, nil
 }
 
 // Get returns tenant's binding for slug (revision 0 = latest).

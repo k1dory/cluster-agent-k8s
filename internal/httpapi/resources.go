@@ -1,17 +1,21 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/connections"
 	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/plan"
 	"agent-sandbox/internal/resource"
 	"agent-sandbox/internal/tenants"
 )
@@ -306,6 +310,72 @@ func (p *Platform) configRoutes(mux *http.ServeMux) {
 		return p.Bindings
 	}, true)
 	p.tenantSettingsRoutes(mux)
+	mux.HandleFunc("POST /v1/plan", p.auth(p.planBundle))
+}
+
+// planBundle validates a bundle of documents and reports what applying it would change. The
+// body is a YAML stream (Content-Type application/yaml or text/yaml) or JSON: an array of
+// documents or {"documents": [...]}. Nothing is written; an invalid bundle is still a 200 plan
+// with valid=false and the problems per document.
+func (p *Platform) planBundle(w http.ResponseWriter, r *http.Request) {
+	if p.Planner == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("plan disabled"))
+		return
+	}
+	pr := principalOf(r)
+	tenant, ok := p.catalogScope(w, r)
+	if !ok {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	docs, err := parseBundle(r.Header.Get("Content-Type"), body)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	out, err := p.Planner.Plan(r.Context(), docs, plan.Scope{Tenant: tenant, Admin: pr.admin(), Subject: pr.Subject})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// parseBundle reads the documents of a plan or apply request.
+func parseBundle(contentType string, body []byte) ([]*resource.Document, error) {
+	if strings.Contains(contentType, "yaml") {
+		return resource.ParseYAMLAll(body)
+	}
+	var raw []json.RawMessage
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		if err := json.Unmarshal(trimmed, &raw); err != nil {
+			return nil, fmt.Errorf("%w: %v", resource.ErrInvalid, err)
+		}
+	} else {
+		var wrapper struct {
+			Documents []json.RawMessage `json:"documents"`
+		}
+		dec := json.NewDecoder(bytes.NewReader(trimmed))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&wrapper); err != nil {
+			return nil, fmt.Errorf("%w: %v", resource.ErrInvalid, err)
+		}
+		raw = wrapper.Documents
+	}
+	docs := make([]*resource.Document, 0, len(raw))
+	for i, r := range raw {
+		d, err := resource.ParseJSON(r)
+		if err != nil {
+			return nil, fmt.Errorf("document %d: %w", i+1, err)
+		}
+		docs = append(docs, d)
+	}
+	return docs, nil
 }
 
 // Compile-time checks: the services fit the shared route shape.

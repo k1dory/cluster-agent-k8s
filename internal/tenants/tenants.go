@@ -48,6 +48,18 @@ func New(st store.Catalog, defaults func(string) Quota) *Service {
 
 // Put writes tenant's settings as a new revision. Admin only; the API enforces that.
 func (s *Service) Put(ctx context.Context, tenant string, d *res.Document, who string) (*model.CatalogItem, error) {
+	it, err := s.Validate(ctx, tenant, d, who)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Store.PutItem(ctx, it, d.Expected()); err != nil {
+		return nil, err
+	}
+	return it, s.Refresh(ctx)
+}
+
+// Validate checks a document and returns the item it would become, without writing.
+func (s *Service) Validate(_ context.Context, tenant string, d *res.Document, who string) (*model.CatalogItem, error) {
 	if tenant == "" {
 		return nil, fmt.Errorf("%w: settings need a tenant", res.ErrInvalid)
 	}
@@ -77,11 +89,7 @@ func (s *Service) Put(ctx context.Context, tenant string, d *res.Document, who s
 	if err != nil {
 		return nil, err
 	}
-	it := &model.CatalogItem{Kind: model.KindTenantSettings, Tenant: tenant, Name: Name, Description: d.Description, Spec: spec, CreatedBy: who}
-	if err := s.Store.PutItem(ctx, it, d.Expected()); err != nil {
-		return nil, err
-	}
-	return it, s.Refresh(ctx)
+	return &model.CatalogItem{Kind: model.KindTenantSettings, Tenant: tenant, Name: Name, Description: d.Description, Spec: spec, CreatedBy: who}, nil
 }
 
 // Get returns tenant's settings (revision 0 = latest); ErrNotFound when the defaults apply.

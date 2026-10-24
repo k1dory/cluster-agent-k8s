@@ -28,6 +28,7 @@ import (
 	"agent-sandbox/internal/ingress"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/orchestrator"
+	"agent-sandbox/internal/plan"
 	"agent-sandbox/internal/policy"
 	"agent-sandbox/internal/store"
 	"agent-sandbox/internal/tenants"
@@ -47,6 +48,7 @@ type Platform struct {
 	Connections    *connections.Service
 	Bindings       *bindings.Service
 	TenantSettings *tenants.Service
+	Planner        *plan.Deps        // POST /v1/plan; nil disables
 	Token          string            // admin token: every tenant, every sandbox
 	Tenants        map[string]string // tenant-scoped tokens: token → tenant
 	// Verifier checks bearer tokens that are not static ones (OIDC JWTs). nil disables.
@@ -59,8 +61,8 @@ type Platform struct {
 }
 
 // SetServices installs the configuration services (see internal/app).
-func (p *Platform) SetServices(cat *catalog.Service, conns *connections.Service, bind *bindings.Service, tset *tenants.Service) {
-	p.Catalog, p.Connections, p.Bindings, p.TenantSettings = cat, conns, bind, tset
+func (p *Platform) SetServices(cat *catalog.Service, conns *connections.Service, bind *bindings.Service, tset *tenants.Service, planner *plan.Deps) {
+	p.Catalog, p.Connections, p.Bindings, p.TenantSettings, p.Planner = cat, conns, bind, tset, planner
 }
 
 // Principal is who is calling: the admin (every tenant) or one tenant. Expires is set for
