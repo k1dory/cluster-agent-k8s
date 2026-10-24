@@ -29,6 +29,7 @@ dev: build
 
 images:
 	docker build -f images/sandboxd/Dockerfile -t $(REGISTRY)/sandboxd:$(TAG) .
+	docker build -f images/sandboxd/Dockerfile --target sandboxctl -t $(REGISTRY)/sandboxctl:$(TAG) .
 	docker build -f images/agent/Dockerfile -t $(REGISTRY)/agent:$(TAG) .
 
 # Checks inside the built agent image: user 1000 is `agent`, tools present, netlock installs its

@@ -331,6 +331,12 @@ rights: a revoked right is never restored (bindings and settings are skipped, an
 policy the tenant lost fails the plan and nothing is written), a creation is not undone, and the
 restored revision says what it rolled back. See [docs/gitops.md](docs/gitops.md).
 
+A repository of bundles drives all of this through pull requests alone: `sandboxctl plan
+-markdown` is the pull request comment, the merge applies with the commit's SHA, a scheduled
+`drift -markdown` pages when the platform moved. Ready-made GitHub Actions and GitLab CI jobs
+(`deploy/git/`) run `sandboxctl` from its own image (`make images`, target `sandboxctl`). The
+scenario of one settings change as one pull request: [docs/git-adapters.md](docs/git-adapters.md).
+
 ### Agent versions and rollouts
 
 Every sandbox reports `agent_version` (the agent image its pod runs), `env_version` (a fingerprint

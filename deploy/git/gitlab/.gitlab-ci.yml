@@ -1,0 +1,88 @@
+# Git adapter for GitLab: the same three jobs as the GitHub workflow (deploy/git/github), for a
+# configuration repository that changes the platform through merge requests alone.
+#
+#   merge request      → plan every bundle; the plan is the job log, an artifact and, with
+#                        GITLAB_TOKEN (api scope), one note on the merge request updated per push;
+#                        an invalid bundle fails the job
+#   default branch     → apply every bundle with the commit as the source of every new revision
+#   scheduled pipeline → drift
+#
+# CI/CD variables: SANDBOXD_URL, SANDBOXD_TOKEN (masked; a tenant key sbk_… or the admin token),
+# SANDBOXCTL_IMAGE (the sandboxctl image built from the platform repository: `make images`, target
+# sandboxctl; it carries sh, curl, jq and git next to the binary), SANDBOX_TENANT (admin
+# repositories only), GITLAB_TOKEN (optional, for the note).
+variables:
+  SANDBOXCTL_IMAGE: registry.example.com/agent-sandbox/sandboxctl:latest
+  GIT_DEPTH: "0"
+
+default:
+  image:
+    name: $SANDBOXCTL_IMAGE
+    entrypoint: [""]
+  before_script:
+    - test -n "$SANDBOXD_URL" -a -n "$SANDBOXD_TOKEN" || { echo "SANDBOXD_URL and SANDBOXD_TOKEN are required"; exit 1; }
+
+plan:
+  stage: test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: ["bundles/**"]
+  script:
+    - 'rc=0; : > plans.md'
+    - |
+      for f in bundles/*.yaml; do
+        /sandboxctl plan -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown >> plans.md; code=$?
+        echo >> plans.md
+        [ "$code" -eq 2 ] && rc=2
+        [ "$code" -eq 1 ] && rc=1
+      done
+    - cat plans.md
+    # One note per merge request, found by the marker line and updated on every push.
+    - |
+      if [ -n "$GITLAB_TOKEN" ]; then
+        api="$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes"
+        id=$(curl -sSf -H "PRIVATE-TOKEN: $GITLAB_TOKEN" "$api?per_page=100" | jq -r '[.[] | select(.body | startswith("<!-- agent-sandbox -->"))][0].id // empty')
+        body=$(jq -Rs '{body: .}' plans.md)
+        if [ -n "$id" ]; then
+          curl -sSf -X PUT -H "PRIVATE-TOKEN: $GITLAB_TOKEN" -H "Content-Type: application/json" -d "$body" "$api/$id" >/dev/null
+        else
+          curl -sSf -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" -H "Content-Type: application/json" -d "$body" "$api" >/dev/null
+        fi
+      fi
+    - exit $rc
+  artifacts:
+    when: always
+    paths: [plans.md]
+    expire_in: 30 days
+
+apply:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: ["bundles/**"]
+  resource_group: sandbox-apply   # one apply at a time; each is continued by key anyway
+  script:
+    - 'rc=0; : > apply.md'
+    - |
+      for f in bundles/*.yaml; do
+        /sandboxctl apply -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -ref "$CI_COMMIT_BRANCH" -repo "$CI_PROJECT_URL" -markdown >> apply.md; code=$?
+        [ "$code" -ne 0 ] && rc=$code      # 2 invalid, 3 stopped (resume once fixed), 1 unreachable
+      done
+    - cat apply.md
+    - exit $rc
+  artifacts:
+    when: always
+    paths: [apply.md]
+    expire_in: 90 days
+
+drift:
+  stage: test
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  script:
+    # exit 3 on drift: alert on the failed pipeline; the report is the artifact
+    - '/sandboxctl drift ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown > drift.md; rc=$?; cat drift.md; exit $rc'
+  artifacts:
+    when: always
+    paths: [drift.md]
+    expire_in: 30 days
