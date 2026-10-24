@@ -129,9 +129,12 @@ type Applies interface {
 	// UpdateApply writes a if its Version still matches the stored one, then increments it;
 	// ErrConflict otherwise.
 	UpdateApply(ctx context.Context, a *Apply) error
-	// ApplyStep, in one transaction: appends it as a new revision (expected as in PutItem;
-	// nil it = no write, a noop step), records a with step's fields filled in (Revision set to
-	// what was written), guarded by a.Version like UpdateApply.
+	// ApplyStep, in one transaction: checks that the step's item is at revision expected (its
+	// latest live revision; 0 = absent or deleted), appends it as a new revision when it is not
+	// nil (a nil it is a noop step: the check alone), refuses the write when the revision it
+	// would get differs from the step's NextRevision (history moved), and records a with the
+	// step's Revision filled in, guarded by a.Version like UpdateApply. ErrConflict on any
+	// mismatch, with nothing written.
 	ApplyStep(ctx context.Context, a *Apply, step int, it *model.CatalogItem, expected int) error
 	ListApplies(ctx context.Context, tenant string, limit int) ([]*Apply, error)
 }

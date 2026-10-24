@@ -897,11 +897,29 @@ func (p *Postgres) ApplyStep(ctx context.Context, a *model.Apply, step int, it *
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	if it != nil {
+	st := &a.Steps[step]
+	if it == nil {
+		// A noop step confirms the revision it planned on, atomically with its progress.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "catalog:"+st.Kind+"|"+st.Tenant+"|"+st.Name); err != nil {
+			return err
+		}
+		var current int
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(max(revision) FILTER (WHERE deleted_at IS NULL), 0) FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3`,
+			st.Kind, st.Tenant, st.Name).Scan(&current); err != nil {
+			return err
+		}
+		if current != expected {
+			return fmt.Errorf("%w: %s %s/%s is at revision %d, expected %d", ErrConflict, st.Kind, st.Tenant, st.Name, current, expected)
+		}
+		st.Revision = expected
+	} else {
 		if err := putItemTx(ctx, tx, it, expected); err != nil {
 			return err
 		}
-		a.Steps[step].Revision = it.Revision
+		if st.NextRevision != 0 && it.Revision != st.NextRevision {
+			return fmt.Errorf("%w: %s %s/%s would become revision %d, the plan promised %d", ErrConflict, it.Kind, it.Tenant, it.Name, it.Revision, st.NextRevision)
+		}
+		st.Revision = it.Revision
 	}
 	if err := updateApplyTx(ctx, tx, a); err != nil {
 		return err

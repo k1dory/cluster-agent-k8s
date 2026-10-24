@@ -85,8 +85,8 @@ type Change struct {
 
 // Plan is the result for a bundle: deterministic for the same documents and the same state.
 type Plan struct {
-	// Bundle fingerprints the canonical documents (not the state): the same files give the same
-	// value, whatever the current revisions. Fingerprint binds the plan to the state as well:
+	// Bundle fingerprints the documents as submitted (not the state, not what their references
+	// resolved to): the same request gives the same value. Fingerprint binds the plan to the state:
 	// scope, every change's action, expected and next revision. Apply takes it and refuses a
 	// bundle whose plan no longer matches what it finds.
 	Bundle      string   `json:"bundle"`
@@ -316,11 +316,9 @@ func (d Deps) PlanItems(ctx context.Context, docs []*res.Document, scope Scope) 
 		default:
 			p.Summary.Invalid++
 		}
-		spec := canonical(e.doc.Spec)
-		if e.item != nil {
-			spec = canonical(e.item.Spec)
-		}
-		fmt.Fprintf(h, "%s|%s|%s\n%s\n%s\n", e.doc.Kind, e.tenant, e.doc.Name, e.doc.Description, spec)
+		// The documents as submitted (not as resolved): the same request stays the same bundle
+		// whatever its references resolve to later, so an idempotency key keeps matching.
+		fmt.Fprintf(h, "%s|%s|%s\n%s\n%s\n", e.doc.Kind, e.tenant, e.doc.Name, e.doc.Description, canonical(e.doc.Spec))
 	}
 	p.Bundle = hex.EncodeToString(h.Sum(nil))[:16]
 	fmt.Fprintf(fp, "bundle %s\n", p.Bundle)

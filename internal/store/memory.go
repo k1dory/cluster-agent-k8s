@@ -816,13 +816,41 @@ func (m *Memory) ApplyStep(_ context.Context, a *model.Apply, step int, it *mode
 	if cur.Version != a.Version {
 		return fmt.Errorf("%w: apply %s changed concurrently", ErrConflict, a.ID)
 	}
-	if it != nil {
-		if err := m.putItem(it, expected); err != nil {
-			return err
+	st := &a.Steps[step]
+	if it == nil {
+		// A noop step confirms the revision it planned on, atomically with its progress.
+		if current := m.currentRevision(st.Kind, st.Tenant, st.Name); current != expected {
+			return fmt.Errorf("%w: %s %s/%s is at revision %d, expected %d", ErrConflict, st.Kind, st.Tenant, st.Name, current, expected)
 		}
-		a.Steps[step].Revision = it.Revision
+		st.Revision = expected
+		return m.updateApply(a)
 	}
+	if next := m.nextRevisionNumber(it.Kind, it.Tenant, it.Name); st.NextRevision != 0 && next != st.NextRevision {
+		return fmt.Errorf("%w: %s %s/%s would become revision %d, the plan promised %d", ErrConflict, it.Kind, it.Tenant, it.Name, next, st.NextRevision)
+	}
+	if err := m.putItem(it, expected); err != nil {
+		return err
+	}
+	st.Revision = it.Revision
 	return m.updateApply(a)
+}
+
+// currentRevision is the latest live revision of an item (0: absent or deleted); lock held.
+func (m *Memory) currentRevision(kind, tenant, name string) int {
+	revs := m.catalog[catalogKey(kind, tenant, name)]
+	if len(revs) == 0 || revs[len(revs)-1].DeletedAt != nil {
+		return 0
+	}
+	return revs[len(revs)-1].Revision
+}
+
+// nextRevisionNumber is what the next write of an item gets; lock held.
+func (m *Memory) nextRevisionNumber(kind, tenant, name string) int {
+	revs := m.catalog[catalogKey(kind, tenant, name)]
+	if len(revs) == 0 {
+		return 1
+	}
+	return revs[len(revs)-1].Revision + 1
 }
 
 func (m *Memory) ListApplies(_ context.Context, tenant string, limit int) ([]*model.Apply, error) {
