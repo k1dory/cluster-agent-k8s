@@ -88,10 +88,13 @@ type CatalogItem struct {
 	DeletedAt   *time.Time      `json:"deleted_at,omitempty"`
 }
 
-// Catalogue kinds.
+// Versioned resource kinds (all stored as CatalogItems).
 const (
-	KindAgent       = "AgentDefinition"
-	KindEnvironment = "EnvironmentProfile"
+	KindAgent          = "AgentDefinition"
+	KindEnvironment    = "EnvironmentProfile"
+	KindConnection     = "Connection"     // an external service an agent may use, credentials by reference
+	KindBinding        = "PolicyBinding"  // the admin's grant of a policy slug to a tenant, with limits
+	KindTenantSettings = "TenantSettings" // a tenant's quotas and allowed environments (name "settings")
 )
 
 // Sandbox is one agent workspace: a persistent volume plus, while awake, one pod.

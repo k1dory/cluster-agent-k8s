@@ -10,6 +10,7 @@ import (
 
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/policy"
+	res "agent-sandbox/internal/resource"
 	"agent-sandbox/internal/store"
 )
 
@@ -304,9 +305,87 @@ func TestYAMLDocument(t *testing.T) {
 	}
 }
 
+// fakeConnections stands for the connections service: a fixed set of names per scope.
+type fakeConnections map[string]bool // "tenant|name"
+
+func (f fakeConnections) Canonical(_ context.Context, tenant, ref string) (string, error) {
+	r, err := res.ParseRef(ref)
+	if err != nil {
+		return "", err
+	}
+	if !r.Shared && f[tenant+"|"+r.Name] {
+		return r.Name, nil
+	}
+	if f["|"+r.Name] {
+		return "shared/" + r.Name, nil
+	}
+	return "", store.ErrNotFound
+}
+
+type allowEnvs map[string][]string
+
+func (a allowEnvs) EnvironmentAllowed(tenant, ref string) bool {
+	list, ok := a[tenant]
+	if !ok {
+		return true
+	}
+	for _, e := range list {
+		if e == ref {
+			return true
+		}
+	}
+	return false
+}
+
+func TestAgentConnectionsAndAllowedEnvironments(t *testing.T) {
+	s := newService()
+	ctx := context.Background()
+	mustPut := func(kind, tenant, name, spec string, admin bool) *model.CatalogItem {
+		t.Helper()
+		it, err := s.Put(ctx, kind, tenant, doc(t, name, spec, nil), admin, "x")
+		if err != nil {
+			t.Fatalf("%s %s/%s: %v", kind, tenant, name, err)
+		}
+		return it
+	}
+	mustPut(model.KindEnvironment, "acme", "py", `{"image":"stable"}`, false)
+	mustPut(model.KindEnvironment, "", "base", `{"image":"stable"}`, true)
+	// Without a connections service, agents may not name connections at all.
+	if _, err := s.Put(ctx, model.KindAgent, "acme", doc(t, "a", `{"policy":"backend-dev","environment":"py","connections":["github"]}`, nil), false, "x"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("connections disabled: %v", err)
+	}
+	s.Connections = fakeConnections{"acme|github": true, "|registry": true, "other|private": true}
+	for _, bad := range []string{`["private"]`, `["missing"]`, `["github","github"]`, `["registry","shared/registry"]`, `["Bad Name"]`} {
+		if _, err := s.Put(ctx, model.KindAgent, "acme", doc(t, "a", `{"policy":"backend-dev","environment":"py","connections":`+bad+`}`, nil), false, "x"); !errors.Is(err, ErrInvalid) {
+			t.Errorf("connections %s must be invalid: %v", bad, err)
+		}
+	}
+	a := mustPut(model.KindAgent, "acme", "a", `{"policy":"backend-dev","environment":"py","connections":["github","registry"]}`, false)
+	var spec AgentSpec
+	_ = json.Unmarshal(a.Spec, &spec)
+	if len(spec.Connections) != 2 || spec.Connections[0] != "github" || spec.Connections[1] != "shared/registry" {
+		t.Fatalf("stored connections must be canonical: %v", spec.Connections)
+	}
+	// Tenant settings confine the environments: at write time and again at resolve time.
+	s.Tenants = allowEnvs{"acme": {"shared/base"}}
+	if _, err := s.Put(ctx, model.KindAgent, "acme", doc(t, "b", `{"policy":"backend-dev","environment":"py"}`, nil), false, "x"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("disallowed environment at write: %v", err)
+	}
+	mustPut(model.KindAgent, "acme", "c", `{"policy":"backend-dev","environment":"base"}`, false)
+	if _, err := s.Resolve(ctx, "acme", "a", false); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("an agent written before the restriction loses the environment: %v", err)
+	}
+	if r, err := s.Resolve(ctx, "acme", "c", false); err != nil || r.EnvironmentRef != "shared/base" {
+		t.Fatalf("allowed: %v %+v", err, r)
+	}
+	// The admin's shared agents and the admin's own writes are not confined.
+	mustPut(model.KindAgent, "", "generic", `{"policy":"shared-agent","environment":"base"}`, true)
+}
+
 // TestShippedExamples: the declarative example files apply as they are.
 func TestShippedExamples(t *testing.T) {
 	s := newService()
+	s.Connections = fakeConnections{"acme|github": true}
 	ctx := context.Background()
 	for _, f := range []string{"../../examples/catalog/environment-python.yaml", "../../examples/catalog/agent-backend.yaml"} {
 		raw, err := os.ReadFile(f)
@@ -321,8 +400,8 @@ func TestShippedExamples(t *testing.T) {
 			t.Fatalf("%s: %v", f, err)
 		}
 	}
-	res, err := s.Resolve(ctx, "acme", "backend", false)
-	if err != nil || res.Launch.Model != "claude-opus-5-5" || res.Launch.VolumeSize != "20Gi" || *res.EnvSpec.Lifecycle.IdleTimeout != 1800 || res.AgentSpec.Repo == "" {
-		t.Fatalf("example resolve: %v %+v", err, res)
+	r, err := s.Resolve(ctx, "acme", "backend", false)
+	if err != nil || r.Launch.Model != "claude-opus-5-5" || r.Launch.VolumeSize != "20Gi" || *r.EnvSpec.Lifecycle.IdleTimeout != 1800 || r.AgentSpec.Repo == "" || len(r.AgentSpec.Connections) != 1 {
+		t.Fatalf("example resolve: %v %+v", err, r)
 	}
 }

@@ -346,10 +346,10 @@ func (p *Postgres) QuerySandboxes(ctx context.Context, f SandboxFilter) ([]*mode
 	return out, rows.Err()
 }
 
-func (p *Postgres) CountSandboxes(ctx context.Context, tenant string) (SandboxCounts, error) {
+func (p *Postgres) CountSandboxes(ctx context.Context, tenant, slug string) (SandboxCounts, error) {
 	var c SandboxCounts
-	err := p.pool.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE status IN ($2,$3,$4)) FROM sandboxes WHERE tenant=$1`,
-		tenant, model.StatusCreating, model.StatusWaking, model.StatusRunning).Scan(&c.Total, &c.Awake)
+	err := p.pool.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE status IN ($2,$3,$4)) FROM sandboxes WHERE tenant=$1 AND ($5 = '' OR slug=$5)`,
+		tenant, model.StatusCreating, model.StatusWaking, model.StatusRunning, slug).Scan(&c.Total, &c.Awake)
 	return c, err
 }
 
@@ -799,6 +799,11 @@ func (p *Postgres) ListItems(ctx context.Context, kind, tenant string) ([]*model
 	// Latest row per name, then only the live ones: a deleted item's latest row is deleted.
 	return p.queryItems(ctx, `SELECT `+itemCols+` FROM (SELECT DISTINCT ON (name) `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 ORDER BY name, revision DESC) latest
 		WHERE deleted_at IS NULL ORDER BY name`, kind, tenant)
+}
+
+func (p *Postgres) ListKind(ctx context.Context, kind string) ([]*model.CatalogItem, error) {
+	return p.queryItems(ctx, `SELECT `+itemCols+` FROM (SELECT DISTINCT ON (tenant, name) `+itemCols+` FROM catalog_items WHERE kind=$1 ORDER BY tenant, name, revision DESC) latest
+		WHERE deleted_at IS NULL ORDER BY tenant, name`, kind)
 }
 
 func (p *Postgres) ListRevisions(ctx context.Context, kind, tenant, name string) ([]*model.CatalogItem, error) {

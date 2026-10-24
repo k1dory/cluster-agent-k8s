@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -59,5 +60,39 @@ func TestReviewPostgresCatalogUpgradeFromFirstCatalogSchema(t *testing.T) {
 	}
 	if err := p.PutItem(ctx, next, 3); err != nil || next.Revision != 4 {
 		t.Fatalf("update on the recreated item: %v %+v", err, next)
+	}
+}
+
+// ListKind and per-slug counting on a real PostgreSQL.
+func TestReviewPostgresListKindAndSlugCounts(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
+	ctx := t.Context()
+	for _, it := range []struct{ tenant, name, spec string }{{"acme", "backend-dev", `{"max_sandboxes":1}`}, {"bob", "backend-dev", `{}`}, {"bob", "netops", `{}`}} {
+		if err := p.PutItem(ctx, &model.CatalogItem{Kind: model.KindBinding, Tenant: it.tenant, Name: it.name, Spec: json.RawMessage(it.spec)}, -1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.PutItem(ctx, &model.CatalogItem{Kind: model.KindBinding, Tenant: "acme", Name: "backend-dev", Spec: json.RawMessage(`{"max_sandboxes":2}`)}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.DeleteItem(ctx, model.KindBinding, "bob", "netops"); err != nil {
+		t.Fatal(err)
+	}
+	all, err := p.ListKind(ctx, model.KindBinding)
+	if err != nil || len(all) != 2 || all[0].Tenant != "acme" || all[0].Revision != 2 || all[1].Tenant != "bob" || all[1].Name != "backend-dev" {
+		t.Fatalf("ListKind: %v %+v", err, all)
+	}
+	now := time.Now()
+	for i, slug := range []string{"backend-dev", "backend-dev", "netops"} {
+		sb := &model.Sandbox{ID: fmt.Sprintf("c%d", i), Name: "n", Slug: slug, Owner: "bob", Tenant: "bob", Status: model.StatusRunning, CreatedAt: now, LastActivity: now}
+		if err := p.CreateSandbox(ctx, sb); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c, err := p.CountSandboxes(ctx, "bob", ""); err != nil || c.Total != 3 || c.Awake != 3 {
+		t.Fatalf("all slugs: %v %+v", err, c)
+	}
+	if c, err := p.CountSandboxes(ctx, "bob", "backend-dev"); err != nil || c.Total != 2 {
+		t.Fatalf("one slug: %v %+v", err, c)
 	}
 }

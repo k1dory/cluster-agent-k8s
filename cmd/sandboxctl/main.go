@@ -30,11 +30,13 @@ const usage = `sandboxctl <command> [flags]
 
   create   -name shop (-slug backend-dev | -agent backend[@3]) -owner alice [-tenant t] [-repo url] [-idle 3600]
            [-ttl 86400] [-wake-on-preview=false] [-version stable] [-key idempotency-key]
-  apply    -f file.yaml [-tenant t] [-expected 3]   put AgentDefinitions / EnvironmentProfiles (new revisions; --- separates documents)
-  get      agent|environment <name> [-revision N] [-tenant t]
-  list     agents|environments [-tenant t]
-  revisions agent|environment <name> [-tenant t]
-  remove   agent|environment <name> [-tenant t]
+  apply    -f file.yaml [-tenant t] [-expected 3]   put AgentDefinitions / EnvironmentProfiles / Connections /
+           PolicyBindings / TenantSettings (new revisions; --- separates documents, applied in order)
+  get      agent|environment|connection|binding <name> [-revision N] [-tenant t]
+  list     agents|environments|connections|bindings [-tenant t]
+  revisions agent|environment|connection|binding <name> [-tenant t]
+  remove   agent|environment|connection|binding <name> [-tenant t]
+  settings <tenant> [-revisions | -reset]     a tenant's quotas and allowed environments (admin writes with apply)
   list     [-tenant t] [-owner o] [-slug s] [-status running] [-n 100] [-after cursor]
   get      <sandbox>
   update   <sandbox> [-idle 600] [-ttl 0] [-wake-on-preview=true] [-repo url]
@@ -319,22 +321,58 @@ func (c *cli) run(cmd string, args []string) error {
 			if *expected >= 0 {
 				doc.ExpectedRevision = expected
 			}
-			path, ok := map[string]string{model.KindAgent: "agents", model.KindEnvironment: "environments"}[doc.Kind]
-			if !ok {
-				return fmt.Errorf("apply: document %d: kind must be %s or %s, got %q", i+1, model.KindAgent, model.KindEnvironment, doc.Kind)
+			target := ""
+			switch doc.Kind {
+			case model.KindTenantSettings:
+				// Settings live under the tenant: -tenant or the document's tenant names it.
+				t := *tenant
+				if doc.Tenant != nil {
+					t = *doc.Tenant
+				}
+				if t == "" {
+					return fmt.Errorf("apply: document %d: TenantSettings need -tenant or a tenant field", i+1)
+				}
+				target = "/v1/tenants/" + url.PathEscape(t) + "/settings"
+			default:
+				path := kindPath(doc.Kind)
+				if path == "" {
+					return fmt.Errorf("apply: document %d: unknown kind %q", i+1, doc.Kind)
+				}
+				target = "/v1/" + path + "/" + doc.Name + q
 			}
 			var out model.CatalogItem
-			if err := c.do("PUT", "/v1/"+path+"/"+doc.Name+q, doc, &out); err != nil {
+			if err := c.do("PUT", target, doc, &out); err != nil {
 				return fmt.Errorf("document %d (%s %s): %w", i+1, doc.Kind, doc.Name, err)
 			}
-			fmt.Printf("%s %s: revision %d\n", out.Kind, out.Name, out.Revision)
+			fmt.Printf("%s %s/%s: revision %d\n", out.Kind, out.Tenant, out.Name, out.Revision)
+		}
+	case "settings":
+		revisions := fs.Bool("revisions", false, "show the history")
+		reset := fs.Bool("reset", false, "return the tenant to the server defaults (admin)")
+		_ = fs.Parse(flags)
+		base := "/v1/tenants/" + url.PathEscape(need(pos, 0, "tenant")) + "/settings"
+		switch {
+		case *reset:
+			return c.do("DELETE", base, nil, nil)
+		case *revisions:
+			var revs []model.CatalogItem
+			if err := c.do("GET", base+"/revisions", nil, &revs); err != nil {
+				return err
+			}
+			printRevisions(revs)
+		default:
+			var out any
+			if err := c.do("GET", base, nil, &out); err != nil {
+				return err
+			}
+			printJSON(out)
 		}
 	case "revisions", "remove":
 		tenant := fs.String("tenant", "", "scope (admin: tenant or empty for shared)")
 		_ = fs.Parse(flags)
-		path := catalogPath(need(pos, 0, "agent|environment"))
+		path := catalogPath(need(pos, 0, "agent|environment|connection|binding"))
 		if path == "" {
-			return errors.New("expected agent or environment")
+			return errors.New("expected agent, environment, connection or binding")
 		}
 		q := ""
 		if *tenant != "" {
@@ -347,12 +385,7 @@ func (c *cli) run(cmd string, args []string) error {
 		if err := c.do("GET", "/v1/"+path+"/"+need(pos, 1, "name")+"/revisions"+q, nil, &revs); err != nil {
 			return err
 		}
-		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-		fmt.Fprintln(tw, "REVISION\tCREATED\tBY\tDESCRIPTION")
-		for _, r := range revs {
-			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\n", r.Revision, r.CreatedAt.Format(time.RFC3339), r.CreatedBy, r.Description)
-		}
-		tw.Flush()
+		printRevisions(revs)
 	case "run":
 		key := fs.String("key", "", "Idempotency-Key: a repeat with the same key returns the same run")
 		_ = fs.Parse(flags)
@@ -591,15 +624,38 @@ func (c *cli) run(cmd string, args []string) error {
 	return nil
 }
 
-// catalogPath maps a CLI noun to the API path of a catalogue kind ("" when it is not one).
+// catalogPath maps a CLI noun to the API path of a versioned resource ("" when it is not one).
 func catalogPath(noun string) string {
 	switch noun {
 	case "agent", "agents":
 		return "agents"
 	case "environment", "environments", "env":
 		return "environments"
+	case "connection", "connections":
+		return "connections"
+	case "binding", "bindings":
+		return "bindings"
 	}
 	return ""
+}
+
+// kindPath maps a document kind to its API path ("" for kinds without a plain path).
+func kindPath(kind string) string {
+	return map[string]string{model.KindAgent: "agents", model.KindEnvironment: "environments",
+		model.KindConnection: "connections", model.KindBinding: "bindings"}[kind]
+}
+
+func printRevisions(revs []model.CatalogItem) {
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "REVISION\tCREATED\tBY\tDELETED\tDESCRIPTION")
+	for _, r := range revs {
+		deleted := ""
+		if r.DeletedAt != nil {
+			deleted = r.DeletedAt.Format(time.RFC3339)
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", r.Revision, r.CreatedAt.Format(time.RFC3339), r.CreatedBy, deleted, r.Description)
+	}
+	tw.Flush()
 }
 
 // shortImage trims a registry path to the last component (name:tag) for tables.

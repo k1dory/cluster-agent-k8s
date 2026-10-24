@@ -38,9 +38,18 @@ const (
 	TraceOff    = "off"
 )
 
+// Policies is what a decision needs from the policy side: the rule that applies and whether
+// the identity's ownership of its slug still holds (the policy set, or the guard that adds
+// PolicyBindings to it).
+type Policies interface {
+	Match(slug, host, method, reqPath string) (*policy.Rule, bool)
+	AllowedFor(slug, tenant string) bool
+	Revoked(slug, tenant string, adminGrant bool) bool
+}
+
 // Handler is the forward_auth endpoint.
 type Handler struct {
-	Policies *policy.Set
+	Policies Policies
 	Secrets  secrets.Provider
 	Checker  Checker
 	Toucher  Toucher

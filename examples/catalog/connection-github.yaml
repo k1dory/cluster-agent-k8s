@@ -1,0 +1,13 @@
+# Connection: an external service the agent may use, with the headers the gateway adds.
+# Credentials are references into the tenant's secrets provider (file, Vault/OpenBao,
+# Infisical): the catalogue, the API responses and the history never carry a value.
+# Apply: sandboxctl apply -f examples/catalog/connection-github.yaml
+kind: Connection
+name: github
+description: GitHub API with the tenant's token
+spec:
+  type: http                        # http | mcp (an MCP server, inspected by the MCP proxy)
+  host: api.github.com              # the policy must serve this host
+  headers:
+    Authorization: Bearer secret:github-token    # a credential header must be a secret: reference
+    X-GitHub-Api-Version: "2022-11-28"

@@ -1,0 +1,11 @@
+# PolicyBinding (admin): grant the policy slug backend-dev to tenant acme at runtime, on top of
+# the policy file's `tenants:` list. Deleting or expiring the binding revokes the slug: new
+# sandboxes and wakes are refused, running agents are denied by the gateway and stopped.
+# Apply: sandboxctl apply -f examples/catalog/binding-backend.yaml -tenant acme
+kind: PolicyBinding
+name: backend-dev                   # the policy slug
+description: Pilot access for the acme backend team
+spec:
+  expires_at: 2027-01-01T00:00:00Z  # optional: the grant ends here
+  max_sandboxes: 5                  # optional: records under this slug (0 = tenant quota only)
+  max_awake: 2                      # optional: pods at once under this slug

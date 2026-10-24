@@ -1,0 +1,11 @@
+# TenantSettings (admin): what tenant acme may have. Quota replaces the server defaults for the
+# tenant; environments confines its agents to the listed profiles (own by name, shared/name).
+# Apply: sandboxctl apply -f examples/catalog/tenant-settings.yaml -tenant acme
+kind: TenantSettings
+spec:
+  quota:
+    max_sandboxes: 20
+    max_awake: 5
+  environments:
+    - python-dev                    # the tenant's own profile
+    - shared/base                   # a shared profile the admin keeps

@@ -219,6 +219,33 @@ sandboxctl create -name shop -owner alice -agent backend
 sandboxctl revisions environment python-dev
 ```
 
+### Connections, policy bindings and tenant settings
+
+Three more versioned resources, each its own service and module (`internal/connections`,
+`internal/bindings`, `internal/tenants`), share the catalogue's document shape, revisions and
+history:
+
+- **Connection** (`/v1/connections`, tenant-scoped, shared ones by the admin): an HTTP API or an
+  MCP server (`type`, `host`) and the headers the gateway adds for agents that use it. A
+  credential header must be a `secret:NAME` reference into the tenant's secrets provider; a
+  literal value is refused (422) and never echoed. The value is resolved by the gateway at request
+  time and appears in no response, history entry or trace. Agents list the connections they use
+  (`connections:`); the reference is resolved when the agent is written and stored with its scope.
+- **PolicyBinding** (`/v1/bindings`, admin writes, tenants read their own): the admin grants a
+  policy slug to a tenant at runtime, on top of the policy file's `tenants:` list, with an optional
+  `expires_at` and per-slug `max_sandboxes` / `max_awake`. The guard every decision goes through
+  (sandbox creation and wake, the gateway's forward_auth, the catalogue's policy check) combines
+  the repository and the live bindings. Deleting or expiring a binding revokes the slug: the
+  gateway denies the running agent at its next request, the reconciler stops its pod, wakes and
+  new sandboxes answer 403; the binding stays in the history.
+- **TenantSettings** (`/v1/tenants/{tenant}/settings`, admin writes): the tenant's `quota`
+  (replacing the server defaults) and the `environments` its agents may use (`name` for its own,
+  `shared/name`). The allow-list is checked when an agent is written and again when a sandbox is
+  created, so an agent written earlier does not keep an environment the tenant lost.
+
+Bindings and settings are decided on every request, so each replica keeps an in-memory snapshot:
+refreshed at once by the replica that writes, every 5 s on the others. See `examples/catalog/`.
+
 ### Agent versions and rollouts
 
 Every sandbox reports `agent_version` (the agent image its pod runs), `env_version` (a fingerprint
