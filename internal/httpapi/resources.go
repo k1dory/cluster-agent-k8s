@@ -10,11 +10,13 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"agent-sandbox/internal/apply"
 	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/connections"
+	"agent-sandbox/internal/drift"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/plan"
 	"agent-sandbox/internal/resource"
@@ -317,6 +319,75 @@ func (p *Platform) configRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/applies", p.auth(p.listApplies))
 	mux.HandleFunc("GET /v1/applies/{id}", p.auth(p.getApply))
 	mux.HandleFunc("POST /v1/applies/{id}/resume", p.auth(p.resumeApply))
+	mux.HandleFunc("GET /v1/drift", p.auth(p.driftReport))
+	mux.HandleFunc("POST /v1/rollback", p.auth(p.rollback))
+}
+
+// driftReport lists the items of the scope that moved away from what an apply last wrote:
+// changed through the resource API, or deleted. Computed from the store alone.
+func (p *Platform) driftReport(w http.ResponseWriter, r *http.Request) {
+	if p.Applier == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+		return
+	}
+	tenant, ok := p.catalogScope(w, r)
+	if !ok {
+		return
+	}
+	rep, err := drift.Detect(r.Context(), p.Applier.Store, tenant, time.Now())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
+// rollback restores what an apply wrote (to the revisions it replaced) or one item to a
+// revision, as a new plan and apply under the caller's current rights. Grants are never
+// restored. `dry_run` plans without writing; an invalid plan is 422 with the plan.
+func (p *Platform) rollback(w http.ResponseWriter, r *http.Request) {
+	if p.Applier == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+		return
+	}
+	pr := principalOf(r)
+	tenant, ok := p.catalogScope(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Apply    string `json:"apply"`
+		Kind     string `json:"kind"`
+		Tenant   string `json:"tenant"`
+		Name     string `json:"name"`
+		Revision int    `json:"revision"`
+		Key      string `json:"key"`
+		DryRun   bool   `json:"dry_run"`
+	}
+	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("%w: %v", resource.ErrInvalid, err))
+		return
+	}
+	if body.Key == "" {
+		body.Key = r.Header.Get("Idempotency-Key")
+	}
+	rb, err := p.Applier.Rollback(r.Context(), apply.RollbackRequest{Apply: body.Apply, Kind: body.Kind, Tenant: body.Tenant, Name: body.Name,
+		Revision: body.Revision, Key: body.Key, DryRun: body.DryRun, Scope: plan.Scope{Tenant: tenant, Admin: pr.admin(), Subject: pr.Subject}})
+	var invalid *apply.InvalidPlan
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, rb)
+	case errors.As(err, &invalid):
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error(), "code": "invalid_plan", "rollback": rb})
+	case errors.Is(err, apply.ErrNothingToRollBack):
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error(), "code": "nothing_to_roll_back", "rollback": rb})
+	case errors.Is(err, resource.ErrInvalid):
+		writeErr(w, http.StatusBadRequest, err)
+	default:
+		writeApply(w, nil, err)
+	}
 }
 
 // applyBundle applies a planned bundle. The body is as for /v1/plan plus the plan fingerprint
@@ -338,56 +409,78 @@ func (p *Platform) applyBundle(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	docs, planFP, key, err := parseApplyBody(r, body)
+	req, err := parseApplyBody(r, body)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	a, err := p.Applier.Submit(r.Context(), apply.Request{Docs: docs, Plan: planFP, Key: key, Scope: plan.Scope{Tenant: tenant, Admin: pr.admin(), Subject: pr.Subject}})
+	req.Scope = plan.Scope{Tenant: tenant, Admin: pr.admin(), Subject: pr.Subject}
+	a, err := p.Applier.Submit(r.Context(), req)
 	writeApply(w, a, err)
 }
 
-func parseApplyBody(r *http.Request, body []byte) ([]*resource.Document, string, string, error) {
+// applySource is the Git provenance a client may attach to an apply: in the JSON wrapper as
+// `source`, or as ?repo= ?ref= ?commit= ?path= for a YAML body.
+type applySource struct {
+	Repo   string `json:"repo,omitempty"`
+	Ref    string `json:"ref,omitempty"`
+	Commit string `json:"commit,omitempty"`
+	Path   string `json:"path,omitempty"`
+}
+
+func (s applySource) model() *model.Source {
+	if s == (applySource{}) {
+		return nil
+	}
+	return &model.Source{Repo: s.Repo, Ref: s.Ref, Commit: s.Commit, Path: s.Path}
+}
+
+func parseApplyBody(r *http.Request, body []byte) (apply.Request, error) {
 	q := r.URL.Query()
-	planFP, key := q.Get("plan"), q.Get("key")
-	if h := r.Header.Get("Idempotency-Key"); h != "" && key == "" {
-		key = h
+	req := apply.Request{Plan: q.Get("plan"), Key: q.Get("key")}
+	src := applySource{Repo: q.Get("repo"), Ref: q.Get("ref"), Commit: q.Get("commit"), Path: q.Get("path")}
+	if h := r.Header.Get("Idempotency-Key"); h != "" && req.Key == "" {
+		req.Key = h
 	}
 	ct := r.Header.Get("Content-Type")
-	if strings.Contains(ct, "yaml") {
-		docs, err := resource.ParseYAMLAll(body)
-		return docs, planFP, key, err
-	}
 	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) > 0 && trimmed[0] == '{' {
+	if !strings.Contains(ct, "yaml") && len(trimmed) > 0 && trimmed[0] == '{' {
 		var wrapper struct {
 			Documents []json.RawMessage `json:"documents"`
 			Plan      string            `json:"plan"`
 			Key       string            `json:"key"`
+			Source    *applySource      `json:"source"`
 		}
 		dec := json.NewDecoder(bytes.NewReader(trimmed))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&wrapper); err != nil {
-			return nil, "", "", fmt.Errorf("%w: %v", resource.ErrInvalid, err)
+			return req, fmt.Errorf("%w: %v", resource.ErrInvalid, err)
 		}
 		if wrapper.Plan != "" {
-			planFP = wrapper.Plan
+			req.Plan = wrapper.Plan
 		}
 		if wrapper.Key != "" {
-			key = wrapper.Key
+			req.Key = wrapper.Key
 		}
-		docs := make([]*resource.Document, 0, len(wrapper.Documents))
+		if wrapper.Source != nil {
+			src = *wrapper.Source
+		}
+		req.Docs = make([]*resource.Document, 0, len(wrapper.Documents))
 		for i, raw := range wrapper.Documents {
 			d, err := resource.ParseJSON(raw)
 			if err != nil {
-				return nil, "", "", fmt.Errorf("document %d: %w", i+1, err)
+				return req, fmt.Errorf("document %d: %w", i+1, err)
 			}
-			docs = append(docs, d)
+			req.Docs = append(req.Docs, d)
 		}
-		return docs, planFP, key, nil
+	} else {
+		var err error
+		if req.Docs, err = parseBundle(ct, body); err != nil {
+			return req, err
+		}
 	}
-	docs, err := parseBundle(ct, body)
-	return docs, planFP, key, err
+	req.Source = src.model()
+	return req, nil
 }
 
 func writeApply(w http.ResponseWriter, a *model.Apply, err error) {

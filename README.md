@@ -301,6 +301,20 @@ plan expected (noop steps too), an applied step must still be the latest revisio
 must still validate; otherwise the apply stops with status `conflict` and says why, its steps
 showing exactly what was applied. `sandboxctl applies` lists them. See `internal/apply`.
 
+### Provenance, drift and rollback
+
+Every revision an apply writes carries its `source`: the apply, the bundle fingerprint and, when
+the bundle came from Git, the repository, ref, commit and path (`sandboxctl apply` detects them
+and records the commit only when the file is identical to its committed version). A revision
+written by hand through the API carries none. An item belongs to the apply that wrote its latest
+revision; `GET /v1/drift` (`sandboxctl drift`, exit 3 when anything moved) lists the items an
+apply wrote that were since changed by hand (with the field diff) or deleted. `POST /v1/rollback`
+(`sandboxctl rollback -apply <id>`, `sandboxctl rollback environment py [-to N]`) restores what
+an apply wrote, or one item to a revision, as a new plan and apply under the caller's current
+rights: a revoked right is never restored (bindings and settings are skipped, an agent whose
+policy the tenant lost fails the plan and nothing is written), a creation is not undone, and the
+restored revision says what it rolled back. See [docs/gitops.md](docs/gitops.md).
+
 ### Agent versions and rollouts
 
 Every sandbox reports `agent_version` (the agent image its pod runs), `env_version` (a fingerprint

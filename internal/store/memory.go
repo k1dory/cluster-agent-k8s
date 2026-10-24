@@ -53,6 +53,10 @@ func cloneItem(it *model.CatalogItem) *model.CatalogItem {
 		d := *it.DeletedAt
 		c.DeletedAt = &d
 	}
+	if it.Source != nil {
+		src := *it.Source
+		c.Source = &src
+	}
 	return &c
 }
 
@@ -132,6 +136,20 @@ func (m *Memory) ListKind(_ context.Context, kind string) ([]*model.CatalogItem,
 	sort.Slice(out, func(i, j int) bool {
 		return out[i].Tenant < out[j].Tenant || out[i].Tenant == out[j].Tenant && out[i].Name < out[j].Name
 	})
+	return out, nil
+}
+
+func (m *Memory) ListDeleted(_ context.Context, kind, tenant string) ([]*model.CatalogItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.CatalogItem
+	for _, revs := range m.catalog {
+		if len(revs) == 0 || revs[0].Kind != kind || revs[0].Tenant != tenant || revs[len(revs)-1].DeletedAt == nil {
+			continue
+		}
+		out = append(out, cloneItem(revs[len(revs)-1]))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
 }
 

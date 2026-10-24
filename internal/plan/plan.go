@@ -381,6 +381,19 @@ func walk(path string, v any, out map[string]any) {
 	}
 }
 
+// Diff is the stable field diff between two revisions of an item (nil from: a creation), the
+// same one a plan reports for a change.
+func Diff(from, to *model.CatalogItem) []FieldChange {
+	var f, t map[string]any
+	if from != nil {
+		f = flatten(from.Spec, from.Description)
+	}
+	if to != nil {
+		t = flatten(to.Spec, to.Description)
+	}
+	return diff(f, t)
+}
+
 // diff lists the leaves that differ between from and to, in path order.
 func diff(from, to map[string]any) []FieldChange {
 	paths := map[string]bool{}
@@ -481,6 +494,10 @@ func (o *overlay) ListKind(ctx context.Context, kind string) ([]*model.CatalogIt
 
 func (o *overlay) ListRevisions(ctx context.Context, kind, tenant, name string) ([]*model.CatalogItem, error) {
 	return o.base.ListRevisions(ctx, kind, tenant, name)
+}
+
+func (o *overlay) ListDeleted(ctx context.Context, kind, tenant string) ([]*model.CatalogItem, error) {
+	return o.base.ListDeleted(ctx, kind, tenant)
 }
 
 func (o *overlay) merge(ctx context.Context, list []*model.CatalogItem, match func(*model.CatalogItem) bool) ([]*model.CatalogItem, error) {

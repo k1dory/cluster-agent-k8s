@@ -23,7 +23,9 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"agent-sandbox/internal/apply"
 	"agent-sandbox/internal/catalog"
+	"agent-sandbox/internal/drift"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/plan"
 )
@@ -35,7 +37,14 @@ const usage = `sandboxctl <command> [flags]
   plan     -f file.yaml [-tenant t] [-json]         validate a bundle (--- separated documents) and show what apply would change; writes nothing
   apply    -f file.yaml [-tenant t] [-key k] [-json]  plan the bundle, then apply it through the controller: one
            transaction per step, continued by key after any failure (apply -resume <id> continues a stopped one)
+           apply records where the bundle came from: the Git commit the file matches is detected (-repo,
+           -ref, -commit, -path override it; -no-git records nothing); a dirty file is applied without a SHA
   applies  [-tenant t] [-json]              applies of the scope, newest first; applies <id> shows one
+  drift    [-tenant t] [-json]              items changed or deleted outside apply since an apply wrote them;
+           drift -f bundle.yaml shows what the bundle would change (Git versus the platform), writing nothing
+  rollback (-apply <id> | agent|environment|connection <name> [-to N]) [-tenant t] [-plan] [-key k] [-json]
+           restore what an apply wrote (to the revisions it replaced) or one item to a revision, as a new
+           plan and apply under your current rights; grants (bindings, settings) are never restored
   get      agent|environment|connection|binding <name> [-revision N] [-tenant t]
   list     agents|environments|connections|bindings [-tenant t]
   revisions agent|environment|connection|binding <name> [-tenant t]
@@ -339,6 +348,12 @@ func (c *cli) run(cmd string, args []string) error {
 		key := fs.String("key", "", "idempotency key (default: the plan fingerprint)")
 		resume := fs.String("resume", "", "continue the apply with this id instead of submitting a bundle")
 		asJSON := fs.Bool("json", false, "print the apply as JSON")
+		var src bundleSource
+		fs.StringVar(&src.Repo, "repo", "", "source: Git remote the bundle comes from (default: detected)")
+		fs.StringVar(&src.Ref, "ref", "", "source: branch or tag (default: detected)")
+		fs.StringVar(&src.Commit, "commit", "", "source: the commit the bundle file matches (default: detected, only when the file is clean)")
+		fs.StringVar(&src.Path, "path", "", "source: bundle path in the repository (default: detected)")
+		noGit := fs.Bool("no-git", false, "record no source")
 		_ = fs.Parse(flags)
 		q := ""
 		if *tenant != "" {
@@ -361,6 +376,20 @@ func (c *cli) run(cmd string, args []string) error {
 			if err != nil {
 				return err
 			}
+			body := map[string]any{"documents": docs, "key": *key}
+			if !*noGit {
+				detected, ok, dirty, err := gitSource(*file)
+				if err != nil {
+					return err
+				}
+				if ok && dirty && src.Commit == "" {
+					fmt.Fprintf(os.Stderr, "warning: %s differs from its committed version: applied without a commit SHA\n", *file)
+				}
+				src = mergeSource(src, detected)
+				if src != (bundleSource{}) {
+					body["source"] = src
+				}
+			}
 			var p plan.Plan
 			if err := c.do("POST", "/v1/plan"+q, map[string]any{"documents": docs}, &p); err != nil {
 				return err
@@ -369,7 +398,8 @@ func (c *cli) run(cmd string, args []string) error {
 				printPlan(p)
 				os.Exit(2)
 			}
-			if err := c.do("POST", "/v1/apply"+q, map[string]any{"documents": docs, "plan": p.Fingerprint, "key": *key}, &a); err != nil {
+			body["plan"] = p.Fingerprint
+			if err := c.do("POST", "/v1/apply"+q, body, &a); err != nil {
 				return err
 			}
 		}
@@ -379,6 +409,82 @@ func (c *cli) run(cmd string, args []string) error {
 			printApply(a)
 		}
 		if a.Status != model.ApplyDone {
+			os.Exit(3)
+		}
+	case "drift":
+		tenant := fs.String("tenant", "", "scope (admin)")
+		file := fs.String("f", "", "bundle to compare the platform with (what apply would change); without it, the store-side report")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(flags)
+		q := ""
+		if *tenant != "" {
+			q = "?tenant=" + url.QueryEscape(*tenant)
+		}
+		if *file != "" {
+			raw, err := os.ReadFile(*file)
+			if err != nil {
+				return err
+			}
+			docs, err := catalog.ParseYAMLAll(raw)
+			if err != nil {
+				return err
+			}
+			var p plan.Plan
+			if err := c.do("POST", "/v1/plan"+q, map[string]any{"documents": docs}, &p); err != nil {
+				return err
+			}
+			if *asJSON {
+				printJSON(p)
+			} else {
+				printPlan(p)
+			}
+			if p.Summary.Create+p.Summary.Update+p.Summary.Invalid > 0 {
+				os.Exit(3)
+			}
+			return nil
+		}
+		var rep drift.Report
+		if err := c.do("GET", "/v1/drift"+q, nil, &rep); err != nil {
+			return err
+		}
+		if *asJSON {
+			printJSON(rep)
+		} else {
+			printDrift(rep)
+		}
+		if len(rep.Drifted) > 0 {
+			os.Exit(3)
+		}
+	case "rollback":
+		tenant := fs.String("tenant", "", "scope (admin)")
+		applyID := fs.String("apply", "", "roll back everything this apply wrote, to the revisions it replaced")
+		to := fs.Int("to", 0, "revision to restore an item to (default: the last one an apply wrote)")
+		key := fs.String("key", "", "idempotency key of the rollback apply (default: its plan fingerprint)")
+		planOnly := fs.Bool("plan", false, "show the plan, write nothing")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(flags)
+		q := ""
+		if *tenant != "" {
+			q = "?tenant=" + url.QueryEscape(*tenant)
+		}
+		body := map[string]any{"key": *key, "dry_run": *planOnly}
+		if *applyID != "" {
+			body["apply"] = *applyID
+		} else {
+			body["kind"] = kindOf(need(pos, 0, "agent|environment|connection"))
+			body["name"] = need(pos, 1, "name")
+			body["revision"] = *to
+		}
+		var rb apply.Rollback
+		if err := c.do("POST", "/v1/rollback"+q, body, &rb); err != nil {
+			return err
+		}
+		if *asJSON {
+			printJSON(rb)
+			return nil
+		}
+		printRollback(rb)
+		if rb.Apply != nil && rb.Apply.Status != model.ApplyDone {
 			os.Exit(3)
 		}
 	case "applies":
@@ -793,6 +899,22 @@ func catalogPath(noun string) string {
 	return ""
 }
 
+// kindOf maps a CLI noun to a document kind (the noun itself when it is not one: the API
+// answers 400 for an unknown kind).
+func kindOf(noun string) string {
+	switch catalogPath(noun) {
+	case "agents":
+		return model.KindAgent
+	case "environments":
+		return model.KindEnvironment
+	case "connections":
+		return model.KindConnection
+	case "bindings":
+		return model.KindBinding
+	}
+	return noun
+}
+
 // kindPath maps a document kind to its API path ("" for kinds without a plain path).
 func kindPath(kind string) string {
 	return map[string]string{model.KindAgent: "agents", model.KindEnvironment: "environments",
@@ -810,20 +932,9 @@ func printPlan(p plan.Plan) {
 		case c.Action == plan.ActionNoop:
 			detail = "-"
 		default:
-			parts := make([]string, 0, len(c.Diff))
-			for _, f := range c.Diff {
-				switch {
-				case f.From == nil:
-					parts = append(parts, fmt.Sprintf("+%s=%v", f.Path, f.To))
-				case f.To == nil:
-					parts = append(parts, fmt.Sprintf("-%s", f.Path))
-				default:
-					parts = append(parts, fmt.Sprintf("%s: %v -> %v", f.Path, f.From, f.To))
-				}
-			}
-			detail = strings.Join(parts, ", ")
+			detail = formatDiff(c.Diff)
 		}
-		rev := fmt.Sprintf("%d -> %d", c.CurrentRevision, c.CurrentRevision+1)
+		rev := fmt.Sprintf("%d -> %d", c.CurrentRevision, c.NextRevision)
 		if c.Action == plan.ActionNoop || c.Action == plan.ActionInvalid {
 			rev = fmt.Sprint(c.CurrentRevision)
 		}
@@ -855,6 +966,83 @@ func printApply(a model.Apply) {
 	if a.Status != model.ApplyDone {
 		fmt.Printf("continue with: sandboxctl apply -resume %s\n", a.ID)
 	}
+}
+
+func printDrift(rep drift.Report) {
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "STATE\tKIND\tTENANT\tNAME\tAPPLIED\tCURRENT\tBY\tCHANGES")
+	for _, e := range rep.Drifted {
+		applied := fmt.Sprintf("%d (%s", e.Applied.Revision, e.Applied.Source.Apply)
+		if e.Applied.Source.Commit != "" {
+			applied += " @ " + shortSHA(e.Applied.Source.Commit)
+		}
+		applied += ")"
+		current, by := "-", ""
+		if e.Current != nil {
+			current, by = fmt.Sprint(e.Current.Revision), e.Current.CreatedBy
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", e.State, e.Kind, e.Tenant, e.Name, applied, current, by, formatDiff(e.Diff))
+	}
+	tw.Flush()
+	fmt.Printf("drift: %d of %d managed items (%s)\n", len(rep.Drifted), rep.Checked, rep.At.Format(time.RFC3339))
+	for _, e := range rep.Drifted {
+		if noun := strings.TrimSuffix(kindPath(e.Kind), "s"); noun != "" && noun != "binding" {
+			fmt.Printf("restore with: sandboxctl rollback %s %s -tenant %q\n", noun, e.Name, e.Tenant)
+		}
+	}
+}
+
+func printRollback(rb apply.Rollback) {
+	fmt.Printf("rollback of %s\n", rb.Target)
+	for _, sk := range rb.Skipped {
+		fmt.Printf("skipped %s %s/%s: %s\n", sk.Kind, sk.Tenant, sk.Name, sk.Reason)
+	}
+	if rb.Plan != nil {
+		printPlan(*rb.Plan)
+	}
+	if rb.Apply != nil {
+		printApply(*rb.Apply)
+	}
+}
+
+// formatDiff renders a field diff the way printPlan does.
+func formatDiff(d []plan.FieldChange) string {
+	parts := make([]string, 0, len(d))
+	for _, f := range d {
+		switch {
+		case f.From == nil:
+			parts = append(parts, fmt.Sprintf("+%s=%v", f.Path, f.To))
+		case f.To == nil:
+			parts = append(parts, fmt.Sprintf("-%s", f.Path))
+		default:
+			parts = append(parts, fmt.Sprintf("%s: %v -> %v", f.Path, f.From, f.To))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+func shortSHA(s string) string {
+	if len(s) > 12 {
+		return s[:12]
+	}
+	return s
+}
+
+// mergeSource lets explicit flags win over what was detected.
+func mergeSource(flags, detected bundleSource) bundleSource {
+	if flags.Repo == "" {
+		flags.Repo = detected.Repo
+	}
+	if flags.Ref == "" {
+		flags.Ref = detected.Ref
+	}
+	if flags.Commit == "" {
+		flags.Commit = detected.Commit
+	}
+	if flags.Path == "" {
+		flags.Path = detected.Path
+	}
+	return flags
 }
 
 func printRevisions(revs []model.CatalogItem) {

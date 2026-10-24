@@ -121,6 +121,31 @@ func startCaddy(t *testing.T, bin string, adminPort int) *caddyProc {
 	return nil
 }
 
+// waitForCertificates handshakes with every host on port until Caddy has a certificate for it.
+// A policy host refuses a handshake without a client certificate; that is a different error
+// from "internal error" and means the certificate is there.
+func waitForCertificates(t *testing.T, proc *caddyProc, port int, pool *x509.CertPool, hosts ...string) {
+	t.Helper()
+	for _, host := range hosts {
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 5*time.Second)
+			if err == nil {
+				tc := tls.Client(conn, &tls.Config{ServerName: host, RootCAs: pool})
+				err = tc.Handshake()
+				tc.Close()
+			}
+			if err == nil || !strings.Contains(err.Error(), "internal error") {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("caddy never issued a certificate for %s: %v\n%s", host, err, proc.out.String())
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
+
 // dialer sends every connection to 127.0.0.1, keeping the port the URL asked for (443 is
 // rewritten to Caddy's test https port). SNI and certificate names stay the real host names,
 // exactly what the pods see behind the gateway's DNS.
@@ -190,6 +215,12 @@ func TestRealCaddyGateway(t *testing.T) {
 	if !pool.AppendCertsFromPEM(root) {
 		t.Fatal("gateway root is not a PEM certificate")
 	}
+	// Caddy issues the sites' certificates from its internal CA in the background right after
+	// the config is loaded; until then every handshake fails with "internal error". The init
+	// container retries bootstrap for that reason; the test waits for every site once so that no
+	// request below can hit a site that is still being issued.
+	waitForCertificates(t, proc, httpsPort, pool, "git.example.com", "mcp.example.com", "api.sandbox.internal")
+	waitForCertificates(t, proc, regPort, pool, "registrar.sandbox.internal")
 
 	// --- the pod: bootstrap without a client certificate ----------------------------------
 	plain := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}, DialContext: dialer(httpsPort)}, Timeout: 10 * time.Second}

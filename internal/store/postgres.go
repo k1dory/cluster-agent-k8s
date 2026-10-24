@@ -762,18 +762,34 @@ func (p *Postgres) ListInstances(ctx context.Context, sandboxID string) ([]*mode
 
 // --- catalogue -------------------------------------------------------------------------
 
-const itemCols = `kind, tenant, name, revision, description, spec, created_by, created_at, deleted_at`
+const itemCols = `kind, tenant, name, revision, description, spec, created_by, created_at, deleted_at, source`
 
 func scanItem(row pgx.Row) (*model.CatalogItem, error) {
 	var it model.CatalogItem
-	err := row.Scan(&it.Kind, &it.Tenant, &it.Name, &it.Revision, &it.Description, &it.Spec, &it.CreatedBy, &it.CreatedAt, &it.DeletedAt)
+	var source []byte
+	err := row.Scan(&it.Kind, &it.Tenant, &it.Name, &it.Revision, &it.Description, &it.Spec, &it.CreatedBy, &it.CreatedAt, &it.DeletedAt, &source)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	if len(source) > 0 {
+		var src model.Source
+		if err := json.Unmarshal(source, &src); err != nil {
+			return nil, fmt.Errorf("catalog item %s %s/%s@%d: source: %w", it.Kind, it.Tenant, it.Name, it.Revision, err)
+		}
+		it.Source = &src
+	}
 	return &it, nil
+}
+
+// sourceJSON renders an item's source for the source column (NULL when absent).
+func sourceJSON(it *model.CatalogItem) ([]byte, error) {
+	if it.Source == nil {
+		return nil, nil
+	}
+	return json.Marshal(it.Source)
 }
 
 func (p *Postgres) PutItem(ctx context.Context, it *model.CatalogItem, expected int) error {
@@ -806,9 +822,13 @@ func putItemTx(ctx context.Context, tx pgx.Tx, it *model.CatalogItem, expected i
 	}
 	it.Revision = latest + 1
 	it.DeletedAt = nil
-	return tx.QueryRow(ctx, `INSERT INTO catalog_items (kind, tenant, name, revision, description, spec, created_by, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,now()) RETURNING created_at`,
-		it.Kind, it.Tenant, it.Name, it.Revision, it.Description, it.Spec, it.CreatedBy).Scan(&it.CreatedAt)
+	source, err := sourceJSON(it)
+	if err != nil {
+		return err
+	}
+	return tx.QueryRow(ctx, `INSERT INTO catalog_items (kind, tenant, name, revision, description, spec, created_by, created_at, source)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,now(),$8) RETURNING created_at`,
+		it.Kind, it.Tenant, it.Name, it.Revision, it.Description, it.Spec, it.CreatedBy, source).Scan(&it.CreatedAt)
 }
 
 // --- applies ---------------------------------------------------------------------------
@@ -982,6 +1002,11 @@ func (p *Postgres) ListItems(ctx context.Context, kind, tenant string) ([]*model
 func (p *Postgres) ListKind(ctx context.Context, kind string) ([]*model.CatalogItem, error) {
 	return p.queryItems(ctx, `SELECT `+itemCols+` FROM (SELECT DISTINCT ON (tenant, name) `+itemCols+` FROM catalog_items WHERE kind=$1 ORDER BY tenant, name, revision DESC) latest
 		WHERE deleted_at IS NULL ORDER BY tenant, name`, kind)
+}
+
+func (p *Postgres) ListDeleted(ctx context.Context, kind, tenant string) ([]*model.CatalogItem, error) {
+	return p.queryItems(ctx, `SELECT `+itemCols+` FROM (SELECT DISTINCT ON (name) `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 ORDER BY name, revision DESC) latest
+		WHERE deleted_at IS NOT NULL ORDER BY name`, kind, tenant)
 }
 
 func (p *Postgres) ListRevisions(ctx context.Context, kind, tenant, name string) ([]*model.CatalogItem, error) {
