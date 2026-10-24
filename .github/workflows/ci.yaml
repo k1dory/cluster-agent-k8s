@@ -68,3 +68,5 @@ jobs:
         run: docker build -f images/sandboxd/Dockerfile -t agent-sandbox/sandboxd:ci .
       - name: smoke test the shipped agent image (user, tools, netlock, agent-init, agent-runner)
         run: hack/smoke-image.sh agent-sandbox/agent:ci
+      - name: network lock on an isolated Docker network (pod ↔ pod denied, gateway ↔ pod allowed both ways)
+        run: python3 hack/test-netlock.py agent-sandbox/agent:ci

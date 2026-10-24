@@ -57,21 +57,30 @@ func run() error {
 	// into a ConfigMap mounted at $GATEWAY_CA_FILE (and the compose/VM layout can bake it into the
 	// image at $GATEWAY_CA_FILE too); without it only the system store is trusted, which fails
 	// against an internal CA, and the error says so.
-	client := &http.Client{Timeout: 30 * time.Second}
-	if caFile := env("GATEWAY_CA_FILE", "/etc/sandbox/gateway-ca/gateway-ca.crt"); caFile != "" {
-		if pemBytes, err := os.ReadFile(caFile); err == nil && len(bytes.TrimSpace(pemBytes)) > 0 {
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(pemBytes) {
-				return fmt.Errorf("%s is not a PEM certificate", caFile)
-			}
-			client.Transport = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}}
-		} else {
-			fmt.Fprintln(os.Stderr, "agent-init: no gateway root at", caFile, "(GATEWAY_CA_FILE); bootstrap will trust the system store only")
+	// The root is published asynchronously and the ConfigMap mount is optional, so it may show
+	// up after the first attempts: the trust store is rebuilt from the file on every attempt.
+	caFile := env("GATEWAY_CA_FILE", "/etc/sandbox/gateway-ca/gateway-ca.crt")
+	trust := func() (*http.Client, error) {
+		client := &http.Client{Timeout: 30 * time.Second}
+		pemBytes, err := os.ReadFile(caFile)
+		if err != nil || len(bytes.TrimSpace(pemBytes)) == 0 {
+			fmt.Fprintln(os.Stderr, "agent-init: no gateway root at", caFile, "(GATEWAY_CA_FILE) yet; trying the system store")
+			return client, nil
 		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pemBytes) {
+			return nil, fmt.Errorf("%s is not a PEM certificate", caFile)
+		}
+		client.Transport = &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}}
+		return client, nil
 	}
 	var res registrar.BootstrapResponse
 	var lastErr error
 	for attempt := 1; attempt <= 10; attempt++ {
+		client, err := trust()
+		if err != nil {
+			return err
+		}
 		req, _ := http.NewRequest(http.MethodPost, strings.TrimRight(registrarURL, "/")+"/bootstrap", bytes.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
 		req.Header.Set("Content-Type", "application/json")
@@ -93,7 +102,7 @@ func run() error {
 				return lastErr
 			}
 		}
-		time.Sleep(time.Duration(attempt) * time.Second)
+		time.Sleep(time.Duration(min(attempt, 5)) * 500 * time.Millisecond)
 	}
 	if lastErr != nil {
 		return lastErr

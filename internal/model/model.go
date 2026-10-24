@@ -37,27 +37,30 @@ type Preview struct {
 // pod was started under (policy content, harness command, image, pod env). Revision is the
 // optimistic-locking counter every update must match.
 type Sandbox struct {
-	ID             string        `json:"id"`
-	Name           string        `json:"name"`
-	Slug           string        `json:"slug"`
-	Owner          string        `json:"owner"`
-	Tenant         string        `json:"tenant"`
-	Repo           string        `json:"repo"`
-	IdleTimeout    int           `json:"idle_timeout"` // seconds; 0 = never sleep
-	WakeOnPreview  bool          `json:"wake_on_preview"`
-	Status         SandboxStatus `json:"status"`
-	IP             string        `json:"ip,omitempty"`
-	Instance       int           `json:"instance"`
-	PodName        string        `json:"pod_name,omitempty"`
-	AgentVersion   string        `json:"agent_version"`
-	DesiredVersion string        `json:"desired_version,omitempty"`
-	EnvVersion     string        `json:"env_version,omitempty"`
-	Revision       int64         `json:"revision"`
-	LastActivity   time.Time     `json:"last_activity"`
-	CreatedAt      time.Time     `json:"created_at"`
-	ExpiresAt      *time.Time    `json:"expires_at,omitempty"` // when set, the sandbox is deleted after this time
-	Preview        *Preview      `json:"preview,omitempty"`
-	Error          string        `json:"error,omitempty"`
+	ID            string        `json:"id"`
+	Name          string        `json:"name"`
+	Slug          string        `json:"slug"`
+	Owner         string        `json:"owner"`
+	Tenant        string        `json:"tenant"`
+	Repo          string        `json:"repo"`
+	IdleTimeout   int           `json:"idle_timeout"` // seconds; 0 = never sleep
+	WakeOnPreview bool          `json:"wake_on_preview"`
+	Status        SandboxStatus `json:"status"`
+	IP            string        `json:"ip,omitempty"`
+	Instance      int           `json:"instance"`
+	PodName       string        `json:"pod_name,omitempty"`
+	// AdminGrant: the admin created this sandbox for a slug its tenant does not own. The grant
+	// lives in the agent certificate and in policy.Set.Revoked; see there for what ends it.
+	AdminGrant     bool       `json:"admin_grant,omitempty"`
+	AgentVersion   string     `json:"agent_version"`
+	DesiredVersion string     `json:"desired_version,omitempty"`
+	EnvVersion     string     `json:"env_version,omitempty"`
+	Revision       int64      `json:"revision"`
+	LastActivity   time.Time  `json:"last_activity"`
+	CreatedAt      time.Time  `json:"created_at"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"` // when set, the sandbox is deleted after this time
+	Preview        *Preview   `json:"preview,omitempty"`
+	Error          string     `json:"error,omitempty"`
 }
 
 // IdleDuration returns the idle timeout as a duration.

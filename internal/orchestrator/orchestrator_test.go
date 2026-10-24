@@ -8,6 +8,7 @@ import (
 
 	"agent-sandbox/internal/events"
 	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/policy"
 	"agent-sandbox/internal/store"
 )
 
@@ -93,13 +94,13 @@ type onlyAcme struct{}
 func (onlyAcme) AllowedFor(slug, tenant string) bool {
 	return slug != "backend-dev" || tenant == "acme"
 }
-func (onlyAcme) Revoked(string, string) bool { return false }
+func (onlyAcme) Revoked(string, string, bool) bool { return false }
 
 // revokeAll stands for a policy repository that dropped every tenant from the slug.
 type revokeAll struct{}
 
-func (revokeAll) AllowedFor(string, string) bool { return false }
-func (revokeAll) Revoked(string, string) bool    { return true }
+func (revokeAll) AllowedFor(string, string) bool    { return false }
+func (revokeAll) Revoked(string, string, bool) bool { return true }
 
 func TestVersionsAndRollouts(t *testing.T) {
 	ctx := context.Background()
@@ -338,5 +339,50 @@ func TestRecovery(t *testing.T) {
 	}
 	if sb = waitStatus(t, o, sb.ID, model.StatusRunning); sb.AgentVersion != "img:2" {
 		t.Fatalf("after slow-delete rollout: %+v", sb)
+	}
+}
+
+// TestAdminGrantRevocation: a sandbox the admin created for a slug the tenant does not own keeps
+// working through a tenants change, but ends when the slug's policy is deleted in strict mode; a
+// policy-granted sandbox ends as soon as the tenant is dropped.
+func TestAdminGrantRevocation(t *testing.T) {
+	ctx := context.Background()
+	rt := NewFakeRuntime()
+	o := New(store.NewMemory(), rt, nil, events.New(), Config{PreviewDomain: "preview.test", IdleCheckEvery: 10 * time.Millisecond}, nil)
+	o.leading.Store(true)
+	set := policy.FromPolicies(&policy.Policy{Slug: "dev", Tenants: []string{"acme"}, Allow: []policy.Rule{{Host: "h.example.com", Paths: []string{"/"}}}})
+	set.Strict = true
+	o.Policies = set
+	if _, err := o.Create(ctx, CreateRequest{Name: "x", Slug: "dev", Owner: "bob", Tenant: "evil"}); err == nil {
+		t.Fatal("tenant without ownership must be refused")
+	}
+	granted, err := o.Create(ctx, CreateRequest{Name: "g", Slug: "dev", Owner: "root", Tenant: "evil", Admin: true})
+	if err != nil || !granted.AdminGrant {
+		t.Fatalf("admin override must be recorded: %v %+v", err, granted)
+	}
+	owned, err := o.Create(ctx, CreateRequest{Name: "o", Slug: "dev", Owner: "alice", Tenant: "acme"})
+	if err != nil || owned.AdminGrant {
+		t.Fatalf("policy grant must not be an admin grant: %v %+v", err, owned)
+	}
+	waitStatus(t, o, granted.ID, model.StatusRunning)
+	waitStatus(t, o, owned.ID, model.StatusRunning)
+	// The tenants list changes: acme is out, nobody new is in.
+	set2 := policy.FromPolicies(&policy.Policy{Slug: "dev", Tenants: []string{"other"}, Allow: []policy.Rule{{Host: "h.example.com", Paths: []string{"/"}}}})
+	set2.Strict = true
+	o.Policies = set2
+	o.Reconcile(ctx)
+	if sb, _ := o.Get(ctx, owned.ID); sb.Status != model.StatusSleeping {
+		t.Fatalf("policy-granted sandbox must stop, got %s", sb.Status)
+	}
+	if sb, _ := o.Get(ctx, granted.ID); sb.Status != model.StatusRunning {
+		t.Fatalf("admin-granted sandbox must keep running, got %s", sb.Status)
+	}
+	// The slug's policy is deleted altogether (strict: no fallback): the admin grant ends too.
+	set3 := policy.FromPolicies(&policy.Policy{Slug: "default", Tenants: []string{"*"}, Allow: []policy.Rule{{Host: "h.example.com", Paths: []string{"/"}}}})
+	set3.Strict = true
+	o.Policies = set3
+	o.Reconcile(ctx)
+	if sb, _ := o.Get(ctx, granted.ID); sb.Status != model.StatusSleeping {
+		t.Fatalf("admin-granted sandbox must stop once its slug is gone, got %s", sb.Status)
 	}
 }

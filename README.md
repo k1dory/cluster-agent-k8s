@@ -82,19 +82,26 @@ VM) is enough: sandboxd reloads, re-renders and pushes the gateway configuration
 The sandbox VLAN is shared by every pod and node, and macvlan `private` only separates pods on
 the same node. Two layers keep pods from talking to each other across nodes: an init container
 with `NET_ADMIN` installs nftables rules inside every pod (`kube.pod_firewall`, on by default)
-that allow egress to the gateway on 53, 443 and 8443 and nothing else, and the main container,
-which has no capabilities, cannot undo them; where the switch supports it, configure the VLAN as
-an isolated private VLAN with the gateway port as the only promiscuous port. The gateway host's
-own nftables rules protect the gateway, not pod-to-pod traffic.
+that allow egress to the gateway on 53, 443 and 8443, accept new connections only from the
+gateway (the preview proxy reaching the application port) and nothing else, and the main
+container, which has no capabilities, cannot undo them; where the switch supports it, configure
+the VLAN as an isolated private VLAN with the gateway port as the only promiscuous port. The
+gateway host's own nftables rules protect the gateway, not pod-to-pod traffic.
+`hack/test-netlock.py` proves the four directions on an isolated Docker network and runs in CI.
+With a gVisor RuntimeClass the in-pod nftables rules do not apply (no netfilter in the sandboxed
+kernel); there the switch-level isolation is the only layer.
 
 ### MCP: enforced, not advisory
 
 A rule with `mcp:` sends the host through sandboxd's MCP proxy instead of straight to the
-upstream. The proxy reads the JSON-RPC body (single calls and batches): with `read_only: true`,
-`tools/call` passes only for tools matching the `tools` globs (`["get_*", "search"]`), and
-`initialize`, `ping`, `tools/list`, `resources/read`, `prompts/get` always pass; everything else
-is a 403 before the request leaves the gateway. `X-Agent-Access: read-only` is still sent
-upstream as a hint, but the policy no longer depends on the server honouring it.
+upstream. The destination is the policy's upstream for the host name Caddy validated by SNI;
+nothing in the request can redirect it. The proxy parses the JSON-RPC body strictly (single
+calls and batches, exact lower-case protocol keys, no duplicates, no trailing data; anything
+ambiguous is refused): with `read_only: true`, `tools/call` passes only for tools matching the
+`tools` globs (`["get_*", "search"]`), and `initialize`, `ping`, `tools/list`, `resources/read`,
+`prompts/get` always pass; everything else is a 403 before the request leaves the gateway.
+`X-Agent-Access: read-only` is still sent upstream as a hint, but the policy no longer depends
+on the server honouring it.
 
 ### Ownership: which tenant may run which agent
 
@@ -104,10 +111,15 @@ tenants: [netops, platform]   # "*" = every tenant; absent = open (or admin-only
 allow: ...
 ```
 
-`POST /v1/sandboxes` with a slug the tenant does not own is 403, so are rollouts by that slug. The
-admin token is never restricted at creation. Revocation is immediate: when a merged policy drops a
-tenant from an explicit `tenants` list, the gateway refuses that tenant's running agents on their
-next request and the reconciler stops their pods. `policies_strict: true` turns the default around: a policy without
+`POST /v1/sandboxes` with a slug the tenant does not own is 403, so are rollouts by that slug.
+Two kinds of grant exist and both are enforced on every request and by the reconciler:
+
+- a **policy grant**: the tenant owns the slug under the policy repository, and keeps its running
+  agents exactly as long as that stays true. Dropping the tenant, emptying the list in strict
+  mode or deleting the slug's file revokes at once: the gateway answers 403, the pod is stopped;
+- an **admin grant**: the admin created a sandbox for a slug the tenant does not own. The decision
+  is the admin's, recorded on the sandbox (`admin_grant`) and in the agent certificate, and it
+  lasts while a policy still applies to the slug (its own file; in permissive mode the default). `policies_strict: true` turns the default around: a policy without
 a `tenants` list is admin-only and a slug without a policy file is refused instead of falling back
 to `default`.
 
@@ -155,8 +167,11 @@ graceful termination before creating the next pod under the same name.
 the network, then `agent-init` bootstraps the identity: it trusts the gateway root that sandboxd
 publishes into the `agent-sandbox-gateway-ca` ConfigMap (mounted into every pod), obtains the
 certificate and writes the mTLS settings every tool reads (`GIT_SSL_*`, `CURL_HOME`,
-`NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_CLIENT_CERT` / `CLAUDE_CODE_CLIENT_KEY`). `agent-runner` clones
-`repo` into `/workspace/repo` once (the volume persists) and starts the harness inside it.
+`NODE_EXTRA_CA_CERTS`, `CLAUDE_CODE_CLIENT_CERT` / `CLAUDE_CODE_CLIENT_KEY`). The trust store is
+rebuilt on every bootstrap attempt, so a root published after the pod started is picked up.
+`agent-runner` clones `repo` into `/workspace/repo` once (the volume persists) and starts the
+harness inside it; a checkout whose origin differs from the sandbox's `repo` is moved aside and
+the right repository cloned, never silently reused.
 `make smoke-image` runs the shipped image's pieces in Docker; CI builds both images on every PR.
 
 ### Agent versions and rollouts

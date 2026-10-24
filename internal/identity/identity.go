@@ -4,6 +4,8 @@
 //	spiffe://sandbox/agent/{slug}/{n}
 //	spiffe://sandbox/sandbox/{sandbox_id}
 //	spiffe://sandbox/tenant/{tenant}
+//	spiffe://sandbox/grant/admin        (only when the admin created the sandbox for a slug
+//	                                     the tenant does not own; see policy.Set.Revoked)
 package identity
 
 import (
@@ -28,11 +30,12 @@ const (
 
 // Identity is what a certificate says about the caller.
 type Identity struct {
-	Slug      string `json:"slug"`
-	Instance  int    `json:"instance"`
-	SandboxID string `json:"sandbox_id"`
-	Tenant    string `json:"tenant"`
-	Serial    string `json:"serial,omitempty"`
+	Slug       string `json:"slug"`
+	Instance   int    `json:"instance"`
+	SandboxID  string `json:"sandbox_id"`
+	Tenant     string `json:"tenant"`
+	AdminGrant bool   `json:"admin_grant,omitempty"`
+	Serial     string `json:"serial,omitempty"`
 }
 
 // String returns slug/n.
@@ -47,6 +50,9 @@ func (id Identity) URIs() []*url.URL {
 	}
 	if id.Tenant != "" {
 		out = append(out, mk("/tenant/"+id.Tenant))
+	}
+	if id.AdminGrant {
+		out = append(out, mk("/grant/admin"))
 	}
 	return out
 }
@@ -70,6 +76,8 @@ func FromURIs(uris []*url.URL) (*Identity, error) {
 			id.SandboxID = parts[1]
 		case len(parts) == 2 && parts[0] == "tenant":
 			id.Tenant = parts[1]
+		case len(parts) == 2 && parts[0] == "grant" && parts[1] == "admin":
+			id.AdminGrant = true
 		}
 	}
 	if id.Slug == "" || id.Instance == 0 {

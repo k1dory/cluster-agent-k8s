@@ -119,7 +119,7 @@ func (r *Registrar) Bootstrap(ctx context.Context, token string, req BootstrapRe
 	if err != nil {
 		return nil, err
 	}
-	id := identity.Identity{Slug: pod.Slug, Instance: n, SandboxID: pod.SandboxID, Tenant: pod.Tenant}
+	id := identity.Identity{Slug: pod.Slug, Instance: n, SandboxID: pod.SandboxID, Tenant: pod.Tenant, AdminGrant: sb.AdminGrant}
 	// The identity never outlives the sandbox: a TTL set on the sandbox (explicitly, or from the
 	// OIDC token that created it) caps the certificate too.
 	var cap time.Time

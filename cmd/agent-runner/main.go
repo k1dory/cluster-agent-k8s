@@ -116,22 +116,23 @@ func main() {
 // leaving the run `running` forever. 4xx means the run is gone or not ours: stop.
 func (c *client) finish(runID string, exit int) {
 	body, _ := json.Marshal(map[string]int{"exit_code": exit})
-	var lastErr error
-	for attempt := 0; attempt < 12; attempt++ {
+	// There is nothing else to do until the result is delivered: retry until it is, or until the
+	// control plane says the run is not ours any more (4xx). The pod has no other work queued
+	// before this run is settled, and the reconciler fails the run if the pod itself dies.
+	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
-			time.Sleep(time.Duration(min(1<<attempt, 60)) * time.Second)
+			time.Sleep(time.Duration(min(1<<min(attempt, 6), 60)) * time.Second)
 		}
 		code, err := c.do(context.Background(), http.MethodPost, "/agent/runs/"+runID+"/finish", body, nil)
 		if err == nil {
 			return
 		}
-		lastErr = err
 		if code >= 400 && code < 500 {
-			break
+			fmt.Fprintln(os.Stderr, "agent-runner: finish refused:", err)
+			return
 		}
 		fmt.Fprintln(os.Stderr, "agent-runner: finish (will retry):", err)
 	}
-	fmt.Fprintln(os.Stderr, "agent-runner: finish gave up:", lastErr)
 }
 
 // ensureRepo clones $SANDBOX_REPO into /workspace/repo once (the workspace volume persists
@@ -144,7 +145,18 @@ func ensureRepo(ctx context.Context) error {
 	}
 	dir := repoDir()
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
-		return nil
+		// The workspace volume persists; it must hold the repository that was asked for, not the
+		// one a previous configuration cloned. A different origin is moved aside, never reused.
+		out, err := exec.CommandContext(ctx, "git", "-C", dir, "remote", "get-url", "origin").Output()
+		origin := strings.TrimSpace(string(out))
+		if err == nil && origin == repo {
+			return nil
+		}
+		aside := fmt.Sprintf("%s.replaced-%d", dir, time.Now().Unix())
+		fmt.Printf("agent-runner: workspace holds %q, sandbox repo is %q: moving the old checkout to %s\n", origin, repo, aside)
+		if err := os.Rename(dir, aside); err != nil {
+			return fmt.Errorf("workspace at %s belongs to another repository (%s) and could not be moved: %w", dir, origin, err)
+		}
 	}
 	fmt.Println("agent-runner: cloning", repo, "into", dir)
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-lc", `git clone -- "$SANDBOX_REPO" "$SANDBOX_REPO_DIR"`)

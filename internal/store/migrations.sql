@@ -122,3 +122,5 @@ CREATE TABLE IF NOT EXISTS blobs (
     data       bytea NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS admin_grant boolean NOT NULL DEFAULT false;

@@ -14,6 +14,8 @@ table inet sandbox {
 		type filter hook output priority 0; policy drop;
 		oif lo accept
 		meta nfproto ipv6 drop
+		# replies to connections the gateway opened (preview proxy → application port)
+		ct state established,related accept
 		ip daddr $GW udp dport 53 accept
 		ip daddr $GW tcp dport { 53, 443, 8443 } accept
 		ip daddr $GW icmp type echo-request accept
@@ -22,7 +24,10 @@ table inet sandbox {
 	chain input {
 		type filter hook input priority 0; policy drop;
 		iif lo accept
+		meta nfproto ipv6 drop
 		ct state established,related accept
+		# only the gateway may open connections to this pod (the preview proxy); no other pod can
+		ip saddr $GW ct state new accept
 		counter drop
 	}
 	chain forward {

@@ -35,6 +35,7 @@ images:
 # rules, agent-init and agent-runner start and complain about the right things.
 smoke-image: images
 	hack/smoke-image.sh $(REGISTRY)/agent:$(TAG)
+	python3 hack/test-netlock.py $(REGISTRY)/agent:$(TAG)
 
 helm-lint:
 	cp policies/*.yaml deploy/helm/agent-sandbox/policies/ && rm -f deploy/helm/agent-sandbox/policies/tests.yaml

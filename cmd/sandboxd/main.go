@@ -328,7 +328,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 		return errors.New("no api_token, api_tokens or oidc configured: nobody could call the API")
 	}
 	gw := &httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, Log: log.With("log", "gateway-api"),
-		MCP: &mcpproxy.Handler{Authz: az, Log: log.With("log", "mcp")}}
+		MCP: &mcpproxy.Handler{Authz: az, Hosts: pols, Log: log.With("log", "mcp")}}
 
 	servers := []*http.Server{
 		{Addr: cfg.Listen.API, Handler: platform.Routes(), ReadHeaderTimeout: 10 * time.Second},
