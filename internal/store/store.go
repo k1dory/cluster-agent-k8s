@@ -134,6 +134,9 @@ type Catalog interface {
 	ListRevisions(ctx context.Context, kind, tenant, name string) ([]*model.CatalogItem, error)
 	// DeleteItem marks every live revision of an item deleted; ErrNotFound when none is live.
 	DeleteItem(ctx context.Context, kind, tenant, name string) error
+	// ListKind returns the latest live revision of every item of kind in every tenant (for
+	// in-memory snapshots of small, decision-critical kinds: bindings, tenant settings).
+	ListKind(ctx context.Context, kind string) ([]*model.CatalogItem, error)
 }
 
 // Lease is a held leadership lock. Ping fails once the lock is lost (connection gone), at
@@ -159,8 +162,8 @@ type Store interface {
 	ListSandboxes(ctx context.Context) ([]*model.Sandbox, error)
 	// QuerySandboxes returns one page matching f, ordered by creation.
 	QuerySandboxes(ctx context.Context, f SandboxFilter) ([]*model.Sandbox, error)
-	// CountSandboxes counts a tenant's sandboxes without paging.
-	CountSandboxes(ctx context.Context, tenant string) (SandboxCounts, error)
+	// CountSandboxes counts a tenant's sandboxes without paging; slug "" counts every slug.
+	CountSandboxes(ctx context.Context, tenant, slug string) (SandboxCounts, error)
 	// UpdateSandbox writes the record if its Revision still matches the stored one, then
 	// increments it (in the store and in s). ErrConflict otherwise.
 	UpdateSandbox(ctx context.Context, s *model.Sandbox) error

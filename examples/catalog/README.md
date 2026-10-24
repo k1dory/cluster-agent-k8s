@@ -21,3 +21,20 @@ revisions it executed under. Editing a
 definition never changes a sandbox or a run that already exists: new sandboxes get the new
 revisions, existing ones keep theirs until they are recreated (step 3 adds controlled
 re-application of changed revisions).
+
+## Connections, bindings, tenant settings
+
+`connection-github.yaml` names an external service with the headers the gateway adds; the
+credential is a `secret:` reference, never a value. `binding-backend.yaml` is the admin's grant
+of a policy slug to a tenant (with an expiry and per-slug limits); `tenant-settings.yaml` sets
+the tenant's quota and the environments its agents may use. All three are versioned and keep
+their history like the catalogue.
+
+```sh
+sandboxctl apply -f examples/catalog/connection-github.yaml                 # tenant token: own scope
+sandboxctl apply -f examples/catalog/binding-backend.yaml -tenant acme      # admin
+sandboxctl apply -f examples/catalog/tenant-settings.yaml -tenant acme      # admin
+sandboxctl list bindings                                                     # a tenant sees its own
+sandboxctl settings acme
+sandboxctl remove binding backend-dev -tenant acme                          # revoke now
+```

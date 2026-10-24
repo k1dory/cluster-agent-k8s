@@ -108,6 +108,22 @@ func (m *Memory) ListItems(_ context.Context, kind, tenant string) ([]*model.Cat
 	return out, nil
 }
 
+func (m *Memory) ListKind(_ context.Context, kind string) ([]*model.CatalogItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.CatalogItem
+	for _, revs := range m.catalog {
+		if len(revs) == 0 || revs[0].Kind != kind || revs[len(revs)-1].DeletedAt != nil {
+			continue
+		}
+		out = append(out, cloneItem(revs[len(revs)-1]))
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Tenant < out[j].Tenant || out[i].Tenant == out[j].Tenant && out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
 func (m *Memory) ListRevisions(_ context.Context, kind, tenant, name string) ([]*model.CatalogItem, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -513,12 +529,12 @@ func (m *Memory) QuerySandboxes(_ context.Context, f SandboxFilter) ([]*model.Sa
 	return out, nil
 }
 
-func (m *Memory) CountSandboxes(_ context.Context, tenant string) (SandboxCounts, error) {
+func (m *Memory) CountSandboxes(_ context.Context, tenant, slug string) (SandboxCounts, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var c SandboxCounts
 	for _, s := range m.sandboxes {
-		if s.Tenant != tenant {
+		if s.Tenant != tenant || slug != "" && s.Slug != slug {
 			continue
 		}
 		c.Total++

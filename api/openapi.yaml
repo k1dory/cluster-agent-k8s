@@ -31,6 +31,16 @@ info:
       (`SANDBOX_*`, `GATEWAY_IP`, `REGISTRAR_URL`, `API_URL`, `CERT_DIR`, `HOME`, `HARNESS_CMD`,
       `HARNESS_RESUME_CMD`, `GATEWAY_CA_FILE`: 422). The same documents are accepted as YAML files
       by `sandboxctl apply` (several, separated by `---`, apply in order).
+    * **Connections** (`/v1/connections`) name external services (HTTP APIs, MCP servers) with the
+      headers the gateway adds; credentials are `secret:NAME` references resolved from the tenant's
+      secrets provider at request time and never stored, returned or traced. Agents list the
+      connections they use.
+    * **PolicyBindings** (`/v1/bindings`, admin writes) grant a policy slug to a tenant at runtime,
+      with an expiry and per-slug limits. Removing or expiring a binding revokes the slug: new
+      sandboxes and wakes are refused, the gateway denies running agents at their next request and
+      the reconciler stops their pods. **TenantSettings** (`/v1/tenants/{tenant}/settings`, admin
+      writes) hold a tenant's quota and the environments its agents may use. Both are versioned
+      like the catalogue and keep their history.
     * **Versions.** Every sandbox carries `agent_version` (the agent image its pod runs),
       `desired_version` (a rollout not yet applied) and `env_version` (fingerprint of policy content,
       harness command, image and pod environment the pod was started under). `GET /v1/version`
@@ -64,6 +74,8 @@ security:
 tags:
   - name: sandboxes
   - name: catalogue
+  - name: connections
+  - name: tenancy
   - name: rollouts
   - name: runs
   - name: events
@@ -435,6 +447,126 @@ paths:
     get:
       tags: [catalogue]
       summary: History of an EnvironmentProfile, oldest first, deleted revisions included
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/connections:
+    get:
+      tags: [connections]
+      summary: List Connections visible in the scope (own + shared)
+      parameters: [{ $ref: "#/components/parameters/scope" }]
+      responses:
+        "200": { description: Latest revisions, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/connections/{name}:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [connections]
+      summary: One Connection (latest, or ?revision=N)
+      parameters: [{ name: revision, in: query, schema: { type: integer, minimum: 1 } }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [connections]
+      summary: Create or update a Connection (appends a revision)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ConnectionDocument" }
+      responses:
+        "201": { description: Created (revision 1), content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "200": { description: New revision, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "403": { description: "Wrote into another scope", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "expected_revision is not the latest", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Invalid document: unknown field, bad type or host, a credential header carrying a value instead of a secret: reference, a reference the tenant cannot resolve (the value is never echoed)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: [connections]
+      summary: Delete a Connection (history kept; agents naming it stop validating)
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/connections/{name}/revisions:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [connections]
+      summary: History of a Connection, oldest first, deleted revisions included
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/bindings:
+    get:
+      tags: [tenancy]
+      summary: List a tenant's PolicyBindings (a tenant its own; the admin with ?tenant=)
+      parameters: [{ $ref: "#/components/parameters/scope" }]
+      responses:
+        "200": { description: Live bindings, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/bindings/{name}:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [tenancy]
+      summary: One PolicyBinding (name = policy slug)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [tenancy]
+      summary: Admin only. Grant the policy slug {name} to the tenant (?tenant= or the document's tenant), appending a revision
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PolicyBindingDocument" }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "200": { description: New revision, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "403": { description: "Not the admin", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "expected_revision is not the latest", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "No tenant, unknown policy, negative limit, expiry in the past", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: [tenancy]
+      summary: Admin only. Revoke the grant now (history kept). Running agents of the tenant under this slug are denied by the gateway and stopped by the reconciler
+      responses:
+        "204": { description: Revoked }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/bindings/{name}/revisions:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [tenancy]
+      summary: History of a PolicyBinding
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/tenants/{tenant}/settings:
+    parameters: [{ name: tenant, in: path, required: true, schema: { type: string } }]
+    get:
+      tags: [tenancy]
+      summary: A tenant's settings (its own; the admin any). 404 while the server defaults apply
+      parameters: [{ name: revision, in: query, schema: { type: integer, minimum: 1 } }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [tenancy]
+      summary: Admin only. Set the tenant's quota and allowed environments (appends a revision)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TenantSettingsDocument" }
+      responses:
+        "201": { description: Created, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "200": { description: New revision, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "403": { description: "Not the admin", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Negative quota, bad environment reference", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: [tenancy]
+      summary: Admin only. Return the tenant to the server defaults (history kept)
+      responses:
+        "204": { description: Reset }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/tenants/{tenant}/settings/revisions:
+    parameters: [{ name: tenant, in: path, required: true, schema: { type: string } }]
+    get:
+      tags: [tenancy]
+      summary: History of the tenant's settings
       responses:
         "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
   /v1/whoami:
@@ -930,8 +1062,8 @@ components:
       type: object
       description: One revision of a catalogue resource
       properties:
-        kind: { type: string, enum: [AgentDefinition, EnvironmentProfile] }
-        tenant: { type: string, description: "Empty for shared items" }
+        kind: { type: string, enum: [AgentDefinition, EnvironmentProfile, Connection, PolicyBinding, TenantSettings] }
+        tenant: { type: string, description: "Empty for shared items; the grantee for a PolicyBinding; the tenant for TenantSettings" }
         name: { type: string }
         revision: { type: integer }
         description: { type: string }
@@ -989,7 +1121,7 @@ components:
         environment: { type: string, description: "EnvironmentProfile reference: name, name@N to pin, shared/name[@N] for a shared profile. A bare name is resolved (own scope, then shared) when the agent is written and stored in the resolved form, so a tenant profile created later under the same name does not capture it" }
         repo: { type: string }
         instructions: { type: string }
-        connections: { type: array, items: { type: string }, description: "Reserved: connection names (step 4)" }
+        connections: { type: array, items: { type: string }, description: "Connection references (name, or shared/name), resolved when the agent is written and stored in the resolved form; each must exist in the tenant's scope or among the shared ones" }
     EnvironmentDocument:
       type: object
       required: [spec]
@@ -1011,6 +1143,69 @@ components:
         name: { type: string }
         description: { type: string }
         spec: { $ref: "#/components/schemas/AgentSpec" }
+        expected_revision: { type: integer, minimum: 0 }
+    ConnectionSpec:
+      type: object
+      required: [type, host]
+      additionalProperties: false
+      properties:
+        type: { type: string, enum: [http, mcp] }
+        host: { type: string, description: "External host name (lower-case, no scheme or port) a policy serves" }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: "Headers the gateway adds for agents using this connection. Values are templates: secret:NAME is resolved from the tenant's secrets at request time. A credential header (Authorization, Cookie, anything named like a key or token) must be a reference such as \"Bearer secret:NAME\"; a literal value is refused and never echoed"
+    ConnectionDocument:
+      type: object
+      required: [spec]
+      additionalProperties: false
+      properties:
+        kind: { type: string, enum: [Connection] }
+        tenant: { type: string, description: "Admin only: scope to write into (empty = shared)" }
+        name: { type: string }
+        description: { type: string }
+        spec: { $ref: "#/components/schemas/ConnectionSpec" }
+        expected_revision: { type: integer, minimum: 0 }
+    PolicyBindingSpec:
+      type: object
+      additionalProperties: false
+      properties:
+        expires_at: { type: string, format: date-time, description: "The grant ends here; absent = until deleted" }
+        max_sandboxes: { type: integer, minimum: 0, description: "Records the tenant may hold under this slug; 0 = tenant quota only" }
+        max_awake: { type: integer, minimum: 0, description: "Pods at once under this slug" }
+    PolicyBindingDocument:
+      type: object
+      required: [spec]
+      additionalProperties: false
+      properties:
+        kind: { type: string, enum: [PolicyBinding] }
+        tenant: { type: string, description: "The grantee (or ?tenant=)" }
+        name: { type: string, description: "The policy slug; must match the path" }
+        description: { type: string }
+        spec: { $ref: "#/components/schemas/PolicyBindingSpec" }
+        expected_revision: { type: integer, minimum: 0 }
+    TenantSettingsSpec:
+      type: object
+      additionalProperties: false
+      properties:
+        quota:
+          type: object
+          additionalProperties: false
+          description: "Replaces the server's default quota for the tenant as a whole (0 = unlimited); absent = defaults"
+          properties:
+            max_sandboxes: { type: integer, minimum: 0 }
+            max_awake: { type: integer, minimum: 0 }
+        environments: { type: array, items: { type: string }, description: "Environment references the tenant's agents may use (name = its own, shared/name); empty = every visible one. Checked when an agent is written and when a sandbox is created" }
+    TenantSettingsDocument:
+      type: object
+      required: [spec]
+      additionalProperties: false
+      properties:
+        kind: { type: string, enum: [TenantSettings] }
+        tenant: { type: string, description: "Must match the path when present" }
+        name: { type: string, enum: [settings] }
+        description: { type: string }
+        spec: { $ref: "#/components/schemas/TenantSettingsSpec" }
         expected_revision: { type: integer, minimum: 0 }
     Usage:
       type: object

@@ -77,6 +77,14 @@ type Quota struct {
 	MaxAwake     int `yaml:"max_awake" json:"max_awake"`         // pods at once (creating, waking, running)
 }
 
+// Quotas decides the limits that apply: per tenant (QuotaFor) and per tenant and slug
+// (SlugQuota, zero when the slug carries no limit of its own). Config implements the tenant
+// part from its static tables; tenant settings and policy bindings replace it at runtime.
+type Quotas interface {
+	QuotaFor(tenant string) Quota
+	SlugQuota(slug, tenant string) Quota
+}
+
 // Config tunes the orchestrator.
 type Config struct {
 	DefaultIdleTimeout time.Duration // 0 → 1h
@@ -95,6 +103,9 @@ type Config struct {
 	// command, image, pod env); stored on the sandbox so drift is visible. nil → "".
 	EnvVersion func(sb *model.Sandbox) string
 }
+
+// SlugQuota: the static configuration has no per-slug limits.
+func (c Config) SlugQuota(string, string) Quota { return Quota{} }
 
 // QuotaFor returns the quota that applies to a tenant.
 func (c Config) QuotaFor(tenant string) Quota {
@@ -129,6 +140,7 @@ type Orchestrator struct {
 	Runtime  Runtime
 	Retirer  Retirer
 	Policies PolicyGuard // optional
+	Quotas   Quotas      // optional: nil = Cfg
 	Hub      *events.Hub
 	Cfg      Config
 	Log      *slog.Logger
@@ -306,7 +318,7 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 	// Quota check and record creation under the tenant lock (shared by every replica): two
 	// concurrent creates cannot both see the last free slot.
 	err = o.Store.WithTenantLock(ctx, sb.Tenant, func(ctx context.Context) error {
-		if err := o.checkQuota(ctx, sb.Tenant, true); err != nil {
+		if err := o.checkQuota(ctx, sb.Tenant, sb.Slug, true); err != nil {
 			return err
 		}
 		return o.Store.CreateSandbox(ctx, sb)
@@ -328,23 +340,33 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 	return sb, nil
 }
 
-// checkQuota enforces the tenant's limits before a new record (newRecord) or a new pod.
-func (o *Orchestrator) checkQuota(ctx context.Context, tenant string, newRecord bool) error {
-	q := o.Cfg.QuotaFor(tenant)
-	if q.MaxSandboxes == 0 && q.MaxAwake == 0 {
+// checkQuota enforces the tenant's limits, then the slug's, before a new record (newRecord)
+// or a new pod.
+func (o *Orchestrator) checkQuota(ctx context.Context, tenant, slug string, newRecord bool) error {
+	var quotas Quotas = o.Cfg
+	if o.Quotas != nil {
+		quotas = o.Quotas
+	}
+	check := func(q Quota, scope, by string) error {
+		if q.MaxSandboxes == 0 && q.MaxAwake == 0 {
+			return nil
+		}
+		c, err := o.Store.CountSandboxes(ctx, tenant, by)
+		if err != nil {
+			return err
+		}
+		if newRecord && q.MaxSandboxes > 0 && c.Total >= q.MaxSandboxes {
+			return fmt.Errorf("%w: %s already has %d sandboxes (max_sandboxes=%d)", ErrQuota, scope, c.Total, q.MaxSandboxes)
+		}
+		if q.MaxAwake > 0 && c.Awake >= q.MaxAwake {
+			return fmt.Errorf("%w: %s already has %d sandboxes awake (max_awake=%d)", ErrQuota, scope, c.Awake, q.MaxAwake)
+		}
 		return nil
 	}
-	c, err := o.Store.CountSandboxes(ctx, tenant)
-	if err != nil {
+	if err := check(quotas.QuotaFor(tenant), "tenant "+tenant, ""); err != nil {
 		return err
 	}
-	if newRecord && q.MaxSandboxes > 0 && c.Total >= q.MaxSandboxes {
-		return fmt.Errorf("%w: tenant %s already has %d sandboxes (max_sandboxes=%d)", ErrQuota, tenant, c.Total, q.MaxSandboxes)
-	}
-	if q.MaxAwake > 0 && c.Awake >= q.MaxAwake {
-		return fmt.Errorf("%w: tenant %s already has %d sandboxes awake (max_awake=%d)", ErrQuota, tenant, c.Awake, q.MaxAwake)
-	}
-	return nil
+	return check(quotas.SlugQuota(slug, tenant), "tenant "+tenant+" on slug "+slug, slug)
 }
 
 // startPod moves the sandbox to waking (under the tenant lock, so the awake quota counts it
@@ -368,7 +390,7 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 			return fmt.Errorf("%w: sandbox is being deleted", ErrConflict)
 		case model.StatusCreating:
 		default:
-			if err := o.checkQuota(ctx, cur.Tenant, false); err != nil {
+			if err := o.checkQuota(ctx, cur.Tenant, cur.Slug, false); err != nil {
 				return err
 			}
 		}
@@ -678,6 +700,11 @@ func (o *Orchestrator) Wake(ctx context.Context, id string) (*model.Sandbox, err
 	case model.StatusRunning, model.StatusWaking:
 		return sb, nil
 	case model.StatusSleeping, model.StatusError:
+		// A sandbox whose tenant lost the slug (policy list, binding) is not started again: the
+		// reconciler would only stop it, and the gateway refuses it anyway.
+		if o.Policies != nil && o.Policies.Revoked(sb.Slug, sb.Tenant, sb.AdminGrant) {
+			return nil, fmt.Errorf("%w: tenant %s no longer owns slug %s", ErrForbidden, sb.Tenant, sb.Slug)
+		}
 		return o.startPod(ctx, id)
 	default:
 		return nil, fmt.Errorf("%w: sandbox is %s", ErrConflict, sb.Status)
