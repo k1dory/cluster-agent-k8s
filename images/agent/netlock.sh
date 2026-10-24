@@ -7,7 +7,7 @@
 # and the registrar port, nothing else, in particular no other pod and no IPv6.
 set -eu
 GW="${GATEWAY_IP:?GATEWAY_IP is not set}"
-nft -f - <<NFT
+/usr/sbin/nft -f - <<NFT
 flush ruleset
 table inet sandbox {
 	chain output {
