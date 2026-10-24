@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -69,7 +70,7 @@ func (p *Platform) keyRoutes(mux *http.ServeMux) {
 			Name string `json:"name"`
 			TTL  string `json:"ttl"` // Go duration, e.g. "720h"; "" = no expiry (or the server's cap)
 		}
-		if err := decodeStrict(r, &req); err != nil {
+		if err := decodeStrict(w, r, &req, bodyLimit); err != nil {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}
@@ -108,7 +109,7 @@ func (p *Platform) keyRoutes(mux *http.ServeMux) {
 			Grace string `json:"grace"` // how long the old key keeps working; "" = revoked at once
 		}
 		if r.ContentLength != 0 {
-			if err := decodeStrict(r, &req); err != nil {
+			if err := decodeStrict(w, r, &req, bodyLimit); err != nil {
 				writeErr(w, http.StatusBadRequest, err)
 				return
 			}
@@ -154,14 +155,23 @@ type issued struct {
 	Replaces string `json:"replaces,omitempty"`
 }
 
-func decodeStrict(r *http.Request, v any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<16))
+// decodeStrict reads exactly one JSON document of at most limit bytes into v: unknown fields,
+// a second document or trailing garbage after the first are errors, so nothing is written on
+// a body that was not what the client meant to send.
+func decodeStrict(w http.ResponseWriter, r *http.Request, v any, limit int64) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return fmt.Errorf("body: %w", err)
 	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("body: trailing data after the JSON document")
+	}
 	return nil
 }
+
+// bodyLimit bounds small JSON request bodies (keys, rotation).
+const bodyLimit = 1 << 16
 
 func parseTTL(s string) (time.Duration, error) {
 	if s == "" {

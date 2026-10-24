@@ -112,6 +112,12 @@ func TestTenantKeysSelfService(t *testing.T) {
 	if resp, _ := call(t, "POST", api+"/v1/tenants/carol/keys", "t0k", map[string]any{"name": "x", "secret": "mine"}, nil); resp.StatusCode != 400 {
 		t.Fatalf("unknown field: %d", resp.StatusCode)
 	}
+	if resp, _ := call(t, "POST", api+"/v1/tenants/carol/keys", "t0k", `{"name":"x"} {"name":"y"}`, nil); resp.StatusCode != 400 {
+		t.Fatalf("trailing document: %d", resp.StatusCode)
+	}
+	if resp, body := call(t, "GET", api+"/v1/tenants/carol/keys", "t0k", nil, nil); resp.StatusCode != 200 || strings.Contains(string(body), `"name":"x"`) {
+		t.Fatalf("a refused body issued a key: %d %s", resp.StatusCode, body)
+	}
 	// An expiring key bounds the sandboxes it creates when ttl_from_token is on.
 	s.p.TTLFromToken = true
 	resp, body = call(t, "POST", api+"/v1/tenants/carol/keys", "t0k", map[string]any{"name": "short", "ttl": "2h"}, nil)

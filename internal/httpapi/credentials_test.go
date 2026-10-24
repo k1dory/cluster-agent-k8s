@@ -51,6 +51,27 @@ func TestBringYourOwnCredentialsEndToEnd(t *testing.T) {
 	if resp, _ := call(t, "PUT", api+"/v1/credentials/bad%2Fname", "alice-tok", map[string]any{"value": "x"}, nil); resp.StatusCode != 422 {
 		t.Fatalf("bad name: %d", resp.StatusCode)
 	}
+	// A body with a second document or trailing garbage writes nothing.
+	for _, bad := range []string{`{"value":"TRAILING"} {"value":"second"}`, `{"value":"TRAILING"}garbage`, `{"value":"TRAILING"}]`} {
+		if resp, _ := call(t, "PUT", api+"/v1/credentials/trailing", "alice-tok", bad, nil); resp.StatusCode != 400 {
+			t.Fatalf("trailing data accepted: %d for %s", resp.StatusCode, bad)
+		}
+	}
+	if resp, _ := call(t, "GET", api+"/v1/credentials/trailing", "alice-tok", nil, nil); resp.StatusCode != 404 {
+		t.Fatal("a refused body wrote a credential")
+	}
+	// The largest allowed value passes the HTTP layer (the limit is on the value, not on the
+	// JSON around it, escaping included); one byte more is refused by the service as 422.
+	big := strings.Repeat("\"", credentials.MaxValue) // every byte escapes to two in JSON
+	if resp, body := call(t, "PUT", api+"/v1/credentials/big", "alice-tok", map[string]any{"value": big}, nil); resp.StatusCode != 201 {
+		t.Fatalf("max value: %d %s", resp.StatusCode, body)
+	}
+	if resp, _ := call(t, "PUT", api+"/v1/credentials/big", "alice-tok", map[string]any{"value": big + "x"}, nil); resp.StatusCode != 422 {
+		t.Fatalf("over max value: %d", resp.StatusCode)
+	}
+	if resp, _ := call(t, "DELETE", api+"/v1/credentials/big", "alice-tok", nil, nil); resp.StatusCode != 204 {
+		t.Fatal("cleanup")
+	}
 	// Now the connection validates, and the gateway injects the value for alice's sandbox.
 	if resp, body := call(t, "PUT", api+"/v1/connections/gh", "alice-tok", conn, nil); resp.StatusCode != 201 {
 		t.Fatalf("connection: %d %s", resp.StatusCode, body)
