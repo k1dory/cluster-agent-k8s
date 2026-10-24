@@ -73,5 +73,6 @@ func (p *Platform) resolveAgentRef(r *http.Request, req *orchestrator.CreateRequ
 	req.EnvironmentRevision = res.Environment.Revision
 	launch := res.Launch
 	req.Launch = &launch
+	req.Connections = res.Connections
 	return nil
 }

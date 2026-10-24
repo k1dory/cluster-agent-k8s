@@ -59,17 +59,17 @@ func (p *Postgres) Close() error { p.pool.Close(); return nil }
 const sandboxCols = `id, name, slug, owner, tenant, repo, idle_timeout, wake_on_preview, status, ip, instance,
 	pod_name, last_activity, created_at, expires_at, preview_port, preview_access, preview_host, error,
 	agent_version, desired_version, env_version, revision, admin_grant,
-	agent_ref, agent_revision, environment_ref, environment_revision, launch`
+	agent_ref, agent_revision, environment_ref, environment_revision, launch, connections`
 
 func scanSandbox(row pgx.Row) (*model.Sandbox, error) {
 	var s model.Sandbox
 	var pPort *int
 	var pAccess, pHost *string
-	var launch []byte
+	var launch, conns []byte
 	err := row.Scan(&s.ID, &s.Name, &s.Slug, &s.Owner, &s.Tenant, &s.Repo, &s.IdleTimeout, &s.WakeOnPreview,
 		&s.Status, &s.IP, &s.Instance, &s.PodName, &s.LastActivity, &s.CreatedAt, &s.ExpiresAt, &pPort, &pAccess, &pHost, &s.Error,
 		&s.AgentVersion, &s.DesiredVersion, &s.EnvVersion, &s.Revision, &s.AdminGrant,
-		&s.AgentRef, &s.AgentRevision, &s.EnvironmentRef, &s.EnvironmentRevision, &launch)
+		&s.AgentRef, &s.AgentRevision, &s.EnvironmentRef, &s.EnvironmentRevision, &launch, &conns)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -80,6 +80,11 @@ func scanSandbox(row pgx.Row) (*model.Sandbox, error) {
 		s.Launch = &model.Launch{}
 		if err := json.Unmarshal(launch, s.Launch); err != nil {
 			return nil, fmt.Errorf("sandbox %s launch: %w", s.ID, err)
+		}
+	}
+	if len(conns) > 0 {
+		if err := json.Unmarshal(conns, &s.Connections); err != nil {
+			return nil, fmt.Errorf("sandbox %s connections: %w", s.ID, err)
 		}
 	}
 	if pPort != nil {
@@ -109,15 +114,23 @@ func launchCol(s *model.Sandbox) []byte {
 	return b
 }
 
+func connectionsCol(s *model.Sandbox) []byte {
+	if len(s.Connections) == 0 {
+		return nil
+	}
+	b, _ := json.Marshal(s.Connections)
+	return b
+}
+
 func (p *Postgres) CreateSandbox(ctx context.Context, s *model.Sandbox) error {
 	port, access, host := previewCols(s)
 	s.Revision = 1
 	_, err := p.pool.Exec(ctx, `INSERT INTO sandboxes (`+sandboxCols+`)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
 		s.PodName, s.LastActivity, s.CreatedAt, s.ExpiresAt, port, access, host, s.Error,
 		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision, s.AdminGrant,
-		s.AgentRef, s.AgentRevision, s.EnvironmentRef, s.EnvironmentRevision, launchCol(s))
+		s.AgentRef, s.AgentRevision, s.EnvironmentRef, s.EnvironmentRevision, launchCol(s), connectionsCol(s))
 	return err
 }
 
@@ -359,12 +372,12 @@ func (p *Postgres) UpdateSandbox(ctx context.Context, s *model.Sandbox) error {
 		wake_on_preview=$8, status=$9, ip=$10, instance=$11, pod_name=$12, last_activity=GREATEST(last_activity, $13), expires_at=$14,
 		preview_port=$15, preview_access=$16, preview_host=$17, error=$18,
 		agent_version=$19, desired_version=$20, env_version=$21, admin_grant=$23,
-		agent_ref=$24, agent_revision=$25, environment_ref=$26, environment_revision=$27, launch=$28, revision=revision+1
+		agent_ref=$24, agent_revision=$25, environment_ref=$26, environment_revision=$27, launch=$28, connections=$29, revision=revision+1
 		WHERE id=$1 AND revision=$22`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
 		s.PodName, s.LastActivity, s.ExpiresAt, port, access, host, s.Error,
 		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision, s.AdminGrant,
-		s.AgentRef, s.AgentRevision, s.EnvironmentRef, s.EnvironmentRevision, launchCol(s))
+		s.AgentRef, s.AgentRevision, s.EnvironmentRef, s.EnvironmentRevision, launchCol(s), connectionsCol(s))
 	if err != nil {
 		return err
 	}

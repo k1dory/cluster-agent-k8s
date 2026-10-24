@@ -135,12 +135,27 @@ func (s *Service) Active(slug, tenant string) (*Spec, bool) {
 	return &sp, true
 }
 
-// Guard is the ownership decision the orchestrator, the gateway and the catalogue use: the
-// policy repository's lists, plus the live bindings. Every other policy question (rules,
-// hosts, fingerprints) is answered by the embedded set.
+// HeaderSource supplies the headers a sandbox's connections add for a host (the connections
+// service).
+type HeaderSource interface {
+	HeadersFor(ctx context.Context, sandboxID, tenant, host string) (map[string]string, error)
+}
+
+// Guard is the effective policy the orchestrator, the gateway and the catalogue decide with:
+// the repository's rules and ownership lists, the live bindings, and the connections' headers.
+// Every other policy question (rules, hosts, fingerprints) is answered by the embedded set.
 type Guard struct {
 	*policy.Set
 	Bindings *Service
+	Headers  HeaderSource // optional
+}
+
+// HeadersFor forwards to the connections service when one is wired (see authz.Connections).
+func (g *Guard) HeadersFor(ctx context.Context, sandboxID, tenant, host string) (map[string]string, error) {
+	if g.Headers == nil {
+		return nil, nil
+	}
+	return g.Headers.HeadersFor(ctx, sandboxID, tenant, host)
 }
 
 // AllowedFor: the repository grants it, or a live binding does.

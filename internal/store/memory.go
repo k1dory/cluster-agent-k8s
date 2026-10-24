@@ -207,6 +207,7 @@ func cloneSandbox(s *model.Sandbox) *model.Sandbox {
 		}
 		c.Launch = &l
 	}
+	c.Connections = append([]string(nil), s.Connections...)
 	return &c
 }
 

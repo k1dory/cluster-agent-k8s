@@ -144,7 +144,8 @@ ALTER TABLE sandboxes
     ADD COLUMN IF NOT EXISTS agent_revision integer NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS environment_ref text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS environment_revision integer NOT NULL DEFAULT 0,
-    ADD COLUMN IF NOT EXISTS launch jsonb;
+    ADD COLUMN IF NOT EXISTS launch jsonb,
+    ADD COLUMN IF NOT EXISTS connections jsonb;
 ALTER TABLE runs
     ADD COLUMN IF NOT EXISTS agent_ref text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS agent_revision integer NOT NULL DEFAULT 0,

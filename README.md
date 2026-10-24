@@ -228,9 +228,14 @@ history:
 - **Connection** (`/v1/connections`, tenant-scoped, shared ones by the admin): an HTTP API or an
   MCP server (`type`, `host`) and the headers the gateway adds for agents that use it. A
   credential header must be a `secret:NAME` reference into the tenant's secrets provider; a
-  literal value is refused (422) and never echoed. The value is resolved by the gateway at request
-  time and appears in no response, history entry or trace. Agents list the connections they use
-  (`connections:`); the reference is resolved when the agent is written and stored with its scope.
+  literal value is refused (422) and never echoed. Agents list the connections they use
+  (`connections:`); the reference is resolved when the agent is written and stored with its scope,
+  and a sandbox created from the agent records them (`connections`). On every allowed request the
+  gateway decision (forward_auth and the MCP proxy) adds the headers of the sandbox's connections
+  for that host, resolved from the sandbox tenant's secrets, under the policy's own injections;
+  the Caddy config strips and copies those header names, so an agent can neither pre-set nor keep
+  one. The values appear in no response, history entry or trace. A deleted connection adds
+  nothing; a reference that no longer resolves fails the request (502) rather than sending part.
 - **PolicyBinding** (`/v1/bindings`, admin writes, tenants read their own): the admin grants a
   policy slug to a tenant at runtime, on top of the policy file's `tenants:` list, with an optional
   `expires_at` and per-slug `max_sandboxes` / `max_awake`. The guard every decision goes through
@@ -241,10 +246,14 @@ history:
 - **TenantSettings** (`/v1/tenants/{tenant}/settings`, admin writes): the tenant's `quota`
   (replacing the server defaults) and the `environments` its agents may use (`name` for its own,
   `shared/name`). The allow-list is checked when an agent is written and again when a sandbox is
-  created, so an agent written earlier does not keep an environment the tenant lost.
+  created, so an agent written earlier does not keep an environment the tenant lost; a restricted
+  tenant cannot create by bare slug either, since that path runs the server's default environment.
 
-Bindings and settings are decided on every request, so each replica keeps an in-memory snapshot:
-refreshed at once by the replica that writes, every 5 s on the others. See `examples/catalog/`.
+Bindings, settings and connections are decided on every request, so each replica keeps an
+in-memory snapshot: refreshed at once by the replica that writes, every 5 s on the others.
+Reloads are serialised, so a reload that started before a revocation can never reinstall the
+revoked grant after it. `internal/app` assembles these services the one way sandboxd runs them
+and the integration tests use the same assembly. See `examples/catalog/`.
 
 ### Agent versions and rollouts
 

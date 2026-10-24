@@ -96,3 +96,31 @@ func TestReviewPostgresListKindAndSlugCounts(t *testing.T) {
 		t.Fatalf("one slug: %v %+v", err, c)
 	}
 }
+
+// A sandbox's connections survive the round trip through PostgreSQL (and are absent for
+// sandboxes created before the column existed).
+func TestReviewPostgresSandboxConnections(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, true))
+	ctx := t.Context()
+	legacy, err := p.GetSandbox(ctx, "legacy-sandbox")
+	if err != nil || legacy.Connections != nil {
+		t.Fatalf("legacy sandbox: %v %+v", err, legacy)
+	}
+	now := time.Now()
+	sb := &model.Sandbox{ID: "conn-sandbox", Name: "n", Slug: "dev", Owner: "alice", Tenant: "acme", Status: model.StatusSleeping,
+		CreatedAt: now, LastActivity: now, Connections: []string{"github", "shared/registry"}}
+	if err := p.CreateSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.GetSandbox(ctx, sb.ID)
+	if err != nil || len(got.Connections) != 2 || got.Connections[1] != "shared/registry" {
+		t.Fatalf("connections after create: %v %+v", err, got)
+	}
+	got.Connections = nil
+	if err := p.UpdateSandbox(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	if again, err := p.GetSandbox(ctx, sb.ID); err != nil || again.Connections != nil {
+		t.Fatalf("connections after update: %v %+v", err, again)
+	}
+}

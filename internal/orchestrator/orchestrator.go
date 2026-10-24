@@ -215,6 +215,7 @@ type CreateRequest struct {
 	EnvironmentRef      string        `json:"-"`
 	EnvironmentRevision int           `json:"-"`
 	Launch              *model.Launch `json:"-"`
+	Connections         []string      `json:"-"` // the agent's connections, as references from the sandbox tenant's scope
 }
 
 // UpdateRequest is the input of PATCH /sandboxes/{id}; nil fields are left alone.
@@ -291,7 +292,7 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 		ID: newID("sb"), Name: req.Name, Slug: req.Slug, Owner: req.Owner, Tenant: req.Tenant, Repo: req.Repo,
 		IdleTimeout: int(o.Cfg.DefaultIdleTimeout.Seconds()), WakeOnPreview: true, AgentVersion: version, AdminGrant: adminGrant,
 		AgentRef: req.AgentRef, AgentRevision: req.AgentRevision, EnvironmentRef: req.EnvironmentRef, EnvironmentRevision: req.EnvironmentRevision,
-		Launch: req.Launch, Status: model.StatusCreating, LastActivity: now, CreatedAt: now,
+		Launch: req.Launch, Connections: req.Connections, Status: model.StatusCreating, LastActivity: now, CreatedAt: now,
 	}
 	if req.IdleTimeout != nil {
 		if *req.IdleTimeout < 0 {

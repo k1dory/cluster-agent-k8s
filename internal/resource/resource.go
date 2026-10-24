@@ -254,13 +254,19 @@ type Snapshot struct {
 	Store store.Catalog
 	Kind  string
 	Every time.Duration // refresh period; 0 = 5s
-	mu    sync.RWMutex
-	items map[string]*model.CatalogItem // tenant|name → latest
-	at    time.Time
+	// refresh serialises reloads: a reload that started before a write cannot install its
+	// (older) reading after the write's own reload, so a revocation is never undone in memory.
+	refresh sync.Mutex
+	mu      sync.RWMutex
+	items   map[string]*model.CatalogItem // tenant|name → latest
+	at      time.Time
 }
 
-// Refresh reloads the snapshot from the store.
+// Refresh reloads the snapshot from the store. Reloads run one at a time, in the order they
+// were asked for: the one a write triggers always lands after any reload already in flight.
 func (s *Snapshot) Refresh(ctx context.Context) error {
+	s.refresh.Lock()
+	defer s.refresh.Unlock()
 	list, err := s.Store.ListKind(ctx, s.Kind)
 	if err != nil {
 		return err
@@ -301,6 +307,17 @@ func (s *Snapshot) Get(tenant, name string) *model.CatalogItem {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.items[tenant+"|"+name]
+}
+
+// All returns every item of the snapshot.
+func (s *Snapshot) All() []*model.CatalogItem {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*model.CatalogItem, 0, len(s.items))
+	for _, it := range s.items {
+		out = append(out, it)
+	}
+	return out
 }
 
 // Loaded reports whether Refresh ever succeeded.

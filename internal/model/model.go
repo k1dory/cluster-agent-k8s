@@ -123,20 +123,23 @@ type Sandbox struct {
 	// revisions this sandbox was built from ("name", or "shared/name" for a shared item, so
 	// the scope is part of the record), and the Launch rendered from them. Empty for
 	// sandboxes created with a bare slug.
-	AgentRef            string     `json:"agent_ref,omitempty"`
-	AgentRevision       int        `json:"agent_revision,omitempty"`
-	EnvironmentRef      string     `json:"environment_ref,omitempty"`
-	EnvironmentRevision int        `json:"environment_revision,omitempty"`
-	Launch              *Launch    `json:"launch,omitempty"`
-	AgentVersion        string     `json:"agent_version"`
-	DesiredVersion      string     `json:"desired_version,omitempty"`
-	EnvVersion          string     `json:"env_version,omitempty"`
-	Revision            int64      `json:"revision"`
-	LastActivity        time.Time  `json:"last_activity"`
-	CreatedAt           time.Time  `json:"created_at"`
-	ExpiresAt           *time.Time `json:"expires_at,omitempty"` // when set, the sandbox is deleted after this time
-	Preview             *Preview   `json:"preview,omitempty"`
-	Error               string     `json:"error,omitempty"`
+	AgentRef            string  `json:"agent_ref,omitempty"`
+	AgentRevision       int     `json:"agent_revision,omitempty"`
+	EnvironmentRef      string  `json:"environment_ref,omitempty"`
+	EnvironmentRevision int     `json:"environment_revision,omitempty"`
+	Launch              *Launch `json:"launch,omitempty"`
+	// Connections the agent uses (references as seen from this tenant: "name" or
+	// "shared/name"), fixed at creation; the gateway adds their headers to matching hosts.
+	Connections    []string   `json:"connections,omitempty"`
+	AgentVersion   string     `json:"agent_version"`
+	DesiredVersion string     `json:"desired_version,omitempty"`
+	EnvVersion     string     `json:"env_version,omitempty"`
+	Revision       int64      `json:"revision"`
+	LastActivity   time.Time  `json:"last_activity"`
+	CreatedAt      time.Time  `json:"created_at"`
+	ExpiresAt      *time.Time `json:"expires_at,omitempty"` // when set, the sandbox is deleted after this time
+	Preview        *Preview   `json:"preview,omitempty"`
+	Error          string     `json:"error,omitempty"`
 }
 
 // IdleDuration returns the idle timeout as a duration.
