@@ -757,11 +757,17 @@ paths:
         the stored documents under the stored scope with its current rights: a pending step must
         still find the revision the plan expected (noop steps too), an applied step must still be the
         latest revision, every document must still validate; otherwise the apply stops with status
-        `conflict` and the reason, the steps showing exactly what was applied.
+        `conflict` and the reason, the steps showing exactly what was applied. `source` (or
+        `?repo=&ref=&commit=&path=` for YAML) is the Git provenance of the bundle: recorded on the
+        apply and on every revision it writes.
       parameters:
         - { $ref: "#/components/parameters/scope" }
         - { name: plan, in: query, schema: { type: string } }
         - { name: key, in: query, schema: { type: string } }
+        - { name: repo, in: query, schema: { type: string }, description: "YAML bodies: source.repo" }
+        - { name: ref, in: query, schema: { type: string }, description: "YAML bodies: source.ref" }
+        - { name: commit, in: query, schema: { type: string }, description: "YAML bodies: source.commit" }
+        - { name: path, in: query, schema: { type: string }, description: "YAML bodies: source.path" }
         - { $ref: "#/components/parameters/idempotencyKey" }
       requestBody:
         required: true
@@ -774,6 +780,14 @@ paths:
                 documents: { type: array, items: { $ref: "#/components/schemas/Document" } }
                 plan: { type: string }
                 key: { type: string }
+                source:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    repo: { type: string }
+                    ref: { type: string }
+                    commit: { type: string, description: "The commit the bundle file matches; omit for a modified file" }
+                    path: { type: string }
           application/yaml:
             schema: { type: string }
       responses:
@@ -804,6 +818,55 @@ paths:
         "200": { description: The apply, content: { application/json: { schema: { $ref: "#/components/schemas/Apply" } } } }
         "403": { description: "A tenant cannot resume the admin's apply", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "404": { $ref: "#/components/responses/Error" }
+  /v1/drift:
+    get:
+      tags: [apply]
+      summary: Items an apply wrote that were since changed by hand or deleted
+      description: |
+        An item belongs to the apply that wrote its latest revision (its `source`). The report
+        lists, for the scope, every such item whose live state is no longer that revision:
+        `changed` (the latest revision has no source: written through the resource API, with the
+        field diff from the applied revision) or `deleted`. Items nobody applied are not drift;
+        items a later apply rewrote are in sync with it. Computed from the store alone. Drift the
+        other way round (Git versus the platform) is `POST /v1/plan` with the bundle.
+      parameters: [{ $ref: "#/components/parameters/scope" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Drift" } } } }
+  /v1/rollback:
+    post:
+      tags: [apply]
+      summary: Restore what an apply wrote, or one item to a revision, as a new plan and apply under the caller's current rights
+      description: |
+        Names an apply (every item it wrote goes back to the revision it replaced) or one item and
+        a revision (0: the last revision an apply wrote). The restored documents are planned and
+        applied like any bundle, so the result is a new revision whose `source.rollback` names the
+        target. Grants (PolicyBinding, TenantSettings) are never restored and cannot be rolled back
+        on their own; an item the apply created has no earlier revision and is listed under
+        `skipped`; a document the caller may no longer write (a policy the tenant lost) makes the
+        plan invalid and nothing is written. `dry_run` returns the plan alone.
+      parameters: [{ $ref: "#/components/parameters/scope" }, { $ref: "#/components/parameters/idempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                apply: { type: string, description: "Roll back everything this apply wrote" }
+                kind: { type: string, enum: [AgentDefinition, EnvironmentProfile, Connection] }
+                tenant: { type: string, description: "Admin: the item's tenant (empty = shared)" }
+                name: { type: string }
+                revision: { type: integer, description: "0: the last revision an apply wrote" }
+                key: { type: string, description: "Idempotency key of the apply (default: its plan fingerprint)" }
+                dry_run: { type: boolean }
+      responses:
+        "200": { description: The rollback (plan, and the apply unless dry_run), content: { application/json: { schema: { $ref: "#/components/schemas/Rollback" } } } }
+        "400": { description: "Neither an apply nor a kind and name, or a grant", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "403": { description: "Another tenant's item or the admin's apply", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: "Unknown apply, item or revision", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "The state moved since the plan", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "invalid_plan (a document no longer validates under the caller's rights) or nothing_to_roll_back; the rollback is included", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/whoami:
     get:
       tags: [sandboxes]
@@ -1311,6 +1374,59 @@ components:
         created_by: { type: string }
         created_at: { type: string, format: date-time }
         deleted_at: { type: string, format: date-time, description: "Set once the item was deleted; the revision stays as history and cannot be referenced" }
+        source: { $ref: "#/components/schemas/Source" }
+    Source:
+      type: object
+      description: Provenance of a revision (set when an apply wrote it; absent on one written through this API), or of an apply's documents
+      properties:
+        apply: { type: string, description: "The apply that wrote the revision" }
+        bundle: { type: string, description: "Fingerprint of the documents it applied" }
+        repo: { type: string }
+        ref: { type: string }
+        commit: { type: string, description: "The commit the bundle file matched when applied" }
+        path: { type: string }
+        rollback: { type: string, description: "What the apply restored: an apply id or `Kind tenant/name@N`" }
+    Drift:
+      type: object
+      properties:
+        tenant: { type: string }
+        checked: { type: integer, description: "Managed items examined" }
+        at: { type: string, format: date-time }
+        drifted:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string }
+              tenant: { type: string }
+              name: { type: string }
+              state: { type: string, enum: [changed, deleted] }
+              applied: { $ref: "#/components/schemas/DriftRevision" }
+              current: { $ref: "#/components/schemas/DriftRevision" }
+              diff: { type: array, items: { $ref: "#/components/schemas/FieldChange" }, description: "applied → current" }
+    DriftRevision:
+      type: object
+      properties:
+        revision: { type: integer }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        source: { $ref: "#/components/schemas/Source" }
+    Rollback:
+      type: object
+      properties:
+        target: { type: string, description: "An apply id or `Kind tenant/name@N`" }
+        documents: { type: array, items: { $ref: "#/components/schemas/Document" } }
+        skipped:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: { type: string }
+              tenant: { type: string }
+              name: { type: string }
+              reason: { type: string }
+        plan: { $ref: "#/components/schemas/Plan" }
+        apply: { $ref: "#/components/schemas/Apply" }
     EnvironmentSpec:
       type: object
       required: [image]
@@ -1488,13 +1604,14 @@ components:
               diff:
                 type: array
                 description: Leaves of the canonical spec (and description) that differ, in path order
-                items:
-                  type: object
-                  properties:
-                    path: { type: string, example: spec.resources.cpu_limit }
-                    from: { description: "Absent when the field is added" }
-                    to: { description: "Absent when the field is removed" }
+                items: { $ref: "#/components/schemas/FieldChange" }
               errors: { type: array, items: { type: string } }
+    FieldChange:
+      type: object
+      properties:
+        path: { type: string, example: spec.resources.cpu_limit }
+        from: { description: "Absent when the field is added" }
+        to: { description: "Absent when the field is removed" }
     Message:
       type: object
       description: One turn of a sandbox's conversation, derived from the event stream
@@ -1539,6 +1656,7 @@ components:
               revision: { type: integer, description: "Written (done) or confirmed (skipped)" }
               error: { type: string }
         documents: { type: array, items: { $ref: "#/components/schemas/Document" } }
+        source: { $ref: "#/components/schemas/Source" }
         lease_owner: { type: string }
         lease_until: { type: string, format: date-time }
         version: { type: integer }

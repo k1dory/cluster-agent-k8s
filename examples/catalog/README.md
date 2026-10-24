@@ -8,7 +8,9 @@ revision numbers: a recreated `python-dev` continues at the next number, never a
 
 ```sh
 sandboxctl plan -f examples/catalog/bundle.yaml                  # what would change, nothing written
-sandboxctl apply -f examples/catalog/bundle.yaml                 # plan, then apply: one transaction per step
+sandboxctl apply -f examples/catalog/bundle.yaml                 # plan, then apply: one transaction per step; the Git commit is recorded
+sandboxctl drift                                                 # items changed or deleted by hand since an apply wrote them
+sandboxctl rollback -apply apply_7c1e5a9b02d4                    # back to the revisions that apply replaced, as a new apply
 sandboxctl create -name shop -owner alice -agent backend         # sandbox: backend@1 on python-dev@1
 sandboxctl run sb_1234 "add integration tests for the checkout flow"
 sandboxctl get agent backend                                     # current revision

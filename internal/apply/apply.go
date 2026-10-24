@@ -51,6 +51,9 @@ type Request struct {
 	Plan  string // fingerprint of the plan the caller approved
 	Key   string // idempotency key; "" = the plan fingerprint
 	Scope plan.Scope
+	// Source is where the documents came from (Git repo, ref, commit, path); recorded on the
+	// apply and on every revision it writes. Apply and Bundle are filled by the controller.
+	Source *model.Source
 }
 
 // Controller applies bundles.
@@ -121,6 +124,11 @@ func (c *Controller) Submit(ctx context.Context, req Request) (*model.Apply, err
 	a := &model.Apply{
 		ID: newID(), Key: key, Tenant: req.Scope.Tenant, Admin: req.Scope.Admin, Subject: req.Scope.Subject,
 		Bundle: p.Bundle, Plan: p.Fingerprint, Status: model.ApplyRunning, Documents: docs,
+	}
+	if req.Source != nil {
+		src := *req.Source
+		src.Apply, src.Bundle = a.ID, a.Bundle
+		a.Source = &src
 	}
 	for _, ch := range p.Changes {
 		a.Steps = append(a.Steps, model.ApplyStep{Kind: ch.Kind, Tenant: ch.Tenant, Name: ch.Name, Action: ch.Action,
@@ -283,6 +291,7 @@ func (c *Controller) execute(ctx context.Context, a *model.Apply, attempt int64)
 		} else {
 			it = items[ci]
 			it.CreatedBy = a.Subject
+			it.Source = c.source(a)
 			st.Status, st.Error = model.StepDone, ""
 		}
 		err := c.Store.ApplyStep(ctx, a, i, it, st.ExpectedRevision)
@@ -318,6 +327,16 @@ func (c *Controller) execute(ctx context.Context, a *model.Apply, attempt int64)
 		c.refresh(ctx)
 	}
 	return a, nil
+}
+
+// source is what a revision written by a carries: the apply and its bundle, plus the Git
+// provenance or rollback target the submission named.
+func (c *Controller) source(a *model.Apply) *model.Source {
+	src := model.Source{Apply: a.ID, Bundle: a.Bundle}
+	if a.Source != nil {
+		src.Repo, src.Ref, src.Commit, src.Path, src.Rollback = a.Source.Repo, a.Source.Ref, a.Source.Commit, a.Source.Path, a.Source.Rollback
+	}
+	return &src
 }
 
 // stop records why the apply did not finish; the caller releases the lease.

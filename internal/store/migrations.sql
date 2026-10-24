@@ -141,6 +141,9 @@ CREATE TABLE IF NOT EXISTS catalog_items (
 );
 -- Deletion keeps history: revisions are marked, never removed, and numbers are never reused.
 ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS deleted_at timestamptz;
+-- Provenance of a revision: the apply that wrote it and the Git commit its bundle came from
+-- (model.Source as JSON); NULL for a revision written directly through the resource API.
+ALTER TABLE catalog_items ADD COLUMN IF NOT EXISTS source jsonb;
 ALTER TABLE sandboxes
     ADD COLUMN IF NOT EXISTS agent_ref text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS agent_revision integer NOT NULL DEFAULT 0,

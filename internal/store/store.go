@@ -163,6 +163,9 @@ type Catalog interface {
 	// ListKind returns the latest live revision of every item of kind in every tenant (for
 	// in-memory snapshots of small, decision-critical kinds: bindings, tenant settings).
 	ListKind(ctx context.Context, kind string) ([]*model.CatalogItem, error)
+	// ListDeleted returns the last revision of every deleted item of kind in tenant (DeletedAt
+	// set): what the drift report needs to notice a managed item that is gone.
+	ListDeleted(ctx context.Context, kind, tenant string) ([]*model.CatalogItem, error)
 }
 
 // Lease is a held leadership lock. Ping fails once the lock is lost (connection gone), at

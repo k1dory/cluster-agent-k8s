@@ -93,7 +93,27 @@ type CatalogItem struct {
 	CreatedBy   string          `json:"created_by,omitempty"`
 	CreatedAt   time.Time       `json:"created_at"`
 	DeletedAt   *time.Time      `json:"deleted_at,omitempty"`
+	// Source says where the revision came from: the apply that wrote it and, when the bundle was
+	// taken from Git, the commit. Absent on a revision written directly through the resource API:
+	// such a revision belongs to nobody, and on an item an apply wrote earlier it is drift.
+	Source *Source `json:"source,omitempty"`
 }
+
+// Source is the provenance of a revision (or of an apply: what its documents came from).
+type Source struct {
+	Apply  string `json:"apply,omitempty"`  // the apply that wrote the revision
+	Bundle string `json:"bundle,omitempty"` // fingerprint of the documents it applied
+	Repo   string `json:"repo,omitempty"`   // Git remote the bundle was read from
+	Ref    string `json:"ref,omitempty"`    // branch or tag
+	Commit string `json:"commit,omitempty"` // the commit the bundle file matches (never a dirty tree)
+	Path   string `json:"path,omitempty"`   // bundle file in the repository
+	// Rollback names what the apply restored: another apply ("apply_…") or one revision
+	// ("Kind tenant/name@N"). Set by the rollback controller, never by a plain apply.
+	Rollback string `json:"rollback,omitempty"`
+}
+
+// Managed reports a revision an apply wrote.
+func (it *CatalogItem) Managed() bool { return it.Source != nil && it.Source.Apply != "" }
 
 // Versioned resource kinds (all stored as CatalogItems).
 const (
@@ -307,6 +327,9 @@ type Apply struct {
 	Error     string          `json:"error,omitempty"`
 	Steps     []ApplyStep     `json:"steps"`
 	Documents json.RawMessage `json:"documents"` // the bundle, as submitted (resume re-plans it)
+	// Source is where the bundle came from (Git repo, ref, commit, path, or the rollback target);
+	// every revision the apply writes carries it, plus the apply's own id and bundle.
+	Source *Source `json:"source,omitempty"`
 	// Lease: the replica executing the apply and until when; another replica waits for it to
 	// lapse before continuing an unfinished apply.
 	LeaseOwner string     `json:"lease_owner,omitempty"`

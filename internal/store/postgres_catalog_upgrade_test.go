@@ -288,3 +288,55 @@ func TestReviewPostgresApplyStepRevisionChecks(t *testing.T) {
 		t.Fatalf("refused step recorded progress: %+v", got)
 	}
 }
+
+// Provenance on a real PostgreSQL: the source column round-trips through every read path, an
+// apply step writes it, a plain write leaves it NULL, and deleted items are listed for drift.
+func TestReviewPostgresSourceAndDeletedItems(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
+	ctx := t.Context()
+	src := &model.Source{Apply: "apply_1", Bundle: "b1", Repo: "git@example.com:acme/platform.git", Ref: "main", Commit: "0123456789abcdef0123456789abcdef01234567", Path: "bundles/acme.yaml"}
+	it := &model.CatalogItem{Kind: model.KindEnvironment, Tenant: "acme", Name: "py", Spec: json.RawMessage(`{"image":"stable"}`), CreatedBy: "ci", Source: src}
+	if err := p.PutItem(ctx, it, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.GetItem(ctx, model.KindEnvironment, "acme", "py", 0)
+	if err != nil || got.Source == nil || *got.Source != *src {
+		t.Fatalf("source round trip: %v %+v", err, got)
+	}
+	// A plain write carries no source; the history keeps both.
+	if err := p.PutItem(ctx, &model.CatalogItem{Kind: model.KindEnvironment, Tenant: "acme", Name: "py", Spec: json.RawMessage(`{"image":"canary"}`), CreatedBy: "mallory"}, 1); err != nil {
+		t.Fatal(err)
+	}
+	revs, err := p.ListRevisions(ctx, model.KindEnvironment, "acme", "py")
+	if err != nil || len(revs) != 2 || !revs[0].Managed() || revs[1].Managed() {
+		t.Fatalf("revisions: %v %+v", err, revs)
+	}
+	list, _ := p.ListItems(ctx, model.KindEnvironment, "acme")
+	if len(list) != 1 || list[0].Managed() {
+		t.Fatalf("list: %+v", list)
+	}
+	// An apply step writes the source inside its transaction.
+	a := &model.Apply{ID: "apply_2", Key: "k2", Tenant: "acme", Status: model.ApplyRunning, Documents: json.RawMessage(`[]`),
+		Steps: []model.ApplyStep{{Kind: model.KindEnvironment, Tenant: "acme", Name: "go", Action: "create", NextRevision: 1, Status: model.StepDone}}}
+	if err := p.CreateApply(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	stepped := &model.CatalogItem{Kind: model.KindEnvironment, Tenant: "acme", Name: "go", Spec: json.RawMessage(`{"image":"stable"}`), Source: &model.Source{Apply: a.ID, Bundle: "b2", Rollback: "apply_1"}}
+	if err := p.ApplyStep(ctx, a, 0, stepped, 0); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := p.GetItem(ctx, model.KindEnvironment, "acme", "go", 0); err != nil || got.Source == nil || got.Source.Apply != a.ID || got.Source.Rollback != "apply_1" {
+		t.Fatalf("stepped source: %v %+v", err, got)
+	}
+	// Deleted items are listed with their last revision; live ones are not.
+	if err := p.DeleteItem(ctx, model.KindEnvironment, "acme", "go"); err != nil {
+		t.Fatal(err)
+	}
+	gone, err := p.ListDeleted(ctx, model.KindEnvironment, "acme")
+	if err != nil || len(gone) != 1 || gone[0].Name != "go" || gone[0].DeletedAt == nil || !gone[0].Managed() {
+		t.Fatalf("deleted: %v %+v", err, gone)
+	}
+	if other, _ := p.ListDeleted(ctx, model.KindEnvironment, "other"); len(other) != 0 {
+		t.Fatalf("another tenant's deleted items: %+v", other)
+	}
+}
