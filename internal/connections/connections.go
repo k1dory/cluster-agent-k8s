@@ -221,6 +221,11 @@ func (s *Service) OwnHosts() ([]policy.Host, string) {
 			if _, repo := s.Hosts.HostInfo(sp.Host); repo {
 				continue
 			}
+			// A tenant's connection serves its host only while the tenant's settings still list
+			// it: the admin withdrawing the host withdraws the site, the DNS answer and the rule.
+			if it.Tenant != "" && !s.Hosts.HostAllowed(it.Tenant, sp.Host) {
+				continue
+			}
 		}
 		h, ok := byName[sp.Host]
 		if !ok {
@@ -270,7 +275,7 @@ func (s *Service) RuleFor(ctx context.Context, sandboxID, tenant, host, method, 
 		return nil, false, fmt.Errorf("identity tenant %q is not the sandbox's %q", tenant, sb.Tenant)
 	}
 	for _, ref := range sb.Connections {
-		sp, err := s.spec(ctx, sb.Tenant, ref)
+		it, sp, err := s.lookup(ctx, sb.Tenant, ref)
 		if errors.Is(err, store.ErrNotFound) {
 			continue
 		}
@@ -278,6 +283,12 @@ func (s *Service) RuleFor(ctx context.Context, sandboxID, tenant, host, method, 
 			return nil, false, fmt.Errorf("connection %s: %w", ref, err)
 		}
 		if sp.Host != host {
+			continue
+		}
+		// Delegation is decided now, not when the connection was written: a host the admin
+		// removed from the tenant's settings is refused on the next request, whatever the
+		// connection says. The admin's shared connections are not delegated and stay.
+		if it.Tenant != "" && s.Hosts != nil && !s.Hosts.HostAllowed(it.Tenant, host) {
 			continue
 		}
 		paths := sp.Paths
@@ -435,19 +446,26 @@ func (s *Service) Headers(ctx context.Context, tenant, ref string) (*Spec, map[s
 
 // spec looks a connection up from tenant's scope without touching any secret.
 func (s *Service) spec(ctx context.Context, tenant, ref string) (*Spec, error) {
+	_, sp, err := s.lookup(ctx, tenant, ref)
+	return sp, err
+}
+
+// lookup is spec with the item it resolved to (whose Tenant says whether it is the tenant's
+// own or a shared one).
+func (s *Service) lookup(ctx context.Context, tenant, ref string) (*model.CatalogItem, *Spec, error) {
 	r, err := res.ParseRef(ref)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", res.ErrInvalid, err)
+		return nil, nil, fmt.Errorf("%w: %v", res.ErrInvalid, err)
 	}
 	it, err := res.Lookup(ctx, s.Store, model.KindConnection, tenant, r)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var sp Spec
 	if err := res.DecodeStrict(it.Spec, &sp); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &sp, nil
+	return it, &sp, nil
 }
 
 // expand resolves the secret references of a connection's headers.

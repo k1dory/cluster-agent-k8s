@@ -169,6 +169,28 @@ func ensureRepo(ctx context.Context) error {
 	return cmd.Run()
 }
 
+// withMCPConfig makes a harness command load $SANDBOX_MCP_CONFIG: a command that runs claude
+// (first word, after any VAR=value assignments) and does not mention --mcp-config or the
+// variable gets ` --mcp-config "$SANDBOX_MCP_CONFIG"` appended; anything else is returned as
+// is, the variable being in its environment.
+func withMCPConfig(cmdline string) string {
+	if strings.Contains(cmdline, "--mcp-config") || strings.Contains(cmdline, "SANDBOX_MCP_CONFIG") {
+		return cmdline
+	}
+	program := ""
+	for _, w := range strings.Fields(cmdline) {
+		if strings.Contains(w, "=") && !strings.HasPrefix(w, "-") {
+			continue // VAR=value prefix
+		}
+		program = w
+		break
+	}
+	if filepath.Base(program) != "claude" {
+		return cmdline
+	}
+	return strings.TrimRight(cmdline, " \t") + ` --mcp-config "$SANDBOX_MCP_CONFIG"`
+}
+
 // writeMCPConfig renders SANDBOX_MCP_SERVERS ([{name, url}]) as a Claude Code MCP
 // configuration ({"mcpServers": {name: {type: http, url}}}) at path. Returns how many servers
 // it wrote; nothing is written for an empty value.
@@ -214,22 +236,21 @@ func repoDir() string {
 // user input events are written to the harness stdin.
 func execute(ctx context.Context, c *client, run *model.Run) int {
 	cmdline := os.Getenv("HARNESS_CMD")
-	defaultCmd := cmdline == ""
-	if defaultCmd {
+	if cmdline == "" {
 		cmdline = `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose`
 	}
 	env := append(os.Environ(), "SANDBOX_TASK="+run.Task, "SANDBOX_RUN_ID="+run.ID)
 	// The MCP servers the agent's connections give it (SANDBOX_MCP_SERVERS, JSON) become a
-	// Claude Code mcp-config file; the default command loads it, a custom one may name
-	// $SANDBOX_MCP_CONFIG itself. The gateway decides what each call may do; this only tells the
-	// harness where the servers are.
+	// Claude Code mcp-config file. Every command that runs claude loads it (the run command and
+	// the resume command, however the deployment spelled them) unless it names the file itself;
+	// a command that is not claude gets $SANDBOX_MCP_CONFIG and decides on its own. The gateway
+	// decides what each call may do; this only tells the harness where the servers are.
+	mcpConfig := ""
 	if path, n, err := writeMCPConfig(os.Getenv("SANDBOX_MCP_SERVERS"), filepath.Join(os.Getenv("HOME"), ".sandbox-mcp.json")); err != nil {
 		fmt.Printf("agent-runner: mcp servers ignored: %v\n", err)
 	} else if n > 0 {
+		mcpConfig = path
 		env = append(env, "SANDBOX_MCP_CONFIG="+path)
-		if defaultCmd {
-			cmdline += ` --mcp-config "$SANDBOX_MCP_CONFIG"`
-		}
 		fmt.Printf("agent-runner: %d mcp server(s) registered from the sandbox's connections\n", n)
 	}
 	// A resume run continues a conversation an earlier run started: after a rollout (the harness
@@ -252,6 +273,9 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 		default:
 			fmt.Printf("agent-runner: run %s resumes %s but no session id was captured: running the task again\n", run.ID, run.ResumeOf)
 		}
+	}
+	if mcpConfig != "" {
+		cmdline = withMCPConfig(cmdline)
 	}
 	fmt.Printf("agent-runner: run %s: %q\n", run.ID, truncate(run.Task, 80))
 	runCtx, cancel := context.WithCancel(ctx)

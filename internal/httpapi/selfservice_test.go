@@ -88,7 +88,24 @@ func TestSelfServiceMCPConnectionEndToEnd(t *testing.T) {
 	if code, _, _ := decide(other.ID, "/mcp"); code != 403 {
 		t.Fatalf("sandbox without the connection: %d", code)
 	}
-	// Revocation: deleting the connection (or the admin withdrawing the host) stops it at once.
+	// The admin withdrawing the host stops the existing connection at once, without anyone
+	// touching the connection: the delegation is decided per request, not at write time.
+	if resp, body := call(t, "PUT", api+"/v1/tenants/alice/settings", "t0k", `{"spec":{"hosts":[]}}`, nil); resp.StatusCode != 200 {
+		t.Fatalf("withdraw: %d %s", resp.StatusCode, body)
+	}
+	if code, _, _ := decide(sb.ID, "/mcp"); code != 403 {
+		t.Fatalf("withdrawn host still granted by the existing connection: %d", code)
+	}
+	if _, ok := guard.HostInfo("mcp.tools.example.com"); ok {
+		t.Fatal("withdrawn host still a gateway host")
+	}
+	if resp, body := call(t, "PUT", api+"/v1/tenants/alice/settings", "t0k", `{"spec":{"hosts":["*.tools.example.com"]}}`, nil); resp.StatusCode != 200 {
+		t.Fatalf("re-grant: %d %s", resp.StatusCode, body)
+	}
+	if code, _, _ := decide(sb.ID, "/mcp"); code != 200 {
+		t.Fatalf("re-granted host: %d", code)
+	}
+	// Revocation: deleting the connection stops it at once too.
 	if resp, _ := call(t, "DELETE", api+"/v1/connections/tools", "alice-tok", nil, nil); resp.StatusCode != 204 {
 		t.Fatalf("delete connection: %d", resp.StatusCode)
 	}

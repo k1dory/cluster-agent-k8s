@@ -19,13 +19,12 @@ import (
 	"strings"
 	"time"
 
-	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
-	"agent-sandbox/internal/connections"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/policy"
 	res "agent-sandbox/internal/resource"
 	"agent-sandbox/internal/secrets"
+	"agent-sandbox/internal/services"
 	"agent-sandbox/internal/store"
 	"agent-sandbox/internal/tenants"
 )
@@ -187,12 +186,9 @@ func (d Deps) PlanItems(ctx context.Context, docs []*res.Document, scope Scope) 
 			ov.pending[e.key] = &model.CatalogItem{Kind: e.doc.Kind, Tenant: e.tenant, Name: e.doc.Name, Description: e.doc.Description, Spec: e.doc.Spec}
 		}
 	}
-	tset := tenants.New(ov, d.Defaults)
-	bind := bindings.New(ov, d.Policies)
-	bind.Now = now
-	guard := &bindings.Guard{Set: d.Policies, Bindings: bind}
-	conns := connections.New(ov, d.Secrets, nil)
-	cat := &catalog.Service{Store: ov, Images: d.Images, Policies: guard, Connections: conns, Tenants: tset}
+	// The same validators the API runs on a PUT, over the overlay instead of the live store.
+	svc := services.Assemble(ov, services.Options{Policies: d.Policies, Images: d.Images, Secrets: d.Secrets, Defaults: d.Defaults, Now: now})
+	tset, bind, conns, cat := svc.Tenants, svc.Bindings, svc.Connections, svc.Catalog
 
 	order := append([]*entry(nil), entries...)
 	sort.SliceStable(order, func(i, j int) bool { return kindRank[order[i].doc.Kind] < kindRank[order[j].doc.Kind] })
