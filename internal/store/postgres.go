@@ -782,6 +782,14 @@ func (p *Postgres) PutItem(ctx context.Context, it *model.CatalogItem, expected 
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := putItemTx(ctx, tx, it, expected); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// putItemTx appends a revision inside tx (see PutItem).
+func putItemTx(ctx context.Context, tx pgx.Tx, it *model.CatalogItem, expected int) error {
 	// One writer per item at a time across replicas: the revision check and the insert are atomic.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "catalog:"+it.Kind+"|"+it.Tenant+"|"+it.Name); err != nil {
 		return err
@@ -798,12 +806,124 @@ func (p *Postgres) PutItem(ctx context.Context, it *model.CatalogItem, expected 
 	}
 	it.Revision = latest + 1
 	it.DeletedAt = nil
-	if err := tx.QueryRow(ctx, `INSERT INTO catalog_items (kind, tenant, name, revision, description, spec, created_by, created_at)
+	return tx.QueryRow(ctx, `INSERT INTO catalog_items (kind, tenant, name, revision, description, spec, created_by, created_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,now()) RETURNING created_at`,
-		it.Kind, it.Tenant, it.Name, it.Revision, it.Description, it.Spec, it.CreatedBy).Scan(&it.CreatedAt); err != nil {
+		it.Kind, it.Tenant, it.Name, it.Revision, it.Description, it.Spec, it.CreatedBy).Scan(&it.CreatedAt)
+}
+
+// --- applies ---------------------------------------------------------------------------
+
+const applyCols = `id, key, tenant, status, doc, version, created_at, updated_at`
+
+func scanApply(row pgx.Row) (*model.Apply, error) {
+	var a model.Apply
+	var doc []byte
+	var id, key, tenant, status string
+	var version int64
+	var created, updated time.Time
+	if err := row.Scan(&id, &key, &tenant, &status, &doc, &version, &created, &updated); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if err := json.Unmarshal(doc, &a); err != nil {
+		return nil, fmt.Errorf("apply %s: %w", id, err)
+	}
+	a.ID, a.Key, a.Tenant, a.Status, a.Version, a.CreatedAt, a.UpdatedAt = id, key, tenant, status, version, created, updated
+	return &a, nil
+}
+
+func (p *Postgres) CreateApply(ctx context.Context, a *model.Apply) error {
+	a.Version, a.CreatedAt, a.UpdatedAt = 1, time.Now(), time.Now()
+	doc, _ := json.Marshal(a)
+	tag, err := p.pool.Exec(ctx, `INSERT INTO applies (id, key, tenant, status, doc, version, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,1,$6,$6) ON CONFLICT (tenant, key) DO NOTHING`, a.ID, a.Key, a.Tenant, a.Status, doc, a.CreatedAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: apply with key %q exists", ErrConflict, a.Key)
+	}
+	return nil
+}
+
+func (p *Postgres) GetApply(ctx context.Context, id string) (*model.Apply, error) {
+	return scanApply(p.pool.QueryRow(ctx, `SELECT `+applyCols+` FROM applies WHERE id=$1`, id))
+}
+
+func (p *Postgres) GetApplyByKey(ctx context.Context, tenant, key string) (*model.Apply, error) {
+	return scanApply(p.pool.QueryRow(ctx, `SELECT `+applyCols+` FROM applies WHERE tenant=$1 AND key=$2`, tenant, key))
+}
+
+// updateApplyTx writes a guarded by its version, inside tx.
+func updateApplyTx(ctx context.Context, tx pgx.Tx, a *model.Apply) error {
+	doc, _ := json.Marshal(a)
+	tag, err := tx.Exec(ctx, `UPDATE applies SET status=$2, doc=$3, version=version+1, updated_at=now() WHERE id=$1 AND version=$4`,
+		a.ID, a.Status, doc, a.Version)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		var one int
+		if err := tx.QueryRow(ctx, `SELECT 1 FROM applies WHERE id=$1`, a.ID).Scan(&one); err != nil {
+			return ErrNotFound
+		}
+		return fmt.Errorf("%w: apply %s changed concurrently", ErrConflict, a.ID)
+	}
+	a.Version++
+	a.UpdatedAt = time.Now()
+	return nil
+}
+
+func (p *Postgres) UpdateApply(ctx context.Context, a *model.Apply) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := updateApplyTx(ctx, tx, a); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func (p *Postgres) ApplyStep(ctx context.Context, a *model.Apply, step int, it *model.CatalogItem, expected int) error {
+	if step < 0 || step >= len(a.Steps) {
+		return fmt.Errorf("%w: step %d out of range", ErrConflict, step)
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if it != nil {
+		if err := putItemTx(ctx, tx, it, expected); err != nil {
+			return err
+		}
+		a.Steps[step].Revision = it.Revision
+	}
+	if err := updateApplyTx(ctx, tx, a); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) ListApplies(ctx context.Context, tenant string, limit int) ([]*model.Apply, error) {
+	rows, err := p.pool.Query(ctx, `SELECT `+applyCols+` FROM applies WHERE ($1 = '' OR tenant=$1) ORDER BY created_at DESC`+limitClause(limit, 100), tenant)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.Apply
+	for rows.Next() {
+		a, err := scanApply(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 func (p *Postgres) GetItem(ctx context.Context, kind, tenant, name string, revision int) (*model.CatalogItem, error) {

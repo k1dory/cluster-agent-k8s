@@ -153,3 +153,17 @@ ALTER TABLE runs
     ADD COLUMN IF NOT EXISTS agent_revision integer NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS environment_ref text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS environment_revision integer NOT NULL DEFAULT 0;
+
+-- Applies: one application of a bundle, continued by key, a step written with its item in
+-- one transaction (see store.Applies).
+CREATE TABLE IF NOT EXISTS applies (
+    id         text PRIMARY KEY,
+    key        text NOT NULL,
+    tenant     text NOT NULL DEFAULT '',
+    status     text NOT NULL,
+    doc        jsonb NOT NULL,
+    version    bigint NOT NULL DEFAULT 1,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (tenant, key)
+);

@@ -11,12 +11,14 @@ import (
 	"strconv"
 	"strings"
 
+	"agent-sandbox/internal/apply"
 	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/connections"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/plan"
 	"agent-sandbox/internal/resource"
+	"agent-sandbox/internal/store"
 	"agent-sandbox/internal/tenants"
 )
 
@@ -311,6 +313,146 @@ func (p *Platform) configRoutes(mux *http.ServeMux) {
 	}, true)
 	p.tenantSettingsRoutes(mux)
 	mux.HandleFunc("POST /v1/plan", p.auth(p.planBundle))
+	mux.HandleFunc("POST /v1/apply", p.auth(p.applyBundle))
+	mux.HandleFunc("GET /v1/applies", p.auth(p.listApplies))
+	mux.HandleFunc("GET /v1/applies/{id}", p.auth(p.getApply))
+	mux.HandleFunc("POST /v1/applies/{id}/resume", p.auth(p.resumeApply))
+}
+
+// applyBundle applies a planned bundle. The body is as for /v1/plan plus the plan fingerprint
+// (`plan` in the JSON wrapper, or ?plan= for YAML); the idempotency key is `key` in the
+// wrapper, ?key=, the Idempotency-Key header, or the plan fingerprint. The same key with the
+// same bundle returns (and finishes) the same apply; another bundle under it is 409.
+func (p *Platform) applyBundle(w http.ResponseWriter, r *http.Request) {
+	if p.Applier == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+		return
+	}
+	pr := principalOf(r)
+	tenant, ok := p.catalogScope(w, r)
+	if !ok {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	docs, planFP, key, err := parseApplyBody(r, body)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	a, err := p.Applier.Submit(r.Context(), apply.Request{Docs: docs, Plan: planFP, Key: key, Scope: plan.Scope{Tenant: tenant, Admin: pr.admin(), Subject: pr.Subject}})
+	writeApply(w, a, err)
+}
+
+func parseApplyBody(r *http.Request, body []byte) ([]*resource.Document, string, string, error) {
+	q := r.URL.Query()
+	planFP, key := q.Get("plan"), q.Get("key")
+	if h := r.Header.Get("Idempotency-Key"); h != "" && key == "" {
+		key = h
+	}
+	ct := r.Header.Get("Content-Type")
+	if strings.Contains(ct, "yaml") {
+		docs, err := resource.ParseYAMLAll(body)
+		return docs, planFP, key, err
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var wrapper struct {
+			Documents []json.RawMessage `json:"documents"`
+			Plan      string            `json:"plan"`
+			Key       string            `json:"key"`
+		}
+		dec := json.NewDecoder(bytes.NewReader(trimmed))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&wrapper); err != nil {
+			return nil, "", "", fmt.Errorf("%w: %v", resource.ErrInvalid, err)
+		}
+		if wrapper.Plan != "" {
+			planFP = wrapper.Plan
+		}
+		if wrapper.Key != "" {
+			key = wrapper.Key
+		}
+		docs := make([]*resource.Document, 0, len(wrapper.Documents))
+		for i, raw := range wrapper.Documents {
+			d, err := resource.ParseJSON(raw)
+			if err != nil {
+				return nil, "", "", fmt.Errorf("document %d: %w", i+1, err)
+			}
+			docs = append(docs, d)
+		}
+		return docs, planFP, key, nil
+	}
+	docs, err := parseBundle(ct, body)
+	return docs, planFP, key, err
+}
+
+func writeApply(w http.ResponseWriter, a *model.Apply, err error) {
+	var invalid *apply.InvalidPlan
+	switch {
+	case err == nil:
+		writeJSON(w, http.StatusOK, a)
+	case errors.As(err, &invalid):
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error(), "code": "invalid_plan", "plan": invalid.Plan})
+	case errors.Is(err, apply.ErrPlanMismatch), errors.Is(err, apply.ErrKeyReused), errors.Is(err, store.ErrConflict):
+		if a != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "code": "conflict", "apply": a})
+			return
+		}
+		writeErr(w, http.StatusConflict, err)
+	case errors.Is(err, apply.ErrForbidden):
+		writeErr(w, http.StatusForbidden, err)
+	case errors.Is(err, store.ErrNotFound):
+		writeErr(w, http.StatusNotFound, err)
+	default:
+		writeErr(w, http.StatusInternalServerError, err)
+	}
+}
+
+func (p *Platform) applyScope(r *http.Request) plan.Scope {
+	pr := principalOf(r)
+	return plan.Scope{Tenant: pr.Tenant, Admin: pr.admin(), Subject: pr.Subject}
+}
+
+func (p *Platform) getApply(w http.ResponseWriter, r *http.Request) {
+	if p.Applier == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+		return
+	}
+	a, err := p.Applier.Get(r.Context(), r.PathValue("id"), p.applyScope(r))
+	writeApply(w, a, err)
+}
+
+func (p *Platform) resumeApply(w http.ResponseWriter, r *http.Request) {
+	if p.Applier == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+		return
+	}
+	a, err := p.Applier.Resume(r.Context(), r.PathValue("id"), p.applyScope(r))
+	writeApply(w, a, err)
+}
+
+func (p *Platform) listApplies(w http.ResponseWriter, r *http.Request) {
+	if p.Applier == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+		return
+	}
+	tenant, ok := p.catalogScope(w, r)
+	if !ok {
+		return
+	}
+	list, err := p.Applier.List(r.Context(), tenant, 100)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if list == nil {
+		list = []*model.Apply{}
+	}
+	writeJSON(w, http.StatusOK, list)
 }
 
 // planBundle validates a bundle of documents and reports what applying it would change. The

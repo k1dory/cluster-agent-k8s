@@ -298,12 +298,21 @@ func TestRealCaddyGateway(t *testing.T) {
 	// Authorization passes, read-only is marked, forbidden tool calls never reach the upstream.
 	post := func(url, body string, hdr map[string]string) (int, map[string]string, string) {
 		t.Helper()
-		req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		for k, v := range hdr {
-			req.Header.Set(k, v)
+		var resp *http.Response
+		var err error
+		for deadline := time.Now().Add(30 * time.Second); ; {
+			req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			for k, v := range hdr {
+				req.Header.Set(k, v)
+			}
+			resp, err = agent.Do(req)
+			// "internal error" is Caddy still issuing the site certificate (see get above).
+			if err == nil || !strings.Contains(err.Error(), "internal error") || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
 		}
-		resp, err := agent.Do(req)
 		if err != nil {
 			t.Fatalf("POST %s: %v\n%s", url, err, proc.out.String())
 		}

@@ -116,6 +116,29 @@ var ErrNotFound = errors.New("not found")
 // latest. Callers reload and reapply their change.
 var ErrConflict = errors.New("changed concurrently")
 
+// Applies persists apply records. ApplyStep is the heart of recovery: it writes an item
+// revision (PutItem semantics with an expected current revision) and the apply's progress in
+// one transaction, guarded by the apply's version, so a step is either fully applied and
+// recorded or not at all, and two replicas cannot both commit the same step.
+type Applies interface {
+	// CreateApply stores a new apply; ErrConflict when its key already exists in its tenant.
+	CreateApply(ctx context.Context, a *Apply) error
+	GetApply(ctx context.Context, id string) (*Apply, error)
+	// GetApplyByKey finds the apply submitted under key in tenant.
+	GetApplyByKey(ctx context.Context, tenant, key string) (*Apply, error)
+	// UpdateApply writes a if its Version still matches the stored one, then increments it;
+	// ErrConflict otherwise.
+	UpdateApply(ctx context.Context, a *Apply) error
+	// ApplyStep, in one transaction: appends it as a new revision (expected as in PutItem;
+	// nil it = no write, a noop step), records a with step's fields filled in (Revision set to
+	// what was written), guarded by a.Version like UpdateApply.
+	ApplyStep(ctx context.Context, a *Apply, step int, it *model.CatalogItem, expected int) error
+	ListApplies(ctx context.Context, tenant string, limit int) ([]*Apply, error)
+}
+
+// Apply is model.Apply (aliased so the store's doc reads on its own).
+type Apply = model.Apply
+
 // Catalog is the narrow interface the configuration catalogue needs: append-only revisions
 // of named items per (kind, tenant), with a compare-and-append on the latest revision.
 // Revision numbers are never reused: DeleteItem marks the live revisions deleted and keeps
@@ -226,6 +249,7 @@ type Store interface {
 
 	// The catalogue uses only this part (see Catalog); the full Store embeds it for wiring.
 	Catalog
+	Applies
 
 	Close() error
 }

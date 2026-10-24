@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -23,6 +24,7 @@ type Memory struct {
 	blobAt    map[string]time.Time
 	tenants   map[string]*sync.Mutex
 	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
+	applies   map[string]*model.Apply
 	nextInst  int
 	nextEvent int64
 }
@@ -38,6 +40,7 @@ func NewMemory() *Memory {
 		blobAt:    map[string]time.Time{},
 		tenants:   map[string]*sync.Mutex{},
 		catalog:   map[string][]*model.CatalogItem{},
+		applies:   map[string]*model.Apply{},
 	}
 }
 
@@ -56,6 +59,11 @@ func cloneItem(it *model.CatalogItem) *model.CatalogItem {
 func (m *Memory) PutItem(_ context.Context, it *model.CatalogItem, expected int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.putItem(it, expected)
+}
+
+// putItem is PutItem under the lock already held.
+func (m *Memory) putItem(it *model.CatalogItem, expected int) error {
 	k := catalogKey(it.Kind, it.Tenant, it.Name)
 	revs := m.catalog[k]
 	latest, current := 0, 0 // highest number ever used; latest live revision (0 when deleted)
@@ -723,6 +731,112 @@ func (m *Memory) CountEvents(_ context.Context, f Filter) ([]EventCount, error) 
 	out := make([]EventCount, 0, len(order))
 	for _, k := range order {
 		out = append(out, EventCount{Tenant: k.tenant, Slug: k.slug, SandboxID: k.sb, RunID: k.run, Type: k.typ, Day: k.day, N: counts[k]})
+	}
+	return out, nil
+}
+
+// --- applies ---------------------------------------------------------------------------
+
+func cloneApply(a *model.Apply) *model.Apply {
+	c := *a
+	c.Steps = append([]model.ApplyStep(nil), a.Steps...)
+	c.Documents = append(json.RawMessage(nil), a.Documents...)
+	if a.LeaseUntil != nil {
+		t := *a.LeaseUntil
+		c.LeaseUntil = &t
+	}
+	return &c
+}
+
+func (m *Memory) CreateApply(_ context.Context, a *model.Apply) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.applies {
+		if e.Tenant == a.Tenant && e.Key == a.Key {
+			return fmt.Errorf("%w: apply with key %q exists", ErrConflict, a.Key)
+		}
+	}
+	a.Version, a.CreatedAt, a.UpdatedAt = 1, time.Now(), time.Now()
+	m.applies[a.ID] = cloneApply(a)
+	return nil
+}
+
+func (m *Memory) GetApply(_ context.Context, id string) (*model.Apply, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.applies[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return cloneApply(a), nil
+}
+
+func (m *Memory) GetApplyByKey(_ context.Context, tenant, key string) (*model.Apply, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, a := range m.applies {
+		if a.Tenant == tenant && a.Key == key {
+			return cloneApply(a), nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+// updateApply is UpdateApply under the lock already held.
+func (m *Memory) updateApply(a *model.Apply) error {
+	cur, ok := m.applies[a.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	if cur.Version != a.Version {
+		return fmt.Errorf("%w: apply %s changed concurrently", ErrConflict, a.ID)
+	}
+	a.Version++
+	a.UpdatedAt = time.Now()
+	m.applies[a.ID] = cloneApply(a)
+	return nil
+}
+
+func (m *Memory) UpdateApply(_ context.Context, a *model.Apply) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.updateApply(a)
+}
+
+func (m *Memory) ApplyStep(_ context.Context, a *model.Apply, step int, it *model.CatalogItem, expected int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if step < 0 || step >= len(a.Steps) {
+		return fmt.Errorf("%w: step %d out of range", ErrConflict, step)
+	}
+	cur, ok := m.applies[a.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	if cur.Version != a.Version {
+		return fmt.Errorf("%w: apply %s changed concurrently", ErrConflict, a.ID)
+	}
+	if it != nil {
+		if err := m.putItem(it, expected); err != nil {
+			return err
+		}
+		a.Steps[step].Revision = it.Revision
+	}
+	return m.updateApply(a)
+}
+
+func (m *Memory) ListApplies(_ context.Context, tenant string, limit int) ([]*model.Apply, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.Apply
+	for _, a := range m.applies {
+		if tenant == "" || a.Tenant == tenant {
+			out = append(out, cloneApply(a))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }

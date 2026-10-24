@@ -291,6 +291,57 @@ const (
 	FSWrite = "write"
 )
 
+// Apply is one application of a bundle of configuration documents: the plan it was made
+// from, frozen with the revisions it expects and will produce, and the progress of each step.
+// It is created once per idempotency key and continued, never redone: a step is applied and
+// marked done in one transaction, so a retry after any failure finds exactly what happened.
+type Apply struct {
+	ID        string          `json:"id"`
+	Key       string          `json:"key"`    // idempotency key: the same key and bundle continue this apply
+	Tenant    string          `json:"tenant"` // the scope it was submitted in ("" = shared / admin default)
+	Admin     bool            `json:"admin"`
+	Subject   string          `json:"subject,omitempty"`
+	Bundle    string          `json:"bundle"` // fingerprint of the documents
+	Plan      string          `json:"plan"`   // fingerprint of the plan (documents + scope + actions + revisions)
+	Status    string          `json:"status"` // running | done | failed | conflict
+	Error     string          `json:"error,omitempty"`
+	Steps     []ApplyStep     `json:"steps"`
+	Documents json.RawMessage `json:"documents"` // the bundle, as submitted (resume re-plans it)
+	// Lease: the replica executing the apply and until when; another replica waits for it to
+	// lapse before continuing an unfinished apply.
+	LeaseOwner string     `json:"lease_owner,omitempty"`
+	LeaseUntil *time.Time `json:"lease_until,omitempty"`
+	Version    int64      `json:"version"` // optimistic-locking counter of the record
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+// ApplyStep is one document of the bundle in apply order.
+type ApplyStep struct {
+	Kind             string `json:"kind"`
+	Tenant           string `json:"tenant"`
+	Name             string `json:"name"`
+	Action           string `json:"action"` // create | update | noop
+	ExpectedRevision int    `json:"expected_revision"`
+	NextRevision     int    `json:"next_revision"`
+	Status           string `json:"status"`             // pending | done | skipped | failed
+	Revision         int    `json:"revision,omitempty"` // the revision written (done) or confirmed (skipped)
+	Error            string `json:"error,omitempty"`
+}
+
+// Apply and step statuses.
+const (
+	ApplyRunning  = "running"
+	ApplyDone     = "done"
+	ApplyFailed   = "failed"   // a step failed; the rest is pending, resume retries
+	ApplyConflict = "conflict" // the state or the caller's rights moved; resume after a new plan
+
+	StepPending = "pending"
+	StepDone    = "done"
+	StepSkipped = "skipped" // noop: the revision was confirmed unchanged
+	StepFailed  = "failed"
+)
+
 // Seconds is the wall time the run has been executing (until now if still running).
 func (r *Run) Seconds(now time.Time) float64 {
 	if r.StartedAt == nil {
