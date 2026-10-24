@@ -378,14 +378,20 @@ func (c *cli) run(cmd string, args []string) error {
 			}
 			body := map[string]any{"documents": docs, "key": *key}
 			if !*noGit {
-				detected, ok, dirty, err := gitSource(*file)
+				detected, ok, dirty, err := gitSource(*file, raw)
 				if err != nil {
 					return err
 				}
 				if ok && dirty && src.Commit == "" {
-					fmt.Fprintf(os.Stderr, "warning: %s differs from its committed version: applied without a commit SHA\n", *file)
+					fmt.Fprintf(os.Stderr, "warning: %s is not what HEAD holds for it: applied without a commit SHA\n", *file)
 				}
 				src = mergeSource(src, detected)
+				// Never send a credential, even one pasted into -repo.
+				ms := model.Source{Repo: src.Repo, Ref: src.Ref, Commit: src.Commit, Path: src.Path}
+				if err := apply.CleanSource(&ms); err != nil {
+					return err
+				}
+				src = bundleSource{Repo: ms.Repo, Ref: ms.Ref, Commit: ms.Commit, Path: ms.Path}
 				if src != (bundleSource{}) {
 					body["source"] = src
 				}
@@ -438,8 +444,8 @@ func (c *cli) run(cmd string, args []string) error {
 			} else {
 				printPlan(p)
 			}
-			if p.Summary.Create+p.Summary.Update+p.Summary.Invalid > 0 {
-				os.Exit(3)
+			if code := planExitCode(p); code != 0 {
+				os.Exit(code)
 			}
 			return nil
 		}
@@ -481,11 +487,11 @@ func (c *cli) run(cmd string, args []string) error {
 		}
 		if *asJSON {
 			printJSON(rb)
-			return nil
+		} else {
+			printRollback(rb)
 		}
-		printRollback(rb)
-		if rb.Apply != nil && rb.Apply.Status != model.ApplyDone {
-			os.Exit(3)
+		if code := rollbackExitCode(rb); code != 0 {
+			os.Exit(code)
 		}
 	case "applies":
 		tenant := fs.String("tenant", "", "scope (admin)")
@@ -966,6 +972,28 @@ func printApply(a model.Apply) {
 	if a.Status != model.ApplyDone {
 		fmt.Printf("continue with: sandboxctl apply -resume %s\n", a.ID)
 	}
+}
+
+// Exit codes, the same whatever the output format: 2 = the bundle or plan is invalid,
+// 3 = something would change / did not finish (drift, an apply that is not done).
+func planExitCode(p plan.Plan) int {
+	if !p.Valid {
+		return 2
+	}
+	if p.Summary.Create+p.Summary.Update > 0 {
+		return 3
+	}
+	return 0
+}
+
+func rollbackExitCode(rb apply.Rollback) int {
+	if rb.Plan == nil || !rb.Plan.Valid {
+		return 2
+	}
+	if rb.Apply != nil && rb.Apply.Status != model.ApplyDone {
+		return 3
+	}
+	return 0
 }
 
 func printDrift(rep drift.Report) {

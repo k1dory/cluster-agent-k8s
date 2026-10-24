@@ -268,3 +268,105 @@ func TestRollbackNeverRestoresGrants(t *testing.T) {
 func itoa(n int) string {
 	return strings.TrimSpace(strings.Repeat(" ", 0) + string(rune('0'+n)))
 }
+
+func TestResumeAfterOwnWriteWithExpectedRevisionZero(t *testing.T) {
+	ctx := context.Background()
+	st := &faulty{Store: store.NewMemory(), failBefore: map[int]error{1: errors.New("boom")}, failAfter: map[int]error{}}
+	c := controller(st, "r1", pols("acme"))
+	scope := plan.Scope{Tenant: "acme", Subject: "alice"}
+	pinned := strings.ReplaceAll(bundle, "spec:", "expected_revision: 0\nspec:")
+	a, err := c.Submit(ctx, planned(t, c, pinned, scope))
+	if err != nil || a.Status != model.ApplyFailed || a.Steps[0].Status != model.StepDone {
+		t.Fatalf("first attempt: %v %+v", err, a)
+	}
+	// The environment this apply created is at revision 1; its document said "must not exist"
+	// about the state before the apply, not about the apply's own work.
+	a, err = c.Resume(ctx, a.ID, scope)
+	if err != nil || a.Status != model.ApplyDone {
+		t.Fatalf("resume: %v %+v", err, a)
+	}
+	// The same through Submit with the original key and bundle.
+	st2 := &faulty{Store: store.NewMemory(), failBefore: map[int]error{1: errors.New("boom")}, failAfter: map[int]error{}}
+	c2 := controller(st2, "r1", pols("acme"))
+	req := planned(t, c2, pinned, scope)
+	if a, _ := c2.Submit(ctx, req); a.Status != model.ApplyFailed {
+		t.Fatalf("first attempt: %+v", a)
+	}
+	if a, err := c2.Submit(ctx, req); err != nil || a.Status != model.ApplyDone {
+		t.Fatalf("resubmit: %v %+v", err, a)
+	}
+	// Rights are still checked on the way: the applied environment stays, the pending agents
+	// are refused once the policy is gone.
+	st3 := &faulty{Store: store.NewMemory(), failBefore: map[int]error{1: errors.New("boom")}, failAfter: map[int]error{}}
+	c3 := controller(st3, "r1", pols("acme"))
+	a3, _ := c3.Submit(ctx, planned(t, c3, pinned, scope))
+	c3.Planner.Policies = pols()
+	if a3, err := c3.Resume(ctx, a3.ID, scope); err != nil || a3.Status != model.ApplyConflict || !strings.Contains(a3.Error, "may not use policy") {
+		t.Fatalf("rights still checked: %v %+v", err, a3)
+	}
+	// And a real outside change to the created item is still a conflict.
+	cat := &catalog.Service{Store: st, Images: images{}}
+	st4 := &faulty{Store: store.NewMemory(), failBefore: map[int]error{1: errors.New("boom")}, failAfter: map[int]error{}}
+	c4 := controller(st4, "r1", pols("acme"))
+	a4, _ := c4.Submit(ctx, planned(t, c4, pinned, scope))
+	cat.Store = st4
+	if _, err := cat.Put(ctx, model.KindEnvironment, "acme", docs(t, "kind: EnvironmentProfile\nname: py\nspec: {image: canary}\n")[0], false, "mallory"); err != nil {
+		t.Fatal(err)
+	}
+	if a4, err := c4.Resume(ctx, a4.ID, scope); err != nil || a4.Status != model.ApplyConflict || !strings.Contains(a4.Error, "changed outside this apply") {
+		t.Fatalf("outside change: %v %+v", err, a4)
+	}
+}
+
+func TestPlanFingerprintCoversWhatReferencesResolveTo(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+	c := controller(st, "r1", pols("acme"))
+	admin := plan.Scope{Admin: true, Subject: "root"}
+	if _, err := c.Submit(ctx, planned(t, c, "kind: EnvironmentProfile\nname: py\nspec: {image: stable}\n", admin)); err != nil {
+		t.Fatal(err)
+	}
+	// acme plans an agent on "py": today that is the shared environment.
+	scope := plan.Scope{Tenant: "acme", Subject: "alice"}
+	agent := "kind: AgentDefinition\nname: backend\nspec: {policy: backend-dev, environment: py}\n"
+	req := planned(t, c, agent, scope)
+	p0, _ := c.Planner.Plan(ctx, req.Docs, scope)
+	// Before apply, acme gets its own "py": the same document now names another item.
+	if _, err := c.Submit(ctx, planned(t, c, "kind: EnvironmentProfile\nname: py\nspec: {image: canary}\n", scope)); err != nil {
+		t.Fatal(err)
+	}
+	p1, _ := c.Planner.Plan(ctx, req.Docs, scope)
+	if p1.Bundle != p0.Bundle {
+		t.Fatal("the request did not change: the bundle hash must not either")
+	}
+	if p1.Fingerprint == p0.Fingerprint || p1.Changes[0].Resolved == p0.Changes[0].Resolved {
+		t.Fatalf("the plan resolved differently but kept its fingerprint: %+v %+v", p0.Changes[0], p1.Changes[0])
+	}
+	if _, err := c.Submit(ctx, req); !errors.Is(err, ErrPlanMismatch) {
+		t.Fatalf("apply of the stale plan: %v", err)
+	}
+	if revisions(t, st, model.KindAgent, "acme", "backend") != 0 {
+		t.Fatal("a refused apply wrote")
+	}
+	// A continuation whose pending step would now resolve differently stops as a conflict.
+	st2 := &faulty{Store: store.NewMemory(), failBefore: map[int]error{1: errors.New("boom")}, failAfter: map[int]error{}}
+	c2 := controller(st2, "r1", pols("acme"))
+	if _, err := c2.Submit(ctx, planned(t, c2, "kind: EnvironmentProfile\nname: py\nspec: {image: stable}\n", admin)); err != nil {
+		t.Fatal(err)
+	}
+	two := "kind: EnvironmentProfile\nname: go\nspec: {image: stable}\n---\nkind: AgentDefinition\nname: backend\nspec: {policy: backend-dev, environment: py}\n"
+	a, _ := c2.Submit(ctx, planned(t, c2, two, scope))
+	if a.Status != model.ApplyFailed {
+		t.Fatalf("first attempt: %+v", a)
+	}
+	if _, err := c2.Submit(ctx, planned(t, c2, "kind: EnvironmentProfile\nname: py\nspec: {image: canary}\n", scope)); err != nil {
+		t.Fatal(err)
+	}
+	a, err := c2.Resume(ctx, a.ID, scope)
+	if err != nil || a.Status != model.ApplyConflict || !strings.Contains(a.Error, "resolves differently") {
+		t.Fatalf("resume: %v %+v", err, a)
+	}
+	if revisions(t, st2, model.KindAgent, "acme", "backend") != 0 {
+		t.Fatal("the conflicting step was written")
+	}
+}

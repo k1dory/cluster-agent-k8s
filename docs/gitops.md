@@ -24,10 +24,18 @@ A revision written by an apply carries a `source`:
 fingerprint of the documents it applied. `repo`, `ref`, `commit` and `path` are what the client
 attached to the apply (`source` in the JSON body, or `?repo=&ref=&commit=&path=` for a YAML
 body). `sandboxctl apply -f bundles/acme.yaml` detects them from the file's Git work tree and
-records the commit only when the file is identical to its committed version: a SHA in the
-catalogue always names exactly the content that was applied. A modified or untracked file is
-applied with a warning and without a commit; `-repo`, `-ref`, `-commit`, `-path` override the
-detection, `-no-git` records nothing.
+records the commit only when the bytes it applies are exactly what `HEAD` holds for the path
+(`git cat-file blob HEAD:path` compared with the file, not `git status`, which an index marked
+assume-unchanged or skip-worktree makes lie): a SHA in the catalogue always names exactly the
+content that was applied. A modified, staged or untracked file is applied with a warning and
+without a commit; `-repo`, `-ref`, `-commit`, `-path` override the detection, `-no-git` records
+nothing.
+
+Credentials never reach the record. A repository URL loses its user information
+(`https://x:TOKEN@host/…` becomes `https://host/…`; in the scp form only the conventional `git@`
+user survives), the commit must be a hex object name, and every field is bounded. `sandboxctl`
+cleans what it detects or was given with `-repo`; the controller cleans again on `POST /v1/apply`,
+so a client that sends a raw URL is covered too.
 
 A revision written directly through the resource API (`PUT /v1/environments/py`) carries no
 source. An unchanged document in a bundle (a noop step) writes no revision, so the item keeps the
@@ -54,8 +62,13 @@ and no access to Git is needed. `sandboxctl drift` exits 3 when anything drifted
 a scheduled check wants.
 
 The other direction, what Git says now versus what the platform holds, is a plan:
-`sandboxctl drift -f bundles/acme.yaml` plans the bundle and exits 3 when anything would be
-created, updated or is invalid. Nothing is written either way.
+`sandboxctl drift -f bundles/acme.yaml` plans the bundle and exits 2 when the bundle is invalid
+(a document or the bundle as a whole) and 3 when anything would be created or updated. Nothing
+is written either way.
+
+Exit codes do not depend on the output format: `-json` prints the same object and exits the same
+way. Across `plan`, `apply`, `drift` and `rollback`: 0 is "nothing to do or done", 2 is "invalid",
+3 is "would change, drifted, or did not finish" (an apply left `conflict`, `failed` or `running`).
 
 ## Rollback: a new plan and apply, under today's rights
 
@@ -63,6 +76,12 @@ Rollback never edits history and never restores a revision in place. It builds d
 stored revisions, plans them and applies them like any bundle, so the result is a new revision
 with its own provenance (`source.rollback` names what it restored) and the same guarantees:
 one transaction per step, continued by key, refused as a whole when the state moved.
+
+A plan's fingerprint covers what its documents resolved to, not only what they said: each change
+carries `resolved`, the fingerprint of the item as it will be written. The same agent document
+that named `environment: py` resolves to the shared `py` today and to the tenant's own `py`
+tomorrow; the request (its bundle hash) is unchanged, the plan is not, and apply refuses to write
+anything but what the plan showed. A continuation checks the same thing for every pending step.
 
 ```sh
 sandboxctl rollback -apply apply_7c1e5a9b02d4 -plan     # what restoring would change, nothing written

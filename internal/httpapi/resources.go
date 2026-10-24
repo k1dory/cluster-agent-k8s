@@ -500,6 +500,8 @@ func writeApply(w http.ResponseWriter, a *model.Apply, err error) {
 		writeErr(w, http.StatusForbidden, err)
 	case errors.Is(err, store.ErrNotFound):
 		writeErr(w, http.StatusNotFound, err)
+	case errors.Is(err, resource.ErrInvalid):
+		writeErr(w, http.StatusBadRequest, err)
 	default:
 		writeErr(w, http.StatusInternalServerError, err)
 	}

@@ -114,11 +114,33 @@ func TestDriftAndRollbackEndpoints(t *testing.T) {
 	if resp.StatusCode != 200 || py.Source == nil || py.Source.Apply != a.ID || py.Source.Commit != sha || py.Source.Path != "bundles/alice.yaml" {
 		t.Fatalf("revision source: %d %s", resp.StatusCode, body)
 	}
+	// The server boundary: a credential in the repository URL never reaches the record, and a
+	// commit that is not an object name is refused before anything is written.
+	leakyDocs, _ := resource.ParseYAMLAll([]byte("kind: EnvironmentProfile\nname: leaky\nspec: {image: stable}\n"))
+	resp, body = call(t, "POST", api+"/v1/plan", "alice-tok", map[string]any{"documents": leakyDocs}, nil)
+	_ = json.Unmarshal(body, &p)
+	if resp, body := call(t, "POST", api+"/v1/apply", "alice-tok", map[string]any{"documents": leakyDocs, "plan": p.Fingerprint, "source": map[string]string{"commit": "ghp_notasha"}}, nil); resp.StatusCode != 400 {
+		t.Fatalf("bad commit: %d %s", resp.StatusCode, body)
+	}
+	if resp, _ := call(t, "GET", api+"/v1/environments/leaky", "alice-tok", nil, nil); resp.StatusCode != 404 {
+		t.Fatal("a refused source wrote")
+	}
+	resp, body = call(t, "POST", api+"/v1/apply", "alice-tok", map[string]any{"documents": leakyDocs, "plan": p.Fingerprint, "source": map[string]string{"repo": "https://x-access-token:ghp_secret777@github.com/acme/platform.git", "commit": sha}}, nil)
+	if resp.StatusCode != 200 || strings.Contains(string(body), "ghp_secret777") {
+		t.Fatalf("credential in the apply record: %d %s", resp.StatusCode, body)
+	}
+	resp, body = call(t, "GET", api+"/v1/environments/leaky/revisions", "alice-tok", nil, nil)
+	if resp.StatusCode != 200 || strings.Contains(string(body), "ghp_secret777") || !strings.Contains(string(body), `"repo":"https://github.com/acme/platform.git"`) {
+		t.Fatalf("credential in the revision history: %d %s", resp.StatusCode, body)
+	}
+	if resp, body := call(t, "GET", api+"/v1/applies", "alice-tok", nil, nil); strings.Contains(string(body), "ghp_secret777") {
+		t.Fatalf("credential in the applies list: %d %s", resp.StatusCode, body)
+	}
 	// Nothing drifts yet.
 	resp, body = call(t, "GET", api+"/v1/drift", "alice-tok", nil, nil)
 	var rep drift.Report
 	_ = json.Unmarshal(body, &rep)
-	if resp.StatusCode != 200 || rep.Checked != 2 || len(rep.Drifted) != 0 {
+	if resp.StatusCode != 200 || rep.Checked != 3 || len(rep.Drifted) != 0 {
 		t.Fatalf("drift: %d %s", resp.StatusCode, body)
 	}
 	// A hand edit through the resource API is drift; another tenant does not see it.
