@@ -48,6 +48,9 @@ func caddyBin(t *testing.T) string {
 	if b, err := exec.LookPath("caddy"); err == nil {
 		return b
 	}
+	if os.Getenv("SANDBOX_TEST_REQUIRE_EXTERNAL") != "" {
+		t.Fatal("SANDBOX_TEST_REQUIRE_EXTERNAL is set but no caddy binary was found")
+	}
 	t.Skip("no caddy binary: set CADDY_BIN or put caddy on PATH")
 	return ""
 }

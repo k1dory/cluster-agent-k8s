@@ -311,9 +311,12 @@ type Apply struct {
 	// lapse before continuing an unfinished apply.
 	LeaseOwner string     `json:"lease_owner,omitempty"`
 	LeaseUntil *time.Time `json:"lease_until,omitempty"`
-	Version    int64      `json:"version"` // optimistic-locking counter of the record
-	CreatedAt  time.Time  `json:"created_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
+	// Attempt counts lease takeovers: a worker writes only while the record still carries its
+	// owner and attempt, so a replica that lost the lease cannot undo its successor's work.
+	Attempt   int64     `json:"attempt"`
+	Version   int64     `json:"version"` // optimistic-locking counter of the record
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // ApplyStep is one document of the bundle in apply order.

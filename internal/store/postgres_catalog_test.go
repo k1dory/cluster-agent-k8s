@@ -20,11 +20,16 @@ import (
 )
 
 // SANDBOX_TEST_POSTGRES_URL must identify a test database. Each invocation creates its
-// own schema and drops only that schema; the production migration runs inside it.
+// own schema and drops only that schema; the production migration runs inside it. Without
+// a database the tests skip, unless SANDBOX_TEST_REQUIRE_EXTERNAL is set (CI sets it so a
+// missing service fails the job instead of passing it with the contract untested).
 func reviewPostgresURL(t *testing.T, upgrade bool) string {
 	t.Helper()
 	dsn := os.Getenv("SANDBOX_TEST_POSTGRES_URL")
 	if dsn == "" {
+		if os.Getenv("SANDBOX_TEST_REQUIRE_EXTERNAL") != "" {
+			t.Fatal("SANDBOX_TEST_REQUIRE_EXTERNAL is set but SANDBOX_TEST_POSTGRES_URL is empty")
+		}
 		t.Skip("set SANDBOX_TEST_POSTGRES_URL to run the real PostgreSQL contract tests")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

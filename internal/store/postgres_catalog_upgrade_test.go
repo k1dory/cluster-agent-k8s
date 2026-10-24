@@ -238,3 +238,53 @@ func TestReviewPostgresApplies(t *testing.T) {
 		t.Fatalf("all tenants: %d", len(all))
 	}
 }
+
+// The step transaction's revision checks on a real PostgreSQL: a noop confirms its revision
+// atomically, and a write whose number differs from the promised one is refused as a whole.
+func TestReviewPostgresApplyStepRevisionChecks(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
+	ctx := t.Context()
+	put := func(name, spec string) {
+		t.Helper()
+		if err := p.PutItem(ctx, &model.CatalogItem{Kind: model.KindEnvironment, Tenant: "acme", Name: name, Spec: json.RawMessage(spec)}, -1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// noop: the item moved after the plan.
+	put("live", `{"image":"stable"}`)
+	a := &model.Apply{ID: "apply_noop", Key: "n", Tenant: "acme", Status: model.ApplyRunning, Documents: json.RawMessage(`[]`),
+		Steps: []model.ApplyStep{{Kind: model.KindEnvironment, Tenant: "acme", Name: "live", Action: "noop", ExpectedRevision: 1, NextRevision: 1, Status: model.StepSkipped}}}
+	if err := p.CreateApply(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	put("live", `{"image":"canary"}`)
+	if err := p.ApplyStep(ctx, a, 0, nil, 1); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale noop: %v", err)
+	}
+	if got, _ := p.GetApply(ctx, a.ID); got.Version != 1 {
+		t.Fatalf("refused noop recorded progress: %+v", got)
+	}
+	if err := p.ApplyStep(ctx, a, 0, nil, 2); err != nil || a.Steps[0].Revision != 2 {
+		t.Fatalf("noop at the current revision: %v %+v", err, a.Steps[0])
+	}
+	// create: history changed (created and deleted) so the next number is 2, the plan promised 1.
+	put("gone", `{"image":"stable"}`)
+	if err := p.DeleteItem(ctx, model.KindEnvironment, "acme", "gone"); err != nil {
+		t.Fatal(err)
+	}
+	b := &model.Apply{ID: "apply_hist", Key: "h", Tenant: "acme", Status: model.ApplyRunning, Documents: json.RawMessage(`[]`),
+		Steps: []model.ApplyStep{{Kind: model.KindEnvironment, Tenant: "acme", Name: "gone", Action: "create", ExpectedRevision: 0, NextRevision: 1, Status: model.StepDone}}}
+	if err := p.CreateApply(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	it := &model.CatalogItem{Kind: model.KindEnvironment, Tenant: "acme", Name: "gone", Spec: json.RawMessage(`{"image":"stable"}`)}
+	if err := p.ApplyStep(ctx, b, 0, it, 0); !errors.Is(err, ErrConflict) {
+		t.Fatalf("promised revision 1, would write 2: %v", err)
+	}
+	if revs, _ := p.ListRevisions(ctx, model.KindEnvironment, "acme", "gone"); len(revs) != 1 {
+		t.Fatalf("refused step wrote: %d revisions", len(revs))
+	}
+	if got, _ := p.GetApply(ctx, b.ID); got.Version != 1 || got.Steps[0].Revision != 0 {
+		t.Fatalf("refused step recorded progress: %+v", got)
+	}
+}

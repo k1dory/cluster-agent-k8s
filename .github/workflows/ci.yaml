@@ -16,12 +16,16 @@ jobs:
           go-version-file: go.mod
       - run: go build ./...
       - run: go vet ./... && test -z "$(gofmt -l .)"
-      - run: go test ./... -count=1
+      # Every regression test, under the race detector: the apply controller, the chat
+      # continuity and the store contract on the in-memory store run here on every PR.
+      - run: go test ./... -count=1 -race
       - run: go run ./cmd/sandboxd policy validate policies
       - run: go run ./cmd/sandboxd policy test policies -f policies/tests.yaml
   postgres:
     # The store contract on a real PostgreSQL: fresh schema, upgrade from earlier schemas,
-    # concurrent writers across two pools, revision numbers never reused.
+    # concurrent writers across two pools, revision numbers never reused, apply steps that
+    # refuse a stale noop or a changed history. SANDBOX_TEST_REQUIRE_EXTERNAL turns the
+    # "no database configured" skip into a failure so a broken service cannot pass silently.
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -38,9 +42,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test ./internal/store/ -run Postgres -count=1 -race -v
+      - run: go test ./internal/store/ -count=1 -race -v
         env:
           SANDBOX_TEST_POSTGRES_URL: postgres://sandbox:sandbox@127.0.0.1:5432/sandbox_test?sslmode=disable
+          SANDBOX_TEST_REQUIRE_EXTERNAL: "1"
   caddy:
     runs-on: ubuntu-latest
     strategy:
@@ -58,7 +63,7 @@ jobs:
           tar -C /tmp -xzf /tmp/caddy.tgz caddy
           /tmp/caddy version
       - name: gateway end to end (render, push, bootstrap, mTLS, policy, injection, agent API)
-        run: CADDY_BIN=/tmp/caddy go test ./internal/integration/ -count=1 -v
+        run: CADDY_BIN=/tmp/caddy SANDBOX_TEST_REQUIRE_EXTERNAL=1 go test ./internal/integration/ -count=1 -v
       - name: the rendered Caddyfile also passes `caddy validate`
         run: |
           cat > /tmp/render.yaml <<CFG

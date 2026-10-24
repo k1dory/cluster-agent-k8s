@@ -301,6 +301,38 @@ func (c *cli) run(cmd string, args []string) error {
 			return err
 		}
 		printJSON(sb)
+	case "plan":
+		file := fs.String("f", "", "YAML file: one document, or several separated by ---")
+		tenant := fs.String("tenant", "", "default scope for documents without a tenant (admin)")
+		asJSON := fs.Bool("json", false, "print the plan as JSON")
+		_ = fs.Parse(flags)
+		if *file == "" {
+			return errors.New("plan: -f is required")
+		}
+		raw, err := os.ReadFile(*file)
+		if err != nil {
+			return err
+		}
+		docs, err := catalog.ParseYAMLAll(raw)
+		if err != nil {
+			return err
+		}
+		q := ""
+		if *tenant != "" {
+			q = "?tenant=" + url.QueryEscape(*tenant)
+		}
+		var out plan.Plan
+		if err := c.do("POST", "/v1/plan"+q, map[string]any{"documents": docs}, &out); err != nil {
+			return err
+		}
+		if *asJSON {
+			printJSON(out)
+		} else {
+			printPlan(out)
+		}
+		if !out.Valid {
+			os.Exit(2)
+		}
 	case "apply":
 		file := fs.String("f", "", "YAML file: one document, or several separated by ---")
 		tenant := fs.String("tenant", "", "default scope for documents without a tenant (admin)")

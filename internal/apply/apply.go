@@ -184,6 +184,7 @@ func (c *Controller) run(ctx context.Context, a *model.Apply) (*model.Apply, err
 		}
 		until := c.now().Add(c.lease())
 		a.LeaseOwner, a.LeaseUntil, a.Status, a.Error = c.Replica, &until, model.ApplyRunning, ""
+		a.Attempt++
 		err := c.Store.UpdateApply(ctx, a)
 		if err == nil {
 			break
@@ -198,9 +199,11 @@ func (c *Controller) run(ctx context.Context, a *model.Apply) (*model.Apply, err
 			return a, nil
 		}
 	}
-	a, err := c.execute(ctx, a)
-	// Release the lease whatever happened (best effort: the record may have moved).
-	if a != nil {
+	attempt := a.Attempt
+	a, err := c.execute(ctx, a, attempt)
+	// Release the lease, but only our own: a record another replica took over (another owner
+	// or a later attempt) is theirs, and the version guard refuses a stale write anyway.
+	if a != nil && c.owns(a, attempt) {
 		a.LeaseOwner, a.LeaseUntil = "", nil
 		if uerr := c.Store.UpdateApply(ctx, a); uerr != nil && c.Log != nil {
 			c.Log.Warn("apply: release lease", "id", a.ID, "err", uerr)
@@ -209,7 +212,12 @@ func (c *Controller) run(ctx context.Context, a *model.Apply) (*model.Apply, err
 	return a, err
 }
 
-func (c *Controller) execute(ctx context.Context, a *model.Apply) (*model.Apply, error) {
+// owns reports whether the record still belongs to this worker's attempt.
+func (c *Controller) owns(a *model.Apply, attempt int64) bool {
+	return a.LeaseOwner == c.Replica && a.Attempt == attempt
+}
+
+func (c *Controller) execute(ctx context.Context, a *model.Apply, attempt int64) (*model.Apply, error) {
 	var docs []*res.Document
 	if err := json.Unmarshal(a.Documents, &docs); err != nil {
 		return c.stop(ctx, a, model.ApplyFailed, "stored documents are unreadable: "+err.Error())
@@ -223,14 +231,26 @@ func (c *Controller) execute(ctx context.Context, a *model.Apply) (*model.Apply,
 	for i, ch := range p.Changes {
 		index[ch.Kind+"|"+ch.Tenant+"|"+ch.Name] = i
 	}
-	wrote := false
+	// A failure recorded by an earlier attempt belongs to that attempt: this one starts from
+	// pending, whatever it then finds.
 	for i := range a.Steps {
+		if a.Steps[i].Status == model.StepFailed {
+			a.Steps[i].Status, a.Steps[i].Error = model.StepPending, ""
+		}
+	}
+	wrote := false
+	for i := 0; i < len(a.Steps); i++ {
 		st := &a.Steps[i]
 		ci, ok := index[st.Kind+"|"+st.Tenant+"|"+st.Name]
 		if !ok {
 			return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s is no longer part of the plan", st.Kind, st.Tenant, st.Name))
 		}
 		ch := p.Changes[ci]
+		// Every document, applied or not, must still validate under the current rights: a
+		// bundle whose applied agent lost its policy does not finish as if nothing happened.
+		if ch.Action == plan.ActionInvalid {
+			return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s no longer validates: %s", st.Kind, st.Tenant, st.Name, strings.Join(ch.Errors, "; ")))
+		}
 		switch st.Status {
 		case model.StepDone, model.StepSkipped:
 			// Applied earlier: it must still be what was written.
@@ -244,15 +264,13 @@ func (c *Controller) execute(ctx context.Context, a *model.Apply) (*model.Apply,
 			}
 			continue
 		}
-		// Pending or failed: the document must still validate under the current rights and the
-		// item must still be at the revision the plan expected (a noop checks it too). A failure
-		// recorded by an earlier attempt belongs to that attempt.
-		st.Status, st.Error = model.StepPending, ""
-		if ch.Action == plan.ActionInvalid {
-			return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s no longer validates: %s", st.Kind, st.Tenant, st.Name, strings.Join(ch.Errors, "; ")))
-		}
+		// Pending: the item must still be at the revision the plan expected (a noop checks it
+		// too) and its history must still lead to the promised revision.
 		if ch.ExpectedRevision != st.ExpectedRevision {
 			return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s is at revision %d, the plan expected %d", st.Kind, st.Tenant, st.Name, ch.ExpectedRevision, st.ExpectedRevision))
+		}
+		if ch.NextRevision != st.NextRevision {
+			return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s would become revision %d, the plan promised %d (its history changed)", st.Kind, st.Tenant, st.Name, ch.NextRevision, st.NextRevision))
 		}
 		if ch.Action != st.Action {
 			return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s would now be a %s, the plan said %s", st.Kind, st.Tenant, st.Name, ch.Action, st.Action))
@@ -273,14 +291,19 @@ func (c *Controller) execute(ctx context.Context, a *model.Apply) (*model.Apply,
 			continue
 		}
 		// Whatever the error, the record decides: the transaction may have committed with its
-		// acknowledgement lost, or another replica may have done the step. Only what is recorded
-		// as pending is retried; nothing is ever written twice.
+		// acknowledgement lost, or another replica may have taken over. Only what is recorded as
+		// pending is retried, nothing is ever written twice, and a record that is no longer ours
+		// is left exactly as its owner has it.
 		if cur, gerr := c.Store.GetApply(ctx, a.ID); gerr == nil {
-			if cur.Steps[i].Status == model.StepDone || cur.Steps[i].Status == model.StepSkipped {
-				c.refresh(ctx)
-				return c.run(ctx, cur)
+			if !c.owns(cur, attempt) {
+				return cur, nil
 			}
 			a = cur
+			st = &a.Steps[i]
+			if st.Status == model.StepDone || st.Status == model.StepSkipped {
+				wrote = wrote || it != nil
+				continue
+			}
 		}
 		if errors.Is(err, store.ErrConflict) {
 			// The item moved under us (its revision is not what the plan expected).
