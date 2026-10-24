@@ -124,3 +124,27 @@ CREATE TABLE IF NOT EXISTS blobs (
 );
 
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS admin_grant boolean NOT NULL DEFAULT false;
+
+-- Catalogue: AgentDefinition / EnvironmentProfile revisions (append-only, latest = current).
+CREATE TABLE IF NOT EXISTS catalog_items (
+    kind        text NOT NULL,
+    tenant      text NOT NULL DEFAULT '',
+    name        text NOT NULL,
+    revision    integer NOT NULL,
+    description text NOT NULL DEFAULT '',
+    spec        jsonb NOT NULL,
+    created_by  text NOT NULL DEFAULT '',
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (kind, tenant, name, revision)
+);
+ALTER TABLE sandboxes
+    ADD COLUMN IF NOT EXISTS agent_ref text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS agent_revision integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS environment_ref text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS environment_revision integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS launch jsonb;
+ALTER TABLE runs
+    ADD COLUMN IF NOT EXISTS agent_ref text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS agent_revision integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS environment_ref text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS environment_revision integer NOT NULL DEFAULT 0;

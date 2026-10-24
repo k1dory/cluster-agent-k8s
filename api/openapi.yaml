@@ -16,6 +16,13 @@ info:
       shows the resolved principal.
     * **Ownership.** A policy's `tenants` list says which tenants may create sandboxes (and roll out
       agents) with that slug; a slug outside the list answers 403.
+    * **Catalogue.** `AgentDefinition`s (`/v1/agents`) and `EnvironmentProfile`s (`/v1/environments`)
+      are versioned configuration per tenant (the admin also keeps shared ones, tenant ""). Every PUT
+      appends a revision, `expected_revision` makes it conditional (409). `POST /v1/sandboxes` with
+      `agent_ref` ("name" or "name@N") takes the policy, repository, lifecycle defaults and the
+      environment's launch parameters from the catalogue; the sandbox records `agent_revision`,
+      `environment_revision` and the rendered `launch`, and every run records the revisions it ran
+      under. The same documents are accepted as YAML files by `sandboxctl apply`.
     * **Versions.** Every sandbox carries `agent_version` (the agent image its pod runs),
       `desired_version` (a rollout not yet applied) and `env_version` (fingerprint of policy content,
       harness command, image and pod environment the pod was started under). `GET /v1/version`
@@ -48,6 +55,7 @@ security:
   - bearer: []
 tags:
   - name: sandboxes
+  - name: catalogue
   - name: rollouts
   - name: runs
   - name: events
@@ -336,6 +344,91 @@ paths:
                   ticket: { type: string }
                   redirect: { type: string, format: uri }
         "409": { description: "Sandbox has no preview", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/agents:
+    get:
+      tags: [catalogue]
+      summary: List AgentDefinitions visible in the scope (own + shared; admin picks a scope with ?tenant=)
+      parameters: [{ $ref: "#/components/parameters/scope" }]
+      responses:
+        "200": { description: Latest revisions, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/agents/{name}:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [catalogue]
+      summary: Get an AgentDefinition (latest, or ?revision=N)
+      parameters: [{ name: revision, in: query, schema: { type: integer, minimum: 1 } }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [catalogue]
+      summary: Create or update an AgentDefinition (appends a revision)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AgentDocument" }
+      responses:
+        "201": { description: Created (revision 1), content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "200": { description: New revision, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "403": { description: "The tenant does not own the policy, or wrote into another scope", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "expected_revision is not the latest", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Invalid document (unknown field, unknown environment or policy, bad quantity)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: [catalogue]
+      summary: Delete an AgentDefinition with its history (existing sandboxes keep their launch)
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/agents/{name}/revisions:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [catalogue]
+      summary: History of an AgentDefinition, oldest first
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/environments:
+    get:
+      tags: [catalogue]
+      summary: List EnvironmentProfiles visible in the scope
+      parameters: [{ $ref: "#/components/parameters/scope" }]
+      responses:
+        "200": { description: Latest revisions, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/environments/{name}:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [catalogue]
+      summary: Get an EnvironmentProfile (latest, or ?revision=N)
+      parameters: [{ name: revision, in: query, schema: { type: integer, minimum: 1 } }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [catalogue]
+      summary: Create or update an EnvironmentProfile (appends a revision)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/EnvironmentDocument" }
+      responses:
+        "201": { description: Created (revision 1), content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "200": { description: New revision, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "409": { description: "expected_revision is not the latest", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Invalid document (unknown field, image not in the catalogue for a tenant, bad quantity)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: [catalogue]
+      summary: Delete an EnvironmentProfile with its history
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/environments/{name}/revisions:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [catalogue]
+      summary: History of an EnvironmentProfile, oldest first
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
   /v1/whoami:
     get:
       tags: [sandboxes]
@@ -695,6 +788,16 @@ components:
       in: query
       schema: { type: string }
       description: Opaque cursor from the previous page's `X-Next-Cursor`
+    catalogName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$" }
+    scope:
+      name: tenant
+      in: query
+      schema: { type: string }
+      description: "Admin only: the tenant scope to work in (empty = shared items). Tenant tokens are confined to their own scope and read shared items."
     idempotencyKey:
       name: Idempotency-Key
       in: header
@@ -733,6 +836,7 @@ components:
         wake_on_preview: { type: boolean, default: true }
         ttl: { type: integer, description: "Seconds until the sandbox is deleted (pod, volume; runs and events stay); absent/0 = keep. Capped at the token's expiry when oidc.ttl_from_token is on" }
         agent_version: { type: string, description: "Version name from the catalogue (tenants) or an image reference (admin); absent = default" }
+        agent_ref: { type: string, description: "AgentDefinition reference, name or name@revision. Supplies slug, repo, lifecycle defaults and the environment's launch; slug must then be absent or equal to the agent's policy" }
     UpdateSandbox:
       type: object
       description: Only the fields present are changed
@@ -757,6 +861,11 @@ components:
         instance: { type: integer, description: "Current identity number; grows on every wake" }
         pod_name: { type: string }
         agent_version: { type: string, description: "Agent image the current (or last) pod runs" }
+        agent_ref: { type: string, description: "AgentDefinition the sandbox was created from (absent for bare-slug sandboxes)" }
+        agent_revision: { type: integer }
+        environment_ref: { type: string }
+        environment_revision: { type: integer }
+        launch: { $ref: "#/components/schemas/Launch" }
         desired_version: { type: string, description: "Rollout target not yet applied; absent when none" }
         env_version: { type: string, description: "Fingerprint of policy content, harness command, image and pod environment at the last pod start" }
         revision: { type: integer, format: int64, description: "Changes on every update; every write is conditional on it (optimistic locking across replicas)" }
@@ -783,11 +892,116 @@ components:
         exit_code: { type: integer }
         usage: { $ref: "#/components/schemas/Usage" }
         agent_version: { type: string, description: "Agent image that executed the run" }
+        agent_ref: { type: string, description: "Catalogue revisions the run executed under, fixed when it was claimed" }
+        agent_revision: { type: integer }
+        environment_ref: { type: string }
+        environment_revision: { type: integer }
         resume_of: { type: string, description: "The run this one continues after a forced rollout" }
         session: { type: string, description: "Harness conversation id captured from the output (Claude Code session_id, Codex thread_id)" }
         created_at: { type: string, format: date-time }
         started_at: { type: string, format: date-time, nullable: true }
         finished_at: { type: string, format: date-time, nullable: true }
+    Launch:
+      type: object
+      description: The environment profile rendered at creation, kept on the sandbox; every pod of the sandbox starts with it
+      properties:
+        image: { type: string }
+        harness_command: { type: string }
+        harness_resume_command: { type: string }
+        resume_prompt: { type: string }
+        model: { type: string, description: "Exported as SANDBOX_MODEL and ANTHROPIC_MODEL" }
+        instructions: { type: string, description: "Exported as SANDBOX_INSTRUCTIONS" }
+        env: { type: object, additionalProperties: { type: string } }
+        cpu_request: { type: string }
+        cpu_limit: { type: string }
+        memory_request: { type: string }
+        memory_limit: { type: string }
+        volume_size: { type: string }
+        runtime_class: { type: string }
+    CatalogItem:
+      type: object
+      description: One revision of a catalogue resource
+      properties:
+        kind: { type: string, enum: [AgentDefinition, EnvironmentProfile] }
+        tenant: { type: string, description: "Empty for shared items" }
+        name: { type: string }
+        revision: { type: integer }
+        description: { type: string }
+        spec:
+          oneOf:
+            - { $ref: "#/components/schemas/AgentSpec" }
+            - { $ref: "#/components/schemas/EnvironmentSpec" }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+    EnvironmentSpec:
+      type: object
+      required: [image]
+      additionalProperties: false
+      properties:
+        image: { type: string, description: "Version name from the server catalogue; the admin may write an image reference" }
+        harness:
+          type: object
+          additionalProperties: false
+          properties:
+            command: { type: string }
+            resume_command: { type: string }
+            resume_prompt: { type: string }
+        model:
+          type: object
+          additionalProperties: false
+          properties:
+            name: { type: string }
+            env: { type: object, additionalProperties: { type: string } }
+        resources:
+          type: object
+          additionalProperties: false
+          properties:
+            cpu_request: { type: string }
+            cpu_limit: { type: string }
+            memory_request: { type: string }
+            memory_limit: { type: string }
+            volume_size: { type: string }
+        lifecycle:
+          type: object
+          additionalProperties: false
+          properties:
+            idle_timeout: { type: integer, minimum: 0 }
+            ttl: { type: integer, minimum: 0 }
+            wake_on_preview: { type: boolean }
+        runtime_class: { type: string }
+        env: { type: object, additionalProperties: { type: string } }
+    AgentSpec:
+      type: object
+      required: [policy, environment]
+      additionalProperties: false
+      properties:
+        policy: { type: string, description: "Policy slug; the tenant must own it (admin may override)" }
+        environment: { type: string, description: "EnvironmentProfile name, or name@revision to pin; own scope first, then shared" }
+        repo: { type: string }
+        instructions: { type: string }
+        connections: { type: array, items: { type: string }, description: "Reserved: connection names (step 4)" }
+    EnvironmentDocument:
+      type: object
+      required: [spec]
+      additionalProperties: false
+      properties:
+        kind: { type: string, enum: [EnvironmentProfile] }
+        tenant: { type: string, description: "Admin only: scope to write into (empty = shared)" }
+        name: { type: string, description: "Must match the path when present" }
+        description: { type: string }
+        spec: { $ref: "#/components/schemas/EnvironmentSpec" }
+        expected_revision: { type: integer, minimum: 0, description: "Conditional write: 0 = must not exist, N = latest must be N" }
+    AgentDocument:
+      type: object
+      required: [spec]
+      additionalProperties: false
+      properties:
+        kind: { type: string, enum: [AgentDefinition] }
+        tenant: { type: string }
+        name: { type: string }
+        description: { type: string }
+        spec: { $ref: "#/components/schemas/AgentSpec" }
+        expected_revision: { type: integer, minimum: 0 }
     Usage:
       type: object
       description: |

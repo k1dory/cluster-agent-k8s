@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -57,20 +58,29 @@ func (p *Postgres) Close() error { p.pool.Close(); return nil }
 
 const sandboxCols = `id, name, slug, owner, tenant, repo, idle_timeout, wake_on_preview, status, ip, instance,
 	pod_name, last_activity, created_at, expires_at, preview_port, preview_access, preview_host, error,
-	agent_version, desired_version, env_version, revision, admin_grant`
+	agent_version, desired_version, env_version, revision, admin_grant,
+	agent_ref, agent_revision, environment_ref, environment_revision, launch`
 
 func scanSandbox(row pgx.Row) (*model.Sandbox, error) {
 	var s model.Sandbox
 	var pPort *int
 	var pAccess, pHost *string
+	var launch []byte
 	err := row.Scan(&s.ID, &s.Name, &s.Slug, &s.Owner, &s.Tenant, &s.Repo, &s.IdleTimeout, &s.WakeOnPreview,
 		&s.Status, &s.IP, &s.Instance, &s.PodName, &s.LastActivity, &s.CreatedAt, &s.ExpiresAt, &pPort, &pAccess, &pHost, &s.Error,
-		&s.AgentVersion, &s.DesiredVersion, &s.EnvVersion, &s.Revision, &s.AdminGrant)
+		&s.AgentVersion, &s.DesiredVersion, &s.EnvVersion, &s.Revision, &s.AdminGrant,
+		&s.AgentRef, &s.AgentRevision, &s.EnvironmentRef, &s.EnvironmentRevision, &launch)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
+	}
+	if len(launch) > 0 {
+		s.Launch = &model.Launch{}
+		if err := json.Unmarshal(launch, s.Launch); err != nil {
+			return nil, fmt.Errorf("sandbox %s launch: %w", s.ID, err)
+		}
 	}
 	if pPort != nil {
 		s.Preview = &model.Preview{Port: *pPort}
@@ -91,14 +101,23 @@ func previewCols(s *model.Sandbox) (*int, *string, *string) {
 	return &s.Preview.Port, &s.Preview.Access, &s.Preview.Host
 }
 
+func launchCol(s *model.Sandbox) []byte {
+	if s.Launch == nil {
+		return nil
+	}
+	b, _ := json.Marshal(s.Launch)
+	return b
+}
+
 func (p *Postgres) CreateSandbox(ctx context.Context, s *model.Sandbox) error {
 	port, access, host := previewCols(s)
 	s.Revision = 1
 	_, err := p.pool.Exec(ctx, `INSERT INTO sandboxes (`+sandboxCols+`)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29)`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
 		s.PodName, s.LastActivity, s.CreatedAt, s.ExpiresAt, port, access, host, s.Error,
-		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision, s.AdminGrant)
+		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision, s.AdminGrant,
+		s.AgentRef, s.AgentRevision, s.EnvironmentRef, s.EnvironmentRevision, launchCol(s))
 	return err
 }
 
@@ -339,11 +358,13 @@ func (p *Postgres) UpdateSandbox(ctx context.Context, s *model.Sandbox) error {
 	tag, err := p.pool.Exec(ctx, `UPDATE sandboxes SET name=$2, slug=$3, owner=$4, tenant=$5, repo=$6, idle_timeout=$7,
 		wake_on_preview=$8, status=$9, ip=$10, instance=$11, pod_name=$12, last_activity=GREATEST(last_activity, $13), expires_at=$14,
 		preview_port=$15, preview_access=$16, preview_host=$17, error=$18,
-		agent_version=$19, desired_version=$20, env_version=$21, admin_grant=$23, revision=revision+1
+		agent_version=$19, desired_version=$20, env_version=$21, admin_grant=$23,
+		agent_ref=$24, agent_revision=$25, environment_ref=$26, environment_revision=$27, launch=$28, revision=revision+1
 		WHERE id=$1 AND revision=$22`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
 		s.PodName, s.LastActivity, s.ExpiresAt, port, access, host, s.Error,
-		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision, s.AdminGrant)
+		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision, s.AdminGrant,
+		s.AgentRef, s.AgentRevision, s.EnvironmentRef, s.EnvironmentRevision, launchCol(s))
 	if err != nil {
 		return err
 	}
@@ -382,14 +403,14 @@ func (p *Postgres) DeleteSandbox(ctx context.Context, id string) error {
 
 const runCols = `id, sandbox_id, tenant, slug, task, status, exit_code, created_at, started_at, finished_at,
 	model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, turns,
-	agent_version, resume_of, session`
+	agent_version, resume_of, session, agent_ref, agent_revision, environment_ref, environment_revision`
 
 func scanRun(row pgx.Row) (*model.Run, error) {
 	var r model.Run
 	u := &r.Usage
 	err := row.Scan(&r.ID, &r.SandboxID, &r.Tenant, &r.Slug, &r.Task, &r.Status, &r.ExitCode, &r.CreatedAt, &r.StartedAt, &r.FinishedAt,
 		&u.Model, &u.InputTokens, &u.OutputTokens, &u.CacheRead, &u.CacheWrite, &u.CostUSD, &u.Turns,
-		&r.AgentVersion, &r.ResumeOf, &r.Session)
+		&r.AgentVersion, &r.ResumeOf, &r.Session, &r.AgentRef, &r.AgentRevision, &r.EnvironmentRef, &r.EnvironmentRevision)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -401,10 +422,10 @@ func scanRun(row pgx.Row) (*model.Run, error) {
 
 func (p *Postgres) CreateRun(ctx context.Context, r *model.Run) error {
 	u := r.Usage
-	_, err := p.pool.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+	_, err := p.pool.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
 		r.ID, r.SandboxID, r.Tenant, r.Slug, r.Task, r.Status, r.ExitCode, r.CreatedAt, r.StartedAt, r.FinishedAt,
 		u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
-		r.AgentVersion, r.ResumeOf, r.Session)
+		r.AgentVersion, r.ResumeOf, r.Session, r.AgentRef, r.AgentRevision, r.EnvironmentRef, r.EnvironmentRevision)
 	return err
 }
 
@@ -416,9 +437,9 @@ func (p *Postgres) UpdateRun(ctx context.Context, r *model.Run) error {
 	u := r.Usage
 	tag, err := p.pool.Exec(ctx, `UPDATE runs SET status=$2, exit_code=$3, started_at=$4, finished_at=$5,
 		model=$6, input_tokens=$7, output_tokens=$8, cache_read_tokens=$9, cache_write_tokens=$10, cost_usd=$11, turns=$12,
-		agent_version=$13, session=$14 WHERE id=$1`,
+		agent_version=$13, session=$14, agent_ref=$15, agent_revision=$16, environment_ref=$17, environment_revision=$18 WHERE id=$1`,
 		r.ID, r.Status, r.ExitCode, r.StartedAt, r.FinishedAt, u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
-		r.AgentVersion, r.Session)
+		r.AgentVersion, r.Session, r.AgentRef, r.AgentRevision, r.EnvironmentRef, r.EnvironmentRevision)
 	if err != nil {
 		return err
 	}
@@ -697,4 +718,93 @@ func (p *Postgres) ListInstances(ctx context.Context, sandboxID string) ([]*mode
 		out = append(out, in)
 	}
 	return out, rows.Err()
+}
+
+// --- catalogue -------------------------------------------------------------------------
+
+const itemCols = `kind, tenant, name, revision, description, spec, created_by, created_at`
+
+func scanItem(row pgx.Row) (*model.CatalogItem, error) {
+	var it model.CatalogItem
+	err := row.Scan(&it.Kind, &it.Tenant, &it.Name, &it.Revision, &it.Description, &it.Spec, &it.CreatedBy, &it.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &it, nil
+}
+
+func (p *Postgres) PutItem(ctx context.Context, it *model.CatalogItem, expected int) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// One writer per item at a time across replicas: the revision check and the insert are atomic.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "catalog:"+it.Kind+"|"+it.Tenant+"|"+it.Name); err != nil {
+		return err
+	}
+	var latest int
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(max(revision), 0) FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3`,
+		it.Kind, it.Tenant, it.Name).Scan(&latest); err != nil {
+		return err
+	}
+	if expected >= 0 && expected != latest {
+		return fmt.Errorf("%w: latest revision is %d, expected %d", ErrConflict, latest, expected)
+	}
+	it.Revision = latest + 1
+	if err := tx.QueryRow(ctx, `INSERT INTO catalog_items (`+itemCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,now()) RETURNING created_at`,
+		it.Kind, it.Tenant, it.Name, it.Revision, it.Description, it.Spec, it.CreatedBy).Scan(&it.CreatedAt); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) GetItem(ctx context.Context, kind, tenant, name string, revision int) (*model.CatalogItem, error) {
+	if revision == 0 {
+		return scanItem(p.pool.QueryRow(ctx, `SELECT `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3 ORDER BY revision DESC LIMIT 1`, kind, tenant, name))
+	}
+	return scanItem(p.pool.QueryRow(ctx, `SELECT `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3 AND revision=$4`, kind, tenant, name, revision))
+}
+
+func (p *Postgres) queryItems(ctx context.Context, q string, args ...any) ([]*model.CatalogItem, error) {
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.CatalogItem
+	for rows.Next() {
+		it, err := scanItem(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) ListItems(ctx context.Context, kind, tenant string) ([]*model.CatalogItem, error) {
+	return p.queryItems(ctx, `SELECT DISTINCT ON (name) `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 ORDER BY name, revision DESC`, kind, tenant)
+}
+
+func (p *Postgres) ListRevisions(ctx context.Context, kind, tenant, name string) ([]*model.CatalogItem, error) {
+	out, err := p.queryItems(ctx, `SELECT `+itemCols+` FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3 ORDER BY revision`, kind, tenant, name)
+	if err == nil && len(out) == 0 {
+		return nil, ErrNotFound
+	}
+	return out, err
+}
+
+func (p *Postgres) DeleteItem(ctx context.Context, kind, tenant, name string) error {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM catalog_items WHERE kind=$1 AND tenant=$2 AND name=$3`, kind, tenant, name)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
 }

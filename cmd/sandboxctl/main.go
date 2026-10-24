@@ -22,13 +22,19 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/model"
 )
 
 const usage = `sandboxctl <command> [flags]
 
-  create   -name shop -slug backend-dev -owner alice [-tenant t] [-repo url] [-idle 3600] [-ttl 86400]
-           [-wake-on-preview=false] [-version stable] [-key idempotency-key]
+  create   -name shop (-slug backend-dev | -agent backend[@3]) -owner alice [-tenant t] [-repo url] [-idle 3600]
+           [-ttl 86400] [-wake-on-preview=false] [-version stable] [-key idempotency-key]
+  apply    -f file.yaml [-tenant t] [-expected 3]   put an AgentDefinition / EnvironmentProfile (a new revision)
+  get      agent|environment <name> [-revision N] [-tenant t]
+  list     agents|environments [-tenant t]
+  revisions agent|environment <name> [-tenant t]
+  remove   agent|environment <name> [-tenant t]
   list     [-tenant t] [-owner o] [-slug s] [-status running] [-n 100] [-after cursor]
   get      <sandbox>
   update   <sandbox> [-idle 600] [-ttl 0] [-wake-on-preview=true] [-repo url]
@@ -170,9 +176,13 @@ func (c *cli) run(cmd string, args []string) error {
 		ttl := fs.Int("ttl", 0, "delete the sandbox after this many seconds (0 = keep)")
 		wop := fs.Bool("wake-on-preview", true, "wake a sleeping sandbox when its preview is opened")
 		version := fs.String("version", "", "agent version name (see `sandboxctl version`); default server-side")
+		agentRef := fs.String("agent", "", "AgentDefinition reference: name or name@revision (replaces -slug)")
 		key := fs.String("key", "", "Idempotency-Key: a repeat with the same key returns the same sandbox")
 		_ = fs.Parse(flags)
-		req := map[string]any{"name": *name, "slug": *slug, "owner": *owner, "tenant": *tenant, "repo": *repo, "wake_on_preview": *wop, "agent_version": *version}
+		req := map[string]any{"name": *name, "slug": *slug, "owner": *owner, "tenant": *tenant, "repo": *repo, "agent_version": *version, "agent_ref": *agentRef}
+		if *agentRef == "" || fs.Lookup("wake-on-preview").Value.String() != "true" {
+			req["wake_on_preview"] = *wop // with an agent, the environment's lifecycle decides unless set explicitly
+		}
 		if *idle >= 0 {
 			req["idle_timeout"] = *idle
 		}
@@ -185,6 +195,29 @@ func (c *cli) run(cmd string, args []string) error {
 		}
 		printJSON(sb)
 	case "list":
+		if len(pos) > 0 && catalogPath(pos[0]) != "" {
+			tenant := fs.String("tenant", "", "scope (admin: tenant or empty for shared)")
+			_ = fs.Parse(flags)
+			q := url.Values{}
+			if *tenant != "" {
+				q.Set("tenant", *tenant)
+			}
+			var items []model.CatalogItem
+			if err := c.do("GET", "/v1/"+catalogPath(pos[0])+"?"+q.Encode(), nil, &items); err != nil {
+				return err
+			}
+			tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(tw, "NAME\tTENANT\tREVISION\tUPDATED\tDESCRIPTION")
+			for _, it := range items {
+				tenant := it.Tenant
+				if tenant == "" {
+					tenant = "(shared)"
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\n", it.Name, tenant, it.Revision, it.CreatedAt.Format(time.RFC3339), it.Description)
+			}
+			tw.Flush()
+			return nil
+		}
 		q := url.Values{}
 		for _, name := range []string{"tenant", "owner", "slug", "status", "after"} {
 			name := name
@@ -232,12 +265,86 @@ func (c *cli) run(cmd string, args []string) error {
 		}
 		printJSON(sb)
 	case "get":
+		if len(pos) > 0 && catalogPath(pos[0]) != "" {
+			rev := fs.Int("revision", 0, "revision (0 = latest)")
+			tenant := fs.String("tenant", "", "scope (admin: tenant or empty for shared)")
+			_ = fs.Parse(flags)
+			q := url.Values{}
+			if *rev > 0 {
+				q.Set("revision", fmt.Sprint(*rev))
+			}
+			if *tenant != "" {
+				q.Set("tenant", *tenant)
+			}
+			var out any
+			if err := c.do("GET", "/v1/"+catalogPath(pos[0])+"/"+need(pos, 1, "name")+"?"+q.Encode(), nil, &out); err != nil {
+				return err
+			}
+			printJSON(out)
+			return nil
+		}
 		_ = fs.Parse(flags)
 		var sb model.Sandbox
 		if err := c.do("GET", "/v1/sandboxes/"+need(pos, 0, "sandbox"), nil, &sb); err != nil {
 			return err
 		}
 		printJSON(sb)
+	case "apply":
+		file := fs.String("f", "", "YAML document (kind, name, description, spec)")
+		tenant := fs.String("tenant", "", "scope (admin: tenant or empty for shared)")
+		expected := fs.Int("expected", -1, "expected current revision (0 = must not exist yet)")
+		_ = fs.Parse(flags)
+		if *file == "" {
+			return errors.New("apply: -f is required")
+		}
+		raw, err := os.ReadFile(*file)
+		if err != nil {
+			return err
+		}
+		doc, err := catalog.ParseYAML(raw)
+		if err != nil {
+			return err
+		}
+		if *expected >= 0 {
+			doc.ExpectedRevision = expected
+		}
+		path, ok := map[string]string{model.KindAgent: "agents", model.KindEnvironment: "environments"}[doc.Kind]
+		if !ok {
+			return fmt.Errorf("apply: kind must be %s or %s, got %q", model.KindAgent, model.KindEnvironment, doc.Kind)
+		}
+		q := ""
+		if *tenant != "" {
+			q = "?tenant=" + url.QueryEscape(*tenant)
+		}
+		var out model.CatalogItem
+		if err := c.do("PUT", "/v1/"+path+"/"+doc.Name+q, doc, &out); err != nil {
+			return err
+		}
+		fmt.Printf("%s %s: revision %d\n", out.Kind, out.Name, out.Revision)
+	case "revisions", "remove":
+		tenant := fs.String("tenant", "", "scope (admin: tenant or empty for shared)")
+		_ = fs.Parse(flags)
+		path := catalogPath(need(pos, 0, "agent|environment"))
+		if path == "" {
+			return errors.New("expected agent or environment")
+		}
+		q := ""
+		if *tenant != "" {
+			q = "?tenant=" + url.QueryEscape(*tenant)
+		}
+		if cmd == "remove" {
+			return c.do("DELETE", "/v1/"+path+"/"+need(pos, 1, "name")+q, nil, nil)
+		}
+		var revs []model.CatalogItem
+		if err := c.do("GET", "/v1/"+path+"/"+need(pos, 1, "name")+"/revisions"+q, nil, &revs); err != nil {
+			return err
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "REVISION\tCREATED\tBY\tDESCRIPTION")
+		for _, r := range revs {
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\n", r.Revision, r.CreatedAt.Format(time.RFC3339), r.CreatedBy, r.Description)
+		}
+		tw.Flush()
 	case "run":
 		key := fs.String("key", "", "Idempotency-Key: a repeat with the same key returns the same run")
 		_ = fs.Parse(flags)
@@ -474,6 +581,17 @@ func (c *cli) run(cmd string, args []string) error {
 		return fmt.Errorf("unknown command %q", cmd)
 	}
 	return nil
+}
+
+// catalogPath maps a CLI noun to the API path of a catalogue kind ("" when it is not one).
+func catalogPath(noun string) string {
+	switch noun {
+	case "agent", "agents":
+		return "agents"
+	case "environment", "environments", "env":
+		return "environments"
+	}
+	return ""
 }
 
 // shortImage trims a registry path to the last component (name:tag) for tables.

@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,6 +29,7 @@ import (
 
 	"agent-sandbox/internal/authz"
 	"agent-sandbox/internal/ca"
+	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/config"
 	"agent-sandbox/internal/events"
 	"agent-sandbox/internal/gateway"
@@ -260,6 +262,10 @@ func serve(cfgPath string, log *slog.Logger) error {
 	envVersion := func(sb *model.Sandbox) string {
 		h := sha256.New()
 		fmt.Fprintf(h, "policy=%s\nimage=%s\nharness=%s\nresume=%s\n", pols.ContentHash(sb.Slug), sb.AgentVersion, cfg.Kube.HarnessCommand, cfg.Kube.HarnessResumeCommand)
+		if sb.Launch != nil {
+			b, _ := json.Marshal(sb.Launch)
+			fmt.Fprintf(h, "launch=%s\nagent=%s@%d\nenvironment=%s@%d\n", b, sb.AgentRef, sb.AgentRevision, sb.EnvironmentRef, sb.EnvironmentRevision)
+		}
 		keys := make([]string, 0, len(cfg.Kube.Env))
 		for k := range cfg.Kube.Env {
 			keys = append(keys, k)
@@ -314,7 +320,8 @@ func serve(cfgPath string, log *slog.Logger) error {
 	for _, t := range cfg.APITokens {
 		tenants[t.Token] = t.Tenant
 	}
-	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken, Tenants: tenants,
+	cat := &catalog.Service{Store: st, Images: orch.Cfg, Policies: pols}
+	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Catalog: cat, Token: cfg.APIToken, Tenants: tenants,
 		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Log: log.With("log", "api")}
 	if cfg.OIDC != nil {
 		v, err := oidc.New(*cfg.OIDC)

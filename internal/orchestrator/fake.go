@@ -19,8 +19,15 @@ type FakeRuntime struct {
 	FailDelete error
 	// DeleteDelay makes DeletePod take this long, like Kubernetes' graceful termination.
 	DeleteDelay time.Duration
-	// Lost pods: PodStatus answers ErrPodNotFound for them although nobody deleted them.
-	lost map[string]bool
+	// Launches remembers the launch each sandbox's latest pod was created with (tests).
+	Launches map[string]*model.Launch
+}
+
+// LaunchOf returns the launch the sandbox's latest pod was created with (nil = defaults).
+func (f *FakeRuntime) LaunchOf(sandboxID string) *model.Launch {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Launches[sandboxID]
 }
 
 // LosePod makes the runtime forget a pod (eviction, node loss) without DeletePod being called.
@@ -39,7 +46,7 @@ func (f *FakeRuntime) SetFailDelete(err error) {
 
 // NewFakeRuntime returns an empty fake.
 func NewFakeRuntime() *FakeRuntime {
-	return &FakeRuntime{pods: map[string]string{}, volumes: map[string]bool{}}
+	return &FakeRuntime{pods: map[string]string{}, volumes: map[string]bool{}, Launches: map[string]*model.Launch{}}
 }
 
 func (f *FakeRuntime) EnsureVolume(_ context.Context, sb *model.Sandbox) error {
@@ -56,6 +63,7 @@ func (f *FakeRuntime) CreatePod(_ context.Context, sb *model.Sandbox) (string, e
 		return "", fmt.Errorf("no volume for %s", sb.ID)
 	}
 	f.next++
+	f.Launches[sb.ID] = sb.Launch
 	f.pods[sb.ID] = fmt.Sprintf("10.77.77.%d", 10+f.next%110)
 	return fmt.Sprintf("agent-%s-%d", sb.Slug, f.next), nil
 }

@@ -83,3 +83,47 @@ func TestReviewGatewayTrustAndNetworkLockWiring(t *testing.T) {
 	}
 	t.Fatal("gateway trust volume is missing")
 }
+
+func TestLaunchShapesThePod(t *testing.T) {
+	ctx := context.Background()
+	client := fake.NewSimpleClientset()
+	rt := &Runtime{Client: client, Cfg: PodConfig{Namespace: "review", Image: "agent:default", GatewayIP: "10.77.77.1",
+		HarnessCommand: "claude -p \"$SANDBOX_TASK\"", CPULimit: "2", MemoryLimit: "4Gi", VolumeSize: "10Gi",
+		Env: map[string]string{"ANTHROPIC_BASE_URL": "https://api.anthropic.com", "KEEP": "1"}}}
+	sb := &model.Sandbox{ID: "sb_launch", Slug: "dev", Tenant: "acme", AgentVersion: "agent:py-1.2", AgentRef: "backend", AgentRevision: 3,
+		EnvironmentRef: "py", EnvironmentRevision: 2, Launch: &model.Launch{
+			Image: "agent:py-1.2", HarnessCommand: "codex exec \"$SANDBOX_TASK\" --json", Model: "claude-opus-5-5", Instructions: "Be brief.",
+			Env:      map[string]string{"ANTHROPIC_MODEL": "claude-opus-5-5", "SANDBOX_INSTRUCTIONS": "Be brief.", "PIP_INDEX_URL": "https://pypi.example.com"},
+			CPULimit: "3", MemoryRequest: "2Gi", VolumeSize: "20Gi", RuntimeClass: "gvisor"}}
+	if err := rt.EnsureVolume(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	pvc, _ := client.CoreV1().PersistentVolumeClaims("review").Get(ctx, pvcName(sb), metav1.GetOptions{})
+	if got := pvc.Spec.Resources.Requests.Storage().String(); got != "20Gi" {
+		t.Fatalf("volume size from the launch: %s", got)
+	}
+	name, err := rt.CreatePod(ctx, sb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod, _ := client.CoreV1().Pods("review").Get(ctx, name, metav1.GetOptions{})
+	c := pod.Spec.Containers[0]
+	env := map[string]string{}
+	for _, e := range c.Env {
+		env[e.Name] = e.Value
+	}
+	switch {
+	case c.Image != "agent:py-1.2":
+		t.Fatalf("image: %s", c.Image)
+	case env["HARNESS_CMD"] != "codex exec \"$SANDBOX_TASK\" --json":
+		t.Fatalf("harness: %q", env["HARNESS_CMD"])
+	case env["ANTHROPIC_MODEL"] != "claude-opus-5-5" || env["SANDBOX_INSTRUCTIONS"] != "Be brief." || env["PIP_INDEX_URL"] == "" || env["KEEP"] != "1" || env["ANTHROPIC_BASE_URL"] == "":
+		t.Fatalf("env merge: %v", env)
+	case env["SANDBOX_AGENT_REF"] != "backend" || env["SANDBOX_AGENT_REVISION"] != "3" || env["SANDBOX_ENVIRONMENT_REVISION"] != "2":
+		t.Fatalf("revision env: %v", env)
+	case c.Resources.Limits.Cpu().String() != "3" || c.Resources.Limits.Memory().String() != "4Gi" || c.Resources.Requests.Memory().String() != "2Gi":
+		t.Fatalf("resources: %+v", c.Resources)
+	case pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "gvisor":
+		t.Fatal("runtime class from the launch")
+	}
+}
