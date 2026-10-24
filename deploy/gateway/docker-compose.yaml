@@ -34,6 +34,10 @@ services:
       K8S_NAMESPACE: ${K8S_NAMESPACE:-agent-sandbox}
       NETWORK_ATTACHMENT: ${NETWORK_ATTACHMENT:-agent-sandbox/sandbox-vlan}
       HARNESS_CMD: ${HARNESS_CMD:-claude -p "$$SANDBOX_TASK" --output-format stream-json --verbose}
+      # external secret providers (sandboxd.yaml secrets.provider vault | infisical)
+      VAULT_TOKEN: ${VAULT_TOKEN:-}
+      INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}
+      INFISICAL_CLIENT_SECRET: ${INFISICAL_CLIENT_SECRET:-}
     volumes:
       - ./sandboxd.yaml:/etc/sandbox/sandboxd.yaml:ro
       - ${POLICIES_DIR:-./policies}:/etc/sandbox/policies:ro

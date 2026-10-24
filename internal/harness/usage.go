@@ -41,6 +41,31 @@ func ParseUsage(line string) (u model.Usage, mode Mode, ok bool) {
 	return u, 0, false
 }
 
+// ParseSession pulls the harness's conversation id out of one output line, when it carries
+// one: Claude Code's stream-json lines have `session_id`, Codex's JSON events `thread_id`.
+// The control plane stores it on the run so a resume after a rollout can continue the same
+// conversation (`claude --resume`, `codex exec resume`).
+func ParseSession(line string) (string, bool) {
+	t := strings.TrimSpace(line)
+	if len(t) < 2 || t[0] != '{' || !strings.Contains(t, "session_id") && !strings.Contains(t, "thread_id") {
+		return "", false
+	}
+	var v struct {
+		SessionID string `json:"session_id"`
+		ThreadID  string `json:"thread_id"`
+	}
+	if json.Unmarshal([]byte(t), &v) != nil {
+		return "", false
+	}
+	switch {
+	case v.SessionID != "":
+		return v.SessionID, true
+	case v.ThreadID != "":
+		return v.ThreadID, true
+	}
+	return "", false
+}
+
 // claudeResult is the tail of Claude Code's `--output-format stream-json` stream.
 type claudeResult struct {
 	Type         string  `json:"type"`

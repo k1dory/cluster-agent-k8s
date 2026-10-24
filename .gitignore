@@ -3,3 +3,7 @@
 *.key
 *.pem
 !deploy/**/*.example.*
+/agent-runner
+/agent-init
+/sandboxd
+/sandboxctl

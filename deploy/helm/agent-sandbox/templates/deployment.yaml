@@ -7,9 +7,14 @@ metadata:
   name: {{ include "agent-sandbox.fullname" . }}
   labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.gateway.replicas }}
   strategy:
     type: Recreate
+  {{- if gt (int .Values.gateway.replicas) 1 }}
+  {{- if ne .Values.sandboxd.ca.source "db" }}
+  {{- fail "gateway.replicas > 1 requires sandboxd.ca.source: db (one agent CA shared through Postgres)" }}
+  {{- end }}
+  {{- end }}
   selector:
     matchLabels: {{- include "agent-sandbox.selector" . | nindent 6 }}
   template:
@@ -85,7 +90,8 @@ spec:
           secret: { secretName: {{ .Values.tenantSecretsSecret }} }
         {{- end }}
 ---
-# Agent CA key and rendered Caddyfile. Losing the CA key means re-issuing every identity: back it up.
+# Agent CA key (ca.source file) and rendered Caddyfile. Losing the CA key means re-issuing every
+# identity: back it up. With ca.source db the key lives in Postgres and this volume is scratch.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

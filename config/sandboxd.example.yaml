@@ -7,17 +7,55 @@ api_token: "${SANDBOXD_API_TOKEN}"
 # Tenant-scoped tokens: each sees only its own sandboxes, runs, events, usage and trace.
 # api_tokens:
 #   - { token: "${ACME_TOKEN}", tenant: acme }
+# OIDC: JWTs from this issuer are accepted next to the static tokens. The tenant comes from
+# tenant_claim (a string, or a list filtered by tenant_prefix), the admin role from admin_claim.
+# The token's expiry bounds the API session; with ttl_from_token also the sandboxes it creates
+# and the agent certificates issued inside them.
+# oidc:
+#   issuer: https://login.example.com/realms/platform
+#   client_id: sandboxd
+#   tenant_claim: groups
+#   tenant_prefix: "sandbox-tenant:"
+#   admin_claim: roles
+#   admin_value: sandbox-admin
+#   ttl_from_token: true
 # Quotas per tenant (0 = unlimited); `default` covers tenants not listed.
 quotas:
   default: { max_sandboxes: 0, max_awake: 0 }
   # tenants:
   #   acme: { max_sandboxes: 20, max_awake: 5 }
-database_url: "${DATABASE_URL}"   # empty = in-memory (dev only)
+database_url: "${DATABASE_URL}"   # empty = in-memory (dev only); required for more than one replica
 policies_dir: policies
-secrets_dir: /etc/sandbox/secrets  # tenants/<tenant>/<name>, shared/<name>
+policies_strict: false             # true: a policy without `tenants:` is admin-only, unknown slugs are refused
+secrets_dir: /etc/sandbox/secrets  # file provider: tenants/<tenant>/<name>, shared/<name>
+# secrets:                         # external provider instead of the directory
+#   provider: vault                # vault (HashiCorp Vault or OpenBao, KV v2) | infisical | file
+#   cache_ttl: 60s
+#   vault:
+#     addr: https://vault.example.com
+#     token: "${VAULT_TOKEN}"      # or kubernetes_role: sandboxd (login with the pod's SA token)
+#     mount: secret
+#     tenant_path: agent-sandbox/tenants/{tenant}   # keys of this KV secret are the names
+#     shared_path: agent-sandbox/shared
+#   infisical:
+#     site_url: https://app.infisical.com
+#     client_id: "${INFISICAL_CLIENT_ID}"
+#     client_secret: "${INFISICAL_CLIENT_SECRET}"
+#     project_id: ...
+#     environment: prod
+#     tenant_path: /tenants/{tenant}
+#     shared_path: /shared
 ca:
   dir: /var/lib/sandboxd/ca        # ca.crt + ca.key for agent identities (generated if missing)
+  source: file                     # db: one key shared by every replica through Postgres
   cert_ttl: 168h                   # 7 days; retirement on pod deletion is what actually revokes
+# Agent versions: names tenants may use as agent_version (create) or version (rollout); the admin
+# may also pass any image reference. default is used when a request names none.
+agent:
+  default: registry.example.com/agent-sandbox/agent:1.4.2
+  versions:
+    stable: registry.example.com/agent-sandbox/agent:1.4.2
+    canary: registry.example.com/agent-sandbox/agent:1.5.0-rc1
 gateway:                           # sandboxd configures Caddy and serves DNS from the policies
   ip: 10.77.77.1                   # this host's address on the sandbox VLAN
   caddy_admin: http://127.0.0.1:2019
@@ -44,6 +82,11 @@ kube:
   memory_request: 1Gi
   memory_limit: 4Gi
   harness_command: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose'
+  # Continues a run that a forced rollout interrupted: $SANDBOX_SESSION is the harness session id
+  # captured from its output, $SANDBOX_RESUME_PROMPT the continuation text (resume_prompt below).
+  harness_resume_command: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose'
+  # Codex: 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'
+  resume_prompt: ""
   env:
     ANTHROPIC_BASE_URL: https://api.anthropic.com   # the gateway injects the real key
 sandbox:

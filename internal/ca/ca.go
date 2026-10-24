@@ -3,6 +3,7 @@
 package ca
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -231,4 +232,60 @@ func ParseCSR(p []byte) (*x509.CertificateRequest, error) {
 		return nil, errors.New("no CERTIFICATE REQUEST block")
 	}
 	return x509.ParseCertificateRequest(b.Bytes)
+}
+
+// Bundle serialises the CA as certificate PEM followed by key PEM, for a shared store.
+func (c *CA) Bundle() ([]byte, error) {
+	keyDER, err := x509.MarshalECPrivateKey(c.key.(*ecdsa.PrivateKey))
+	if err != nil {
+		return nil, err
+	}
+	return append(append([]byte{}, c.pem...), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})...), nil
+}
+
+// ParseBundle reads what Bundle wrote.
+func ParseBundle(b []byte) (*CA, error) {
+	var certPEM, keyPEM []byte
+	rest := b
+	for {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		switch blk.Type {
+		case "CERTIFICATE":
+			certPEM = pem.EncodeToMemory(blk)
+		case "EC PRIVATE KEY", "PRIVATE KEY":
+			keyPEM = pem.EncodeToMemory(blk)
+		}
+	}
+	if certPEM == nil || keyPEM == nil {
+		return nil, errors.New("ca bundle: certificate or key missing")
+	}
+	return Parse(certPEM, keyPEM)
+}
+
+// Blobs is where a shared CA lives (the store's GetOrCreateBlob).
+type Blobs interface {
+	GetOrCreateBlob(ctx context.Context, name string, create func() ([]byte, error)) ([]byte, error)
+}
+
+// BlobName is the store key of the shared agent CA.
+const BlobName = "agent-ca"
+
+// LoadOrCreateShared returns the CA every replica shares: generated once by whoever gets to
+// the store first, read by everyone else.
+func LoadOrCreateShared(ctx context.Context, st Blobs) (*CA, error) {
+	data, err := st.GetOrCreateBlob(ctx, BlobName, func() ([]byte, error) {
+		c, err := Generate("agent-sandbox agent CA", 10*365*24*time.Hour)
+		if err != nil {
+			return nil, err
+		}
+		return c.Bundle()
+	})
+	if err != nil {
+		return nil, err
+	}
+	return ParseBundle(data)
 }

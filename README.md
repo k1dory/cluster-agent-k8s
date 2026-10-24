@@ -16,11 +16,15 @@ gateway (Caddy) that enforces per-agent host+path policy and injects secrets, an
 
 Policy-as-Code: `policies/*.yaml` is the single source of truth. From it sandboxd renders the
 Caddy configuration (one TLS site per host, client-certificate check, header stripping), answers
-DNS for exactly those names and decides every request. Nobody edits the gateway by hand.
+DNS for exactly those names and decides every request. Nobody edits the gateway by hand. A policy
+also says which tenants own the slug, so a tenant cannot borrow another agent's rights.
+
+Everything is driven through one API: sandboxes, runs, previews, usage, trace, agent versions and
+rollouts, with static tokens or OIDC. Several `sandboxd` replicas can share one Postgres.
 
 ```
 cmd/sandboxd        control plane binary (+ `sandboxd policy validate|test|render`)
-cmd/sandboxctl      CLI over the API: create, run, watch, say, cancel, sleep, wake, preview, delete
+cmd/sandboxctl      CLI over the API: create, run, watch, say, cancel, sleep, wake, preview, rollout, version, delete
 cmd/agent-init      pod init container: key + CSR → Registrar → certificate, client-cert config
 cmd/agent-runner    pod main process: long-polls runs, executes the harness, streams output
 api/openapi.yaml    API spec (served at /openapi.yaml, Swagger UI at /docs)
@@ -30,7 +34,8 @@ deploy/helm/        Helm chart: gateway on a cluster node (mode node) or cluster
 deploy/k8s/         the same, rendered to plain manifests for kubectl apply (-k)
 deploy/ansible/     playbooks: cluster.yaml (manifests, Secret, node label, token) and gateway.yaml (the VM)
 images/             Dockerfiles for sandboxd, the agent image, an optional Caddy build with a DNS module
-internal/           policy, gateway (Caddy render/push, DNS), identity, ca, registrar, authz, orchestrator, kube, ingress, store, httpapi
+internal/           policy, gateway (Caddy render/push, DNS), identity, ca, registrar, authz, orchestrator, kube, ingress, store, httpapi, oidc, secrets
+internal/integration  the gateway path end to end on a real Caddy (make integration)
 ```
 
 ## Install
@@ -72,6 +77,29 @@ sandboxd policy render -config sandboxd.yaml           # the Caddyfile that will
 touches `policies/`. After merge, `helm upgrade` (or a `git pull` of the policies directory on the
 VM) is enough: sandboxd reloads, re-renders and pushes the gateway configuration within seconds.
 
+### Ownership: which tenant may run which agent
+
+```yaml
+slug: netops
+tenants: [netops, platform]   # "*" = every tenant; absent = open (or admin-only with policies_strict)
+allow: ...
+```
+
+`POST /v1/sandboxes` with a slug the tenant does not own is 403, so are rollouts by that slug. The
+admin token is never restricted. `policies_strict: true` turns the default around: a policy without
+a `tenants` list is admin-only and a slug without a policy file is refused instead of falling back
+to `default`.
+
+### How the gateway is generated and tested
+
+Caddy sorts directives in a fixed order, so every site is rendered as an explicit `route {}`: strip
+what the agent sent in identity and injected headers, `forward_auth` to sandboxd, copy the verdict
+headers (identity plus injected secrets) onto the request, proxy. `make integration` starts a real
+`caddy` (from `PATH` or `CADDY_BIN`), pushes the rendered configuration through the admin API,
+bootstraps an identity through the registrar site and checks injection, stripping, policy denial,
+the agent API and identity retirement end to end. CI runs it for Caddy 2.8, 2.9 and 2.10 (the
+configuration needs 2.8 or newer for `trust_pool inline`).
+
 ## Use it
 
 Everything goes through the API (`/docs` for Swagger UI); `sandboxctl` wraps it:
@@ -84,12 +112,89 @@ sandboxctl watch sb_1234                 # live output, status changes, your own
 sandboxctl say sb_1234 run_5678 "use pytest, not unittest"
 sandboxctl preview sb_1234 -port 3000    # https://shop-alice.preview.example.com
 sandboxctl sleep sb_1234                 # or wait an hour of silence
+sandboxctl version                       # control plane build, agent versions, env version per slug
+sandboxctl rollout -version canary -slug backend-dev -percent 10
 ```
+
+### Agent versions and rollouts
+
+Every sandbox reports `agent_version` (the agent image its pod runs), `env_version` (a fingerprint
+of the policy content, harness command, image and pod environment it was started under) and, while
+a rollout is pending, `desired_version`. `GET /v1/version` returns the control plane build, the
+version catalogue and the current environment version per slug, so drift is one comparison away.
+
+```yaml
+agent:
+  default: registry.example.com/agent-sandbox/agent:1.4.2
+  versions:
+    stable: registry.example.com/agent-sandbox/agent:1.4.2
+    canary: registry.example.com/agent-sandbox/agent:1.5.0-rc1
+```
+
+Tenants name versions from the catalogue; the admin may pass any image reference.
+
+```sh
+sandboxctl rollout -version canary -slug backend-dev -percent 10   # canary: a stable 10% of the slug
+sandboxctl rollout -version canary -slug backend-dev               # the rest, when the canary looks good
+sandboxctl rollout -version stable -instance 42                    # one agent by its identity number
+sandboxctl rollout -version stable -all -force                     # admin: everyone, now
+```
+
+Per sandbox the mode is `wake` (asleep: applied on the next wake), `now` (running and idle: the pod
+is replaced, the identity retired and reissued), `deferred` (a run is in progress: applied when it
+finishes) or, with `-force`, `forced`: the run is cancelled, the pod replaced and a resume run is
+queued that carries the harness session id captured from the output stream (Claude Code
+`session_id`, Codex `thread_id`). The runner continues it with `harness_resume_command`
+(default `claude --resume`; for Codex `codex exec resume "$SANDBOX_SESSION" ...`). The workspace
+volume keeps the harness's own session files, so the conversation goes on in the new pod. Every
+decision is a `rollout` event in the trace; every run records the `agent_version` that executed it.
+
+### High availability
+
+`sandboxd` is stateless apart from Postgres. With `database_url` set and `ca.source: db` (one agent
+CA shared through the database) any number of replicas can run at once: every write is checked
+against the record's `revision`, quota decisions happen under a tenant lock shared by all replicas,
+the reconciler (idle sleep, expiry, deferred rollouts, refused deletes, pods a dead replica left
+behind) runs on the replica holding the leadership lease, and events appended by one replica reach
+the SSE clients of the others through `LISTEN/NOTIFY`. Each replica drives its own Caddy and DNS,
+so in the node layout you label several gateway nodes and put a VIP or DNS round-robin in front
+(`gateway.replicas` in the chart, which refuses more than one replica without `ca.source: db`).
+
+### Authentication: static tokens or OIDC
+
+```yaml
+oidc:
+  issuer: https://login.example.com/realms/platform
+  client_id: sandboxd
+  tenant_claim: groups
+  tenant_prefix: "sandbox-tenant:"      # groups ["sandbox-tenant:acme"] → tenant acme
+  admin_claim: roles
+  admin_value: sandbox-admin
+  ttl_from_token: true
+```
+
+A JWT from the issuer is verified against its JWKS (signature, issuer, audience, expiry) and mapped
+to a tenant or the admin role; `GET /v1/whoami` shows the result. The token's expiry bounds the API
+session and, with `ttl_from_token`, the sandboxes it creates: their `expires_at` is capped at the
+token's expiry and the agent certificates issued inside them cannot outlive the sandbox. Static
+`api_token` / `api_tokens[]` keep working next to it.
+
+### Secrets: directory, Vault/OpenBao or Infisical
+
+`secret:NAME` references in policies are resolved per tenant with a shared fallback, from a mounted
+directory (`secrets_dir`), from HashiCorp Vault or OpenBao KV v2 (`secrets.provider: vault`, token
+or Kubernetes auth) or from Infisical (`secrets.provider: infisical`, machine identity). Values are
+cached for `cache_ttl` and only ever appear in the gateway's response to Caddy, never in a pod.
 
 ### API contract in short
 
 - **Tokens.** `api_token` is the admin; `api_tokens[]` are tenant-scoped: creation forces the tenant,
-  foreign sandboxes are 403, lists, usage and trace are filtered. `GET /v1/whoami` tells which you hold.
+  foreign sandboxes are 403, lists, usage and trace are filtered. With `oidc`, JWTs are accepted
+  too. `GET /v1/whoami` tells which you hold and when it expires.
+- **Ownership.** A slug outside the policy's `tenants` list is 403; a version outside the catalogue
+  is 403 for tenants.
+- **Revisions.** Every sandbox carries `revision`; writes are conditional on it, so two replicas
+  (or two clients) never overwrite each other silently.
 - **Errors** are `{error, code, request_id}` with a stable `code`; `X-Request-Id` is echoed and logged.
   Malformed query parameters are 400, never silently defaulted.
 - **Paging.** `limit` + `after` on lists; `X-Next-Cursor` appears only when a next page exists and
@@ -124,6 +229,8 @@ from the harness (Claude Code's stream-json `result` line is understood; others 
 ## Run locally (no Kubernetes)
 
 ```sh
+make test           # unit tests
+make integration    # the gateway on a real caddy (CADDY_BIN=... or caddy on PATH)
 make dev            # fake runtime, in-memory store, API on 127.0.0.1:8080, token dev-token, DNS on 127.0.0.1:15353
 SANDBOXD_TOKEN=dev-token go run ./cmd/sandboxctl create -name shop -slug backend-dev -owner alice
 dig @127.0.0.1 -p 15353 git.example.com

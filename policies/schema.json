@@ -16,6 +16,11 @@
         "description": { "type": "string" }
       }
     },
+    "tenants": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "description": "Tenants that may create sandboxes and roll out agents with this slug; \"*\" means every tenant. Absent: open in permissive mode, admin-only when policies_strict is set."
+    },
     "allow": {
       "type": "array",
       "items": {

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -44,5 +45,46 @@ func TestRunScopeAndCursor(t *testing.T) {
 	}
 	if _, err := ParseCursor("not-a-cursor!"); err == nil {
 		t.Fatal("malformed cursor must fail")
+	}
+}
+
+func TestRevisionConflictAndTouch(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+	sb := &model.Sandbox{ID: "sb1", Status: model.StatusRunning, CreatedAt: time.Now(), LastActivity: time.Now().Add(-time.Hour)}
+	if err := m.CreateSandbox(ctx, sb); err != nil || sb.Revision != 1 {
+		t.Fatalf("create: %v rev=%d", err, sb.Revision)
+	}
+	a, _ := m.GetSandbox(ctx, "sb1")
+	b, _ := m.GetSandbox(ctx, "sb1")
+	a.Status = model.StatusSleeping
+	if err := m.UpdateSandbox(ctx, a); err != nil || a.Revision != 2 {
+		t.Fatalf("first writer: %v rev=%d", err, a.Revision)
+	}
+	b.Status = model.StatusError
+	if err := m.UpdateSandbox(ctx, b); !errors.Is(err, ErrConflict) {
+		t.Fatalf("stale writer must get ErrConflict, got %v", err)
+	}
+	// Touch never bumps the revision, so a writer holding the current record still succeeds.
+	now := time.Now()
+	if err := m.TouchSandbox(ctx, "sb1", now); err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := m.GetSandbox(ctx, "sb1")
+	if cur.Revision != 2 || !cur.LastActivity.Equal(now) || cur.Status != model.StatusSleeping {
+		t.Fatalf("after touch: %+v", cur)
+	}
+	a.IdleTimeout = 7
+	if err := m.UpdateSandbox(ctx, a); err != nil {
+		t.Fatalf("writer with the current revision after a touch: %v", err)
+	}
+	if _, err := m.GetOrCreateBlob(ctx, "k", func() ([]byte, error) { return []byte("v1"), nil }); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := m.GetOrCreateBlob(ctx, "k", func() ([]byte, error) { return []byte("v2"), nil }); string(v) != "v1" {
+		t.Fatalf("blob must be created once, got %s", v)
+	}
+	if lease, held, err := m.TryLead(ctx, "x"); err != nil || !held || lease.Ping(ctx) != nil {
+		t.Fatal("memory store always leads")
 	}
 }

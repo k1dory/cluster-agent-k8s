@@ -39,18 +39,35 @@ type Platform struct {
 	Pricing  usage.Pricing
 	Token    string            // admin token: every tenant, every sandbox
 	Tenants  map[string]string // tenant-scoped tokens: token → tenant
-	Log      *slog.Logger
+	// Verifier checks bearer tokens that are not static ones (OIDC JWTs). nil disables.
+	Verifier TokenVerifier
+	// TTLFromToken caps the lifetime of sandboxes created with a short-lived token (and so
+	// their agent certificates) at the token's expiry.
+	TTLFromToken bool
+	Build        string // control-plane version reported by GET /v1/version
+	Log          *slog.Logger
 }
 
-// principal is who is calling: the admin (tenant "") or one tenant.
-type principal struct{ tenant string }
+// Principal is who is calling: the admin (every tenant) or one tenant. Expires is set for
+// credentials with a lifetime of their own (OIDC tokens); zero for static tokens.
+type Principal struct {
+	Tenant  string    `json:"tenant"`
+	Admin   bool      `json:"admin"`
+	Subject string    `json:"subject,omitempty"`
+	Expires time.Time `json:"expires,omitempty"`
+}
 
-func (pr principal) admin() bool { return pr.tenant == "" }
+func (pr Principal) admin() bool { return pr.Admin }
+
+// TokenVerifier resolves a bearer token that is not one of the configured static tokens.
+type TokenVerifier interface {
+	Verify(ctx context.Context, token string) (Principal, error)
+}
 
 type principalKey struct{}
 
-func principalOf(r *http.Request) principal {
-	pr, _ := r.Context().Value(principalKey{}).(principal)
+func principalOf(r *http.Request) Principal {
+	pr, _ := r.Context().Value(principalKey{}).(Principal)
 	return pr
 }
 
@@ -85,11 +102,49 @@ func (p *Platform) Routes() http.Handler {
 	}))
 	mux.HandleFunc("GET /v1/usage", p.auth(p.usage))
 	mux.HandleFunc("GET /v1/trace", p.auth(p.trace))
+	mux.HandleFunc("POST /v1/rollouts", p.auth(p.rollout))
+	mux.HandleFunc("GET /v1/version", p.auth(p.version))
 	mux.HandleFunc("GET /v1/whoami", p.auth(func(w http.ResponseWriter, r *http.Request) {
-		pr := principalOf(r)
-		writeJSON(w, http.StatusOK, map[string]any{"admin": pr.admin(), "tenant": pr.tenant})
+		writeJSON(w, http.StatusOK, principalOf(r))
 	}))
 	return logRequests(p.Log, jsonMuxErrors(mux))
+}
+
+// rollout answers POST /v1/rollouts: move agents to another version (see orchestrator.RolloutRequest).
+func (p *Platform) rollout(w http.ResponseWriter, r *http.Request) {
+	var req orchestrator.RolloutRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	pr := principalOf(r)
+	req.Admin, req.Tenant = pr.admin(), pr.Tenant
+	res, err := p.Orch.Rollout(r.Context(), req)
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// version answers GET /v1/version: what this control plane runs and what agents it hands out.
+func (p *Platform) version(w http.ResponseWriter, r *http.Request) {
+	cfg := p.Orch.Cfg
+	envs := map[string]string{}
+	if p.Policies != nil {
+		for _, slug := range p.Policies.Slugs() {
+			envs[slug] = cfg.EnvVersion(&model.Sandbox{Slug: slug, AgentVersion: cfg.DefaultAgentVersion})
+		}
+	}
+	versions := cfg.Versions
+	if versions == nil {
+		versions = map[string]string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sandboxd": p.Build,
+		"agent":    map[string]any{"default": cfg.DefaultAgentVersion, "versions": versions},
+		"env":      envs,
+	})
 }
 
 // jsonMuxErrors turns the router's own text 404/405 into the API's error shape.
@@ -146,14 +201,22 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		got := []byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-		var pr *principal
+		var pr *Principal
 		if p.Token != "" && subtle.ConstantTimeCompare(got, []byte(p.Token)) == 1 {
-			pr = &principal{}
+			pr = &Principal{Admin: true, Subject: "admin-token"}
 		}
 		for tok, tenant := range p.Tenants { // no early exit: timing stays independent of the match position
 			if subtle.ConstantTimeCompare(got, []byte(tok)) == 1 && pr == nil {
-				pr = &principal{tenant: tenant}
+				pr = &Principal{Tenant: tenant, Subject: "tenant-token"}
 			}
+		}
+		if pr == nil && p.Verifier != nil && strings.Count(string(got), ".") == 2 {
+			v, err := p.Verifier.Verify(r.Context(), string(got))
+			if err != nil {
+				writeErr(w, http.StatusUnauthorized, fmt.Errorf("token: %w", err))
+				return
+			}
+			pr = &v
 		}
 		if pr == nil {
 			writeErr(w, http.StatusUnauthorized, errors.New("bad token"))
@@ -170,7 +233,7 @@ func (p *Platform) sandbox(w http.ResponseWriter, r *http.Request) (*model.Sandb
 		writeOrchErr(w, err)
 		return nil, false
 	}
-	if pr := principalOf(r); !pr.admin() && sb.Tenant != pr.tenant {
+	if pr := principalOf(r); !pr.admin() && sb.Tenant != pr.Tenant {
 		writeErr(w, http.StatusForbidden, errors.New("sandbox belongs to another tenant"))
 		return nil, false
 	}
@@ -183,11 +246,11 @@ func tenantScope(w http.ResponseWriter, r *http.Request, requested string) (stri
 	if pr.admin() {
 		return requested, true
 	}
-	if requested != "" && requested != pr.tenant {
-		writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.tenant))
+	if requested != "" && requested != pr.Tenant {
+		writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.Tenant))
 		return "", false
 	}
-	return pr.tenant, true
+	return pr.Tenant, true
 }
 
 // idempotent replays the stored response when the client repeats a request with the same
@@ -211,7 +274,7 @@ func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		sum := sha256.Sum256(body)
 		hash := hex.EncodeToString(sum[:])
-		full := principalOf(r).tenant + "|" + r.Method + " " + r.URL.Path + "|" + key
+		full := principalOf(r).Tenant + "|" + r.Method + " " + r.URL.Path + "|" + key
 		// The reservation is the lock: concurrent repeats see it and wait, a repeat with another
 		// body is refused, and a finished request is replayed from the stored response.
 		existing, reserved, err := p.Orch.Store.ReserveIdempotent(r.Context(), full, hash)
@@ -299,12 +362,17 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if pr := principalOf(r); !pr.admin() {
-		if req.Tenant != "" && req.Tenant != pr.tenant {
-			writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.tenant))
+	pr := principalOf(r)
+	if !pr.admin() {
+		if req.Tenant != "" && req.Tenant != pr.Tenant {
+			writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.Tenant))
 			return
 		}
-		req.Tenant = pr.tenant
+		req.Tenant = pr.Tenant
+	}
+	req.Admin = pr.admin()
+	if p.TTLFromToken && !pr.Expires.IsZero() {
+		req.ExpiresBefore = pr.Expires
 	}
 	sb, err := p.Orch.Create(r.Context(), req)
 	if err != nil && sb == nil {
@@ -843,7 +911,9 @@ func writeOrchErr(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusNotFound, err)
 	case errors.Is(err, orchestrator.ErrBadRequest):
 		writeErr(w, http.StatusBadRequest, err)
-	case errors.Is(err, orchestrator.ErrConflict):
+	case errors.Is(err, orchestrator.ErrForbidden):
+		writeErr(w, http.StatusForbidden, err)
+	case errors.Is(err, orchestrator.ErrConflict), errors.Is(err, store.ErrConflict):
 		writeErr(w, http.StatusConflict, err)
 	case errors.Is(err, orchestrator.ErrQuota):
 		writeErr(w, http.StatusTooManyRequests, err)

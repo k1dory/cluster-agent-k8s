@@ -103,3 +103,22 @@ CREATE TABLE IF NOT EXISTS idempotency (
 );
 ALTER TABLE idempotency ADD COLUMN IF NOT EXISTS body_hash text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency (created_at);
+
+-- Agent versioning and optimistic locking (see model.Sandbox).
+ALTER TABLE sandboxes
+    ADD COLUMN IF NOT EXISTS agent_version text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS desired_version text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS env_version text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS revision bigint NOT NULL DEFAULT 1;
+CREATE INDEX IF NOT EXISTS sandboxes_instance ON sandboxes (instance);
+ALTER TABLE runs
+    ADD COLUMN IF NOT EXISTS agent_version text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS resume_of text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS session text NOT NULL DEFAULT '';
+
+-- Shared blobs: the agent CA (certificate + key) when replicas must sign with one key.
+CREATE TABLE IF NOT EXISTS blobs (
+    name       text PRIMARY KEY,
+    data       bytea NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);

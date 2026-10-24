@@ -15,6 +15,10 @@ What runs:
 | sandboxd | renders the Caddy config from the policies, pushes it on every policy change, fetches Caddy's internal root for the pods, serves DNS on the VLAN address, runs the control plane |
 | postgres | optional, state of sandboxes/runs/identities |
 
+Several gateway VMs can run the same compose stack against one Postgres (`ca.source: db` in
+`sandboxd.yaml`, a VIP or DNS round-robin in front): the control plane is replica-safe and the
+reconciler runs on whichever replica holds the leadership lease.
+
 Adding an external host is one edit in a policy file. sandboxd re-renders the Caddy site
 block, the DNS answer and the header stripping from it. The rendered Caddyfile is kept at
 `/var/lib/sandboxd/Caddyfile` inside the sandboxd volume for inspection (`sandboxd policy render` prints it too).
