@@ -115,6 +115,8 @@ ALTER TABLE runs
     ADD COLUMN IF NOT EXISTS agent_version text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS resume_of text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS session text NOT NULL DEFAULT '';
+-- Conversation continuity: how a run relates to the one it continues (resume | message).
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT '';
 
 -- Shared blobs: the agent CA (certificate + key) when replicas must sign with one key.
 CREATE TABLE IF NOT EXISTS blobs (

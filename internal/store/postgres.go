@@ -222,6 +222,33 @@ func (p *Postgres) GetOrCreateBlob(ctx context.Context, name string, create func
 	return data, nil
 }
 
+func (p *Postgres) PutBlob(ctx context.Context, name string, data []byte) error {
+	_, err := p.pool.Exec(ctx, `INSERT INTO blobs (name, data) VALUES ($1,$2) ON CONFLICT (name) DO UPDATE SET data=EXCLUDED.data, created_at=now()`, name, data)
+	return err
+}
+
+func (p *Postgres) GetBlob(ctx context.Context, name string) ([]byte, error) {
+	var data []byte
+	err := p.pool.QueryRow(ctx, `SELECT data FROM blobs WHERE name=$1`, name).Scan(&data)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return data, err
+}
+
+func (p *Postgres) DeleteBlob(ctx context.Context, name string) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM blobs WHERE name=$1`, name)
+	return err
+}
+
+func (p *Postgres) DeleteBlobsBefore(ctx context.Context, prefix string, t time.Time) (int, error) {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM blobs WHERE left(name, length($1)) = $1 AND created_at < $2`, prefix, t)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 const eventsChannel = "agent_sandbox_events"
 
 // ListenEvents feeds events appended by any replica to fn, in id order, until ctx ends.
@@ -416,14 +443,14 @@ func (p *Postgres) DeleteSandbox(ctx context.Context, id string) error {
 
 const runCols = `id, sandbox_id, tenant, slug, task, status, exit_code, created_at, started_at, finished_at,
 	model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, turns,
-	agent_version, resume_of, session, agent_ref, agent_revision, environment_ref, environment_revision`
+	agent_version, resume_of, session, agent_ref, agent_revision, environment_ref, environment_revision, mode`
 
 func scanRun(row pgx.Row) (*model.Run, error) {
 	var r model.Run
 	u := &r.Usage
 	err := row.Scan(&r.ID, &r.SandboxID, &r.Tenant, &r.Slug, &r.Task, &r.Status, &r.ExitCode, &r.CreatedAt, &r.StartedAt, &r.FinishedAt,
 		&u.Model, &u.InputTokens, &u.OutputTokens, &u.CacheRead, &u.CacheWrite, &u.CostUSD, &u.Turns,
-		&r.AgentVersion, &r.ResumeOf, &r.Session, &r.AgentRef, &r.AgentRevision, &r.EnvironmentRef, &r.EnvironmentRevision)
+		&r.AgentVersion, &r.ResumeOf, &r.Session, &r.AgentRef, &r.AgentRevision, &r.EnvironmentRef, &r.EnvironmentRevision, &r.Mode)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -435,10 +462,10 @@ func scanRun(row pgx.Row) (*model.Run, error) {
 
 func (p *Postgres) CreateRun(ctx context.Context, r *model.Run) error {
 	u := r.Usage
-	_, err := p.pool.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
+	_, err := p.pool.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
 		r.ID, r.SandboxID, r.Tenant, r.Slug, r.Task, r.Status, r.ExitCode, r.CreatedAt, r.StartedAt, r.FinishedAt,
 		u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
-		r.AgentVersion, r.ResumeOf, r.Session, r.AgentRef, r.AgentRevision, r.EnvironmentRef, r.EnvironmentRevision)
+		r.AgentVersion, r.ResumeOf, r.Session, r.AgentRef, r.AgentRevision, r.EnvironmentRef, r.EnvironmentRevision, r.Mode)
 	return err
 }
 

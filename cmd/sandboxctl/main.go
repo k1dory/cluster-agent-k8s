@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -43,6 +44,12 @@ const usage = `sandboxctl <command> [flags]
   get      <sandbox>
   update   <sandbox> [-idle 600] [-ttl 0] [-wake-on-preview=true] [-repo url]
   run      <sandbox> "task text" [-key k]  queue a task (wakes the sandbox)
+  chat     <sandbox> [-raw]                 talk to the agent: replay, then your lines go in, its answers come out
+                                           (/attach <file>, /files [path], /close, /quit)
+  messages <sandbox> [-after n] [-raw] [-json]   the conversation so far (one page)
+  files    <sandbox> [path] [-depth 1] [-json]   list the workspace (wakes a sleeping sandbox)
+  cat      <sandbox> <path>                 print a workspace file
+  put      <sandbox> <local> [remote]       upload a file into the workspace (default uploads/<name>)
   runs     <sandbox> [run] [-status queued] [-n 100] [-after cursor]
   watch    <sandbox> [-run id] [-after n]  follow the event stream (SSE)
   events   <sandbox> [-run id] [-after n] [-n 1000] [-json]   one JSON page of the log
@@ -429,6 +436,85 @@ func (c *cli) run(cmd string, args []string) error {
 			return err
 		}
 		printJSON(r)
+	case "chat":
+		raw := fs.Bool("raw", false, "also show harness output that is not a message")
+		_ = fs.Parse(flags)
+		return c.chat(need(pos, 0, "sandbox"), *raw)
+	case "messages":
+		after := fs.Int64("after", 0, "continue after this message id")
+		raw := fs.Bool("raw", false, "include harness output that is not a message")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(flags)
+		var msgs []model.Message
+		if err := c.do("GET", fmt.Sprintf("/v1/sandboxes/%s/messages?after=%d&raw=%v", need(pos, 0, "sandbox"), *after, *raw), nil, &msgs); err != nil {
+			return err
+		}
+		if *asJSON {
+			printJSON(msgs)
+			return nil
+		}
+		for _, m := range msgs {
+			printMessage(m)
+		}
+	case "files":
+		depth := fs.Int("depth", 1, "levels to list (1..8)")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(flags)
+		dir := ""
+		if len(pos) > 1 {
+			dir = pos[1]
+		}
+		var out struct {
+			Entries   []model.FSEntry `json:"entries"`
+			Truncated bool            `json:"truncated"`
+		}
+		if err := c.do("GET", fmt.Sprintf("/v1/sandboxes/%s/files?path=%s&depth=%d", need(pos, 0, "sandbox"), url.QueryEscape(dir), *depth), nil, &out); err != nil {
+			return err
+		}
+		if *asJSON {
+			printJSON(out)
+			return nil
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "TYPE\tSIZE\tMODIFIED\tPATH")
+		for _, e := range out.Entries {
+			size := ""
+			if e.Type == "file" {
+				size = fmt.Sprint(e.Size)
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%s\n", e.Type, size, e.ModTime.Local().Format("2006-01-02 15:04"), e.Path)
+		}
+		tw.Flush()
+		if out.Truncated {
+			fmt.Println("(listing truncated)")
+		}
+	case "cat":
+		_ = fs.Parse(flags)
+		resp, err := c.raw("GET", "/v1/sandboxes/"+need(pos, 0, "sandbox")+"/files/content?path="+url.QueryEscape(need(pos, 1, "path")), "", nil)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		_, err = io.Copy(os.Stdout, resp.Body)
+		return err
+	case "put":
+		_ = fs.Parse(flags)
+		local := need(pos, 1, "local file")
+		remote := "uploads/" + filepath.Base(local)
+		if len(pos) > 2 {
+			remote = pos[2]
+		}
+		f, err := os.Open(local)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		resp, err := c.raw("PUT", "/v1/sandboxes/"+need(pos, 0, "sandbox")+"/files/content?path="+url.QueryEscape(remote), "application/octet-stream", f)
+		if err != nil {
+			return err
+		}
+		resp.Body.Close()
+		fmt.Println("uploaded", remote)
 	case "runs":
 		q := url.Values{}
 		for _, name := range []string{"status", "after"} {
@@ -847,6 +933,164 @@ func (c *cli) watch(id, runID string, after int64, raw bool) error {
 		}
 		return e.Type == model.EventRunDone && runID != "" && e.RunID == runID
 	})
+}
+
+// raw performs a request with an arbitrary body and returns the response (the caller closes
+// it); a non-2xx status is an error with the server's message.
+func (c *cli) raw(method, path, contentType string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(method, c.base+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		var e struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(data, &e)
+		if e.Error == "" {
+			e.Error = strings.TrimSpace(string(data))
+		}
+		return nil, fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, e.Error)
+	}
+	return resp, nil
+}
+
+func printMessage(m model.Message) {
+	at := m.At.Local().Format("15:04:05")
+	switch m.Role {
+	case model.RoleUser:
+		fmt.Printf("%s you » %s\n", at, m.Text)
+	case model.RoleAssistant:
+		fmt.Printf("%s agent: %s\n", at, m.Text)
+	case model.RoleTool:
+		fmt.Printf("%s   ⚙ %s\n", at, m.Text)
+	case model.RoleLog:
+		fmt.Printf("%s   | %s\n", at, m.Text)
+	default:
+		fmt.Printf("%s [%s]\n", at, m.Text)
+	}
+}
+
+// chat replays the conversation, follows it live and sends what you type. Lines starting
+// with / are commands: /attach <file>, /files [path], /close, /quit.
+func (c *cli) chat(id string, raw bool) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	var after int64
+	for {
+		var msgs []model.Message
+		resp, err := c.raw("GET", fmt.Sprintf("/v1/sandboxes/%s/messages?after=%d&raw=%v", id, after, raw), "", nil)
+		if err != nil {
+			return err
+		}
+		next, _ := strconv.ParseInt(resp.Header.Get("X-Next-Cursor"), 10, 64)
+		_ = json.NewDecoder(resp.Body).Decode(&msgs)
+		resp.Body.Close()
+		for _, m := range msgs {
+			printMessage(m)
+		}
+		if next <= after {
+			break
+		}
+		after = next
+	}
+	fmt.Println("— type a message and press Enter; /attach <file>, /files [path], /close, /quit —")
+	go c.followMessages(ctx, id, after, raw)
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
+	for ctx.Err() == nil && sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		var err error
+		switch cmd, arg, _ := strings.Cut(line, " "); cmd {
+		case "/quit", "/exit":
+			return nil
+		case "/close":
+			err = c.do("POST", "/v1/sandboxes/"+id+"/messages/close", nil, nil)
+		case "/files":
+			var out struct {
+				Entries []model.FSEntry `json:"entries"`
+			}
+			if err = c.do("GET", "/v1/sandboxes/"+id+"/files?path="+url.QueryEscape(strings.TrimSpace(arg)), nil, &out); err == nil {
+				for _, e := range out.Entries {
+					fmt.Printf("  %-8s %s\n", e.Type, e.Path)
+				}
+			}
+		case "/attach":
+			local := strings.TrimSpace(arg)
+			remote := "uploads/" + filepath.Base(local)
+			var f *os.File
+			if f, err = os.Open(local); err == nil {
+				var resp *http.Response
+				resp, err = c.raw("PUT", "/v1/sandboxes/"+id+"/files/content?path="+url.QueryEscape(remote), "application/octet-stream", f)
+				f.Close()
+				if err == nil {
+					resp.Body.Close()
+					err = c.do("POST", "/v1/sandboxes/"+id+"/messages", map[string]any{"text": "", "attachments": []string{remote}}, nil)
+				}
+			}
+		default:
+			err = c.do("POST", "/v1/sandboxes/"+id+"/messages", map[string]any{"text": line}, nil)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "chat:", err)
+		}
+	}
+	return nil
+}
+
+// followMessages prints the conversation as it grows (SSE, reconnecting with Last-Event-ID).
+func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bool) {
+	for ctx.Err() == nil {
+		req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/sandboxes/%s/messages/stream?raw=%v", c.base, id, raw), nil)
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Accept", "text/event-stream")
+		if after > 0 {
+			req.Header.Set("Last-Event-ID", fmt.Sprint(after))
+		}
+		resp, err := (&http.Client{}).Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if resp.StatusCode != 200 {
+			resp.Body.Close()
+			fmt.Fprintln(os.Stderr, "chat: stream:", resp.Status)
+			return
+		}
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
+		for sc.Scan() {
+			line := sc.Text()
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var m model.Message
+			if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) != nil {
+				continue
+			}
+			after = m.ID
+			if m.Role != model.RoleUser { // what you typed is already on your screen
+				printMessage(m)
+			}
+		}
+		resp.Body.Close()
+	}
 }
 
 // follow reads an SSE endpoint, reconnecting with Last-Event-ID. print returns true to stop;

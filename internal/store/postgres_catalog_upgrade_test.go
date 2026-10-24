@@ -124,3 +124,45 @@ func TestReviewPostgresSandboxConnections(t *testing.T) {
 		t.Fatalf("connections after update: %v %+v", err, again)
 	}
 }
+
+// Run mode and transfer blobs round-trip through PostgreSQL.
+func TestReviewPostgresRunModeAndBlobs(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, true))
+	ctx := t.Context()
+	if legacy, err := p.GetRun(ctx, "legacy-run"); err != nil || legacy.Mode != "" {
+		t.Fatalf("legacy run: %v %+v", err, legacy)
+	}
+	now := time.Now()
+	r := &model.Run{ID: "chat-run", SandboxID: "legacy-sandbox", Task: "next message", Status: model.RunQueued, CreatedAt: now,
+		ResumeOf: "legacy-run", Session: "sess-1", Mode: model.RunMessage}
+	if err := p.CreateRun(ctx, r); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := p.GetRun(ctx, r.ID); err != nil || got.Mode != model.RunMessage || got.Session != "sess-1" || got.ResumeOf != "legacy-run" {
+		t.Fatalf("run mode: %v %+v", err, got)
+	}
+	if err := p.PutBlob(ctx, "fs/sb/one", []byte("content")); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.PutBlob(ctx, "fs/sb/one", []byte("replaced")); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := p.GetBlob(ctx, "fs/sb/one"); err != nil || string(b) != "replaced" {
+		t.Fatalf("blob: %v %q", err, b)
+	}
+	if err := p.PutBlob(ctx, "other/keep", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := p.DeleteBlobsBefore(ctx, "fs/", time.Now().Add(time.Minute)); err != nil || n != 1 {
+		t.Fatalf("purge by prefix: %v %d", err, n)
+	}
+	if _, err := p.GetBlob(ctx, "fs/sb/one"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("purged blob: %v", err)
+	}
+	if b, err := p.GetBlob(ctx, "other/keep"); err != nil || string(b) != "x" {
+		t.Fatalf("other prefix kept: %v", err)
+	}
+	if err := p.DeleteBlob(ctx, "other/keep"); err != nil {
+		t.Fatal(err)
+	}
+}

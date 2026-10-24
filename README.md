@@ -176,6 +176,20 @@ harness inside it; a checkout whose origin differs from the sandbox's `repo` is 
 the right repository cloned, never silently reused.
 `make smoke-image` runs the shipped image's pieces in Docker; CI builds both images on every PR.
 
+### Talking to the agent, reaching its workspace
+
+A sandbox is a conversation, not a one-shot task. `sandboxctl chat <sandbox>` replays what was
+said and lets you keep talking: a message reaches the running harness as input (with Claude
+Code's streaming input, `harness.input: stream-json`, the conversation stays open and the
+agent answers each message in the same process), and when no run is active the next message
+resumes the harness session in a new run (`resume_command` with `$SANDBOX_SESSION` and the
+message in `$SANDBOX_RESUME_PROMPT`). `/attach <file>` uploads into `/workspace/uploads/` and tells
+the agent; `/close` ends the open conversation cleanly. The transcript (`GET /messages`, SSE at
+`/messages/stream`) is derived from the event stream: user turns, assistant text, tool calls,
+run boundaries. Workspace access goes through the runner over the same mTLS channel:
+`files` (tree), `cat` (read), `put` (upload), each confined to `/workspace`. See
+[docs/chat-and-files.md](docs/chat-and-files.md).
+
 ### Agents and environments as versioned configuration
 
 Two catalogue resources describe what runs, per tenant (the admin also keeps shared ones):

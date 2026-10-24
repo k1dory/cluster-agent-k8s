@@ -185,6 +185,7 @@ var (
 	ErrForbidden  = errors.New("forbidden")
 	ErrConflict   = errors.New("conflict")
 	ErrQuota      = errors.New("quota exceeded")
+	ErrTimeout    = errors.New("timed out waiting for the agent pod")
 	ErrRuntime    = errors.New("runtime") // the cluster refused or failed; retry later
 )
 
@@ -1162,7 +1163,7 @@ func (o *Orchestrator) rolloutOne(ctx context.Context, sb *model.Sandbox, versio
 	}
 	var resumeID string
 	if resume {
-		nr, err := o.queueRun(ctx, sb.ID, &model.Run{Task: r.Task, ResumeOf: r.ID, Session: r.Session})
+		nr, err := o.queueRun(ctx, sb.ID, &model.Run{Task: r.Task, ResumeOf: r.ID, Session: r.Session, Mode: model.RunResume})
 		if err != nil {
 			item.Reason = strings.TrimSpace(item.Reason + " resume run not queued: " + err.Error())
 		} else {
@@ -1281,6 +1282,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 		o.Log.Error("reconcile", "err", err)
 		return
 	}
+	o.purgeFSBlobs(ctx)
 	now := time.Now()
 	for _, sb := range sbs {
 		switch {

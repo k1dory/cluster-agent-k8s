@@ -27,6 +27,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/resource"
 
+	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	res "agent-sandbox/internal/resource"
 	"agent-sandbox/internal/store"
@@ -58,6 +59,13 @@ type HarnessSpec struct {
 	Command       string `yaml:"command,omitempty" json:"command,omitempty"`
 	ResumeCommand string `yaml:"resume_command,omitempty" json:"resume_command,omitempty"`
 	ResumePrompt  string `yaml:"resume_prompt,omitempty" json:"resume_prompt,omitempty"`
+	// Input: "text" (default; a line on stdin) or "stream-json" (Claude Code's streaming
+	// input, which keeps the conversation open: follow-up messages reach the running harness).
+	// ChatIdle: seconds without a new message after a turn before the runner closes an open
+	// conversation (0 = runtime default, 600). Between runs the conversation continues through
+	// ResumeCommand with $SANDBOX_SESSION and the message in $SANDBOX_RESUME_PROMPT.
+	Input    string `yaml:"input,omitempty" json:"input,omitempty"`
+	ChatIdle *int   `yaml:"chat_idle,omitempty" json:"chat_idle,omitempty"`
 }
 
 // ModelSpec names the model and its client settings.
@@ -181,6 +189,12 @@ func (s *Service) validate(ctx context.Context, kind, tenant string, raw json.Ra
 		if err := validateResources(e.Resources); err != nil {
 			return nil, err
 		}
+		if e.Harness.Input != "" && e.Harness.Input != harness.InputText && e.Harness.Input != harness.InputStreamJSON {
+			return nil, fmt.Errorf("%w: spec.harness.input must be %s or %s", ErrInvalid, harness.InputText, harness.InputStreamJSON)
+		}
+		if e.Harness.ChatIdle != nil && *e.Harness.ChatIdle < 0 {
+			return nil, fmt.Errorf("%w: spec.harness.chat_idle must be >= 0", ErrInvalid)
+		}
 		if e.Lifecycle.IdleTimeout != nil && *e.Lifecycle.IdleTimeout < 0 || e.Lifecycle.TTL != nil && *e.Lifecycle.TTL < 0 {
 			return nil, fmt.Errorf("%w: spec.lifecycle values must be >= 0", ErrInvalid)
 		}
@@ -247,6 +261,13 @@ func (s *Service) validate(ctx context.Context, kind, tenant string, raw json.Ra
 		return json.Marshal(a)
 	}
 	return nil, fmt.Errorf("%w: unknown kind %q", ErrInvalid, kind)
+}
+
+func intOf(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
 }
 
 // RefOf is the reference string that names an item from tenant's point of view.
@@ -392,7 +413,8 @@ func (s *Service) Resolve(ctx context.Context, tenant, agentRef string, admin bo
 		AgentSpec: as, EnvSpec: es, Image: image,
 		Launch: model.Launch{
 			Image: image, HarnessCommand: es.Harness.Command, HarnessResumeCommand: es.Harness.ResumeCommand,
-			ResumePrompt: es.Harness.ResumePrompt, Model: es.Model.Name, Instructions: as.Instructions, Env: envVars,
+			ResumePrompt: es.Harness.ResumePrompt, HarnessInput: es.Harness.Input, ChatIdle: intOf(es.Harness.ChatIdle),
+			Model: es.Model.Name, Instructions: as.Instructions, Env: envVars,
 			CPURequest: es.Resources.CPURequest, CPULimit: es.Resources.CPULimit,
 			MemoryRequest: es.Resources.MemoryRequest, MemoryLimit: es.Resources.MemoryLimit,
 			VolumeSize: es.Resources.VolumeSize, RuntimeClass: es.RuntimeClass,

@@ -1,5 +1,7 @@
 // agent-runner is PID 1 of the agent container: it long-polls the control plane for runs,
-// executes the harness command for each, streams its output back and forwards user input.
+// executes the harness command for each, streams its output back, forwards the user's
+// messages into the harness (keeping a conversation open in stream-json mode) and serves the
+// workspace file operations the control plane asks for.
 //
 // Everything goes through the mTLS gateway with the certificate agent-init obtained.
 package main
@@ -26,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 )
 
@@ -91,6 +94,7 @@ func main() {
 	if err := ensureRepo(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, "agent-runner: repository:", err)
 	}
+	go serveFiles(ctx, c, workspaceRoot())
 	fmt.Println("agent-runner: waiting for runs")
 	for ctx.Err() == nil {
 		var run model.Run
@@ -180,11 +184,15 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 		cmdline = `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose`
 	}
 	env := append(os.Environ(), "SANDBOX_TASK="+run.Task, "SANDBOX_RUN_ID="+run.ID)
-	// A resume run continues a conversation an earlier pod started (the sandbox was rolled out
-	// to a new agent version mid-task). The harness's own session lives on the workspace volume.
+	// A resume run continues a conversation an earlier run started: after a rollout (the harness
+	// is told to carry on) or as the next message of the conversation (the message is the
+	// prompt). The harness's own session lives on the workspace volume.
 	if run.ResumeOf != "" {
 		env = append(env, "SANDBOX_RESUME_OF="+run.ResumeOf, "SANDBOX_SESSION="+run.Session)
-		if os.Getenv("SANDBOX_RESUME_PROMPT") == "" {
+		switch {
+		case run.Mode == model.RunMessage:
+			env = append(env, "SANDBOX_RESUME_PROMPT="+run.Task)
+		case os.Getenv("SANDBOX_RESUME_PROMPT") == "":
 			env = append(env, "SANDBOX_RESUME_PROMPT=The sandbox was restarted to update the agent. Continue the task where you left off.")
 		}
 		switch resume := os.Getenv("HARNESS_RESUME_CMD"); {
@@ -221,13 +229,15 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 		c.post(run.ID, []string{"[agent-runner] cannot start harness: " + err.Error()})
 		return 127
 	}
-	// Harnesses that take the task on stdin get it first; CLI-arg harnesses just ignore it.
-	go func() { _, _ = io.WriteString(stdin, run.Task+"\n") }()
+	chat := newChat(os.Getenv("HARNESS_INPUT"), chatIdle())
+	// Harnesses that take the task on stdin get it first (in stream-json mode as the first user
+	// message); CLI-arg harnesses just ignore it.
+	go func() { _, _ = io.WriteString(stdin, harness.FormatInput(chat.mode, run.Task)) }()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); streamOutput(c, run.ID, stdout) }()
-	go func() { defer wg.Done(); forwardInput(runCtx, c, run.ID, stdin, cancel) }()
+	go func() { defer wg.Done(); streamOutput(c, run.ID, stdout, chat.sawLine) }()
+	go func() { defer wg.Done(); forwardInput(runCtx, c, run.ID, stdin, cancel, chat) }()
 
 	err = cmd.Wait()
 	cancel()
@@ -242,7 +252,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	return 0
 }
 
-func streamOutput(c *client, runID string, r io.Reader) {
+func streamOutput(c *client, runID string, r io.Reader, onLine func(string)) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	var batch []string
@@ -269,6 +279,9 @@ func streamOutput(c *client, runID string, r io.Reader) {
 				return
 			}
 			fmt.Println(l) // also to pod stdout for kubectl logs / log shipping
+			if onLine != nil {
+				onLine(l)
+			}
 			batch = append(batch, l)
 			if len(batch) >= 50 {
 				flush()
@@ -348,12 +361,77 @@ func storedCount(msg string) int {
 	return n
 }
 
-func forwardInput(ctx context.Context, c *client, runID string, w io.WriteCloser, cancelRun context.CancelFunc) {
+// chatState tracks an open conversation: how messages are written to the harness and when
+// the harness last finished a turn, so an idle conversation is closed (stdin), which lets
+// the harness exit and the run finish. The next message then resumes the session in a new run.
+type chatState struct {
+	mode string
+	idle time.Duration
+	mu   sync.Mutex
+	// turnEnd is when the harness last completed a turn with nothing sent since (zero: a turn
+	// is in progress, or nothing has been said yet).
+	turnEnd time.Time
+}
+
+func newChat(mode string, idle time.Duration) *chatState {
+	if mode == "" {
+		mode = harness.InputText
+	}
+	return &chatState{mode: mode, idle: idle}
+}
+
+// chatIdle reads HARNESS_CHAT_IDLE (seconds; 0 or unset = 10 minutes).
+func chatIdle() time.Duration {
+	var n int
+	if _, err := fmt.Sscanf(os.Getenv("HARNESS_CHAT_IDLE"), "%d", &n); err != nil || n <= 0 {
+		return 10 * time.Minute
+	}
+	return time.Duration(n) * time.Second
+}
+
+func (s *chatState) sawLine(line string) {
+	if harness.IsTurnEnd(line) {
+		s.mu.Lock()
+		s.turnEnd = time.Now()
+		s.mu.Unlock()
+	}
+}
+
+func (s *chatState) sent() {
+	s.mu.Lock()
+	s.turnEnd = time.Time{}
+	s.mu.Unlock()
+}
+
+// idleFor is how long the conversation has been waiting for the user since the last turn.
+func (s *chatState) idleFor() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnEnd.IsZero() {
+		return 0
+	}
+	return time.Since(s.turnEnd)
+}
+
+// forwardInput delivers the user's messages to the harness: input events as lines (or
+// stream-json user messages), run.cancel as a kill, run.close as end of input. In stream-json
+// mode the conversation is also closed after the idle period following a completed turn.
+func forwardInput(ctx context.Context, c *client, runID string, w io.WriteCloser, cancelRun context.CancelFunc, chat *chatState) {
 	defer w.Close()
 	var after int64
 	for ctx.Err() == nil {
+		wait := 30 * time.Second
+		if chat.mode == harness.InputStreamJSON {
+			if idle := chat.idleFor(); idle > 0 {
+				if idle >= chat.idle {
+					fmt.Printf("agent-runner: no message for %s after the last turn, closing the conversation\n", chat.idle)
+					return
+				}
+				wait = min(wait, chat.idle-idle)
+			}
+		}
 		var evs []model.Event
-		_, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/agent/runs/%s/input?after=%d&wait=30s", runID, after), nil, &evs)
+		_, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/agent/runs/%s/input?after=%d&wait=%s", runID, after, wait.Round(time.Second)), nil, &evs)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -363,14 +441,19 @@ func forwardInput(ctx context.Context, c *client, runID string, w io.WriteCloser
 		}
 		for _, e := range evs {
 			after = e.ID
-			if e.Type == model.EventRunCancel {
+			switch e.Type {
+			case model.EventRunCancel:
 				fmt.Println("agent-runner: run cancelled by the control plane")
 				cancelRun()
 				return
-			}
-			if _, err := io.WriteString(w, e.Data+"\n"); err != nil {
+			case model.EventRunClose:
+				fmt.Println("agent-runner: conversation closed by the control plane")
 				return
 			}
+			if _, err := io.WriteString(w, harness.FormatInput(chat.mode, e.Data)); err != nil {
+				return
+			}
+			chat.sent()
 		}
 	}
 }

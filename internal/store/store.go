@@ -181,6 +181,13 @@ type Store interface {
 	// GetOrCreateBlob returns the stored bytes under name, creating them with create when
 	// absent. Exactly one creator wins across replicas (the shared agent CA key lives here).
 	GetOrCreateBlob(ctx context.Context, name string, create func() ([]byte, error)) ([]byte, error)
+	// PutBlob stores (or replaces) bytes under name; GetBlob reads them (ErrNotFound when
+	// absent); DeleteBlob removes one; DeleteBlobsBefore removes every blob whose name has the
+	// prefix and which was created before t (file transfers that were never collected).
+	PutBlob(ctx context.Context, name string, data []byte) error
+	GetBlob(ctx context.Context, name string) ([]byte, error)
+	DeleteBlob(ctx context.Context, name string) error
+	DeleteBlobsBefore(ctx context.Context, prefix string, t time.Time) (int, error)
 
 	CreateRun(ctx context.Context, r *model.Run) error
 	GetRun(ctx context.Context, id string) (*model.Run, error)

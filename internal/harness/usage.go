@@ -1,6 +1,7 @@
 // Package harness understands the output formats of agent harnesses enough to pull
-// accounting data out of their streams. Everything else in the stream is passed through
-// as opaque run.output events.
+// accounting data, session ids and the conversation (assistant text, tool calls, turn ends)
+// out of their streams, and to hand messages in. Everything else in the stream is passed
+// through as opaque run.output events.
 package harness
 
 import (

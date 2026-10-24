@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +20,7 @@ type Memory struct {
 	instances map[int]*model.Instance
 	idem      map[string]*Idempotent
 	blobs     map[string][]byte
+	blobAt    map[string]time.Time
 	tenants   map[string]*sync.Mutex
 	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
 	nextInst  int
@@ -33,6 +35,7 @@ func NewMemory() *Memory {
 		instances: map[int]*model.Instance{},
 		idem:      map[string]*Idempotent{},
 		blobs:     map[string][]byte{},
+		blobAt:    map[string]time.Time{},
 		tenants:   map[string]*sync.Mutex{},
 		catalog:   map[string][]*model.CatalogItem{},
 	}
@@ -188,7 +191,48 @@ func (m *Memory) GetOrCreateBlob(_ context.Context, name string, create func() (
 		return nil, err
 	}
 	m.blobs[name] = append([]byte(nil), b...)
+	m.blobAt[name] = time.Now()
 	return b, nil
+}
+
+func (m *Memory) PutBlob(_ context.Context, name string, data []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.blobs[name] = append([]byte(nil), data...)
+	m.blobAt[name] = time.Now()
+	return nil
+}
+
+func (m *Memory) GetBlob(_ context.Context, name string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.blobs[name]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return append([]byte(nil), b...), nil
+}
+
+func (m *Memory) DeleteBlob(_ context.Context, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.blobs, name)
+	delete(m.blobAt, name)
+	return nil
+}
+
+func (m *Memory) DeleteBlobsBefore(_ context.Context, prefix string, t time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for name, at := range m.blobAt {
+		if strings.HasPrefix(name, prefix) && at.Before(t) {
+			delete(m.blobs, name)
+			delete(m.blobAt, name)
+			n++
+		}
+	}
+	return n, nil
 }
 
 func cloneSandbox(s *model.Sandbox) *model.Sandbox {
