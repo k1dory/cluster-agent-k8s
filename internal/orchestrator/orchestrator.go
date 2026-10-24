@@ -756,31 +756,46 @@ func (o *Orchestrator) CreateRun(ctx context.Context, sandboxID, task string) (*
 }
 
 func (o *Orchestrator) queueRun(ctx context.Context, sandboxID string, r *model.Run) (*model.Run, error) {
-	if strings.TrimSpace(r.Task) == "" {
-		return nil, fmt.Errorf("%w: task is required", ErrBadRequest)
-	}
-	sb, err := o.Store.GetSandbox(ctx, sandboxID)
+	r, wake, err := o.enqueue(ctx, sandboxID, r)
 	if err != nil {
 		return nil, err
 	}
+	if wake {
+		o.wakeForRun(ctx, sandboxID, r.ID)
+	}
+	return r, nil
+}
+
+// enqueue records a queued run and reports whether the sandbox must be woken for it. Waking
+// is left to the caller: it takes the tenant lock, so it must happen outside any other lock
+// the caller holds (locks are a bounded resource shared by every replica).
+func (o *Orchestrator) enqueue(ctx context.Context, sandboxID string, r *model.Run) (*model.Run, bool, error) {
+	if strings.TrimSpace(r.Task) == "" {
+		return nil, false, fmt.Errorf("%w: task is required", ErrBadRequest)
+	}
+	sb, err := o.Store.GetSandbox(ctx, sandboxID)
+	if err != nil {
+		return nil, false, err
+	}
 	if sb.Status == model.StatusDeleting {
-		return nil, fmt.Errorf("%w: sandbox is being deleted", ErrConflict)
+		return nil, false, fmt.Errorf("%w: sandbox is being deleted", ErrConflict)
 	}
 	r.ID, r.SandboxID, r.Tenant, r.Slug = newID("run"), sandboxID, sb.Tenant, sb.Slug
 	r.Status, r.CreatedAt = model.RunQueued, time.Now()
 	if err := o.Store.CreateRun(ctx, r); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunQueued, Data: r.ResumeOf})
 	o.Touch(ctx, sandboxID)
-	if sb.Status == model.StatusSleeping || sb.Status == model.StatusError {
-		// The run is queued either way; a failed wake shows in the sandbox status and the run
-		// starts on the next successful wake. The caller still gets the run it created.
-		if _, err := o.Wake(ctx, sandboxID); err != nil {
-			o.Log.Warn("wake for run failed", "sandbox", sandboxID, "run", r.ID, "err", err)
-		}
+	return r, sb.Status == model.StatusSleeping || sb.Status == model.StatusError, nil
+}
+
+// wakeForRun wakes a sandbox that has a run waiting. The run is queued either way; a failed
+// wake shows in the sandbox status and the run starts on the next successful wake.
+func (o *Orchestrator) wakeForRun(ctx context.Context, sandboxID, runID string) {
+	if _, err := o.Wake(ctx, sandboxID); err != nil {
+		o.Log.Warn("wake for run failed", "sandbox", sandboxID, "run", runID, "err", err)
 	}
-	return r, nil
 }
 
 // Input forwards a user message to the agent. The run must exist in this sandbox and still be
