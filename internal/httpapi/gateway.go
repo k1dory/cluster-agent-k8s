@@ -43,6 +43,10 @@ func (g *Gateway) Routes() http.Handler {
 	mux.HandleFunc("POST /agent/runs/{run}/events", g.agent(g.appendOutput))
 	mux.HandleFunc("GET /agent/runs/{run}/input", g.agent(g.pollInput))
 	mux.HandleFunc("POST /agent/runs/{run}/finish", g.agent(g.finish))
+	mux.HandleFunc("GET /agent/fs/requests", g.agent(g.fsRequests))
+	mux.HandleFunc("POST /agent/fs/results", g.agent(g.fsResult))
+	mux.HandleFunc("POST /agent/blobs", g.agent(g.putBlob))
+	mux.HandleFunc("GET /agent/blobs/{name...}", g.agent(g.getBlob))
 	if g.MCP != nil {
 		mux.Handle("/", g.MCP) // everything else is an MCP host proxied by Caddy (see gateway template)
 	}
@@ -216,7 +220,7 @@ func (g *Gateway) pollInput(w http.ResponseWriter, r *http.Request, id *identity
 		// Type and run scope are both applied in the store, before LIMIT: events of other runs
 		// in this sandbox cannot fill the page and hide ours.
 		out, err := g.Orch.Store.QueryEvents(r.Context(), store.Filter{SandboxID: id.SandboxID, AfterID: after,
-			Types: []string{model.EventInput, model.EventRunCancel}, RunScope: run.ID, Limit: 200})
+			Types: []string{model.EventInput, model.EventRunCancel, model.EventRunClose}, RunScope: run.ID, Limit: 200})
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
@@ -252,4 +256,89 @@ func (g *Gateway) finish(w http.ResponseWriter, r *http.Request, id *identity.Id
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// fsRequests long-polls for file operations the control plane asked this pod to perform
+// (fs.request events without an answer yet).
+func (g *Gateway) fsRequests(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
+	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	if r.URL.Query().Get("after") != "" && err != nil {
+		writeErr(w, http.StatusBadRequest, errors.New("after must be an integer event id"))
+		return
+	}
+	deadline := time.Now().Add(waitParam(r))
+	for {
+		out, err := g.Orch.PendingFS(r.Context(), id.SandboxID, after)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		if out == nil {
+			out = []*model.Event{}
+		}
+		if len(out) > 0 || time.Now().After(deadline) {
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// fsResult records the pod's answer to a file request.
+func (g *Gateway) fsResult(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
+	var res model.FSResult
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxBodyBytes)).Decode(&res); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if res.Blob != "" && !orchestrator.OwnsFSBlob(id.SandboxID, res.Blob) {
+		writeErr(w, http.StatusForbidden, errors.New("blob belongs to another sandbox"))
+		return
+	}
+	if err := g.Orch.AnswerFS(r.Context(), id.SandboxID, res); err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// putBlob stores file content the pod read, under a name confined to its sandbox.
+func (g *Gateway) putBlob(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, orchestrator.MaxFileBytes))
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("file exceeds %d bytes", orchestrator.MaxFileBytes))
+			return
+		}
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	name := orchestrator.FSBlobName(id.SandboxID)
+	if err := g.Orch.Store.PutBlob(r.Context(), name, data); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"name": name, "size": len(data)})
+}
+
+// getBlob hands the pod content the control plane wants written into its workspace.
+func (g *Gateway) getBlob(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
+	name := r.PathValue("name")
+	if !orchestrator.OwnsFSBlob(id.SandboxID, name) {
+		writeErr(w, http.StatusNotFound, store.ErrNotFound)
+		return
+	}
+	data, err := g.Orch.Store.GetBlob(r.Context(), name)
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	w.Write(data)
 }

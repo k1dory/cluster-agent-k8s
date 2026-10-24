@@ -42,8 +42,15 @@ type Launch struct {
 	HarnessCommand       string `json:"harness_command,omitempty"`
 	HarnessResumeCommand string `json:"harness_resume_command,omitempty"`
 	ResumePrompt         string `json:"resume_prompt,omitempty"`
-	Model                string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
-	Instructions         string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
+	// HarnessInput says how the runner hands messages to the harness: "text" (a line on stdin;
+	// the default) or "stream-json" (Claude Code's streaming input: one JSON user message per
+	// line, which keeps the conversation open for follow-ups). ChatIdle is how many seconds a
+	// run in stream-json mode waits for the next message after a turn before the runner closes
+	// the conversation (0 = the runtime default, 600).
+	HarnessInput string `json:"harness_input,omitempty"`
+	ChatIdle     int    `json:"chat_idle,omitempty"`
+	Model        string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
+	Instructions string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
 	// Env is the profile's own variables for the agent container. They never reach the init
 	// containers and never shadow a platform variable (see PlatformEnv).
 	Env           map[string]string `json:"env,omitempty"`
@@ -65,7 +72,7 @@ func PlatformEnv(name string) bool {
 	}
 	switch name {
 	case "GATEWAY_IP", "GATEWAY_CA_FILE", "REGISTRAR_URL", "API_URL", "CERT_DIR", "HOME",
-		"HARNESS_CMD", "HARNESS_RESUME_CMD":
+		"HARNESS_CMD", "HARNESS_RESUME_CMD", "HARNESS_INPUT", "HARNESS_CHAT_IDLE":
 		return true
 	}
 	return false
@@ -206,8 +213,11 @@ type Run struct {
 	AgentRevision       int    `json:"agent_revision,omitempty"`
 	EnvironmentRef      string `json:"environment_ref,omitempty"`
 	EnvironmentRevision int    `json:"environment_revision,omitempty"`
-	// ResumeOf names the run this one continues after a forced rollout interrupted it.
+	// ResumeOf names the run this one continues: after a forced rollout interrupted it (Mode
+	// RunResume: the task is the original one, the harness is told to carry on), or as the next
+	// message of the same conversation (Mode RunMessage: the task is the message).
 	ResumeOf string `json:"resume_of,omitempty"`
+	Mode     string `json:"mode,omitempty"`
 	// Session is the harness's own conversation id (Claude Code `session_id`, Codex thread id),
 	// captured from the output stream so a resume run can continue where the agent stopped.
 	Session    string     `json:"session,omitempty"`
@@ -215,6 +225,71 @@ type Run struct {
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
 }
+
+// Run modes (Mode): how the run relates to the conversation.
+const (
+	RunTask    = ""        // a fresh task: a new conversation
+	RunResume  = "resume"  // continues ResumeOf after a rollout interrupted it
+	RunMessage = "message" // the next message of the conversation ResumeOf belongs to
+)
+
+// Message is one turn of a sandbox's conversation, derived from the event stream: what the
+// user sent (run tasks and inputs) and what the agent answered (assistant text pulled out of
+// the harness output), with run boundaries as system notes. ID is the event it came from, so
+// a client resumes with ?after=.
+type Message struct {
+	ID    int64     `json:"id"`
+	RunID string    `json:"run_id,omitempty"`
+	Role  string    `json:"role"` // user | assistant | tool | system | log
+	Text  string    `json:"text"`
+	At    time.Time `json:"at"`
+}
+
+// Message roles.
+const (
+	RoleUser      = "user"
+	RoleAssistant = "assistant"
+	RoleTool      = "tool"   // a tool call the agent made (name only)
+	RoleSystem    = "system" // run boundaries: queued, resumed, finished
+	RoleLog       = "log"    // raw harness output that is not a message (only with raw=true)
+)
+
+// FSRequest is the payload of an fs.request event: one file operation the control plane
+// asks the running pod to perform in its workspace. Paths are relative to /workspace.
+type FSRequest struct {
+	ID    string `json:"id"`
+	Op    string `json:"op"` // list | read | write
+	Path  string `json:"path"`
+	Depth int    `json:"depth,omitempty"` // list: levels below Path to include (1 = Path's entries)
+	Blob  string `json:"blob,omitempty"`  // write: the blob holding the content to write
+}
+
+// FSEntry is one entry of a listing.
+type FSEntry struct {
+	Path    string    `json:"path"`
+	Type    string    `json:"type"` // file | dir | symlink | other
+	Size    int64     `json:"size,omitempty"`
+	ModTime time.Time `json:"mod_time"`
+}
+
+// FSResult is the payload of an fs.result event: the pod's answer to one FSRequest.
+type FSResult struct {
+	Request     string    `json:"request"`
+	OK          bool      `json:"ok"`
+	Error       string    `json:"error,omitempty"`
+	Entries     []FSEntry `json:"entries,omitempty"`      // list
+	Truncated   bool      `json:"truncated,omitempty"`    // list: more entries than the limit
+	Blob        string    `json:"blob,omitempty"`         // read: the blob holding the content
+	Size        int64     `json:"size,omitempty"`         // read / write
+	ContentType string    `json:"content_type,omitempty"` // read
+}
+
+// File operations.
+const (
+	FSList  = "list"
+	FSRead  = "read"
+	FSWrite = "write"
+)
 
 // Seconds is the wall time the run has been executing (until now if still running).
 func (r *Run) Seconds(now time.Time) float64 {
@@ -280,7 +355,10 @@ const (
 	EventRunOutput = "run.output"
 	EventRunDone   = "run.finished"
 	EventRunCancel = "run.cancel" // control event: the runner must stop the harness
+	EventRunClose  = "run.close"  // control event: the runner closes the harness's input; the run ends when the harness does
 	EventInput     = "input"
+	EventFSRequest = "fs.request"   // data: FSRequest JSON (control plane → pod)
+	EventFSResult  = "fs.result"    // data: FSResult JSON (pod → control plane)
 	EventEgressOK  = "egress.allow" // data: Egress JSON
 	EventEgressDen = "egress.deny"
 	EventRollout   = "rollout" // data: Rollout JSON

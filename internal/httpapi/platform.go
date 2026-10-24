@@ -119,6 +119,8 @@ func (p *Platform) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/sandboxes/{id}/runs/{run}", p.auth(p.getRun))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/runs/{run}/cancel", p.auth(p.cancelRun))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/runs/{run}/input", p.auth(p.input))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/runs/{run}/close", p.auth(p.closeRun))
+	p.chatRoutes(mux)
 	mux.HandleFunc("GET /v1/sandboxes/{id}/events", p.auth(p.events))
 	mux.HandleFunc("PUT /v1/sandboxes/{id}/preview", p.auth(p.setPreview))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/preview/ticket", p.auth(p.previewTicket))
@@ -959,6 +961,8 @@ func writeOrchErr(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusTooManyRequests, err)
 	case errors.Is(err, orchestrator.ErrRuntime):
 		writeErr(w, http.StatusBadGateway, err)
+	case errors.Is(err, orchestrator.ErrTimeout):
+		writeErr(w, http.StatusGatewayTimeout, err)
 	default:
 		writeErr(w, http.StatusInternalServerError, err)
 	}

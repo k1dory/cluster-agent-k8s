@@ -81,6 +81,8 @@ tags:
   - name: apply
   - name: rollouts
   - name: runs
+  - name: conversation
+  - name: files
   - name: events
   - name: preview
   - name: accounting
@@ -297,6 +299,137 @@ paths:
         "400": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "409": { description: "Run already finished", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/sandboxes/{id}/messages:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    post:
+      tags: [conversation]
+      summary: Send the next message of the conversation
+      description: |
+        A run in progress (or queued) receives the message as input (delivery `input`; with a
+        stream-json harness it is answered in the same process). Otherwise a new run continues the
+        latest harness session with the message as its prompt (`resumed`), or starts a fresh
+        conversation when there is none (`new`). JSON `{text, attachments}` names workspace files
+        already uploaded; multipart/form-data with a `text` field and `file` parts uploads each file
+        to `uploads/<name>` first. Attached paths are listed after the text so the agent knows where
+        to look. Supports `Idempotency-Key`.
+      parameters: [{ $ref: "#/components/parameters/idempotencyKey" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text: { type: string }
+                attachments: { type: array, items: { type: string }, description: "Workspace paths (relative to /workspace)" }
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                text: { type: string }
+                file: { type: array, items: { type: string, format: binary } }
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run: { $ref: "#/components/schemas/Run" }
+                  delivery: { type: string, enum: [input, resumed, new] }
+                  files: { type: array, items: { type: string }, description: "Workspace paths the attachments were written to" }
+        "409": { description: "Sandbox is being deleted", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { $ref: "#/components/responses/Error" }
+    get:
+      tags: [conversation]
+      summary: The conversation so far (one page)
+      description: Turns derived from the event stream. `X-Next-Cursor` is the last event scanned; continue with `?after=`.
+      parameters:
+        - { name: after, in: query, schema: { type: integer, format: int64 }, description: "Event id to continue after" }
+        - { name: limit, in: query, schema: { type: integer, default: 500, maximum: 5000 }, description: "Events to scan" }
+        - { name: raw, in: query, schema: { type: boolean, default: false }, description: "Also return harness output that is not a turn (role log)" }
+      responses:
+        "200":
+          description: Turns
+          headers: { X-Next-Cursor: { schema: { type: string } } }
+          content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Message" } } } }
+  /v1/sandboxes/{id}/messages/stream:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    get:
+      tags: [conversation]
+      summary: The conversation as server-sent events (replay after ?after or Last-Event-ID, then live)
+      parameters:
+        - { name: after, in: query, schema: { type: integer, format: int64 } }
+        - { name: raw, in: query, schema: { type: boolean, default: false } }
+      responses:
+        "200": { description: "text/event-stream; event = role, id = event id, data = Message" }
+  /v1/sandboxes/{id}/messages/close:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    post:
+      tags: [conversation]
+      summary: End the open conversation
+      description: The runner closes the harness's input (`run.close`); the harness exits and the run finishes with its result. The next message resumes the session in a new run.
+      responses:
+        "200": { description: The run being closed, content: { application/json: { schema: { $ref: "#/components/schemas/Run" } } } }
+        "409": { description: "No run in progress", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/sandboxes/{id}/runs/{run}/close:
+    parameters: [{ $ref: "#/components/parameters/id" }, { name: run, in: path, required: true, schema: { type: string } }]
+    post:
+      tags: [runs]
+      summary: Close a run's conversation (a queued run is cancelled instead)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Run" } } } }
+  /v1/sandboxes/{id}/files:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    get:
+      tags: [files]
+      summary: List the workspace below a path
+      description: |
+        Performed by the agent pod on request (it is the only one that sees the volume), over the
+        agent API. A sleeping sandbox is woken first unless `wake=false` (then 409). Paths are
+        relative to /workspace; nothing outside it is reachable.
+      parameters:
+        - { name: path, in: query, schema: { type: string }, description: "Directory, relative to /workspace (default: the workspace root)" }
+        - { name: depth, in: query, schema: { type: integer, default: 1, minimum: 1, maximum: 8 } }
+        - { name: wake, in: query, schema: { type: boolean, default: true } }
+      responses:
+        "200":
+          description: Entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries: { type: array, items: { $ref: "#/components/schemas/FSEntry" } }
+                  truncated: { type: boolean, description: "More than 5000 entries" }
+        "404": { description: "No such directory", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "Sandbox asleep and wake=false, or being deleted", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "504": { description: "The pod did not answer in time", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/sandboxes/{id}/files/content:
+    parameters: [{ $ref: "#/components/parameters/id" }]
+    get:
+      tags: [files]
+      summary: Read a workspace file (up to 16 MiB)
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: wake, in: query, schema: { type: boolean, default: true } }
+      responses:
+        "200": { description: "The file, with its detected Content-Type and X-File-Size" }
+        "404": { $ref: "#/components/responses/Error" }
+        "413": { description: "File larger than 16 MiB", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "504": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [files]
+      summary: Write a workspace file (the request body, up to 16 MiB; parents are created)
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: wake, in: query, schema: { type: boolean, default: true } }
+      requestBody: { required: true, content: { "*/*": { schema: { type: string, format: binary } } } }
+      responses:
+        "200": { description: Written, content: { application/json: { schema: { type: object, properties: { path: { type: string }, size: { type: integer } } } } } }
+        "413": { $ref: "#/components/responses/Error" }
+        "504": { $ref: "#/components/responses/Error" }
   /v1/sandboxes/{id}/events:
     parameters: [{ $ref: "#/components/parameters/id" }]
     get:
@@ -1076,7 +1209,8 @@ components:
         agent_revision: { type: integer }
         environment_ref: { type: string }
         environment_revision: { type: integer }
-        resume_of: { type: string, description: "The run this one continues after a forced rollout" }
+        resume_of: { type: string, description: "The run this one continues: after a forced rollout (mode resume) or as the next message of the conversation (mode message)" }
+        mode: { type: string, enum: ["", resume, message], description: "Empty: a fresh task; resume: continues resume_of after a rollout; message: the task is the next message of resume_of's session" }
         session: { type: string, description: "Harness conversation id captured from the output (Claude Code session_id, Codex thread_id)" }
         created_at: { type: string, format: date-time }
         started_at: { type: string, format: date-time, nullable: true }
@@ -1125,8 +1259,10 @@ components:
           additionalProperties: false
           properties:
             command: { type: string }
-            resume_command: { type: string }
-            resume_prompt: { type: string }
+            resume_command: { type: string, description: "Continues a session: $SANDBOX_SESSION, the message (or the rollout prompt) in $SANDBOX_RESUME_PROMPT" }
+            resume_prompt: { type: string, description: "What a rollout resume tells the harness (default: continue the task)" }
+            input: { type: string, enum: [text, stream-json], description: "How messages reach the harness: a line on stdin, or Claude Code's streaming JSON input (keeps the conversation open)" }
+            chat_idle: { type: integer, minimum: 0, description: "stream-json: seconds without a message after a turn before the runner closes the conversation (0 = 600)" }
         model:
           type: object
           additionalProperties: false
@@ -1294,6 +1430,22 @@ components:
                     from: { description: "Absent when the field is added" }
                     to: { description: "Absent when the field is removed" }
               errors: { type: array, items: { type: string } }
+    Message:
+      type: object
+      description: One turn of a sandbox's conversation, derived from the event stream
+      properties:
+        id: { type: integer, format: int64, description: "The event it came from (resume with ?after=)" }
+        run_id: { type: string }
+        role: { type: string, enum: [user, assistant, tool, system, log] }
+        text: { type: string }
+        at: { type: string, format: date-time }
+    FSEntry:
+      type: object
+      properties:
+        path: { type: string, description: "Relative to /workspace" }
+        type: { type: string, enum: [file, dir, symlink, other] }
+        size: { type: integer, format: int64 }
+        mod_time: { type: string, format: date-time }
     Usage:
       type: object
       description: |
