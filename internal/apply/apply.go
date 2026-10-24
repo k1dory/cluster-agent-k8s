@@ -30,6 +30,7 @@ import (
 	"agent-sandbox/internal/plan"
 	res "agent-sandbox/internal/resource"
 	"agent-sandbox/internal/store"
+	"agent-sandbox/internal/tenants"
 )
 
 // Errors the API maps to status codes.
@@ -126,13 +127,17 @@ func (c *Controller) Submit(ctx context.Context, req Request) (*model.Apply, err
 		Bundle: p.Bundle, Plan: p.Fingerprint, Status: model.ApplyRunning, Documents: docs,
 	}
 	if req.Source != nil {
+		// The server boundary: whatever the client sent, no credential reaches the record.
 		src := *req.Source
+		if err := CleanSource(&src); err != nil {
+			return nil, err
+		}
 		src.Apply, src.Bundle = a.ID, a.Bundle
 		a.Source = &src
 	}
 	for _, ch := range p.Changes {
 		a.Steps = append(a.Steps, model.ApplyStep{Kind: ch.Kind, Tenant: ch.Tenant, Name: ch.Name, Action: ch.Action,
-			ExpectedRevision: ch.ExpectedRevision, NextRevision: ch.NextRevision, Status: model.StepPending})
+			ExpectedRevision: ch.ExpectedRevision, NextRevision: ch.NextRevision, Resolved: ch.Resolved, Status: model.StepPending})
 	}
 	if err := c.Store.CreateApply(ctx, a); err != nil {
 		if !errors.Is(err, store.ErrConflict) {
@@ -231,6 +236,20 @@ func (c *Controller) execute(ctx context.Context, a *model.Apply, attempt int64)
 		return c.stop(ctx, a, model.ApplyFailed, "stored documents are unreadable: "+err.Error())
 	}
 	scope := plan.Scope{Tenant: a.Tenant, Admin: a.Admin, Subject: a.Subject}
+	// The bundle is re-planned against the state after the steps already applied: a document
+	// whose own expected_revision named the state before this apply (0 for "must not exist")
+	// now expects the revision this apply wrote, not a conflict with its own work. Every
+	// document is still validated under the current rights.
+	for i := range a.Steps {
+		st := &a.Steps[i]
+		if st.Status != model.StepDone && st.Status != model.StepSkipped {
+			continue
+		}
+		if d := documentOf(docs, a.Tenant, st); d != nil && d.ExpectedRevision != nil {
+			rev := st.Revision
+			d.ExpectedRevision = &rev
+		}
+	}
 	p, items, err := c.Planner.PlanItems(ctx, docs, scope)
 	if err != nil {
 		return c.stop(ctx, a, model.ApplyFailed, "plan: "+err.Error())
@@ -254,14 +273,9 @@ func (c *Controller) execute(ctx context.Context, a *model.Apply, attempt int64)
 			return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s is no longer part of the plan", st.Kind, st.Tenant, st.Name))
 		}
 		ch := p.Changes[ci]
-		// Every document, applied or not, must still validate under the current rights: a
-		// bundle whose applied agent lost its policy does not finish as if nothing happened.
-		if ch.Action == plan.ActionInvalid {
-			return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s no longer validates: %s", st.Kind, st.Tenant, st.Name, strings.Join(ch.Errors, "; ")))
-		}
-		switch st.Status {
-		case model.StepDone, model.StepSkipped:
-			// Applied earlier: it must still be what was written.
+		if st.Status == model.StepDone || st.Status == model.StepSkipped {
+			// Applied earlier: it must still be what was written (the clearer message when it
+			// moved), and must still validate under the current rights.
 			cur, err := c.Store.GetItem(ctx, st.Kind, st.Tenant, st.Name, 0)
 			if err != nil || cur.Revision != st.Revision {
 				got := "deleted"
@@ -270,6 +284,13 @@ func (c *Controller) execute(ctx context.Context, a *model.Apply, attempt int64)
 				}
 				return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s was changed outside this apply after step %d wrote revision %d (now %s)", st.Kind, st.Tenant, st.Name, i+1, st.Revision, got))
 			}
+		}
+		// Every document, applied or not, must still validate under the current rights: a
+		// bundle whose applied agent lost its policy does not finish as if nothing happened.
+		if ch.Action == plan.ActionInvalid {
+			return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s no longer validates: %s", st.Kind, st.Tenant, st.Name, strings.Join(ch.Errors, "; ")))
+		}
+		if st.Status == model.StepDone || st.Status == model.StepSkipped {
 			continue
 		}
 		// Pending: the item must still be at the revision the plan expected (a noop checks it
@@ -282,6 +303,9 @@ func (c *Controller) execute(ctx context.Context, a *model.Apply, attempt int64)
 		}
 		if ch.Action != st.Action {
 			return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s would now be a %s, the plan said %s", st.Kind, st.Tenant, st.Name, ch.Action, st.Action))
+		}
+		if ch.Resolved != st.Resolved {
+			return c.stop(ctx, a, model.ApplyConflict, fmt.Sprintf("%s %s/%s resolves differently now than when it was planned (a reference points at another item or revision): plan again", st.Kind, st.Tenant, st.Name))
 		}
 		until := c.now().Add(c.lease())
 		a.LeaseUntil = &until
@@ -327,6 +351,24 @@ func (c *Controller) execute(ctx context.Context, a *model.Apply, attempt int64)
 		c.refresh(ctx)
 	}
 	return a, nil
+}
+
+// documentOf finds the stored document a step came from.
+func documentOf(docs []*res.Document, scopeTenant string, st *model.ApplyStep) *res.Document {
+	for _, d := range docs {
+		tenant := scopeTenant
+		if d.Tenant != nil {
+			tenant = *d.Tenant
+		}
+		name := d.Name
+		if d.Kind == model.KindTenantSettings && name == "" {
+			name = tenants.Name
+		}
+		if d.Kind == st.Kind && tenant == st.Tenant && name == st.Name {
+			return d
+		}
+	}
+	return nil
 }
 
 // source is what a revision written by a carries: the apply and its bundle, plus the Git

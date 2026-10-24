@@ -305,7 +305,8 @@ showing exactly what was applied. `sandboxctl applies` lists them. See `internal
 
 Every revision an apply writes carries its `source`: the apply, the bundle fingerprint and, when
 the bundle came from Git, the repository, ref, commit and path (`sandboxctl apply` detects them
-and records the commit only when the file is identical to its committed version). A revision
+and records the commit only when the applied bytes are what HEAD holds for the file; credentials
+in a repository URL are stripped by the client and again by the server). A revision
 written by hand through the API carries none. An item belongs to the apply that wrote its latest
 revision; `GET /v1/drift` (`sandboxctl drift`, exit 3 when anything moved) lists the items an
 apply wrote that were since changed by hand (with the field diff) or deleted. `POST /v1/rollback`

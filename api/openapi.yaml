@@ -1601,6 +1601,7 @@ components:
               current_revision: { type: integer, description: "Live revision compared with (0 = none)" }
               expected_revision: { type: integer, description: "Revision apply must find for this change" }
               next_revision: { type: integer, description: "Revision the item will have after apply: the next number of its history (deleted revisions included) for create and update, the current one for noop. Pinned references in the bundle are checked against it" }
+              resolved: { type: string, description: "Fingerprint of the item as apply will write it (canonical spec, references resolved). Part of the plan fingerprint: the same document resolving to another item is another plan" }
               diff:
                 type: array
                 description: Leaves of the canonical spec (and description) that differ, in path order
@@ -1652,6 +1653,7 @@ components:
               action: { type: string, enum: [create, update, noop] }
               expected_revision: { type: integer }
               next_revision: { type: integer }
+              resolved: { type: string, description: "Fingerprint of the item as planned; a continuation refuses a step that would now resolve differently" }
               status: { type: string, enum: [pending, done, skipped, failed] }
               revision: { type: integer, description: "Written (done) or confirmed (skipped)" }
               error: { type: string }

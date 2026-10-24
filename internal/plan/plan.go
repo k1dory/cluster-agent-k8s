@@ -78,9 +78,15 @@ type Change struct {
 	ExpectedRevision int `json:"expected_revision"`
 	// NextRevision is the revision the item will have after apply: a new number for create and
 	// update (numbering continues past deleted revisions), the current one for noop.
-	NextRevision int           `json:"next_revision"`
-	Diff         []FieldChange `json:"diff,omitempty"`
-	Errors       []string      `json:"errors,omitempty"`
+	NextRevision int `json:"next_revision"`
+	// Resolved fingerprints the item as apply will write it: the canonical spec after every
+	// reference was resolved (a bare environment name to the tenant's own item or the shared
+	// one, a connection to its canonical form). The same document resolves differently once
+	// the state changes, so the plan's fingerprint includes it and apply refuses to write
+	// anything but what the plan showed.
+	Resolved string        `json:"resolved,omitempty"`
+	Diff     []FieldChange `json:"diff,omitempty"`
+	Errors   []string      `json:"errors,omitempty"`
 }
 
 // Plan is the result for a bundle: deterministic for the same documents and the same state.
@@ -299,13 +305,16 @@ func (d Deps) PlanItems(ctx context.Context, docs []*res.Document, scope Scope) 
 	fmt.Fprintf(fp, "scope %s admin=%v\n", scope.Tenant, scope.Admin)
 	var items []*model.CatalogItem
 	for _, e := range entries {
-		p.Changes = append(p.Changes, *e.change)
 		if e.change.Action == ActionInvalid {
 			items = append(items, nil)
 		} else {
 			items = append(items, e.item)
+			e.change.Resolved = ResolvedOf(e.item)
 		}
-		fmt.Fprintf(fp, "%s|%s|%s %s %d %d\n", e.doc.Kind, e.tenant, e.doc.Name, e.change.Action, e.change.ExpectedRevision, e.change.NextRevision)
+		p.Changes = append(p.Changes, *e.change)
+		// The state the plan saw (action, revisions) and what it resolved to: a bundle whose
+		// references would now resolve to other items is another plan, whatever its documents.
+		fmt.Fprintf(fp, "%s|%s|%s %s %d %d %s\n", e.doc.Kind, e.tenant, e.doc.Name, e.change.Action, e.change.ExpectedRevision, e.change.NextRevision, e.change.Resolved)
 		switch e.change.Action {
 		case ActionCreate:
 			p.Summary.Create++
@@ -325,6 +334,14 @@ func (d Deps) PlanItems(ctx context.Context, docs []*res.Document, scope Scope) 
 	p.Fingerprint = hex.EncodeToString(fp.Sum(nil))[:16]
 	p.Valid = len(p.Errors) == 0 && p.Summary.Invalid == 0
 	return p, items, nil
+}
+
+// ResolvedOf is the fingerprint of an item as it would be written: description and canonical
+// spec, references resolved.
+func ResolvedOf(it *model.CatalogItem) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s\n%s", it.Description, canonical(it.Spec))
+	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 func appendOnce(xs []string, x string) []string {

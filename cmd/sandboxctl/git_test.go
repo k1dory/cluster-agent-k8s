@@ -6,6 +6,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"agent-sandbox/internal/apply"
+	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/plan"
 )
 
 func run(t *testing.T, dir string, args ...string) string {
@@ -38,7 +42,14 @@ func TestGitSourceNamesOnlyCommittedContent(t *testing.T) {
 	run(t, repo, "commit", "-q", "-m", "bundle")
 	head := run(t, repo, "rev-parse", "HEAD")
 
-	src, ok, dirty, err := gitSource(file)
+	read := func(f string) []byte {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	src, ok, dirty, err := gitSource(file, read(file))
 	if err != nil || !ok || dirty {
 		t.Fatalf("clean file: %v ok=%v dirty=%v", err, ok, dirty)
 	}
@@ -49,16 +60,40 @@ func TestGitSourceNamesOnlyCommittedContent(t *testing.T) {
 	if err := os.WriteFile(file, []byte("kind: EnvironmentProfile\nname: py\nspec: {image: canary}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	src, ok, dirty, err = gitSource(file)
+	src, ok, dirty, err = gitSource(file, read(file))
 	if err != nil || !ok || !dirty || src.Commit != "" || src.Path != "bundles/acme.yaml" || src.Ref != "main" {
 		t.Fatalf("dirty file: %v ok=%v dirty=%v %+v", err, ok, dirty, src)
+	}
+	// `git status` can be made to lie (assume-unchanged, skip-worktree): the decision is made on
+	// the bytes, so the modified file still gets no SHA.
+	run(t, repo, "update-index", "--assume-unchanged", "--", file)
+	if status := run(t, repo, "status", "--porcelain", "--", file); status != "" {
+		t.Fatalf("precondition: status should report clean, got %q", status)
+	}
+	if src, _, dirty, _ := gitSource(file, read(file)); !dirty || src.Commit != "" {
+		t.Fatalf("assume-unchanged hid a modification: dirty=%v %+v", dirty, src)
+	}
+	run(t, repo, "update-index", "--no-assume-unchanged", "--", file)
+	// A staged change is not committed either.
+	run(t, repo, "add", "--", file)
+	if src, _, dirty, _ := gitSource(file, read(file)); !dirty || src.Commit != "" {
+		t.Fatalf("staged content attributed to HEAD: dirty=%v %+v", dirty, src)
+	}
+	// The bytes being applied are what count: the committed bytes, wherever they come from, match.
+	if src, _, dirty, _ := gitSource(file, []byte("kind: EnvironmentProfile\nname: py\nspec: {image: stable}\n")); dirty || src.Commit != head {
+		t.Fatalf("committed bytes: dirty=%v %+v", dirty, src)
+	}
+	// A credential in the remote never leaves the client.
+	run(t, repo, "remote", "set-url", "origin", "https://x-access-token:ghp_secret123@github.com/acme/platform.git")
+	if src, _, _, _ := gitSource(file, read(file)); src.Repo != "https://github.com/acme/platform.git" || strings.Contains(src.Repo, "secret") {
+		t.Fatalf("credential in remote: %+v", src)
 	}
 	// An untracked file: in the repository, but no commit holds it.
 	other := filepath.Join(repo, "bundles", "new.yaml")
 	if err := os.WriteFile(other, []byte("kind: EnvironmentProfile\nname: go\nspec: {image: stable}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if src, ok, dirty, err := gitSource(other); err != nil || !ok || !dirty || src.Commit != "" || src.Path != "" {
+	if src, ok, dirty, err := gitSource(other, read(other)); err != nil || !ok || !dirty || src.Commit != "" || src.Path != "" {
 		t.Fatalf("untracked file: %v ok=%v dirty=%v %+v", err, ok, dirty, src)
 	}
 	// Outside a work tree: nothing to record.
@@ -66,12 +101,42 @@ func TestGitSourceNamesOnlyCommittedContent(t *testing.T) {
 	if err := os.WriteFile(plain, []byte("x: 1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _, err := gitSource(plain); err != nil || ok {
+	if _, ok, _, err := gitSource(plain, read(plain)); err != nil || ok {
 		t.Fatalf("outside a repository: ok=%v %v", ok, err)
 	}
 	// Explicit flags win over detection.
 	merged := mergeSource(bundleSource{Commit: "deadbeef"}, bundleSource{Commit: head, Ref: "main"})
 	if merged.Commit != "deadbeef" || merged.Ref != "main" {
 		t.Fatalf("merge: %+v", merged)
+	}
+}
+
+func TestExitCodesDoNotDependOnTheOutputFormat(t *testing.T) {
+	valid := plan.Plan{Valid: true}
+	if planExitCode(valid) != 0 || planExitCode(plan.Plan{Valid: true, Summary: plan.Summary{Update: 1}}) != 3 || planExitCode(plan.Plan{Valid: false}) != 2 {
+		t.Fatal("plan exit codes")
+	}
+	// A bundle-level error (duplicate documents) is invalid even with every change a noop.
+	if planExitCode(plan.Plan{Valid: false, Errors: []string{"documents 1 and 2 both describe …"}}) != 2 {
+		t.Fatal("bundle-level errors are failures")
+	}
+	done := &model.Apply{Status: model.ApplyDone}
+	conflict := &model.Apply{Status: model.ApplyConflict}
+	running := &model.Apply{Status: model.ApplyRunning}
+	cases := []struct {
+		rb   apply.Rollback
+		want int
+	}{
+		{apply.Rollback{Plan: &valid, Apply: done}, 0},
+		{apply.Rollback{Plan: &valid}, 0}, // dry run of a valid plan
+		{apply.Rollback{Plan: &plan.Plan{Valid: false}}, 2},
+		{apply.Rollback{Plan: &valid, Apply: conflict}, 3},
+		{apply.Rollback{Plan: &valid, Apply: running}, 3},
+		{apply.Rollback{}, 2},
+	}
+	for i, c := range cases {
+		if got := rollbackExitCode(c.rb); got != c.want {
+			t.Fatalf("case %d: exit %d, want %d", i, got, c.want)
+		}
 	}
 }

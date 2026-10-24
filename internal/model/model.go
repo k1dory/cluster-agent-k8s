@@ -350,6 +350,7 @@ type ApplyStep struct {
 	Action           string `json:"action"` // create | update | noop
 	ExpectedRevision int    `json:"expected_revision"`
 	NextRevision     int    `json:"next_revision"`
+	Resolved         string `json:"resolved,omitempty"` // fingerprint of the item as planned (plan.Change.Resolved)
 	Status           string `json:"status"`             // pending | done | skipped | failed
 	Revision         int    `json:"revision,omitempty"` // the revision written (done) or confirmed (skipped)
 	Error            string `json:"error,omitempty"`
