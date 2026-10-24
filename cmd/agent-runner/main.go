@@ -8,8 +8,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -200,6 +202,7 @@ func streamOutput(c *client, runID string, r io.Reader) {
 // (the control plane keeps lines before it, so a retry never duplicates them).
 func (c *client) post(runID string, lines []string) {
 	body := []byte(strings.Join(lines, "\n") + "\n")
+	batch := newBatchID()
 	var lastErr error
 	for attempt := 0; attempt < 4; attempt++ {
 		if attempt > 0 {
@@ -207,6 +210,7 @@ func (c *client) post(runID string, lines []string) {
 		}
 		req, _ := http.NewRequest(http.MethodPost, c.base+"/agent/runs/"+runID+"/events", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "text/plain")
+		req.Header.Set("X-Batch-Id", batch) // same id on every retry: the server skips lines it already stored
 		resp, err := c.http.Do(req)
 		if err != nil {
 			lastErr = err
@@ -243,6 +247,12 @@ func (c *client) post(runID string, lines []string) {
 		}
 	}
 	fmt.Fprintln(os.Stderr, "agent-runner: post output gave up:", lastErr)
+}
+
+func newBatchID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 // storedCount pulls "stored N lines" out of a 413 message, so a retry resumes after them.

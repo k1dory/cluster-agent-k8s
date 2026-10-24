@@ -147,12 +147,15 @@ func (m *Memory) ListRuns(_ context.Context, sandboxID string) ([]*model.Run, er
 	return m.runsOf(sandboxID), nil
 }
 
-func (m *Memory) NextQueuedRun(_ context.Context, sandboxID string) (*model.Run, error) {
+func (m *Memory) ClaimQueuedRun(_ context.Context, sandboxID string, startedAt time.Time) (*model.Run, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, r := range m.runsOf(sandboxID) {
-		if r.Status == model.RunQueued {
-			return r, nil
+	for _, c := range m.runsOf(sandboxID) {
+		if c.Status == model.RunQueued {
+			r := m.runs[c.ID]
+			r.Status, r.StartedAt = model.RunRunning, &startedAt
+			out := *r
+			return &out, nil
 		}
 	}
 	return nil, ErrNotFound
@@ -253,20 +256,38 @@ func (m *Memory) ListInstances(_ context.Context, sandboxID string) ([]*model.In
 	return out, nil
 }
 
-func (m *Memory) PutIdempotent(_ context.Context, rec *Idempotent) error {
+func (m *Memory) ReserveIdempotent(_ context.Context, key, bodyHash string) (*Idempotent, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cutoff := time.Now().Add(-IdempotencyTTL)
+	now := time.Now()
 	for k, v := range m.idem {
-		if v.CreatedAt.Before(cutoff) {
+		if v.CreatedAt.Before(now.Add(-IdempotencyTTL)) || v.InProgress() && v.CreatedAt.Before(now.Add(-IdempotencyStale)) {
 			delete(m.idem, k)
 		}
 	}
+	if v, ok := m.idem[key]; ok {
+		c := *v
+		return &c, false, nil
+	}
+	m.idem[key] = &Idempotent{Key: key, BodyHash: bodyHash, CreatedAt: now}
+	return nil, true, nil
+}
+
+func (m *Memory) PutIdempotent(_ context.Context, rec *Idempotent) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	c := *rec
 	if c.CreatedAt.IsZero() {
 		c.CreatedAt = time.Now()
 	}
 	m.idem[rec.Key] = &c
+	return nil
+}
+
+func (m *Memory) ReleaseIdempotent(_ context.Context, key string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.idem, key)
 	return nil
 }
 
@@ -301,12 +322,8 @@ func (m *Memory) QuerySandboxes(_ context.Context, f SandboxFilter) ([]*model.Sa
 		return all[i].CreatedAt.Before(all[j].CreatedAt)
 	})
 	var out []*model.Sandbox
-	skip := f.Cursor != ""
 	for _, s := range all {
-		if skip {
-			if s.ID == f.Cursor {
-				skip = false
-			}
+		if !f.Cursor.after(s.CreatedAt, s.ID) {
 			continue
 		}
 		out = append(out, cloneSandbox(s))
@@ -315,6 +332,23 @@ func (m *Memory) QuerySandboxes(_ context.Context, f SandboxFilter) ([]*model.Sa
 		}
 	}
 	return out, nil
+}
+
+func (m *Memory) CountSandboxes(_ context.Context, tenant string) (SandboxCounts, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var c SandboxCounts
+	for _, s := range m.sandboxes {
+		if s.Tenant != tenant {
+			continue
+		}
+		c.Total++
+		switch s.Status {
+		case model.StatusCreating, model.StatusWaking, model.StatusRunning:
+			c.Awake++
+		}
+	}
+	return c, nil
 }
 
 func (f Filter) matchRun(r *model.Run) bool {
@@ -353,6 +387,9 @@ func (f Filter) matchEvent(e *model.Event) bool {
 		return false
 	}
 	if f.RunID != "" && e.RunID != f.RunID {
+		return false
+	}
+	if f.RunScope != "" && e.RunID != "" && e.RunID != f.RunScope {
 		return false
 	}
 	if e.ID <= f.AfterID {
@@ -395,12 +432,8 @@ func (m *Memory) QueryRuns(_ context.Context, f Filter) ([]*model.Run, error) {
 		return all[i].CreatedAt.Before(all[j].CreatedAt)
 	})
 	var out []*model.Run
-	skip := f.Cursor != ""
 	for _, r := range all {
-		if skip {
-			if r.ID == f.Cursor {
-				skip = false
-			}
+		if !f.Cursor.after(r.CreatedAt, r.ID) {
 			continue
 		}
 		c := *r

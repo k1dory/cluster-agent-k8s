@@ -124,8 +124,9 @@ func (p *Postgres) QuerySandboxes(ctx context.Context, f SandboxFilter) ([]*mode
 	if f.Status != "" {
 		add("status=$%d", f.Status)
 	}
-	if f.Cursor != "" {
-		add("(created_at, id) > (SELECT created_at, id FROM sandboxes WHERE id=$%d)", f.Cursor)
+	if !f.Cursor.IsZero() {
+		args = append(args, f.Cursor.At, f.Cursor.ID)
+		conds = append(conds, fmt.Sprintf("(created_at, id) > ($%d, $%d)", len(args)-1, len(args)))
 	}
 	q := `SELECT ` + sandboxCols + ` FROM sandboxes`
 	if len(conds) > 0 {
@@ -145,6 +146,13 @@ func (p *Postgres) QuerySandboxes(ctx context.Context, f SandboxFilter) ([]*mode
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+func (p *Postgres) CountSandboxes(ctx context.Context, tenant string) (SandboxCounts, error) {
+	var c SandboxCounts
+	err := p.pool.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE status IN ($2,$3,$4)) FROM sandboxes WHERE tenant=$1`,
+		tenant, model.StatusCreating, model.StatusWaking, model.StatusRunning).Scan(&c.Total, &c.Awake)
+	return c, err
 }
 
 func (p *Postgres) UpdateSandbox(ctx context.Context, s *model.Sandbox) error {
@@ -238,9 +246,11 @@ func (p *Postgres) ListRuns(ctx context.Context, sandboxID string) ([]*model.Run
 	return p.queryRuns(ctx, `SELECT `+runCols+` FROM runs WHERE sandbox_id=$1 ORDER BY created_at`, sandboxID)
 }
 
-func (p *Postgres) NextQueuedRun(ctx context.Context, sandboxID string) (*model.Run, error) {
-	return scanRun(p.pool.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE sandbox_id=$1 AND status=$2
-		ORDER BY created_at LIMIT 1`, sandboxID, model.RunQueued))
+func (p *Postgres) ClaimQueuedRun(ctx context.Context, sandboxID string, startedAt time.Time) (*model.Run, error) {
+	// One statement: pick the oldest queued run, skipping rows another poller is claiming.
+	return scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4 WHERE id = (
+			SELECT id FROM runs WHERE sandbox_id=$1 AND status=$2 ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED)
+		RETURNING `+runCols, sandboxID, model.RunQueued, model.RunRunning, startedAt))
 }
 
 func (p *Postgres) RunningRun(ctx context.Context, sandboxID string) (*model.Run, error) {
@@ -306,12 +316,16 @@ func (f Filter) where(idCol, timeCol string, events bool) (string, []any) {
 			add("id=$%d", f.RunID)
 		}
 	}
+	if events && f.RunScope != "" {
+		add("(run_id = '' OR run_id = $%d)", f.RunScope)
+	}
 	if !events {
 		if f.Status != "" {
 			add("status=$%d", f.Status)
 		}
-		if f.Cursor != "" {
-			add("(created_at, id) > (SELECT created_at, id FROM runs WHERE id=$%d)", f.Cursor)
+		if !f.Cursor.IsZero() {
+			args = append(args, f.Cursor.At, f.Cursor.ID)
+			conds = append(conds, fmt.Sprintf("(created_at, id) > ($%d, $%d)", len(args)-1, len(args)))
 		}
 	}
 	if !f.From.IsZero() {
@@ -371,21 +385,46 @@ func (p *Postgres) CountEvents(ctx context.Context, f Filter) ([]EventCount, err
 	return out, rows.Err()
 }
 
+func (p *Postgres) ReserveIdempotent(ctx context.Context, key, bodyHash string) (*Idempotent, bool, error) {
+	// Expired responses and abandoned reservations make room; then the INSERT is the lock:
+	// exactly one concurrent caller gets a row back.
+	_, _ = p.pool.Exec(ctx, `DELETE FROM idempotency WHERE created_at < now() - $1::interval
+		OR (status = 0 AND created_at < now() - $2::interval)`, IdempotencyTTL.String(), IdempotencyStale.String())
+	tag, err := p.pool.Exec(ctx, `INSERT INTO idempotency (key, body_hash, status, body, created_at) VALUES ($1,$2,0,'',now())
+		ON CONFLICT (key) DO NOTHING`, key, bodyHash)
+	if err != nil {
+		return nil, false, err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil, true, nil
+	}
+	existing, err := p.GetIdempotent(ctx, key)
+	if errors.Is(err, ErrNotFound) {
+		// Released between our INSERT and SELECT; let the caller retry the reservation.
+		return p.ReserveIdempotent(ctx, key, bodyHash)
+	}
+	return existing, false, err
+}
+
 func (p *Postgres) PutIdempotent(ctx context.Context, rec *Idempotent) error {
 	if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = time.Now()
 	}
-	_, _ = p.pool.Exec(ctx, `DELETE FROM idempotency WHERE created_at < now() - $1::interval`, IdempotencyTTL.String())
-	_, err := p.pool.Exec(ctx, `INSERT INTO idempotency (key, status, body, created_at) VALUES ($1,$2,$3,$4)
+	_, err := p.pool.Exec(ctx, `INSERT INTO idempotency (key, body_hash, status, body, created_at) VALUES ($1,$2,$3,$4,$5)
 		ON CONFLICT (key) DO UPDATE SET status=EXCLUDED.status, body=EXCLUDED.body, created_at=EXCLUDED.created_at`,
-		rec.Key, rec.Status, rec.Body, rec.CreatedAt)
+		rec.Key, rec.BodyHash, rec.Status, rec.Body, rec.CreatedAt)
+	return err
+}
+
+func (p *Postgres) ReleaseIdempotent(ctx context.Context, key string) error {
+	_, err := p.pool.Exec(ctx, `DELETE FROM idempotency WHERE key=$1`, key)
 	return err
 }
 
 func (p *Postgres) GetIdempotent(ctx context.Context, key string) (*Idempotent, error) {
 	var rec Idempotent
-	err := p.pool.QueryRow(ctx, `SELECT key, status, body, created_at FROM idempotency WHERE key=$1 AND created_at >= now() - $2::interval`,
-		key, IdempotencyTTL.String()).Scan(&rec.Key, &rec.Status, &rec.Body, &rec.CreatedAt)
+	err := p.pool.QueryRow(ctx, `SELECT key, body_hash, status, body, created_at FROM idempotency WHERE key=$1 AND created_at >= now() - $2::interval`,
+		key, IdempotencyTTL.String()).Scan(&rec.Key, &rec.BodyHash, &rec.Status, &rec.Body, &rec.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}

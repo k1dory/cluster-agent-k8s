@@ -135,20 +135,43 @@ func (g *Gateway) appendOutput(w http.ResponseWriter, r *http.Request, id *ident
 	}
 	// Limits: MaxBodyBytes per request, MaxLineBytes per line. Exceeding either is a 413 and
 	// nothing after the offending point is stored; lines before it are, and are acknowledged.
+	//
+	// With X-Batch-Id the server remembers how many lines of that batch it stored, so a retry
+	// of the same batch (after a lost response or a 5xx) skips them instead of duplicating
+	// output and usage. Progress is recorded before every response, success or error.
+	batchKey := ""
+	skip := 0
+	if bid := r.Header.Get("X-Batch-Id"); bid != "" && len(bid) <= 100 {
+		batchKey = "batch|" + run.ID + "|" + bid
+		if rec, err := g.Orch.Store.GetIdempotent(r.Context(), batchKey); err == nil {
+			skip = rec.Status
+		}
+	}
+	n := 0
+	remember := func() {
+		if batchKey != "" {
+			_ = g.Orch.Store.PutIdempotent(r.Context(), &store.Idempotent{Key: batchKey, Status: n, Body: []byte{}})
+		}
+	}
 	sc := bufio.NewScanner(http.MaxBytesReader(w, r.Body, MaxBodyBytes))
 	sc.Buffer(make([]byte, 0, 64<<10), MaxLineBytes)
-	n := 0
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" {
 			continue
 		}
+		if n < skip {
+			n++
+			continue
+		}
 		if err := g.Orch.Output(r.Context(), id.SandboxID, run.ID, line); err != nil {
+			remember()
 			writeErr(w, http.StatusInternalServerError, fmt.Errorf("stored %d lines, then: %w", n, err))
 			return
 		}
 		n++
 	}
+	remember()
 	if err := sc.Err(); err != nil {
 		var mbe *http.MaxBytesError
 		switch {
@@ -161,7 +184,7 @@ func (g *Gateway) appendOutput(w http.ResponseWriter, r *http.Request, id *ident
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int{"accepted": n})
+	writeJSON(w, http.StatusOK, map[string]int{"accepted": n, "skipped": skip})
 }
 
 // Output stream limits for POST /agent/runs/{run}/events.
@@ -185,17 +208,16 @@ func (g *Gateway) pollInput(w http.ResponseWriter, r *http.Request, id *identity
 	for {
 		// Filter by type in the store, so a run that writes a lot of output cannot push a
 		// message or a cancel beyond the page the poll reads.
-		evs, err := g.Orch.Store.QueryEvents(r.Context(), store.Filter{SandboxID: id.SandboxID, AfterID: after,
-			Types: []string{model.EventInput, model.EventRunCancel}, Limit: 200})
+		// Type and run scope are both applied in the store, before LIMIT: events of other runs
+		// in this sandbox cannot fill the page and hide ours.
+		out, err := g.Orch.Store.QueryEvents(r.Context(), store.Filter{SandboxID: id.SandboxID, AfterID: after,
+			Types: []string{model.EventInput, model.EventRunCancel}, RunScope: run.ID, Limit: 200})
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
-		out := []*model.Event{}
-		for _, e := range evs {
-			if e.RunID == "" || e.RunID == run.ID {
-				out = append(out, e)
-			}
+		if out == nil {
+			out = []*model.Event{}
 		}
 		if len(out) > 0 || time.Now().After(deadline) {
 			writeJSON(w, http.StatusOK, out)

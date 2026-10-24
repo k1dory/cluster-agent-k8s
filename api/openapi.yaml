@@ -20,10 +20,15 @@ info:
       `quota_exceeded`, `upstream_failed`, `internal`, `unavailable`). `request_id` also comes back
       as the `X-Request-Id` header and is in the server log; send your own `X-Request-Id` to correlate.
     * **Malformed query parameters are 400**, never silently defaulted.
-    * **Paging**: list endpoints take `limit` and `after` (cursor = id of the last item). When a page
-      is full the response carries `X-Next-Cursor`; no header means the end.
-    * **Idempotency**: `POST /v1/sandboxes` and `POST .../runs` honour `Idempotency-Key`; a repeat
-      within 24h (same tenant, route and key) replays the stored response with `Idempotency-Replayed: true`.
+    * **Paging**: list endpoints take `limit` and `after`. `X-Next-Cursor` is present only when
+      another page exists (the server fetches one row more than `limit`); its value is opaque and
+      keeps working after the anchor row is deleted or stops matching the filter. Event endpoints
+      use the numeric event id as cursor.
+    * **Idempotency**: `POST /v1/sandboxes` and `POST .../runs` honour `Idempotency-Key`. The key is
+      reserved before the request runs: a concurrent repeat gets 409 with `Retry-After: 1`, a repeat
+      with a different body gets 422, a repeat after success replays the stored response with
+      `Idempotency-Replayed: true` (24h, per tenant and route).
+    * Unknown routes and methods answer the same JSON error shape (404 / 405 with `Allow`).
 servers:
   - url: http://localhost:8080
     description: platform API
@@ -78,6 +83,8 @@ paths:
               schema: { $ref: "#/components/schemas/Sandbox" }
         "400": { $ref: "#/components/responses/Error" }
         "403": { $ref: "#/components/responses/Error" }
+        "409": { description: "Idempotency-Key request still in progress (Retry-After)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Idempotency-Key reused with a different body", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "429": { $ref: "#/components/responses/Error" }
   /v1/sandboxes/{id}:
     parameters: [{ $ref: "#/components/parameters/id" }]
@@ -240,7 +247,7 @@ paths:
               properties:
                 text: { type: string, description: "Non-empty; written to the harness stdin" }
       responses:
-        "204": { description: Delivered to the event stream }
+        "204": { description: Persisted in the event stream (a storage failure is a 500, never a silent 204) }
         "400": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
         "409": { description: "Run already finished", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
@@ -445,6 +452,12 @@ paths:
         Limits: 4 MiB per request, 1 MiB per line. Lines up to the first violation are stored and
         the 413 message says how many (`stored N lines`), so a retry resumes after them. Lines
         that carry usage (Claude Code's `result`, generic `{"type":"usage"}`) update the run's accounting.
+
+        Send `X-Batch-Id` (any id, kept across retries of the same batch): the server remembers how
+        many lines of that batch it stored, records that before every response, and a retry skips
+        them (`skipped` in the answer). Without it a retry after a lost response duplicates lines.
+      parameters:
+        - { name: X-Batch-Id, in: header, schema: { type: string, maxLength: 100 } }
       requestBody:
         content:
           text/plain:
@@ -457,7 +470,8 @@ paths:
               schema:
                 type: object
                 properties:
-                  accepted: { type: integer, description: "Lines stored" }
+                  accepted: { type: integer, description: "Lines of this batch stored in total" }
+                  skipped: { type: integer, description: "Lines skipped because an earlier attempt stored them" }
         "413": { $ref: "#/components/responses/Error" }
   /agent/runs/{run}/input:
     parameters: [{ name: run, in: path, required: true, schema: { type: string } }]
@@ -579,12 +593,14 @@ components:
       name: after
       in: query
       schema: { type: string }
-      description: Cursor from the previous page's `X-Next-Cursor` (the id of its last item)
+      description: Opaque cursor from the previous page's `X-Next-Cursor`
     idempotencyKey:
       name: Idempotency-Key
       in: header
       schema: { type: string, maxLength: 200 }
-      description: Repeating the request with the same key within 24h replays the stored 2xx response
+      description: |
+        Repeating the request with the same key and body within 24h replays the stored 2xx response.
+        409 while the first request is still running, 422 if the body differs.
   responses:
     Error:
       description: Error

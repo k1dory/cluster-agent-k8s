@@ -3,11 +3,58 @@ package store
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
+	"strconv"
+	"strings"
 	"time"
 
 	"agent-sandbox/internal/model"
 )
+
+// Cursor is an opaque page cursor: the (created_at, id) of the last item of a page. It keeps
+// working when that item is later deleted or no longer matches the filter.
+type Cursor struct {
+	At time.Time
+	ID string
+}
+
+// Encode renders the cursor for clients.
+func (c Cursor) Encode() string {
+	return base64.RawURLEncoding.EncodeToString([]byte(strconv.FormatInt(c.At.UnixNano(), 10) + ":" + c.ID))
+}
+
+// IsZero reports an unset cursor.
+func (c Cursor) IsZero() bool { return c.ID == "" }
+
+// ParseCursor decodes what Encode produced.
+func ParseCursor(s string) (Cursor, error) {
+	if s == "" {
+		return Cursor{}, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		return Cursor{}, fmt.Errorf("malformed cursor")
+	}
+	ns, id, ok := strings.Cut(string(raw), ":")
+	n, err2 := strconv.ParseInt(ns, 10, 64)
+	if !ok || err2 != nil || id == "" {
+		return Cursor{}, fmt.Errorf("malformed cursor")
+	}
+	return Cursor{At: time.Unix(0, n), ID: id}, nil
+}
+
+// after reports whether (at, id) sorts after the cursor.
+func (c Cursor) after(at time.Time, id string) bool {
+	if c.IsZero() {
+		return true
+	}
+	if at.Equal(c.At) {
+		return id > c.ID
+	}
+	return at.After(c.At)
+}
 
 // Filter selects runs or events across sandboxes for accounting and tracing.
 // Empty fields match everything; From/To bound CreatedAt (runs) or At (events).
@@ -18,26 +65,40 @@ type Filter struct {
 	RunID     string
 	Status    string   // runs only
 	Types     []string // events only
-	From, To  time.Time
-	AfterID   int64  // events only: pagination cursor
-	Cursor    string // runs only: id of the last run of the previous page
-	Limit     int
+	// RunScope (events only): keep events of this run and events addressed to no run (run_id ""),
+	// applied in the store before LIMIT.
+	RunScope string
+	From, To time.Time
+	AfterID  int64  // events only: pagination cursor
+	Cursor   Cursor // runs only: page cursor
+	Limit    int
 }
 
 // SandboxFilter selects sandboxes for a list page.
 type SandboxFilter struct {
 	Tenant, Owner, Slug, Status string
-	Cursor                      string // id of the last sandbox of the previous page
+	Cursor                      Cursor
 	Limit                       int
 }
 
-// Idempotent is a stored response, replayed when a client repeats a request with the same key.
+// SandboxCounts is what quotas are checked against.
+type SandboxCounts struct {
+	Total int // records, any status
+	Awake int // creating, waking, running
+}
+
+// Idempotent is a reservation of an Idempotency-Key and, once the request finished, its
+// stored 2xx response. Status 0 means "in progress".
 type Idempotent struct {
 	Key       string
+	BodyHash  string // sha256 of the request body: the same key with another body is an error
 	Status    int
 	Body      []byte
 	CreatedAt time.Time
 }
+
+// InProgress reports a reserved key whose request has not finished.
+func (i *Idempotent) InProgress() bool { return i.Status == 0 }
 
 // EventCount is one row of a GROUP BY over events.
 type EventCount struct {
@@ -57,6 +118,8 @@ type Store interface {
 	ListSandboxes(ctx context.Context) ([]*model.Sandbox, error)
 	// QuerySandboxes returns one page matching f, ordered by creation.
 	QuerySandboxes(ctx context.Context, f SandboxFilter) ([]*model.Sandbox, error)
+	// CountSandboxes counts a tenant's sandboxes without paging.
+	CountSandboxes(ctx context.Context, tenant string) (SandboxCounts, error)
 	UpdateSandbox(ctx context.Context, s *model.Sandbox) error
 	DeleteSandbox(ctx context.Context, id string) error
 	SandboxByPreviewHost(ctx context.Context, host string) (*model.Sandbox, error)
@@ -67,7 +130,9 @@ type Store interface {
 	ListRuns(ctx context.Context, sandboxID string) ([]*model.Run, error)
 	// QueryRuns returns runs matching f across sandboxes, oldest first.
 	QueryRuns(ctx context.Context, f Filter) ([]*model.Run, error)
-	NextQueuedRun(ctx context.Context, sandboxID string) (*model.Run, error)
+	// ClaimQueuedRun atomically moves the oldest queued run of the sandbox to running and
+	// returns it; concurrent callers never get the same run. ErrNotFound when none is queued.
+	ClaimQueuedRun(ctx context.Context, sandboxID string, startedAt time.Time) (*model.Run, error)
 	RunningRun(ctx context.Context, sandboxID string) (*model.Run, error)
 
 	AppendEvent(ctx context.Context, e *model.Event) error
@@ -84,8 +149,14 @@ type Store interface {
 	RetireInstance(ctx context.Context, n int) error
 	ListInstances(ctx context.Context, sandboxID string) ([]*model.Instance, error)
 
-	// PutIdempotent stores a response under key; GetIdempotent returns ErrNotFound when unknown or expired.
+	// ReserveIdempotent atomically claims key for this body. reserved=true means the caller
+	// owns the key and must finish with PutIdempotent or ReleaseIdempotent; otherwise existing
+	// is the earlier reservation or stored response.
+	ReserveIdempotent(ctx context.Context, key, bodyHash string) (existing *Idempotent, reserved bool, err error)
+	// PutIdempotent records the finished response under a reserved key.
 	PutIdempotent(ctx context.Context, rec *Idempotent) error
+	// ReleaseIdempotent drops a reservation whose request failed, so a retry may run.
+	ReleaseIdempotent(ctx context.Context, key string) error
 	GetIdempotent(ctx context.Context, key string) (*Idempotent, error)
 
 	Close() error
@@ -93,3 +164,7 @@ type Store interface {
 
 // IdempotencyTTL is how long a stored response is replayed.
 const IdempotencyTTL = 24 * time.Hour
+
+// IdempotencyStale is how long an unfinished reservation blocks retries before it is
+// considered abandoned (the process died mid-request) and may be taken over.
+const IdempotencyStale = 2 * time.Minute

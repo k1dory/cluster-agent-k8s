@@ -92,9 +92,11 @@ sandboxctl sleep sb_1234                 # or wait an hour of silence
   foreign sandboxes are 403, lists, usage and trace are filtered. `GET /v1/whoami` tells which you hold.
 - **Errors** are `{error, code, request_id}` with a stable `code`; `X-Request-Id` is echoed and logged.
   Malformed query parameters are 400, never silently defaulted.
-- **Paging.** `limit` + `after` on lists; a full page returns `X-Next-Cursor`, no header means the end.
-- **Idempotency.** `Idempotency-Key` on `POST /v1/sandboxes` and `POST .../runs` replays the stored
-  response for 24h, so a CI retry after a timeout never creates a second sandbox or run.
+- **Paging.** `limit` + `after` on lists; `X-Next-Cursor` appears only when a next page exists and
+  stays valid when its anchor row is deleted.
+- **Idempotency.** `Idempotency-Key` on `POST /v1/sandboxes` and `POST .../runs`: the key is reserved
+  before the request runs, so a CI retry after a timeout never creates a second sandbox or run, a
+  concurrent repeat waits (409), and a reuse with another body is refused (422).
 - **Lifecycle.** `ttl` on create or `PATCH` sets `expires_at`; the sweeper deletes expired sandboxes.
   `PATCH` also changes `idle_timeout`, `wake_on_preview`, `repo`. Per-tenant `quotas` cap
   `max_sandboxes` and `max_awake` (429 `quota_exceeded`).

@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -374,24 +376,29 @@ func TestTenantsAndContracts(t *testing.T) {
 		t.Fatalf("bob reading alice usage: %d", resp.StatusCode)
 	}
 
-	// Paging: limit=1 gives a cursor; following it reaches the end.
+	// Paging: limit=1 gives an opaque cursor; the last page carries none even when it is full.
 	resp, body = call(t, "GET", api+"/v1/sandboxes?limit=1", "t0k", nil, nil)
 	_ = json.Unmarshal(body, &list)
 	cur := resp.Header.Get("X-Next-Cursor")
-	if len(list) != 1 || cur != list[0].ID {
+	first := list[0].ID
+	if len(list) != 1 || cur == "" {
 		t.Fatalf("page 1: %s cursor=%q", body, cur)
 	}
 	resp, body = call(t, "GET", api+"/v1/sandboxes?limit=1&after="+cur, "t0k", nil, nil)
 	_ = json.Unmarshal(body, &list)
-	if len(list) != 1 || list[0].ID == cur || resp.Header.Get("X-Next-Cursor") == "" {
-		t.Fatalf("page 2: %s", body)
+	if len(list) != 1 || list[0].ID == first || resp.Header.Get("X-Next-Cursor") != "" {
+		t.Fatalf("page 2 must be the last, without cursor: %s %q", body, resp.Header.Get("X-Next-Cursor"))
 	}
-	resp, body = call(t, "GET", api+"/v1/sandboxes?limit=1&after="+list[0].ID, "t0k", nil, nil)
-	if string(bytes.TrimSpace(body)) != "[]" || resp.Header.Get("X-Next-Cursor") != "" {
-		t.Fatalf("page 3 must be empty without cursor: %s %q", body, resp.Header.Get("X-Next-Cursor"))
+	// The cursor keeps working when its anchor no longer matches the filter (status changed).
+	call(t, "POST", api+"/v1/sandboxes/"+first+"/sleep", "t0k", nil, nil)
+	resp, body = call(t, "GET", api+"/v1/sandboxes?limit=1&status=running&after="+cur, "t0k", nil, nil)
+	_ = json.Unmarshal(body, &list)
+	if len(list) != 1 || list[0].ID == first {
+		t.Fatalf("cursor after a filtered-out anchor: %s", body)
 	}
-	// Strict parameters.
-	for _, bad := range []string{"?limit=0", "?limit=abc", "?status=awake", "?limit=99999"} {
+	call(t, "POST", api+"/v1/sandboxes/"+first+"/wake", "t0k", nil, nil)
+	// Strict parameters, including a malformed cursor.
+	for _, bad := range []string{"?limit=0", "?limit=abc", "?status=awake", "?limit=99999", "?after=!!!", "?after=bm9wZQ"} {
 		if resp, body := call(t, "GET", api+"/v1/sandboxes"+bad, "t0k", nil, nil); resp.StatusCode != 400 {
 			t.Fatalf("%s must be 400: %d %s", bad, resp.StatusCode, body)
 		}
@@ -413,6 +420,22 @@ func TestTenantsAndContracts(t *testing.T) {
 	_ = json.Unmarshal(body2, &i2)
 	if resp.StatusCode != 201 || resp2.StatusCode != 201 || i1.ID != i2.ID || resp2.Header.Get("Idempotency-Replayed") != "true" {
 		t.Fatalf("idempotent create: %d %d %s / %s", resp.StatusCode, resp2.StatusCode, i1.ID, i2.ID)
+	}
+	// Same key, different body: refused; router errors are JSON too.
+	resp, body = call(t, "POST", api+"/v1/sandboxes", "alice-tok", map[string]any{"name": "other", "slug": "backend-dev", "owner": "alice"}, h)
+	_ = json.Unmarshal(body, &eb)
+	if resp.StatusCode != 422 || eb.Code == "" {
+		t.Fatalf("key reuse with another body: %d %s", resp.StatusCode, body)
+	}
+	resp, body = call(t, "GET", api+"/v1/nope", "alice-tok", nil, nil)
+	_ = json.Unmarshal(body, &eb)
+	if resp.StatusCode != 404 || eb.Code != CodeNotFound || eb.RequestID == "" {
+		t.Fatalf("router 404: %d %s", resp.StatusCode, body)
+	}
+	resp, body = call(t, "PUT", api+"/v1/sandboxes", "alice-tok", nil, nil)
+	_ = json.Unmarshal(body, &eb)
+	if resp.StatusCode != 405 || eb.Code == "" || resp.Header.Get("Allow") == "" {
+		t.Fatalf("router 405: %d %s allow=%q", resp.StatusCode, body, resp.Header.Get("Allow"))
 	}
 	// Same key, other tenant: not shared.
 	if resp, _ := call(t, "POST", api+"/v1/sandboxes", "t0k", map[string]any{"name": "idem", "slug": "backend-dev", "owner": "carol"}, h); resp.StatusCode != 201 || resp.Header.Get("Idempotency-Replayed") != "" {
@@ -480,5 +503,110 @@ func TestTenantsAndContracts(t *testing.T) {
 	}
 	if resp, _ := call(t, "GET", api+"/v1/sandboxes/"+a1.ID, "alice-tok", nil, nil); resp.StatusCode != 404 {
 		t.Fatalf("deleted sandbox still there: %d", resp.StatusCode)
+	}
+}
+
+// TestConcurrency pins the races the review found: one quota slot, two creators; one queued
+// run, two pollers; one output batch sent twice.
+func TestConcurrency(t *testing.T) {
+	s := newStack(t)
+	api, gw := s.platform.URL, s.gateway.URL
+
+	var wg sync.WaitGroup
+	codes := make([]int, 6)
+	for i := range codes {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, _ := call(t, "POST", api+"/v1/sandboxes", "bob-tok", map[string]any{"name": fmt.Sprintf("c%d", i), "slug": "backend-dev", "owner": "bob"}, nil)
+			codes[i] = resp.StatusCode
+		}(i)
+	}
+	wg.Wait()
+	created := 0
+	for _, c := range codes {
+		if c == 201 {
+			created++
+		}
+	}
+	if created != 1 {
+		t.Fatalf("quota max_sandboxes=1 let %d creates through: %v", created, codes)
+	}
+
+	// One queued run, two concurrent pollers: exactly one gets it.
+	resp, body := call(t, "POST", api+"/v1/sandboxes", "t0k", map[string]any{"name": "race", "slug": "backend-dev", "owner": "alice"}, nil)
+	var sb model.Sandbox
+	_ = json.Unmarshal(body, &sb)
+	if resp.StatusCode != 201 {
+		t.Fatalf("create: %d %s", resp.StatusCode, body)
+	}
+	s.tokens["race-token"] = registrar.PodInfo{Name: "agent-r", SandboxID: sb.ID, Slug: "backend-dev", Tenant: "alice"}
+	_, csr, _ := ca.NewCSR("backend-dev")
+	_, body = call(t, "POST", gw+"/bootstrap", "race-token", registrar.BootstrapRequest{CSR: string(csr)}, nil)
+	var boot registrar.BootstrapResponse
+	_ = json.Unmarshal(body, &boot)
+	blk, _ := pem.Decode([]byte(boot.Cert))
+	certHdr := map[string]string{identity.HeaderCertDER: base64.StdEncoding.EncodeToString(blk.Bytes)}
+	call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/runs", "t0k", map[string]string{"task": "once"}, nil)
+	got := make([]int, 2)
+	for i := range got {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp, _ := call(t, "GET", gw+"/agent/runs/next?wait=1s", "", nil, certHdr)
+			got[i] = resp.StatusCode
+		}(i)
+	}
+	wg.Wait()
+	if !(got[0] == 200 && got[1] == 204 || got[0] == 204 && got[1] == 200) {
+		t.Fatalf("one run, two pollers: %v", got)
+	}
+	_, body = call(t, "GET", api+"/v1/sandboxes/"+sb.ID+"/runs?status=running", "t0k", nil, nil)
+	var runs []model.Run
+	_ = json.Unmarshal(body, &runs)
+	if len(runs) != 1 {
+		t.Fatalf("running runs: %s", body)
+	}
+	run := runs[0]
+
+	// The same batch twice: stored once, the retry reports skipped lines and adds no events or usage.
+	h := map[string]string{"X-Batch-Id": "b-1"}
+	for k, v := range certHdr {
+		h[k] = v
+	}
+	usageLine := `{"type":"usage","input_tokens":10,"output_tokens":5,"cost_usd":0.5}`
+	resp, body = call(t, "POST", gw+"/agent/runs/"+run.ID+"/events", "", "a\nb\n"+usageLine+"\n", h)
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"accepted":3`) || !strings.Contains(string(body), `"skipped":0`) {
+		t.Fatalf("batch 1: %d %s", resp.StatusCode, body)
+	}
+	resp, body = call(t, "POST", gw+"/agent/runs/"+run.ID+"/events", "", "a\nb\n"+usageLine+"\n", h)
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"skipped":3`) {
+		t.Fatalf("batch 1 retry: %d %s", resp.StatusCode, body)
+	}
+	_, body = call(t, "GET", api+"/v1/sandboxes/"+sb.ID+"/events?stream=false&run="+run.ID, "t0k", nil, nil)
+	var evs []model.Event
+	_ = json.Unmarshal(body, &evs)
+	outputs := 0
+	for _, e := range evs {
+		if e.Type == model.EventRunOutput {
+			outputs++
+		}
+	}
+	_, body = call(t, "GET", api+"/v1/sandboxes/"+sb.ID+"/runs/"+run.ID, "t0k", nil, nil)
+	var r model.Run
+	_ = json.Unmarshal(body, &r)
+	if outputs != 3 || r.Usage.CostUSD != 0.5 {
+		t.Fatalf("retry duplicated: outputs=%d cost=%v", outputs, r.Usage.CostUSD)
+	}
+}
+
+func TestSafeNext(t *testing.T) {
+	for in, want := range map[string]string{
+		"": "/", "/": "/", "/app?x=1": "/app?x=1", "//evil.example.com": "/", "/\\evil.example.com": "/",
+		"https://evil.example.com": "/", "/a\x00b": "/", "/ok/path#frag": "/ok/path#frag",
+	} {
+		if got := SafeNext(in); got != want {
+			t.Errorf("SafeNext(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

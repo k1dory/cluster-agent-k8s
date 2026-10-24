@@ -76,8 +76,21 @@ type Orchestrator struct {
 
 	mu      sync.Mutex
 	waking  map[string]bool
-	meta    map[string]sbMeta // sandbox id → tenant/slug, for stamping events
-	running map[string]string // sandbox id → running run id ("" = none), for egress attribution
+	meta    map[string]sbMeta      // sandbox id → tenant/slug, for stamping events
+	running map[string]string      // sandbox id → running run id ("" = none), for egress attribution
+	tenants map[string]*sync.Mutex // serialises quota check + allocation per tenant
+}
+
+// tenantLock returns the mutex that guards quota decisions of one tenant.
+func (o *Orchestrator) tenantLock(tenant string) *sync.Mutex {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	m, ok := o.tenants[tenant]
+	if !ok {
+		m = &sync.Mutex{}
+		o.tenants[tenant] = m
+	}
+	return m
 }
 
 type sbMeta struct{ tenant, slug string }
@@ -97,7 +110,7 @@ func New(st store.Store, rt Runtime, ret Retirer, hub *events.Hub, cfg Config, l
 		log = slog.Default()
 	}
 	return &Orchestrator{Store: st, Runtime: rt, Retirer: ret, Hub: hub, Cfg: cfg, Log: log,
-		waking: map[string]bool{}, meta: map[string]sbMeta{}, running: map[string]string{}}
+		waking: map[string]bool{}, meta: map[string]sbMeta{}, running: map[string]string{}, tenants: map[string]*sync.Mutex{}}
 }
 
 // Errors surfaced to the API.
@@ -174,10 +187,16 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 			sb.ExpiresAt = &t
 		}
 	}
-	if err := o.checkQuota(ctx, sb.Tenant, true); err != nil {
-		return nil, err
+	// Quota check and record creation under the tenant lock: two concurrent creates cannot
+	// both see the last free slot.
+	lock := o.tenantLock(sb.Tenant)
+	lock.Lock()
+	err := o.checkQuota(ctx, sb.Tenant, true)
+	if err == nil {
+		err = o.Store.CreateSandbox(ctx, sb)
 	}
-	if err := o.Store.CreateSandbox(ctx, sb); err != nil {
+	lock.Unlock()
+	if err != nil {
 		return nil, err
 	}
 	o.remember(sb)
@@ -197,29 +216,25 @@ func (o *Orchestrator) checkQuota(ctx context.Context, tenant string, newRecord 
 	if q.MaxSandboxes == 0 && q.MaxAwake == 0 {
 		return nil
 	}
-	sbs, err := o.Store.QuerySandboxes(ctx, store.SandboxFilter{Tenant: tenant})
+	c, err := o.Store.CountSandboxes(ctx, tenant)
 	if err != nil {
 		return err
 	}
-	if newRecord && q.MaxSandboxes > 0 && len(sbs) >= q.MaxSandboxes {
-		return fmt.Errorf("%w: tenant %s already has %d sandboxes (max_sandboxes=%d)", ErrQuota, tenant, len(sbs), q.MaxSandboxes)
+	if newRecord && q.MaxSandboxes > 0 && c.Total >= q.MaxSandboxes {
+		return fmt.Errorf("%w: tenant %s already has %d sandboxes (max_sandboxes=%d)", ErrQuota, tenant, c.Total, q.MaxSandboxes)
 	}
-	if q.MaxAwake > 0 {
-		awake := 0
-		for _, s := range sbs {
-			switch s.Status {
-			case model.StatusCreating, model.StatusWaking, model.StatusRunning:
-				awake++
-			}
-		}
-		if awake >= q.MaxAwake {
-			return fmt.Errorf("%w: tenant %s already has %d sandboxes awake (max_awake=%d)", ErrQuota, tenant, awake, q.MaxAwake)
-		}
+	if q.MaxAwake > 0 && c.Awake >= q.MaxAwake {
+		return fmt.Errorf("%w: tenant %s already has %d sandboxes awake (max_awake=%d)", ErrQuota, tenant, c.Awake, q.MaxAwake)
 	}
 	return nil
 }
 
+// startPod checks the awake quota and creates the pod under the tenant lock, so the status
+// flip to waking (which the next check counts) happens before another wake is evaluated.
 func (o *Orchestrator) startPod(ctx context.Context, sb *model.Sandbox) error {
+	lock := o.tenantLock(sb.Tenant)
+	lock.Lock()
+	defer lock.Unlock()
 	if sb.Status != model.StatusCreating {
 		if err := o.checkQuota(ctx, sb.Tenant, false); err != nil {
 			return err
@@ -560,21 +575,15 @@ func (o *Orchestrator) Input(ctx context.Context, sandboxID, runID, text string)
 		return fmt.Errorf("%w: run is %s", ErrConflict, r.Status)
 	}
 	o.Touch(ctx, sandboxID)
-	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventInput, Data: text})
-	return nil
+	return o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventInput, Data: text})
 }
 
 // NextRun long-polls for a queued run (agent side) and marks it running.
 func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.Duration) (*model.Run, error) {
 	deadline := time.Now().Add(wait)
 	for {
-		r, err := o.Store.NextQueuedRun(ctx, sandboxID)
+		r, err := o.Store.ClaimQueuedRun(ctx, sandboxID, time.Now())
 		if err == nil {
-			now := time.Now()
-			r.Status, r.StartedAt = model.RunRunning, &now
-			if err := o.Store.UpdateRun(ctx, r); err != nil {
-				return nil, err
-			}
 			o.setRunning(sandboxID, r.ID)
 			o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunStart})
 			return r, nil

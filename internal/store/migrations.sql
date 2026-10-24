@@ -93,11 +93,13 @@ CREATE TABLE IF NOT EXISTS instances (
 );
 CREATE INDEX IF NOT EXISTS instances_sandbox ON instances (sandbox_id);
 
--- Stored responses for Idempotency-Key replays (24h).
+-- Idempotency-Key reservations and stored responses (24h). status 0 = request in progress.
 CREATE TABLE IF NOT EXISTS idempotency (
     key        text PRIMARY KEY,
+    body_hash  text NOT NULL DEFAULT '',
     status     integer NOT NULL,
     body       bytea NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE idempotency ADD COLUMN IF NOT EXISTS body_hash text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency (created_at);

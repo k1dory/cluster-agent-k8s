@@ -6,11 +6,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -87,7 +89,52 @@ func (p *Platform) Routes() http.Handler {
 		pr := principalOf(r)
 		writeJSON(w, http.StatusOK, map[string]any{"admin": pr.admin(), "tenant": pr.tenant})
 	}))
-	return logRequests(p.Log, mux)
+	return logRequests(p.Log, jsonMuxErrors(mux))
+}
+
+// jsonMuxErrors turns the router's own text 404/405 into the API's error shape.
+func jsonMuxErrors(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h, pattern := mux.Handler(r)
+		if pattern != "" {
+			mux.ServeHTTP(w, r) // through the mux, so path values are bound
+			return
+		}
+		probe := &statusWriter{ResponseWriter: &discard{header: http.Header{}}, code: 200}
+		h.ServeHTTP(probe, r)
+		if allow := probe.ResponseWriter.Header().Get("Allow"); allow != "" {
+			w.Header().Set("Allow", allow)
+		}
+		switch probe.code {
+		case http.StatusMethodNotAllowed:
+			writeErr(w, http.StatusMethodNotAllowed, fmt.Errorf("%s not allowed on %s", r.Method, r.URL.Path))
+		default:
+			writeErr(w, http.StatusNotFound, fmt.Errorf("no route for %s %s", r.Method, r.URL.Path))
+		}
+	})
+}
+
+type discard struct{ header http.Header }
+
+func (d *discard) Header() http.Header         { return d.header }
+func (d *discard) Write(b []byte) (int, error) { return len(b), nil }
+func (d *discard) WriteHeader(int)             {}
+
+// SafeNext keeps a post-sign-in redirect on the preview host: one leading slash, no scheme,
+// no backslashes or control characters. Anything else becomes "/".
+func SafeNext(next string) string {
+	if next == "" || next[0] != '/' || strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/\\") {
+		return "/"
+	}
+	for _, c := range next {
+		if c < 0x20 || c == 0x7f || c == '\\' {
+			return "/"
+		}
+	}
+	if u, err := url.Parse(next); err != nil || u.Host != "" || u.Scheme != "" {
+		return "/"
+	}
+	return next
 }
 
 // auth resolves the bearer token to a principal: the admin token sees everything, a tenant
@@ -156,20 +203,48 @@ func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, errors.New("Idempotency-Key longer than 200 bytes"))
 			return
 		}
+		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		sum := sha256.Sum256(body)
+		hash := hex.EncodeToString(sum[:])
 		full := principalOf(r).tenant + "|" + r.Method + " " + r.URL.Path + "|" + key
-		if rec, err := p.Orch.Store.GetIdempotent(r.Context(), full); err == nil {
-			w.Header().Set("Idempotency-Replayed", "true")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(rec.Status)
-			w.Write(rec.Body)
+		// The reservation is the lock: concurrent repeats see it and wait, a repeat with another
+		// body is refused, and a finished request is replayed from the stored response.
+		existing, reserved, err := p.Orch.Store.ReserveIdempotent(r.Context(), full, hash)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		if !reserved {
+			switch {
+			case existing.BodyHash != hash:
+				writeErr(w, http.StatusUnprocessableEntity, errors.New("Idempotency-Key was already used with a different request body"))
+			case existing.InProgress():
+				w.Header().Set("Retry-After", "1")
+				writeErr(w, http.StatusConflict, errors.New("a request with this Idempotency-Key is still in progress"))
+			default:
+				w.Header().Set("Idempotency-Replayed", "true")
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(existing.Status)
+				w.Write(existing.Body)
+			}
 			return
 		}
 		rec := &recorder{ResponseWriter: w, code: 200}
 		next(rec, r)
 		if rec.code >= 200 && rec.code < 300 {
-			if err := p.Orch.Store.PutIdempotent(r.Context(), &store.Idempotent{Key: full, Status: rec.code, Body: rec.body.Bytes()}); err != nil {
-				p.Log.Warn("store idempotent response", "err", err)
-			}
+			err = p.Orch.Store.PutIdempotent(r.Context(), &store.Idempotent{Key: full, BodyHash: hash, Status: rec.code, Body: rec.body.Bytes()})
+		} else {
+			err = p.Orch.Store.ReleaseIdempotent(r.Context(), full)
+		}
+		if err != nil {
+			// The response is already on the wire; the reservation stays until IdempotencyStale,
+			// so a fast retry gets 409 rather than a duplicate, and the log says why.
+			p.Log.Error("finish idempotent request", "key", key, "err", err)
 		}
 	}
 }
@@ -188,9 +263,10 @@ func (rc *recorder) Write(b []byte) (int, error) {
 
 func (p *Platform) list(w http.ResponseWriter, r *http.Request) {
 	q := &query{r: r}
-	f := store.SandboxFilter{Owner: q.str("owner"), Slug: q.str("slug"), Cursor: q.str("after"),
+	limit := q.limit(100, 1000)
+	f := store.SandboxFilter{Owner: q.str("owner"), Slug: q.str("slug"), Cursor: q.cursor("after"),
 		Status: q.oneOf("status", "", "creating", "waking", "running", "stopping", "sleeping", "deleting", "error"),
-		Limit:  q.limit(100, 1000)}
+		Limit:  limit + 1}
 	if q.err != nil {
 		writeErr(w, http.StatusBadRequest, q.err)
 		return
@@ -208,8 +284,11 @@ func (p *Platform) list(w http.ResponseWriter, r *http.Request) {
 	if sbs == nil {
 		sbs = []*model.Sandbox{}
 	}
-	if len(sbs) == f.Limit {
-		w.Header().Set("X-Next-Cursor", sbs[len(sbs)-1].ID)
+	// One extra row tells whether a next page exists; the cursor is the last row returned.
+	if len(sbs) > limit {
+		sbs = sbs[:limit]
+		last := sbs[limit-1]
+		w.Header().Set("X-Next-Cursor", store.Cursor{At: last.CreatedAt, ID: last.ID}.Encode())
 	}
 	writeJSON(w, http.StatusOK, sbs)
 }
@@ -316,7 +395,8 @@ func (p *Platform) listRuns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := &query{r: r}
-	f := store.Filter{SandboxID: r.PathValue("id"), Cursor: q.str("after"), Limit: q.limit(100, 1000),
+	limit := q.limit(100, 1000)
+	f := store.Filter{SandboxID: r.PathValue("id"), Cursor: q.cursor("after"), Limit: limit + 1,
 		Status: q.oneOf("status", "", "queued", "running", "done", "failed", "cancelled")}
 	if q.err != nil {
 		writeErr(w, http.StatusBadRequest, q.err)
@@ -330,8 +410,10 @@ func (p *Platform) listRuns(w http.ResponseWriter, r *http.Request) {
 	if runs == nil {
 		runs = []*model.Run{}
 	}
-	if len(runs) == f.Limit {
-		w.Header().Set("X-Next-Cursor", runs[len(runs)-1].ID)
+	if len(runs) > limit {
+		runs = runs[:limit]
+		last := runs[limit-1]
+		w.Header().Set("X-Next-Cursor", store.Cursor{At: last.CreatedAt, ID: last.ID}.Encode())
 	}
 	writeJSON(w, http.StatusOK, runs)
 }
@@ -427,7 +509,7 @@ func (p *Platform) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !stream {
-		f.Limit = limit
+		f.Limit = limit + 1
 		evs, err := p.Orch.Store.QueryEvents(r.Context(), f)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
@@ -436,8 +518,9 @@ func (p *Platform) events(w http.ResponseWriter, r *http.Request) {
 		if evs == nil {
 			evs = []*model.Event{}
 		}
-		if len(evs) == limit {
-			w.Header().Set("X-Next-Cursor", strconv.FormatInt(evs[len(evs)-1].ID, 10))
+		if len(evs) > limit {
+			evs = evs[:limit]
+			w.Header().Set("X-Next-Cursor", strconv.FormatInt(evs[limit-1].ID, 10))
 		}
 		writeJSON(w, http.StatusOK, evs)
 		return
@@ -533,10 +616,7 @@ func (p *Platform) previewTicket(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, errors.New("ingress disabled"))
 		return
 	}
-	next := req.Next
-	if next == "" || !strings.HasPrefix(next, "/") {
-		next = "/"
-	}
+	next := SafeNext(req.Next)
 	t := p.Ingress.SignTicket(sb.Preview.Host, req.User, time.Minute)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"ticket":   t,
@@ -604,7 +684,7 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f := store.Filter{Tenant: tenant, Slug: q.str("slug"), SandboxID: q.str("sandbox"), RunID: q.str("run"),
-		From: from, To: to, AfterID: after, Limit: limit}
+		From: from, To: to, AfterID: after, Limit: limit + 1}
 	// Agent output is the bulk of the log; a trace is about what happened, so it is opt-in.
 	switch t := q.str("type"); t {
 	case "":
@@ -623,8 +703,9 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		if evs == nil {
 			evs = []*model.Event{}
 		}
-		if len(evs) == limit {
-			w.Header().Set("X-Next-Cursor", strconv.FormatInt(evs[len(evs)-1].ID, 10))
+		if len(evs) > limit {
+			evs = evs[:limit]
+			w.Header().Set("X-Next-Cursor", strconv.FormatInt(evs[limit-1].ID, 10))
 		}
 		writeJSON(w, http.StatusOK, evs)
 		return
@@ -851,6 +932,14 @@ func (q *query) when(name string) time.Time {
 		q.fail(name, errors.New("must be RFC 3339 or YYYY-MM-DD"))
 	}
 	return t
+}
+
+func (q *query) cursor(name string) store.Cursor {
+	c, err := store.ParseCursor(q.str(name))
+	if err != nil {
+		q.fail(name, err)
+	}
+	return c
 }
 
 func (q *query) oneOf(name, def string, allowed ...string) string {

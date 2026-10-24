@@ -152,11 +152,7 @@ func (h *Handler) callback(w http.ResponseWriter, r *http.Request, sb *model.San
 	}
 	cookie := h.Sign(ticket{Host: t.Host, User: t.User, Exp: time.Now().Add(ttl).Unix()})
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: cookie, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: int(ttl.Seconds())})
-	next := r.URL.Query().Get("next")
-	if next == "" || !strings.HasPrefix(next, "/") {
-		next = "/"
-	}
-	http.Redirect(w, r, next, http.StatusFound)
+	http.Redirect(w, r, safeNext(r.URL.Query().Get("next")), http.StatusFound)
 }
 
 // Sign produces host.user.exp.sig (base64url parts). The API mints these with a short exp.
@@ -199,4 +195,21 @@ func (h *Handler) verify(s string) (*ticket, error) {
 		return nil, errors.New("expired")
 	}
 	return &t, nil
+}
+
+// safeNext keeps the post-sign-in redirect on this host: one leading slash, no scheme or host,
+// no backslashes or control characters. Anything else becomes "/".
+func safeNext(next string) string {
+	if next == "" || next[0] != '/' || strings.HasPrefix(next, "//") || strings.HasPrefix(next, "/\\") {
+		return "/"
+	}
+	for _, c := range next {
+		if c < 0x20 || c == 0x7f || c == '\\' {
+			return "/"
+		}
+	}
+	if u, err := url.Parse(next); err != nil || u.Host != "" || u.Scheme != "" {
+		return "/"
+	}
+	return next
 }
