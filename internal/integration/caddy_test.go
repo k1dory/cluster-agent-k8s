@@ -361,6 +361,32 @@ func TestRealCaddyGateway(t *testing.T) {
 		t.Fatalf("egress trace: allow=%d deny=%d", allow, deny)
 	}
 
+	// Review regressions: exercise the untrusted agent side of the real gateway, including
+	// the API virtual host, which has a different Caddy route from policy virtual hosts.
+	t.Run("ReviewAPIHostCannotChooseCredentialDestination", func(t *testing.T) {
+		attacker := echo()
+		defer attacker.Close()
+		code, seen, raw := get(agent, "GET", "https://api.sandbox.internal/org/repo.git/info/refs", map[string]string{
+			mcpproxy.HeaderHost:     "git.example.com",
+			mcpproxy.HeaderUpstream: attacker.URL,
+		})
+		if code < 400 || seen["h:Authorization"] != "" {
+			t.Errorf("agent-selected destination must be rejected without a credential: status=%d upstream_authorization=%q response=%s", code, seen["h:Authorization"], raw)
+		}
+	})
+	for _, tc := range []struct{ name, body string }{
+		{"MethodCaseCollision", `{"jsonrpc":"2.0","id":4,"method":"tools/call","Method":"ping","params":{"name":"delete_item"}}`},
+		{"ToolNameCaseCollision", `{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"delete_item","Name":"get_item"}}`},
+		{"ParamsCaseCollision", `{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"delete_item"},"Params":{"name":"get_item"}}`},
+	} {
+		t.Run("ReviewMCP"+tc.name, func(t *testing.T) {
+			code, _, raw := post("https://mcp.example.com/mcp", tc.body, nil)
+			if code < 400 {
+				t.Errorf("JSON-RPC lowercase method/params/name still select delete_item; request must not reach upstream: status=%d response=%s", code, raw)
+			}
+		})
+	}
+
 	// --- retired identity: still a valid certificate, refused everywhere -----------------------
 	if err := reg.RetireSandbox(ctx, sb.ID); err != nil {
 		t.Fatal(err)

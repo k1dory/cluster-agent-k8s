@@ -220,11 +220,21 @@ func TestVersionsAndRollouts(t *testing.T) {
 		t.Fatalf("resume run claimed on the new agent: %v %+v", err, got)
 	}
 
-	// Canary: a percentage targets a deterministic subset; already-updated sandboxes are skipped.
+	// Canary: hash selection is deterministic. With just four random IDs, selecting all
+	// four (or none) is valid; the percentage is not an exact population quota.
 	res, _ = o.Rollout(ctx, RolloutRequest{Version: "stable", All: true, Tenant: "acme", Percent: 50})
 	again, _ := o.Rollout(ctx, RolloutRequest{Version: "stable", All: true, Tenant: "acme", Percent: 50})
-	if res.Selected != 4 || res.Targeted == 0 || res.Targeted == 4 || res.Targeted != again.Targeted {
+	if res.Selected != 4 || res.Targeted > res.Selected || res.Targeted != again.Targeted {
 		t.Fatalf("canary: %+v / %+v", res, again)
+	}
+	selected := make(map[string]bool, len(res.Items))
+	for _, item := range res.Items {
+		selected[item.Sandbox] = true
+	}
+	for _, item := range again.Items {
+		if !selected[item.Sandbox] {
+			t.Fatalf("canary membership changed: %+v / %+v", res, again)
+		}
 	}
 	// A tenant cannot touch another tenant's sandbox, nor the admin's by id.
 	if _, err := o.Rollout(ctx, RolloutRequest{Version: "stable", Sandbox: adm.ID, Tenant: "acme"}); err == nil || !errorsIs(err, ErrForbidden) {
