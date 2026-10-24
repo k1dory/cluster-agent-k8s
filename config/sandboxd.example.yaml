@@ -85,6 +85,8 @@ kube:
   cpu_limit: "2"
   memory_request: 1Gi
   memory_limit: 4Gi
+  # The runner appends --mcp-config "$SANDBOX_MCP_CONFIG" to this default command when the sandbox's
+  # connections give the agent MCP servers; a custom command names "$SANDBOX_MCP_CONFIG" itself.
   harness_command: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose'
   # Continues a run that a forced rollout interrupted: $SANDBOX_SESSION is the harness session id
   # captured from its output, $SANDBOX_RESUME_PROMPT the continuation text (resume_prompt below).

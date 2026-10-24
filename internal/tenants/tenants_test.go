@@ -66,3 +66,30 @@ func TestTenantSettings(t *testing.T) {
 		t.Fatalf("history: %v %+v", err, revs)
 	}
 }
+
+func TestSelfServiceHosts(t *testing.T) {
+	ctx := context.Background()
+	s := New(store.NewMemory(), func(string) Quota { return Quota{} })
+	if err := s.Refresh(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if s.HostAllowed("bob", "mcp.vendor.com") {
+		t.Fatal("no settings: no self-service hosts")
+	}
+	for _, bad := range []string{`{"hosts":["https://a.example.com"]}`, `{"hosts":["a.example.com:443"]}`, `{"hosts":["*"]}`, `{"hosts":["*.com"]}`, `{"hosts":["bad host"]}`} {
+		if _, err := s.Put(ctx, "bob", &res.Document{Spec: json.RawMessage(bad)}, "admin"); !errors.Is(err, res.ErrInvalid) {
+			t.Errorf("%s must be invalid: %v", bad, err)
+		}
+	}
+	if _, err := s.Put(ctx, "bob", &res.Document{Spec: json.RawMessage(`{"hosts":["MCP.Vendor.com","*.internal.example.com"]}`)}, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	for host, want := range map[string]bool{"mcp.vendor.com": true, "api.vendor.com": false, "tools.internal.example.com": true, "a.b.internal.example.com": true, "internal.example.com": false, "xinternal.example.com": false} {
+		if got := s.HostAllowed("bob", host); got != want {
+			t.Errorf("%s: %v, want %v", host, got, want)
+		}
+	}
+	if s.HostAllowed("alice", "mcp.vendor.com") {
+		t.Fatal("another tenant's hosts")
+	}
+}

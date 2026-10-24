@@ -47,6 +47,12 @@ type Policies interface {
 	Revoked(slug, tenant string, adminGrant bool) bool
 }
 
+// ConnectionRules is what a policy side may add to Policies: the rule a sandbox's connection
+// gives it for a host the repository does not serve (the guard over the connections service).
+type ConnectionRules interface {
+	RuleFor(ctx context.Context, sandboxID, tenant, host, method, reqPath string) (*policy.Rule, bool, error)
+}
+
 // Connections is what a policy side may add to Policies: the headers of the sandbox's
 // connections for a host (bindings.Guard forwards to the connections service). A plain policy
 // set has none.
@@ -109,6 +115,18 @@ func (h *Handler) Decide(ctx context.Context, r *http.Request, host, method, p s
 		return d
 	}
 	rule, ok := h.Policies.Match(id.Slug, host, method, p)
+	if !ok {
+		// A host the repository does not serve may be one of the sandbox's own connections
+		// (tenant settings allowed it): the connection is then the rule.
+		if cr, isCR := h.Policies.(ConnectionRules); isCR {
+			r, found, err := cr.RuleFor(ctx, id.SandboxID, id.Tenant, host, method, p)
+			if err != nil {
+				d.Code, d.Reason = http.StatusBadGateway, "connection: "+err.Error()
+				return d
+			}
+			rule, ok = r, found
+		}
+	}
 	if !ok {
 		d.Code, d.Reason = http.StatusForbidden, "policy: no rule for "+method+" "+host+p
 		return d

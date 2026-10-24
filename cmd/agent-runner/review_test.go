@@ -89,3 +89,31 @@ func TestReviewRepoChangeCannotSilentlyReusePreviousCheckout(t *testing.T) {
 		t.Fatalf("requested repo B, but ensureRepo succeeded with origin %q (repo A)", got)
 	}
 }
+
+func TestMCPServersBecomeAHarnessConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "home", ".sandbox-mcp.json")
+	if p, n, err := writeMCPConfig("", path); err != nil || n != 0 || p != "" {
+		t.Fatalf("empty: %v %d %q", err, n, p)
+	}
+	if _, _, err := writeMCPConfig("not json", path); err == nil {
+		t.Fatal("garbage accepted")
+	}
+	p, n, err := writeMCPConfig(`[{"name":"registry","url":"https://mcp.registry.example.com/mcp"},{"name":"","url":"x"},{"name":"shared/tools","url":"https://tools.example.com/rpc"}]`, path)
+	if err != nil || n != 2 || p != path {
+		t.Fatalf("write: %v %d %q", err, n, p)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg struct {
+		Servers map[string]map[string]string `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(b, &cfg); err != nil || len(cfg.Servers) != 2 || cfg.Servers["registry"]["url"] != "https://mcp.registry.example.com/mcp" || cfg.Servers["registry"]["type"] != "http" || cfg.Servers["shared/tools"]["url"] != "https://tools.example.com/rpc" {
+		t.Fatalf("config: %v %s", err, b)
+	}
+	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode: %v", info.Mode())
+	}
+}

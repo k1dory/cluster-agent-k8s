@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"agent-sandbox/internal/app"
 	"agent-sandbox/internal/authz"
 	"agent-sandbox/internal/ca"
 	"agent-sandbox/internal/events"
@@ -36,6 +37,7 @@ import (
 	"agent-sandbox/internal/orchestrator"
 	"agent-sandbox/internal/policy"
 	"agent-sandbox/internal/registrar"
+	"agent-sandbox/internal/resource"
 	"agent-sandbox/internal/secrets"
 	"agent-sandbox/internal/store"
 )
@@ -184,9 +186,17 @@ func TestRealCaddyGateway(t *testing.T) {
 			Inject: map[string]string{"Authorization": "Basic secret:forgejo"}},
 		{Host: "mcp.example.com", Upstream: up.URL, Paths: []string{"/mcp", "/mcp/**"}, MCP: &policy.MCPRule{ReadOnly: true, Tools: []string{"get_*"}}},
 	}})
-	az := &authz.Handler{Policies: pols, Secrets: secrets.Static{"shared/forgejo": "forgejo-injected"}, Checker: reg, Toucher: orch, Recorder: orch,
+	// The real wiring: the guard adds the live bindings and the connections (headers and the
+	// hosts tenants declare on their own) to the repository, for authz, the MCP proxy, the DNS
+	// and the gateway config alike.
+	secretStore := secrets.Static{"shared/forgejo": "forgejo-injected", "alice/tools": "tools-token"}
+	services, err := app.Wire(ctx, app.Deps{Store: st, Policies: pols, Secrets: secretStore, Orch: orch})
+	if err != nil {
+		t.Fatal(err)
+	}
+	az := &authz.Handler{Policies: services.Guard, Secrets: secretStore, Checker: reg, Toucher: orch, Recorder: orch,
 		Quiet: map[string]bool{"api.sandbox.internal": true}}
-	gw := httptest.NewServer((&httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, MCP: &mcpproxy.Handler{Authz: az, Hosts: pols}}).Routes())
+	gw := httptest.NewServer((&httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, MCP: &mcpproxy.Handler{Authz: az, Hosts: services.Guard}}).Routes())
 	defer gw.Close()
 	sandboxdAddr := strings.TrimPrefix(gw.URL, "http://")
 
@@ -202,7 +212,7 @@ func TestRealCaddyGateway(t *testing.T) {
 		CaddyAdmin: fmt.Sprintf("http://127.0.0.1:%d", adminPort), SandboxdAddr: sandboxdAddr,
 		APIHost: "api.sandbox.internal", RegistrarHost: "registrar.sandbox.internal", RegistrarPort: regPort,
 		AccessLog: "stderr", StrictSNI: true}
-	syncer := &gateway.Syncer{Cfg: cfg, Policies: pols, AgentCA: agentCA.PEM()}
+	syncer := &gateway.Syncer{Cfg: cfg, Policies: services.Guard, Headers: services.Connections, AgentCA: agentCA.PEM()}
 	if err := syncer.SyncOnce(ctx, true); err != nil {
 		t.Fatalf("push config: %v\n%s", err, proc.out.String())
 	}
@@ -403,6 +413,78 @@ func TestRealCaddyGateway(t *testing.T) {
 	if allow != 4 || deny != 2 {
 		t.Fatalf("egress trace: allow=%d deny=%d", allow, deny)
 	}
+
+	// --- self-service MCP: a host nobody put in a policy file or a manifest ------------------
+	// The admin allows alice the host (tenant settings), alice declares the MCP server as a
+	// connection and a sandbox that uses it; the next gateway sync serves the host, the DNS
+	// answers for it, the proxy enforces the connection's read-only rule, and a sandbox without
+	// the connection is refused at forward_auth.
+	t.Run("SelfServiceMCPHost", func(t *testing.T) {
+		if _, err := services.Tenants.Put(ctx, "alice", &resource.Document{Spec: json.RawMessage(`{"hosts":["mcp.tools.example.com"]}`)}, "admin"); err != nil {
+			t.Fatal(err)
+		}
+		conn := `{"type":"mcp","host":"mcp.tools.example.com","upstream":"` + up.URL + `","paths":["/mcp","/mcp/**"],"mcp":{"read_only":true,"tools":["get_*"]},"headers":{"Authorization":"Bearer secret:tools"}}`
+		if _, err := services.Connections.Put(ctx, "alice", &resource.Document{Name: "tools", Spec: json.RawMessage(conn)}, false, "alice"); err != nil {
+			t.Fatal(err)
+		}
+		sb2, err := orch.Create(ctx, orchestrator.CreateRequest{Name: "tools", Slug: "backend-dev", Owner: "alice", Tenant: "alice", Admin: true, Connections: []string{"tools"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokens["pod-token-2"] = registrar.PodInfo{Name: "agent-2", SandboxID: sb2.ID, Slug: "backend-dev", Tenant: "alice"}
+		// The DNS answers for the new host before and without any Caddy change.
+		d := &gateway.DNS{IP: net.ParseIP("127.0.0.1"), Policies: services.Guard}
+		if !d.Allowed("mcp.tools.example.com") || d.Allowed("mcp.other.example.com") {
+			t.Fatal("dns must answer exactly the connection's host")
+		}
+		// The gateway syncs on the changed fingerprint (what the syncer's loop does on its own).
+		if err := syncer.SyncOnce(ctx, false); err != nil {
+			t.Fatalf("re-sync: %v\n%s", err, proc.out.String())
+		}
+		waitForCertificates(t, proc, httpsPort, pool, "mcp.tools.example.com")
+		// A second pod, bootstrapped for the sandbox that carries the connection.
+		key2, csr2, _ := ca.NewCSR("backend-dev")
+		body2, _ := json.Marshal(registrar.BootstrapRequest{CSR: string(csr2)})
+		req2, _ := http.NewRequest(http.MethodPost, fmt.Sprintf("https://registrar.sandbox.internal:%d/bootstrap", regPort), bytes.NewReader(body2))
+		req2.Header.Set("Authorization", "Bearer pod-token-2")
+		resp2, err := plain.Do(req2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data2, _ := io.ReadAll(resp2.Body)
+		resp2.Body.Close()
+		var boot2 registrar.BootstrapResponse
+		_ = json.Unmarshal(data2, &boot2)
+		leaf2, err := tls.X509KeyPair([]byte(boot2.Cert), key2)
+		if err != nil {
+			t.Fatalf("bootstrap 2: %v %s", err, data2)
+		}
+		agent2 := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, Certificates: []tls.Certificate{leaf2}}, DialContext: dialer(httpsPort)}, Timeout: 10 * time.Second}
+		do := func(c *http.Client, body string) (int, map[string]string, string) {
+			req, _ := http.NewRequest(http.MethodPost, "https://mcp.tools.example.com/mcp", strings.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := c.Do(req)
+			if err != nil {
+				t.Fatalf("POST mcp.tools.example.com: %v\n%s", err, proc.out.String())
+			}
+			defer resp.Body.Close()
+			raw, _ := io.ReadAll(resp.Body)
+			var m map[string]string
+			_ = json.Unmarshal(raw, &m)
+			return resp.StatusCode, m, string(raw)
+		}
+		code, seen, raw := do(agent2, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_item","arguments":{}}}`)
+		if code != 200 || seen["h:Authorization"] != "Bearer tools-token" || seen["h:X-Agent-Access"] != "read-only" || seen["h:X-Agent-Sandbox"] != sb2.ID || seen["host"] != "mcp.tools.example.com" {
+			t.Fatalf("allowed call through the connection host: %d %s\n%s", code, raw, proc.out.String())
+		}
+		if code, _, raw := do(agent2, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_item"}}`); code != 403 || !strings.Contains(raw, "not allowed") {
+			t.Fatalf("the connection's read-only rule must hold: %d %s", code, raw)
+		}
+		// The first sandbox does not carry the connection: refused by forward_auth.
+		if code, _, raw := do(agent, `{"jsonrpc":"2.0","id":3,"method":"tools/list"}`); code != 403 {
+			t.Fatalf("sandbox without the connection: %d %s", code, raw)
+		}
+	})
 
 	// Review regressions: exercise the untrusted agent side of the real gateway, including
 	// the API virtual host, which has a different Caddy route from policy virtual hosts.

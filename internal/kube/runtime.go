@@ -66,6 +66,7 @@ type PodConfig struct {
 	// as SANDBOX_MODEL / ANTHROPIC_MODEL and SANDBOX_INSTRUCTIONS.
 	Model              string
 	Instructions       string
+	MCPServers         []model.MCPServer // exported as SANDBOX_MCP_SERVERS (JSON)
 	PriorityClassName  string
 	TerminationSeconds int64
 	// PodFirewall adds an init container (NET_ADMIN, dropped afterwards) that installs nftables
@@ -136,6 +137,7 @@ func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 	pick(&e.RuntimeClassName, l.RuntimeClass)
 	pick(&e.Model, l.Model)
 	pick(&e.Instructions, l.Instructions)
+	e.MCPServers = l.MCPServers
 	e.UserEnv = l.Env
 	e.CPURequest, e.CPULimit = reconcile(e.CPURequest, e.CPULimit, l.CPURequest, l.CPULimit, defaultCPURequest, defaultCPULimit)
 	e.MemoryRequest, e.MemoryLimit = reconcile(e.MemoryRequest, e.MemoryLimit, l.MemoryRequest, l.MemoryLimit, defaultMemoryRequest, defaultMemoryLimit)
@@ -278,6 +280,10 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 	}
 	if c.Instructions != "" {
 		env = append(env, corev1.EnvVar{Name: "SANDBOX_INSTRUCTIONS", Value: c.Instructions})
+	}
+	if len(c.MCPServers) > 0 {
+		servers, _ := json.Marshal(c.MCPServers)
+		env = append(env, corev1.EnvVar{Name: "SANDBOX_MCP_SERVERS", Value: string(servers)})
 	}
 	image := c.Image
 	env = append(env, sortedEnv(c.Env, nil)...)

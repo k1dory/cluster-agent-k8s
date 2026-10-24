@@ -1,0 +1,18 @@
+# Connection (tenant): an MCP server the tenant connects on its own. The host is not in any
+# policy file: the admin listed it under the tenant's settings (tenant-settings.yaml, hosts),
+# so this connection is the egress rule for it. The gateway serves the host on its next sync;
+# agents that name the connection reach it, read-only, with the token resolved at request time.
+# Apply: sandboxctl apply -f examples/catalog/connection-mcp.yaml
+kind: Connection
+name: tools
+description: The team's MCP tools server
+spec:
+  type: mcp
+  host: mcp.tools.example.com
+  upstream: https://10.0.0.5:8443          # optional: where the gateway sends it (default https://host)
+  paths: ["/mcp", "/mcp/**"]               # optional: what agents may call (default /**)
+  mcp:
+    read_only: true                        # the MCP proxy refuses writes and tools outside the list
+    tools: ["get_*", "list_*", "search"]
+  headers:
+    Authorization: Bearer secret:tools-token

@@ -240,7 +240,12 @@ Three more versioned resources, each its own service and module (`internal/conne
 history:
 
 - **Connection** (`/v1/connections`, tenant-scoped, shared ones by the admin): an HTTP API or an
-  MCP server (`type`, `host`) and the headers the gateway adds for agents that use it. A
+  MCP server (`type`, `host`) and the headers the gateway adds for agents that use it. For a host
+  the policy repository does not serve, the connection is the whole egress rule (`upstream`,
+  `paths`, `mcp` restrictions): the gateway gets a site, the DNS an answer and the MCP proxy a
+  rule for it on the next sync, and only sandboxes carrying the connection pass. A tenant may
+  declare such a host only when its settings list it; the admin's shared connections may name
+  any host. See [docs/self-service.md](docs/self-service.md). A
   credential header must be a `secret:NAME` reference into the tenant's secrets provider; a
   literal value is refused (422) and never echoed. Agents list the connections they use
   (`connections:`); the reference is resolved when the agent is written and stored with its scope,
@@ -258,8 +263,9 @@ history:
   gateway denies the running agent at its next request, the reconciler stops its pod, wakes and
   new sandboxes answer 403; the binding stays in the history.
 - **TenantSettings** (`/v1/tenants/{tenant}/settings`, admin writes): the tenant's `quota`
-  (replacing the server defaults) and the `environments` its agents may use (`name` for its own,
-  `shared/name`). The allow-list is checked when an agent is written and again when a sandbox is
+  (replacing the server defaults), the `environments` its agents may use (`name` for its own,
+  `shared/name`) and the `hosts` it may reach through connections of its own (exact names or
+  `*.suffix`). The environment allow-list is checked when an agent is written and again when a sandbox is
   created, so an agent written earlier does not keep an environment the tenant lost; a restricted
   tenant cannot create by bare slug either, since that path runs the server's default environment.
 
@@ -268,6 +274,15 @@ in-memory snapshot: refreshed at once by the replica that writes, every 5 s on t
 Reloads are serialised, so a reload that started before a revocation can never reinstall the
 revoked grant after it. `internal/app` assembles these services the one way sandboxd runs them
 and the integration tests use the same assembly. See `examples/catalog/`.
+
+### Self-service: nothing to edit in the cluster
+
+A tenant is onboarded, connects an MCP server and launches an agent through the API alone: the
+admin issues a key and writes the tenant's binding and settings (`hosts`), the tenant declares
+its connections and agents, creates a sandbox and runs it. The pod learns the MCP endpoints of
+its connections (`SANDBOX_MCP_SERVERS`; the runner turns them into a Claude Code `--mcp-config`).
+The policy repository, the secrets provider and the chart stay the operator's and are never
+touched on the way. The whole path, step by step: [docs/self-service.md](docs/self-service.md).
 
 ### Plan: a bundle checked as a whole, nothing written
 

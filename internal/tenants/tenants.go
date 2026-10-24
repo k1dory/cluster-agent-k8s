@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 
 	"agent-sandbox/internal/model"
@@ -31,7 +32,13 @@ type Spec struct {
 	// Environments the tenant's agents may use: "name" (the tenant's own) or "shared/name".
 	// Empty: every environment visible to the tenant.
 	Environments []string `yaml:"environments,omitempty" json:"environments,omitempty"`
+	// Hosts the tenant may reach through its own connections beyond what the policy repository
+	// serves: exact names or "*.suffix". A connection for a host the repository already serves
+	// only adds headers and needs no entry. Empty: no self-service hosts.
+	Hosts []string `yaml:"hosts,omitempty" json:"hosts,omitempty"`
 }
+
+var hostPatternRe = regexp.MustCompile(`^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
 
 // Service stores settings and answers quota and environment questions from a snapshot.
 type Service struct {
@@ -84,6 +91,13 @@ func (s *Service) Validate(_ context.Context, tenant string, d *res.Document, wh
 		if err != nil || r.Rev != 0 {
 			return nil, fmt.Errorf("%w: environments: %q must be \"name\" or \"shared/name\"", res.ErrInvalid, e)
 		}
+	}
+	for i, h := range sp.Hosts {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if !hostPatternRe.MatchString(h) {
+			return nil, fmt.Errorf("%w: hosts: %q must be a host name or \"*.suffix\"", res.ErrInvalid, sp.Hosts[i])
+		}
+		sp.Hosts[i] = h
 	}
 	spec, err := res.Marshal(sp)
 	if err != nil {
@@ -151,6 +165,22 @@ func (s *Service) QuotaFor(tenant string) Quota {
 func (s *Service) Restricted(tenant string) bool {
 	sp := s.current(tenant)
 	return sp != nil && len(sp.Environments) > 0
+}
+
+// HostAllowed reports whether tenant may declare a connection for host on its own (tenant
+// settings `hosts`). The admin's shared connections are not subject to it.
+func (s *Service) HostAllowed(tenant, host string) bool {
+	sp := s.current(tenant)
+	if sp == nil {
+		return false
+	}
+	host = strings.ToLower(host)
+	for _, pat := range sp.Hosts {
+		if pat == host || strings.HasPrefix(pat, "*.") && strings.HasSuffix(host, pat[1:]) && len(host) > len(pat)-1 {
+			return true
+		}
+	}
+	return false
 }
 
 // EnvironmentAllowed reports whether tenant may use the environment named by ref ("name" or
