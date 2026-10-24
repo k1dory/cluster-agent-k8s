@@ -20,27 +20,58 @@ CREATE TABLE IF NOT EXISTS sandboxes (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS sandboxes_preview_host ON sandboxes (preview_host) WHERE preview_host IS NOT NULL;
 
+-- Runs and events are the accounting record: no foreign key to sandboxes, so deleting a
+-- sandbox does not erase what it cost. tenant/slug are copied in for that reason.
 CREATE TABLE IF NOT EXISTS runs (
-    id          text PRIMARY KEY,
-    sandbox_id  text NOT NULL REFERENCES sandboxes(id) ON DELETE CASCADE,
-    task        text NOT NULL,
-    status      text NOT NULL,
-    exit_code   integer NOT NULL DEFAULT 0,
-    created_at  timestamptz NOT NULL,
-    started_at  timestamptz,
-    finished_at timestamptz
+    id                 text PRIMARY KEY,
+    sandbox_id         text NOT NULL,
+    tenant             text NOT NULL DEFAULT '',
+    slug               text NOT NULL DEFAULT '',
+    task               text NOT NULL,
+    status             text NOT NULL,
+    exit_code          integer NOT NULL DEFAULT 0,
+    created_at         timestamptz NOT NULL,
+    started_at         timestamptz,
+    finished_at        timestamptz,
+    model              text NOT NULL DEFAULT '',
+    input_tokens       bigint NOT NULL DEFAULT 0,
+    output_tokens      bigint NOT NULL DEFAULT 0,
+    cache_read_tokens  bigint NOT NULL DEFAULT 0,
+    cache_write_tokens bigint NOT NULL DEFAULT 0,
+    cost_usd           double precision NOT NULL DEFAULT 0,
+    turns              integer NOT NULL DEFAULT 0
 );
+ALTER TABLE runs DROP CONSTRAINT IF EXISTS runs_sandbox_id_fkey;
+ALTER TABLE runs
+    ADD COLUMN IF NOT EXISTS tenant text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS slug text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS model text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS input_tokens bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS output_tokens bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS cache_read_tokens bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS cache_write_tokens bigint NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS cost_usd double precision NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS turns integer NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS runs_sandbox ON runs (sandbox_id, created_at);
+CREATE INDEX IF NOT EXISTS runs_tenant ON runs (tenant, created_at);
+CREATE INDEX IF NOT EXISTS runs_slug ON runs (slug, created_at);
 
 CREATE TABLE IF NOT EXISTS events (
     id          bigserial PRIMARY KEY,
     sandbox_id  text NOT NULL,
+    tenant      text NOT NULL DEFAULT '',
+    slug        text NOT NULL DEFAULT '',
     run_id      text NOT NULL DEFAULT '',
     type        text NOT NULL,
     data        text NOT NULL DEFAULT '',
     at          timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE events
+    ADD COLUMN IF NOT EXISTS tenant text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS slug text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS events_sandbox ON events (sandbox_id, id);
+CREATE INDEX IF NOT EXISTS events_tenant ON events (tenant, id);
+CREATE INDEX IF NOT EXISTS events_type_at ON events (type, at);
 
 -- Instance numbers come from a sequence: allocation is atomic and numbers are never reused.
 CREATE SEQUENCE IF NOT EXISTS instance_seq;

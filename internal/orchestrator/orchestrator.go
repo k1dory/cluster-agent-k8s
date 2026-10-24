@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"agent-sandbox/internal/events"
+	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/store"
 )
@@ -56,9 +58,13 @@ type Orchestrator struct {
 	Cfg     Config
 	Log     *slog.Logger
 
-	mu     sync.Mutex
-	waking map[string]bool
+	mu      sync.Mutex
+	waking  map[string]bool
+	meta    map[string]sbMeta // sandbox id → tenant/slug, for stamping events
+	running map[string]string // sandbox id → running run id ("" = none), for egress attribution
 }
+
+type sbMeta struct{ tenant, slug string }
 
 // New wires an orchestrator.
 func New(st store.Store, rt Runtime, ret Retirer, hub *events.Hub, cfg Config, log *slog.Logger) *Orchestrator {
@@ -74,7 +80,8 @@ func New(st store.Store, rt Runtime, ret Retirer, hub *events.Hub, cfg Config, l
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Orchestrator{Store: st, Runtime: rt, Retirer: ret, Hub: hub, Cfg: cfg, Log: log, waking: map[string]bool{}}
+	return &Orchestrator{Store: st, Runtime: rt, Retirer: ret, Hub: hub, Cfg: cfg, Log: log,
+		waking: map[string]bool{}, meta: map[string]sbMeta{}, running: map[string]string{}}
 }
 
 // Errors surfaced to the API.
@@ -134,6 +141,7 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 	if err := o.Store.CreateSandbox(ctx, sb); err != nil {
 		return nil, err
 	}
+	o.remember(sb)
 	if err := o.Runtime.EnsureVolume(ctx, sb); err != nil {
 		o.fail(ctx, sb, "volume: "+err.Error())
 		return sb, err
@@ -218,7 +226,56 @@ func (o *Orchestrator) fail(ctx context.Context, sb *model.Sandbox, msg string) 
 	o.setStatus(ctx, sb, model.StatusError)
 }
 
+func (o *Orchestrator) remember(sb *model.Sandbox) {
+	o.mu.Lock()
+	o.meta[sb.ID] = sbMeta{sb.Tenant, sb.Slug}
+	o.mu.Unlock()
+}
+
+// metaOf returns the tenant and slug of a sandbox, from cache or the store.
+func (o *Orchestrator) metaOf(ctx context.Context, id string) sbMeta {
+	o.mu.Lock()
+	m, ok := o.meta[id]
+	o.mu.Unlock()
+	if ok {
+		return m
+	}
+	sb, err := o.Store.GetSandbox(ctx, id)
+	if err != nil {
+		return sbMeta{}
+	}
+	o.remember(sb)
+	return sbMeta{sb.Tenant, sb.Slug}
+}
+
+// setRunning records which run is executing in a sandbox (for attributing egress).
+func (o *Orchestrator) setRunning(sandboxID, runID string) {
+	o.mu.Lock()
+	o.running[sandboxID] = runID
+	o.mu.Unlock()
+}
+
+// runningRunID returns the executing run of a sandbox, or "" if none.
+func (o *Orchestrator) runningRunID(ctx context.Context, sandboxID string) string {
+	o.mu.Lock()
+	id, ok := o.running[sandboxID]
+	o.mu.Unlock()
+	if ok {
+		return id
+	}
+	id = ""
+	if r, err := o.Store.RunningRun(ctx, sandboxID); err == nil {
+		id = r.ID
+	}
+	o.setRunning(sandboxID, id)
+	return id
+}
+
 func (o *Orchestrator) emit(ctx context.Context, e model.Event) {
+	if e.Tenant == "" && e.Slug == "" {
+		m := o.metaOf(ctx, e.SandboxID)
+		e.Tenant, e.Slug = m.tenant, m.slug
+	}
 	if err := o.Store.AppendEvent(ctx, &e); err != nil {
 		o.Log.Error("append event", "err", err)
 	}
@@ -280,6 +337,7 @@ func (o *Orchestrator) Sleep(ctx context.Context, id string, force bool) (*model
 		_ = o.Store.UpdateRun(ctx, r)
 		o.emit(ctx, model.Event{SandboxID: id, RunID: r.ID, Type: model.EventRunDone, Data: string(model.RunCancelled)})
 	}
+	o.setRunning(id, "")
 	sb.PodName, sb.IP = "", ""
 	o.setStatus(ctx, sb, model.StatusSleeping)
 	return sb, nil
@@ -322,7 +380,18 @@ func (o *Orchestrator) Delete(ctx context.Context, id string) error {
 	if err := o.Runtime.DeleteVolume(ctx, sb); err != nil {
 		o.Log.Error("delete volume", "id", id, "err", err)
 	}
-	return o.Store.DeleteSandbox(ctx, id)
+	if r, err := o.Store.RunningRun(ctx, id); err == nil {
+		now := time.Now()
+		r.Status, r.FinishedAt = model.RunCancelled, &now
+		_ = o.Store.UpdateRun(ctx, r)
+		o.emit(ctx, model.Event{SandboxID: id, RunID: r.ID, Type: model.EventRunDone, Data: string(model.RunCancelled)})
+	}
+	err = o.Store.DeleteSandbox(ctx, id)
+	o.mu.Lock()
+	delete(o.meta, id)
+	delete(o.running, id)
+	o.mu.Unlock()
+	return err
 }
 
 // CreateRun queues a task and wakes the sandbox if needed.
@@ -334,7 +403,7 @@ func (o *Orchestrator) CreateRun(ctx context.Context, sandboxID, task string) (*
 	if err != nil {
 		return nil, err
 	}
-	r := &model.Run{ID: newID("run"), SandboxID: sandboxID, Task: task, Status: model.RunQueued, CreatedAt: time.Now()}
+	r := &model.Run{ID: newID("run"), SandboxID: sandboxID, Tenant: sb.Tenant, Slug: sb.Slug, Task: task, Status: model.RunQueued, CreatedAt: time.Now()}
 	if err := o.Store.CreateRun(ctx, r); err != nil {
 		return nil, err
 	}
@@ -371,6 +440,7 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 			if err := o.Store.UpdateRun(ctx, r); err != nil {
 				return nil, err
 			}
+			o.setRunning(sandboxID, r.ID)
 			o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunStart})
 			return r, nil
 		}
@@ -388,13 +458,33 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 	}
 }
 
-// Output appends agent output to the event stream.
+// Output appends agent output to the event stream. Lines that carry usage (Claude Code's
+// result line, generic `{"type":"usage"}` records) also update the run's accounting.
 func (o *Orchestrator) Output(ctx context.Context, sandboxID, runID, data string) {
 	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventRunOutput, Data: data})
+	if u, mode, ok := harness.ParseUsage(data); ok {
+		if err := o.applyUsage(ctx, sandboxID, runID, u, mode == harness.Total); err != nil {
+			o.Log.Warn("record usage", "run", runID, "err", err)
+		}
+	}
 }
 
-// FinishRun records the result of a run.
-func (o *Orchestrator) FinishRun(ctx context.Context, sandboxID, runID string, exitCode int) error {
+func (o *Orchestrator) applyUsage(ctx context.Context, sandboxID, runID string, u model.Usage, replace bool) error {
+	r, err := o.Store.GetRun(ctx, runID)
+	if err != nil || r.SandboxID != sandboxID {
+		return store.ErrNotFound
+	}
+	if replace {
+		r.Usage = u
+	} else {
+		r.Usage.Add(u)
+	}
+	return o.Store.UpdateRun(ctx, r)
+}
+
+// FinishRun records the result of a run. usage, if given, is the harness's own total and
+// overrides whatever was parsed from the output stream.
+func (o *Orchestrator) FinishRun(ctx context.Context, sandboxID, runID string, exitCode int, usage *model.Usage) error {
 	r, err := o.Store.GetRun(ctx, runID)
 	if err != nil {
 		return err
@@ -402,6 +492,7 @@ func (o *Orchestrator) FinishRun(ctx context.Context, sandboxID, runID string, e
 	if r.SandboxID != sandboxID {
 		return store.ErrNotFound
 	}
+	o.setRunning(sandboxID, "")
 	if r.Status == model.RunCancelled {
 		return nil
 	}
@@ -411,11 +502,28 @@ func (o *Orchestrator) FinishRun(ctx context.Context, sandboxID, runID string, e
 	if exitCode != 0 {
 		r.Status = model.RunFailed
 	}
+	if usage != nil && !usage.IsZero() {
+		r.Usage = *usage
+	}
 	if err := o.Store.UpdateRun(ctx, r); err != nil {
 		return err
 	}
 	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventRunDone, Data: string(r.Status)})
 	return nil
+}
+
+// RecordEgress writes one gateway decision into the trace, attributed to the run that was
+// executing at the time. Called by the authz handler on the hot path: it must stay cheap.
+func (o *Orchestrator) RecordEgress(ctx context.Context, sandboxID string, allowed bool, eg model.Egress) {
+	if sandboxID == "" {
+		return
+	}
+	typ := model.EventEgressDen
+	if allowed {
+		typ = model.EventEgressOK
+	}
+	b, _ := json.Marshal(eg)
+	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: o.runningRunID(ctx, sandboxID), Type: typ, Data: string(b)})
 }
 
 // CancelRun stops a queued or running run. A running run is cancelled by telling the agent
@@ -434,6 +542,7 @@ func (o *Orchestrator) CancelRun(ctx context.Context, sandboxID, runID string) (
 	if err := o.Store.UpdateRun(ctx, r); err != nil {
 		return nil, err
 	}
+	o.setRunning(sandboxID, "")
 	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventRunCancel})
 	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventRunDone, Data: string(model.RunCancelled)})
 	return r, nil

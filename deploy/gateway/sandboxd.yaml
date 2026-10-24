@@ -28,6 +28,11 @@ kube:
   harness_command: '${HARNESS_CMD}'
 sandbox:
   default_idle_timeout: 1h
+# Accounting: GET /v1/usage prices pod time with this; the trace records gateway decisions.
+accounting:
+  pod_hour_usd: 0        # 0 = report pod time without a price
+  egress_trace: all      # all | denied | off  (requests to the control-plane API are never traced)
+
 preview:
   domain: "${PREVIEW_DOMAIN}"
   auth_url: "${PREVIEW_AUTH_URL}"

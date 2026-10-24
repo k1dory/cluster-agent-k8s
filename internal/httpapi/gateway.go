@@ -186,10 +186,11 @@ func (g *Gateway) finish(w http.ResponseWriter, r *http.Request, id *identity.Id
 		return
 	}
 	var req struct {
-		ExitCode int `json:"exit_code"`
+		ExitCode int          `json:"exit_code"`
+		Usage    *model.Usage `json:"usage,omitempty"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	if err := g.Orch.FinishRun(r.Context(), id.SandboxID, run.ID, req.ExitCode); err != nil {
+	if err := g.Orch.FinishRun(r.Context(), id.SandboxID, run.ID, req.ExitCode, req.Usage); err != nil {
 		writeOrchErr(w, err)
 		return
 	}

@@ -54,7 +54,7 @@ func TestLifecycle(t *testing.T) {
 	if sb, _ = o.Get(ctx, sb.ID); sb.Status != model.StatusRunning {
 		t.Fatalf("sandbox with running run must stay up, got %s", sb.Status)
 	}
-	if err := o.FinishRun(ctx, sb.ID, run.ID, 0); err != nil {
+	if err := o.FinishRun(ctx, sb.ID, run.ID, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	o.sweepIdle(ctx)

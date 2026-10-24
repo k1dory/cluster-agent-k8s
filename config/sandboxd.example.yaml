@@ -42,6 +42,11 @@ sandbox:
   default_idle_timeout: 1h
   ready_timeout: 3m
   idle_check_every: 1m
+# Accounting: GET /v1/usage prices pod time with this; the trace records gateway decisions.
+accounting:
+  pod_hour_usd: 0        # 0 = report pod time without a price
+  egress_trace: all      # all | denied | off  (requests to the control-plane API are never traced)
+
 preview:
   domain: preview.example.com
   auth_url: https://ai.example.com/api/preview/auth   # your auth service checks the user, mints a ticket

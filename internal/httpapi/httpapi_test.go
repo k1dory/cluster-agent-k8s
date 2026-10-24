@@ -25,6 +25,7 @@ import (
 	"agent-sandbox/internal/registrar"
 	"agent-sandbox/internal/secrets"
 	"agent-sandbox/internal/store"
+	"agent-sandbox/internal/usage"
 )
 
 type stack struct {
@@ -44,7 +45,8 @@ func newStack(t *testing.T) *stack {
 		{Host: "api.anthropic.com", Paths: []string{"/v1/**"}, Inject: map[string]string{"X-Api-Key": "secret:anthropic"}},
 		{Host: "api.sandbox.internal", Paths: []string{"/agent/**"}},
 	}})
-	az := &authz.Handler{Policies: pols, Secrets: secrets.Static{"alice/anthropic": "sk-alice"}, Checker: reg, Toucher: orch}
+	az := &authz.Handler{Policies: pols, Secrets: secrets.Static{"alice/anthropic": "sk-alice"}, Checker: reg, Toucher: orch,
+		Recorder: orch, Quiet: map[string]bool{"api.sandbox.internal": true}}
 	ing := &ingress.Handler{Store: st, Waker: orch, TicketKey: []byte("k")}
 	p := &Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: "t0k"}
 	g := &Gateway{Orch: orch, Registrar: reg, Authz: az}
@@ -157,7 +159,8 @@ func TestEndToEnd(t *testing.T) {
 	if resp.StatusCode != 200 || got.ID != run.ID || got.Task != "write tests" {
 		t.Fatalf("next run: %d %s", resp.StatusCode, body)
 	}
-	if resp, _ = call(t, "POST", gw+"/agent/runs/"+run.ID+"/events", "", "hello\nworld\n", certHdr); resp.StatusCode != 204 {
+	claudeResult := `{"type":"result","subtype":"success","num_turns":4,"total_cost_usd":0.0421,"usage":{"input_tokens":12,"output_tokens":640,"cache_read_input_tokens":22000,"cache_creation_input_tokens":1500},"modelUsage":{"claude-opus-5-5":{}}}`
+	if resp, _ = call(t, "POST", gw+"/agent/runs/"+run.ID+"/events", "", "hello\nworld\n"+claudeResult+"\n", certHdr); resp.StatusCode != 204 {
 		t.Fatalf("events: %d", resp.StatusCode)
 	}
 	if resp, _ = call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/runs/"+run.ID+"/input", "t0k", map[string]string{"text": "use pytest"}, nil); resp.StatusCode != 204 {
@@ -192,11 +195,11 @@ func TestEndToEnd(t *testing.T) {
 		if strings.HasPrefix(line, "event: ") {
 			types = append(types, strings.TrimPrefix(line, "event: "))
 		}
-		if len(types) >= 8 {
+		if len(types) >= 11 {
 			break
 		}
 	}
-	want := []string{"status", "status", "run.queued", "run.started", "run.output", "run.output", "input", "run.finished"}
+	want := []string{"status", "status", "egress.allow", "egress.deny", "run.queued", "run.started", "run.output", "run.output", "run.output", "input", "run.finished"}
 	if strings.Join(types, ",") != strings.Join(want, ",") {
 		t.Fatalf("event trail %v, want %v", types, want)
 	}
@@ -251,5 +254,50 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if resp, _ = call(t, "GET", api+"/openapi.yaml", "", nil, nil); resp.StatusCode != 200 {
 		t.Fatalf("openapi: %d", resp.StatusCode)
+	}
+
+	// Accounting survives the sandbox: cost parsed from the harness stream, egress decisions, pod time.
+	resp, body = call(t, "GET", api+"/v1/usage?tenant=alice&group_by=slug", "t0k", nil, nil)
+	var rep usage.Report
+	_ = json.Unmarshal(body, &rep)
+	if resp.StatusCode != 200 || len(rep.Rows) != 1 || rep.Rows[0].Key != "backend-dev" {
+		t.Fatalf("usage: %d %s", resp.StatusCode, body)
+	}
+	tot := rep.Total
+	if tot.Runs != 2 || tot.RunsDone != 1 || tot.RunsCancelled != 1 || tot.ModelUSD != 0.0421 || tot.OutputTokens != 640 ||
+		tot.CacheRead != 22000 || tot.Turns != 4 || tot.EgressAllowed != 1 || tot.EgressDenied != 2 || tot.PodSeconds <= 0 {
+		t.Fatalf("usage totals: %+v", tot)
+	}
+	resp, body = call(t, "GET", api+"/v1/usage?tenant=bob", "t0k", nil, nil)
+	_ = json.Unmarshal(body, &rep)
+	if resp.StatusCode != 200 || rep.Total.Runs != 0 || len(rep.Rows) != 0 {
+		t.Fatalf("usage for another tenant must be empty: %s", body)
+	}
+	if resp, body = call(t, "GET", api+"/v1/usage?group_by=week", "t0k", nil, nil); resp.StatusCode != 400 {
+		t.Fatalf("bad group_by: %d %s", resp.StatusCode, body)
+	}
+	// Trace: what the tenant's agents did, without the output noise unless asked.
+	resp, body = call(t, "GET", api+"/v1/trace?tenant=alice", "t0k", nil, nil)
+	var trace []model.Event
+	_ = json.Unmarshal(body, &trace)
+	var egress, outputs int
+	for _, e := range trace {
+		switch e.Type {
+		case model.EventEgressOK:
+			egress++
+			if !strings.Contains(e.Data, `"host":"api.anthropic.com"`) || e.Tenant != "alice" || e.Slug != "backend-dev" {
+				t.Fatalf("egress event: %+v", e)
+			}
+		case model.EventRunOutput:
+			outputs++
+		}
+	}
+	if resp.StatusCode != 200 || egress != 1 || outputs != 0 {
+		t.Fatalf("trace: %d egress=%d outputs=%d %s", resp.StatusCode, egress, outputs, body)
+	}
+	resp, body = call(t, "GET", api+"/v1/trace?tenant=alice&type=all&run="+run.ID, "t0k", nil, nil)
+	_ = json.Unmarshal(body, &trace)
+	if resp.StatusCode != 200 || len(trace) != 7 || trace[0].Type != "run.queued" {
+		t.Fatalf("trace run with output: %d %s", resp.StatusCode, body)
 	}
 }

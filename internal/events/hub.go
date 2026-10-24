@@ -16,7 +16,10 @@ type Hub struct {
 // New returns an empty hub.
 func New() *Hub { return &Hub{subs: map[string]map[chan model.Event]struct{}{}} }
 
-// Subscribe returns a channel receiving events for sandboxID and a cancel func.
+// All is the subscription key that receives every sandbox's events (tenant-wide traces).
+const All = "*"
+
+// Subscribe returns a channel receiving events for sandboxID (or All) and a cancel func.
 func (h *Hub) Subscribe(sandboxID string) (<-chan model.Event, func()) {
 	ch := make(chan model.Event, 64)
 	h.mu.Lock()
@@ -42,10 +45,12 @@ func (h *Hub) Subscribe(sandboxID string) (<-chan model.Event, func()) {
 func (h *Hub) Publish(e model.Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	for ch := range h.subs[e.SandboxID] {
-		select {
-		case ch <- e:
-		default:
+	for _, key := range [2]string{e.SandboxID, All} {
+		for ch := range h.subs[key] {
+			select {
+			case ch <- e:
+			default:
+			}
 		}
 	}
 }

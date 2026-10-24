@@ -252,3 +252,121 @@ func (m *Memory) ListInstances(_ context.Context, sandboxID string) ([]*model.In
 }
 
 func (m *Memory) Close() error { return nil }
+
+func (f Filter) matchRun(r *model.Run) bool {
+	if f.Tenant != "" && r.Tenant != f.Tenant {
+		return false
+	}
+	if f.Slug != "" && r.Slug != f.Slug {
+		return false
+	}
+	if f.SandboxID != "" && r.SandboxID != f.SandboxID {
+		return false
+	}
+	if f.RunID != "" && r.ID != f.RunID {
+		return false
+	}
+	if !f.From.IsZero() && r.CreatedAt.Before(f.From) {
+		return false
+	}
+	if !f.To.IsZero() && !r.CreatedAt.Before(f.To) {
+		return false
+	}
+	return true
+}
+
+func (f Filter) matchEvent(e *model.Event) bool {
+	if f.Tenant != "" && e.Tenant != f.Tenant {
+		return false
+	}
+	if f.Slug != "" && e.Slug != f.Slug {
+		return false
+	}
+	if f.SandboxID != "" && e.SandboxID != f.SandboxID {
+		return false
+	}
+	if f.RunID != "" && e.RunID != f.RunID {
+		return false
+	}
+	if e.ID <= f.AfterID {
+		return false
+	}
+	if !f.From.IsZero() && e.At.Before(f.From) {
+		return false
+	}
+	if !f.To.IsZero() && !e.At.Before(f.To) {
+		return false
+	}
+	if len(f.Types) > 0 {
+		ok := false
+		for _, t := range f.Types {
+			if t == e.Type {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *Memory) QueryRuns(_ context.Context, f Filter) ([]*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.Run
+	for _, r := range m.runs {
+		if f.matchRun(r) {
+			c := *r
+			out = append(out, &c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	if f.Limit > 0 && len(out) > f.Limit {
+		out = out[:f.Limit]
+	}
+	return out, nil
+}
+
+func (m *Memory) QueryEvents(_ context.Context, f Filter) ([]*model.Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.Event
+	for _, e := range m.events {
+		if f.matchEvent(e) {
+			c := *e
+			out = append(out, &c)
+			if f.Limit > 0 && len(out) >= f.Limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+func (m *Memory) CountEvents(_ context.Context, f Filter) ([]EventCount, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	type key struct {
+		tenant, slug, sb, run, typ string
+		day                        time.Time
+	}
+	counts := map[key]int64{}
+	var order []key
+	for _, e := range m.events {
+		if !f.matchEvent(e) {
+			continue
+		}
+		k := key{e.Tenant, e.Slug, e.SandboxID, e.RunID, e.Type, e.At.UTC().Truncate(24 * time.Hour)}
+		if _, ok := counts[k]; !ok {
+			order = append(order, k)
+		}
+		counts[k]++
+	}
+	out := make([]EventCount, 0, len(order))
+	for _, k := range order {
+		out = append(out, EventCount{Tenant: k.tenant, Slug: k.slug, SandboxID: k.sb, RunID: k.run, Type: k.typ, Day: k.day, N: counts[k]})
+	}
+	return out, nil
+}

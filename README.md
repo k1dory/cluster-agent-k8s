@@ -86,6 +86,24 @@ sandboxctl preview sb_1234 -port 3000    # https://shop-alice.preview.example.co
 sandboxctl sleep sb_1234                 # or wait an hour of silence
 ```
 
+## Accounting and trace
+
+Every run keeps what the harness reported (tokens, cost, turns), every gateway decision lands in
+the event log with the tenant and slug stamped on it, and pod uptime is derived from status
+changes. All of it is queried through the API, scoped by tenant, agent slug, sandbox or run:
+
+```sh
+sandboxctl usage -tenant acme -since 720h -by slug      # GET /v1/usage?tenant=acme&since=720h&group_by=slug
+sandboxctl usage -slug backend-dev -by day
+sandboxctl trace -tenant acme -since 24h                # GET /v1/trace: runs, inputs, every egress allow/deny
+sandboxctl trace -slug netops -type egress.deny -f      # follow refusals live
+```
+
+Runs and events are not deleted with the sandbox, so history stays billable. Model cost comes
+from the harness (Claude Code's stream-json `result` line is understood; others print
+`{"type":"usage",...}` lines or send a total with `/finish`); compute is `pod_seconds` priced with
+`accounting.pod_hour_usd` in the config.
+
 ## Run locally (no Kubernetes)
 
 ```sh

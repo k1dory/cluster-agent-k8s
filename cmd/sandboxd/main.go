@@ -35,6 +35,7 @@ import (
 	"agent-sandbox/internal/registrar"
 	"agent-sandbox/internal/secrets"
 	"agent-sandbox/internal/store"
+	"agent-sandbox/internal/usage"
 )
 
 func main() {
@@ -189,7 +190,8 @@ func serve(cfgPath string, log *slog.Logger) error {
 	if cfg.SecretsDir != "" {
 		secretProvider = secrets.FileProvider{Dir: cfg.SecretsDir}
 	}
-	az := &authz.Handler{Policies: pols, Secrets: secretProvider, Checker: reg, Toucher: orch, Audit: log.With("log", "egress")}
+	az := &authz.Handler{Policies: pols, Secrets: secretProvider, Checker: reg, Toucher: orch, Recorder: orch,
+		Trace: cfg.Accounting.EgressTrace, Quiet: map[string]bool{cfg.Gateway.APIHost: true}, Audit: log.With("log", "egress")}
 
 	var ing *ingress.Handler
 	if cfg.Listen.Ingress != "" {
@@ -197,7 +199,8 @@ func serve(cfgPath string, log *slog.Logger) error {
 			CookieTTL: cfg.Preview.CookieTTL, HitsAsActivity: cfg.Preview.HitsAsActivity, Log: log}
 	}
 
-	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken, Log: log.With("log", "api")}
+	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken,
+		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Log: log.With("log", "api")}
 	gw := &httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, Log: log.With("log", "gateway-api")}
 
 	servers := []*http.Server{

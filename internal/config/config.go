@@ -73,6 +73,11 @@ type Config struct {
 		ReadyTimeout       time.Duration `yaml:"ready_timeout"`
 		IdleCheckEvery     time.Duration `yaml:"idle_check_every"`
 	} `yaml:"sandbox"`
+	// Accounting: what GET /v1/usage prices and how much of the gateway traffic lands in the trace.
+	Accounting struct {
+		PodHourUSD  float64 `yaml:"pod_hour_usd"` // price of one sandbox pod-hour; 0 = report time only
+		EgressTrace string  `yaml:"egress_trace"` // all (default) | denied | off
+	} `yaml:"accounting"`
 	Preview struct {
 		Domain         string        `yaml:"domain"`
 		AuthURL        string        `yaml:"auth_url"`
@@ -118,6 +123,13 @@ func Load(path string) (*Config, error) {
 	}
 	if c.Preview.Domain == "" {
 		c.Preview.Domain = "preview.localhost"
+	}
+	switch c.Accounting.EgressTrace {
+	case "":
+		c.Accounting.EgressTrace = "all"
+	case "all", "denied", "off":
+	default:
+		return nil, fmt.Errorf("%s: accounting.egress_trace must be all, denied or off", path)
 	}
 	g := &c.Gateway
 	if g.APIHost == "" {

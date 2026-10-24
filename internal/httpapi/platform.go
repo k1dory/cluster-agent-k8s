@@ -21,6 +21,7 @@ import (
 	"agent-sandbox/internal/orchestrator"
 	"agent-sandbox/internal/policy"
 	"agent-sandbox/internal/store"
+	"agent-sandbox/internal/usage"
 )
 
 // Platform is the client-facing API.
@@ -29,6 +30,7 @@ type Platform struct {
 	Hub      *events.Hub
 	Policies *policy.Set
 	Ingress  *ingress.Handler
+	Pricing  usage.Pricing
 	Token    string
 	Log      *slog.Logger
 }
@@ -61,7 +63,178 @@ func (p *Platform) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/policies", p.auth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, p.Policies.Slugs())
 	}))
+	mux.HandleFunc("GET /v1/usage", p.auth(p.usage))
+	mux.HandleFunc("GET /v1/trace", p.auth(p.trace))
 	return logRequests(p.Log, mux)
+}
+
+// window reads from/to (RFC 3339 or YYYY-MM-DD) and since (duration back from now).
+func window(r *http.Request, now time.Time) (from, to time.Time, err error) {
+	parse := func(v string) (time.Time, error) {
+		if t, err := time.Parse(time.RFC3339, v); err == nil {
+			return t, nil
+		}
+		return time.Parse("2006-01-02", v)
+	}
+	q := r.URL.Query()
+	if v := q.Get("from"); v != "" {
+		if from, err = parse(v); err != nil {
+			return from, to, fmt.Errorf("from: %w", err)
+		}
+	}
+	if v := q.Get("to"); v != "" {
+		if to, err = parse(v); err != nil {
+			return from, to, fmt.Errorf("to: %w", err)
+		}
+	}
+	if v := q.Get("since"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return from, to, fmt.Errorf("since: %w", err)
+		}
+		from = now.Add(-d)
+	}
+	return from, to, nil
+}
+
+// usage answers GET /v1/usage: cost and consumption per tenant / slug / sandbox / run / day.
+func (p *Platform) usage(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	from, to, err := window(r, now)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	q := r.URL.Query()
+	rep, err := usage.Build(r.Context(), p.Orch.Store, usage.Query{
+		Tenant: q.Get("tenant"), Slug: q.Get("slug"), SandboxID: q.Get("sandbox"), RunID: q.Get("run"),
+		From: from, To: to, GroupBy: q.Get("group_by"),
+	}, p.Pricing, now)
+	if err != nil {
+		code := http.StatusInternalServerError
+		if strings.HasPrefix(err.Error(), "group_by") {
+			code = http.StatusBadRequest
+		}
+		writeErr(w, code, err)
+		return
+	}
+	if rep.Rows == nil {
+		rep.Rows = []usage.Row{}
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
+
+// trace answers GET /v1/trace: the event log across sandboxes, filtered by tenant / slug /
+// sandbox / run / type. JSON page by default; stream=true follows live over SSE.
+func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
+	from, to, err := window(r, now)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	q := r.URL.Query()
+	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
+	if v := r.Header.Get("Last-Event-ID"); v != "" {
+		after, _ = strconv.ParseInt(v, 10, 64)
+	}
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 || limit > 5000 {
+		limit = 500
+	}
+	f := store.Filter{Tenant: q.Get("tenant"), Slug: q.Get("slug"), SandboxID: q.Get("sandbox"), RunID: q.Get("run"),
+		From: from, To: to, AfterID: after, Limit: limit}
+	// Agent output is the bulk of the log; a trace is about what happened, so it is opt-in.
+	switch t := q.Get("type"); t {
+	case "":
+		f.Types = []string{model.EventStatus, model.EventRunQueued, model.EventRunStart, model.EventRunDone,
+			model.EventRunCancel, model.EventInput, model.EventEgressOK, model.EventEgressDen}
+	case "all":
+	default:
+		f.Types = strings.Split(t, ",")
+	}
+	stream, _ := strconv.ParseBool(q.Get("stream"))
+	if !stream {
+		evs, err := p.Orch.Store.QueryEvents(r.Context(), f)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err)
+			return
+		}
+		if evs == nil {
+			evs = []*model.Event{}
+		}
+		writeJSON(w, http.StatusOK, evs)
+		return
+	}
+	fl, ok := w.(http.Flusher)
+	if !ok {
+		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
+		return
+	}
+	want := func(e *model.Event) bool {
+		g := f
+		g.Limit, g.To = 0, time.Time{}
+		return matches(g, e)
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	ch, cancel := p.Hub.Subscribe(events.All)
+	defer cancel()
+	send := func(e model.Event) {
+		b, _ := json.Marshal(e)
+		fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Type, b)
+		fl.Flush()
+	}
+	for {
+		g := f
+		g.AfterID, g.Limit = after, 500
+		evs, err := p.Orch.Store.QueryEvents(r.Context(), g)
+		if err != nil || len(evs) == 0 {
+			break
+		}
+		for _, e := range evs {
+			send(*e)
+			after = e.ID
+		}
+	}
+	keepalive := time.NewTicker(20 * time.Second)
+	defer keepalive.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case e := <-ch:
+			if e.ID > after && want(&e) {
+				send(e)
+				after = e.ID
+			}
+		case <-keepalive.C:
+			fmt.Fprint(w, ": keepalive\n\n")
+			fl.Flush()
+		}
+	}
+}
+
+// matches applies a store.Filter to one live event (same semantics as the store query).
+func matches(f store.Filter, e *model.Event) bool {
+	if f.Tenant != "" && e.Tenant != f.Tenant || f.Slug != "" && e.Slug != f.Slug ||
+		f.SandboxID != "" && e.SandboxID != f.SandboxID || f.RunID != "" && e.RunID != f.RunID {
+		return false
+	}
+	if !f.From.IsZero() && e.At.Before(f.From) {
+		return false
+	}
+	if len(f.Types) == 0 {
+		return true
+	}
+	for _, t := range f.Types {
+		if t == e.Type {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {

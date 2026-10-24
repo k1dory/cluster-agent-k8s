@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -37,6 +38,8 @@ const usage = `sandboxctl <command> [flags]
   preview  <sandbox> -port 3000 [-access link|sso|members]   (-port 0 removes)
   delete   <sandbox>
   policies
+  usage    [-tenant t] [-slug s] [-sandbox id] [-run id] [-since 720h | -from DATE -to DATE] [-by tenant|slug|sandbox|run|day] [-json]
+  trace    [-tenant t] [-slug s] [-sandbox id] [-run id] [-since 24h] [-type egress.deny,run.finished|all] [-n 500] [-f] [-json]
 
 Environment: SANDBOXD_URL (default http://127.0.0.1:8080), SANDBOXD_TOKEN.
 `
@@ -236,6 +239,49 @@ func (c *cli) run(cmd string, args []string) error {
 			return err
 		}
 		fmt.Println(strings.Join(ps, "\n"))
+	case "usage":
+		q := scopeFlags(fs)
+		by := fs.String("by", "", "group rows by tenant | slug | sandbox | run | day")
+		raw := fs.Bool("json", false, "print the full report as JSON")
+		_ = fs.Parse(flags)
+		if *by != "" {
+			q.Set("group_by", *by)
+		}
+		var rep usageReport
+		if err := c.do("GET", "/v1/usage?"+q.Encode(), nil, &rep); err != nil {
+			return err
+		}
+		if *raw {
+			printJSON(rep)
+			return nil
+		}
+		printUsage(rep)
+	case "trace":
+		q := scopeFlags(fs)
+		typ := fs.String("type", "", "comma-separated event types, or all (default: everything but run.output)")
+		n := fs.Int("n", 500, "max events")
+		follow := fs.Bool("f", false, "follow live (SSE)")
+		raw := fs.Bool("json", false, "print raw event JSON")
+		_ = fs.Parse(flags)
+		if *typ != "" {
+			q.Set("type", *typ)
+		}
+		q.Set("limit", fmt.Sprint(*n))
+		if *follow {
+			return c.follow("/v1/trace?stream=true&"+q.Encode(), *raw, nil)
+		}
+		var evs []model.Event
+		if err := c.do("GET", "/v1/trace?"+q.Encode(), nil, &evs); err != nil {
+			return err
+		}
+		for _, e := range evs {
+			if *raw {
+				b, _ := json.Marshal(e)
+				fmt.Println(string(b))
+			} else {
+				printTrace(e)
+			}
+		}
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:
@@ -254,16 +300,120 @@ func need(pos []string, i int, what string) string {
 	return pos[i]
 }
 
-// watch follows the SSE stream, reconnecting with Last-Event-ID, and prints events readably.
+// scopeFlags registers the filters shared by usage and trace and returns them as query values.
+func scopeFlags(fs *flag.FlagSet) url.Values {
+	q := url.Values{}
+	for _, name := range []string{"tenant", "slug", "sandbox", "run", "since", "from", "to"} {
+		name := name
+		fs.Func(name, "filter: "+name, func(v string) error { q.Set(name, v); return nil })
+	}
+	return q
+}
+
+type usageReport struct {
+	From, To time.Time
+	GroupBy  string `json:"group_by"`
+	Total    usageTotals
+	Rows     []struct {
+		Key string
+		usageTotals
+	}
+}
+
+type usageTotals struct {
+	Runs          int     `json:"runs"`
+	RunsDone      int     `json:"runs_done"`
+	RunsFailed    int     `json:"runs_failed"`
+	RunsCancelled int     `json:"runs_cancelled"`
+	RunSeconds    float64 `json:"run_seconds"`
+	PodSeconds    float64 `json:"pod_seconds"`
+	InputTokens   int64   `json:"input_tokens"`
+	OutputTokens  int64   `json:"output_tokens"`
+	CacheRead     int64   `json:"cache_read_tokens"`
+	CacheWrite    int64   `json:"cache_write_tokens"`
+	EgressAllowed int64   `json:"egress_allowed"`
+	EgressDenied  int64   `json:"egress_denied"`
+	ModelUSD      float64 `json:"model_usd"`
+	ComputeUSD    float64 `json:"compute_usd"`
+	TotalUSD      float64 `json:"total_usd"`
+}
+
+func printUsage(rep usageReport) {
+	fmt.Printf("%s → %s\n", rep.From.Local().Format("2006-01-02 15:04"), rep.To.Local().Format("2006-01-02 15:04"))
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	key := strings.ToUpper(rep.GroupBy)
+	if key == "" {
+		key = "SCOPE"
+	}
+	fmt.Fprintf(tw, "%s\tRUNS\tOK/FAIL/CANCEL\tRUN TIME\tPOD TIME\tIN TOK\tOUT TOK\tCACHE R/W\tEGRESS OK/DENY\tMODEL $\tCOMPUTE $\tTOTAL $\n", key)
+	line := func(k string, t usageTotals) {
+		fmt.Fprintf(tw, "%s\t%d\t%d/%d/%d\t%s\t%s\t%d\t%d\t%d/%d\t%d/%d\t%.4f\t%.4f\t%.4f\n", k, t.Runs, t.RunsDone, t.RunsFailed, t.RunsCancelled,
+			dur(t.RunSeconds), dur(t.PodSeconds), t.InputTokens, t.OutputTokens, t.CacheRead, t.CacheWrite, t.EgressAllowed, t.EgressDenied,
+			t.ModelUSD, t.ComputeUSD, t.TotalUSD)
+	}
+	if rep.GroupBy != "" {
+		for _, r := range rep.Rows {
+			line(r.Key, r.usageTotals)
+		}
+	}
+	line("total", rep.Total)
+	tw.Flush()
+}
+
+func dur(sec float64) string {
+	return (time.Duration(sec) * time.Second).Round(time.Second).String()
+}
+
+func printTrace(e model.Event) {
+	who := e.Tenant + "/" + e.Slug
+	switch e.Type {
+	case model.EventEgressOK, model.EventEgressDen:
+		var eg model.Egress
+		_ = json.Unmarshal([]byte(e.Data), &eg)
+		mark := "→"
+		extra := ""
+		if e.Type == model.EventEgressDen {
+			mark = "✗"
+			extra = fmt.Sprintf("  %d %s", eg.Code, eg.Reason)
+		}
+		fmt.Printf("%s %-28s %s %s %s %s%s\n", e.At.Local().Format("15:04:05"), who, e.SandboxID, mark, eg.Method, eg.Host+eg.Path, extra)
+	case model.EventRunOutput:
+		fmt.Printf("%s %-28s %s   %s\n", e.At.Local().Format("15:04:05"), who, e.SandboxID, e.Data)
+	default:
+		fmt.Println(strings.TrimRight(fmt.Sprintf("%s %-28s %s %s %s %s", e.At.Local().Format("15:04:05"), who, e.SandboxID, e.Type, e.RunID, e.Data), " "))
+	}
+}
+
+// watch follows one sandbox's SSE stream and prints events readably.
 func (c *cli) watch(id, runID string, after int64, raw bool) error {
+	path := fmt.Sprintf("/v1/sandboxes/%s/events?after=%d", id, after)
+	if runID != "" {
+		path += "&run=" + runID
+	}
+	return c.follow(path, raw, func(e model.Event) bool {
+		switch e.Type {
+		case model.EventRunOutput:
+			fmt.Println(e.Data)
+		case model.EventInput:
+			fmt.Printf("» %s\n", e.Data)
+		default:
+			fmt.Printf("[%s] %s %s %s\n", e.At.Local().Format("15:04:05"), e.Type, e.RunID, e.Data)
+		}
+		return e.Type == model.EventRunDone && runID != "" && e.RunID == runID
+	})
+}
+
+// follow reads an SSE endpoint, reconnecting with Last-Event-ID. print returns true to stop;
+// nil means the trace format.
+func (c *cli) follow(path string, raw bool, print func(model.Event) bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	var after int64
 	for ctx.Err() == nil {
-		url := fmt.Sprintf("%s/v1/sandboxes/%s/events?after=%d", c.base, id, after)
-		if runID != "" {
-			url += "&run=" + runID
+		req, _ := http.NewRequestWithContext(ctx, "GET", c.base+path, nil)
+		if after > 0 {
+			req.Header.Set("Last-Event-ID", fmt.Sprint(after))
 		}
-		req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 		req.Header.Set("Authorization", "Bearer "+c.token)
 		req.Header.Set("Accept", "text/event-stream")
 		resp, err := (&http.Client{}).Do(req)
@@ -296,15 +446,11 @@ func (c *cli) watch(id, runID string, after int64, raw bool) error {
 				fmt.Println(strings.TrimPrefix(line, "data: "))
 				continue
 			}
-			switch e.Type {
-			case model.EventRunOutput:
-				fmt.Println(e.Data)
-			case model.EventInput:
-				fmt.Printf("» %s\n", e.Data)
-			default:
-				fmt.Printf("[%s] %s %s %s\n", e.At.Format("15:04:05"), e.Type, e.RunID, e.Data)
+			if print == nil {
+				printTrace(e)
+				continue
 			}
-			if e.Type == model.EventRunDone && runID != "" && e.RunID == runID {
+			if print(e) {
 				resp.Body.Close()
 				return nil
 			}

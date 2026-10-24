@@ -26,12 +26,27 @@ type Toucher interface {
 	Touch(ctx context.Context, sandboxID string)
 }
 
+// Recorder writes gateway decisions into the sandbox trace (the orchestrator).
+type Recorder interface {
+	RecordEgress(ctx context.Context, sandboxID string, allowed bool, eg model.Egress)
+}
+
+// Trace levels for Recorder.
+const (
+	TraceAll    = "all"    // every decision
+	TraceDenied = "denied" // only refusals
+	TraceOff    = "off"
+)
+
 // Handler is the forward_auth endpoint.
 type Handler struct {
 	Policies *policy.Set
 	Secrets  secrets.Provider
 	Checker  Checker
 	Toucher  Toucher
+	Recorder Recorder
+	Trace    string          // TraceAll (default), TraceDenied or TraceOff
+	Quiet    map[string]bool // hosts never traced (the control plane's own API: the runner polls it constantly)
 	Audit    *slog.Logger
 }
 
@@ -57,12 +72,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if log == nil {
 		log = slog.Default()
 	}
+	p := uri
+	if u, err := url.ParseRequestURI(uri); err == nil {
+		p = u.Path
+	}
+	record := func(id *identity.Identity, allowed bool, code int, reason string) {
+		if h.Recorder == nil || id == nil || h.Trace == TraceOff || h.Quiet[host] || (allowed && h.Trace == TraceDenied) {
+			return
+		}
+		h.Recorder.RecordEgress(r.Context(), id.SandboxID, allowed, model.Egress{Host: host, Method: method, Path: p, Code: code, Reason: reason})
+	}
 	deny := func(code int, reason string, id *identity.Identity) {
 		attrs := []any{"verdict", "deny", "reason", reason, "host", host, "method", method, "uri", uri, "src", src, "code", code}
 		if id != nil {
 			attrs = append(attrs, "agent", id.String(), "tenant", id.Tenant, "sandbox", id.SandboxID)
 		}
 		log.Warn("egress", attrs...)
+		record(id, false, code, reason)
 		http.Error(w, reason, code)
 	}
 
@@ -76,10 +102,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			deny(http.StatusForbidden, "identity rejected: "+err.Error(), id)
 			return
 		}
-	}
-	p := uri
-	if u, err := url.ParseRequestURI(uri); err == nil {
-		p = u.Path
 	}
 	rule, ok := h.Policies.Match(id.Slug, host, method, p)
 	if !ok {
@@ -105,6 +127,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.Toucher != nil && id.SandboxID != "" {
 		h.Toucher.Touch(r.Context(), id.SandboxID)
 	}
+	record(id, true, 0, "")
 	log.Info("egress", "verdict", "allow", "agent", id.String(), "tenant", id.Tenant, "sandbox", id.SandboxID,
 		"host", host, "method", method, "uri", uri, "src", src, "took_us", time.Since(start).Microseconds())
 	w.WriteHeader(http.StatusOK)
