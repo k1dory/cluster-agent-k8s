@@ -66,3 +66,21 @@ func TestBootstrapIssuesMonotonicInstances(t *testing.T) {
 		t.Fatal("bad token must be rejected")
 	}
 }
+
+func TestAdminGrantInCertificate(t *testing.T) {
+	r, st := newTestRegistrar(t)
+	ctx := context.Background()
+	_ = st.CreateSandbox(ctx, &model.Sandbox{ID: "sb2", Slug: "backend-dev", Tenant: "u2", AdminGrant: true, Status: model.StatusRunning, CreatedAt: time.Now()})
+	r.Resolver = StaticResolver{"tok-b": {Name: "pod-b", SandboxID: "sb2", Slug: "backend-dev", Tenant: "u2"}}
+	_, csr, _ := ca.NewCSR("backend-dev")
+	res, err := r.Bootstrap(ctx, "tok-b", BootstrapRequest{CSR: string(csr)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := pem.Decode([]byte(res.Cert))
+	cert, _ := x509.ParseCertificate(b.Bytes)
+	id, err := identity.FromCert(cert)
+	if err != nil || !id.AdminGrant {
+		t.Fatalf("the admin grant must travel in the certificate: %+v %v", id, err)
+	}
+}

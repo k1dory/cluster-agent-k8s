@@ -155,3 +155,37 @@ func TestStrictParseAndDuplicates(t *testing.T) {
 		t.Fatalf("duplicate slugs across files must be refused: %v", err)
 	}
 }
+
+func TestRevocationModel(t *testing.T) {
+	owned := &Policy{Slug: "dev", Tenants: []string{"acme"}, Allow: []Rule{{Host: "h.example.com", Paths: []string{"/"}}}}
+	untagged := &Policy{Slug: "open", Allow: []Rule{{Host: "h.example.com", Paths: []string{"/"}}}}
+	def := &Policy{Slug: "default", Tenants: []string{"*"}, Allow: []Rule{{Host: "h.example.com", Paths: []string{"/"}}}}
+	for _, c := range []struct {
+		name         string
+		set          *Set
+		strict       bool
+		slug, tenant string
+		adminGrant   bool
+		want         bool
+	}{
+		{"owned tenant keeps access", FromPolicies(owned, def), true, "dev", "acme", false, false},
+		{"other tenant revoked", FromPolicies(owned, def), true, "dev", "evil", false, true},
+		{"last tenant removed, strict", FromPolicies(untagged, def), true, "open", "acme", false, true},
+		{"last tenant removed, permissive", FromPolicies(untagged, def), false, "open", "acme", false, false},
+		{"slug deleted, strict: no fallback", FromPolicies(def), true, "dev", "acme", false, true},
+		{"slug deleted, permissive: default applies", FromPolicies(def), false, "dev", "acme", false, false},
+		{"admin grant survives a tenants change", FromPolicies(owned, def), true, "dev", "evil", true, false},
+		{"admin grant on an untagged policy, strict", FromPolicies(untagged, def), true, "open", "evil", true, false},
+		{"admin grant ends when the slug file is deleted, strict", FromPolicies(def), true, "dev", "evil", true, true},
+		{"admin grant falls back to default, permissive", FromPolicies(def), false, "dev", "evil", true, false},
+		{"admin grant with nothing left", FromPolicies(), false, "dev", "evil", true, true},
+	} {
+		c.set.Strict = c.strict
+		if got := c.set.Revoked(c.slug, c.tenant, c.adminGrant); got != c.want {
+			t.Errorf("%s: Revoked=%v, want %v", c.name, got, c.want)
+		}
+	}
+	if h, ok := FromPolicies(owned).HostInfo("h.example.com"); !ok || h.Upstream != "https://h.example.com" {
+		t.Fatal("HostInfo")
+	}
+}

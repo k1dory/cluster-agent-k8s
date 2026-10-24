@@ -354,7 +354,7 @@ func (r *Runtime) PodStatus(ctx context.Context, sb *model.Sandbox) (bool, strin
 	}
 	switch pod.Status.Phase {
 	case corev1.PodFailed, corev1.PodSucceeded:
-		return false, pod.Status.PodIP, fmt.Errorf("pod %s: %s", name, pod.Status.Phase)
+		return false, pod.Status.PodIP, fmt.Errorf("%w: pod %s is %s", orchestrator.ErrPodTerminated, name, pod.Status.Phase)
 	}
 	ip := pod.Status.PodIP
 	if ip == "" {

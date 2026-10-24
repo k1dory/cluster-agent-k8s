@@ -30,9 +30,19 @@ import (
 	"agent-sandbox/internal/store"
 )
 
-// ErrPodNotFound is returned by Runtime.PodStatus when the pod does not exist (yet, or any
-// more). Every other error is a real failure (terminal phase, API error).
-var ErrPodNotFound = errors.New("pod not found")
+// Runtime.PodStatus distinguishes three outcomes by error: ErrPodNotFound (the pod does not
+// exist, yet or any more), ErrPodTerminated (it exists in a terminal phase) and any other
+// error, which means the state could not be observed (API outage) and says nothing about the
+// pod. Only the first two are facts the orchestrator acts on.
+var (
+	ErrPodNotFound   = errors.New("pod not found")
+	ErrPodTerminated = errors.New("pod terminated")
+)
+
+// podGone reports an observed fact (absent or terminal), never an observation failure.
+func podGone(err error) bool {
+	return errors.Is(err, ErrPodNotFound) || errors.Is(err, ErrPodTerminated)
+}
 
 // Runtime creates and destroys the pod and volume behind a sandbox.
 type Runtime interface {
@@ -54,11 +64,11 @@ type Retirer interface {
 }
 
 // PolicyGuard decides which tenant may use which slug (the policy set's tenants lists).
-// AllowedFor gates creation; Revoked says an existing sandbox lost its slug (explicit tenants
-// list that no longer includes the tenant) and must be stopped.
+// AllowedFor gates creation; Revoked says an existing sandbox lost its slug and must be
+// stopped (see policy.Set.Revoked for the two kinds of grant).
 type PolicyGuard interface {
 	AllowedFor(slug, tenant string) bool
-	Revoked(slug, tenant string) bool
+	Revoked(slug, tenant string, adminGrant bool) bool
 }
 
 // Quota bounds what one tenant may hold. Zero means unlimited.
@@ -128,10 +138,9 @@ type Orchestrator struct {
 	ListenerPublishes bool
 
 	mu       sync.Mutex
-	waking   map[string]bool     // sandboxes this replica is watching to readiness
-	meta     map[string]sbMeta   // sandbox id → tenant/slug, for stamping events
-	running  map[string]runCache // sandbox id → running run id ("" = none), for egress attribution
-	sessions map[string]string   // run id → last harness session id stored, to skip repeated writes
+	waking   map[string]bool   // sandboxes this replica is watching to readiness
+	meta     map[string]sbMeta // sandbox id → tenant/slug, for stamping events
+	sessions map[string]string // run id → last harness session id stored, to skip repeated writes
 	leading  atomic.Bool
 }
 
@@ -139,15 +148,6 @@ type Orchestrator struct {
 func (o *Orchestrator) Leading() bool { return o.leading.Load() }
 
 type sbMeta struct{ tenant, slug string }
-
-// runCache is a short-lived answer to "which run executes in this sandbox": another replica may
-// have claimed or finished a run, so the cache expires quickly.
-type runCache struct {
-	id string
-	at time.Time
-}
-
-const runCacheTTL = 2 * time.Second
 
 // New wires an orchestrator.
 func New(st store.Store, rt Runtime, ret Retirer, hub *events.Hub, cfg Config, log *slog.Logger) *Orchestrator {
@@ -164,7 +164,7 @@ func New(st store.Store, rt Runtime, ret Retirer, hub *events.Hub, cfg Config, l
 		log = slog.Default()
 	}
 	return &Orchestrator{Store: st, Runtime: rt, Retirer: ret, Hub: hub, Cfg: cfg, Log: log,
-		waking: map[string]bool{}, meta: map[string]sbMeta{}, running: map[string]runCache{}, sessions: map[string]string{}}
+		waking: map[string]bool{}, meta: map[string]sbMeta{}, sessions: map[string]string{}}
 }
 
 // Errors surfaced to the API.
@@ -251,8 +251,12 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 	if req.Tenant == "" {
 		req.Tenant = req.Owner
 	}
-	if o.Policies != nil && !req.Admin && !o.Policies.AllowedFor(req.Slug, req.Tenant) {
-		return nil, fmt.Errorf("%w: tenant %s may not use slug %s (policy tenants list)", ErrForbidden, req.Tenant, req.Slug)
+	adminGrant := false
+	if o.Policies != nil && !o.Policies.AllowedFor(req.Slug, req.Tenant) {
+		if !req.Admin {
+			return nil, fmt.Errorf("%w: tenant %s may not use slug %s (policy tenants list)", ErrForbidden, req.Tenant, req.Slug)
+		}
+		adminGrant = true // the admin overrides ownership; recorded, carried in the certificate
 	}
 	version, err := o.Cfg.ResolveVersion(req.AgentVersion, req.Admin)
 	if err != nil {
@@ -261,7 +265,7 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 	now := time.Now()
 	sb := &model.Sandbox{
 		ID: newID("sb"), Name: req.Name, Slug: req.Slug, Owner: req.Owner, Tenant: req.Tenant, Repo: req.Repo,
-		IdleTimeout: int(o.Cfg.DefaultIdleTimeout.Seconds()), WakeOnPreview: true, AgentVersion: version,
+		IdleTimeout: int(o.Cfg.DefaultIdleTimeout.Seconds()), WakeOnPreview: true, AgentVersion: version, AdminGrant: adminGrant,
 		Status: model.StatusCreating, LastActivity: now, CreatedAt: now,
 	}
 	if req.IdleTimeout != nil {
@@ -422,12 +426,13 @@ func (o *Orchestrator) waitReady(id string) {
 			ready, ip, err := o.Runtime.PodStatus(ctx, sb)
 			lastErr = err
 			switch {
-			case errors.Is(err, ErrPodNotFound):
-				// Not visible yet (another replica is still creating it, or the API lags): keep waiting.
-			case err != nil:
-				// Terminal phase or API error: no point waiting for the deadline.
+			case errors.Is(err, ErrPodTerminated):
+				// Crashed init container, evicted: no point waiting for the deadline.
 				o.fail(context.Background(), id, "pod status: "+err.Error())
 				return
+			case err != nil:
+				// Not visible yet (another replica is still creating it) or the API is unreachable:
+				// neither says anything about the pod, keep waiting.
 			default:
 				if ip != "" && ip != sb.IP {
 					_, _ = o.mutate(ctx, id, func(s *model.Sandbox) error { s.IP = ip; return nil })
@@ -518,29 +523,14 @@ func (o *Orchestrator) metaOf(ctx context.Context, id string) sbMeta {
 	return sbMeta{sb.Tenant, sb.Slug}
 }
 
-// setRunning records which run is executing in a sandbox (for attributing egress).
-func (o *Orchestrator) setRunning(sandboxID, runID string) {
-	o.mu.Lock()
-	o.running[sandboxID] = runCache{id: runID, at: time.Now()}
-	o.mu.Unlock()
-}
-
-// runningRunID returns the executing run of a sandbox, or "" if none. Cached for runCacheTTL so
-// the egress hot path costs one store read every few seconds, not one per request, while a run
-// claimed or finished on another replica is attributed correctly soon after.
+// runningRunID returns the executing run of a sandbox, or "" if none. It is always read from
+// the store: egress events are kept forever with this run id, and a run may have been claimed
+// or finished on another replica a moment ago. One indexed query per allowed request.
 func (o *Orchestrator) runningRunID(ctx context.Context, sandboxID string) string {
-	o.mu.Lock()
-	c, ok := o.running[sandboxID]
-	o.mu.Unlock()
-	if ok && time.Since(c.at) < runCacheTTL {
-		return c.id
-	}
-	id := ""
 	if r, err := o.Store.RunningRun(ctx, sandboxID); err == nil {
-		id = r.ID
+		return r.ID
 	}
-	o.setRunning(sandboxID, id)
-	return id
+	return ""
 }
 
 func (o *Orchestrator) emit(ctx context.Context, e model.Event) error {
@@ -654,7 +644,6 @@ func (o *Orchestrator) stopPod(ctx context.Context, id string, final model.Sandb
 		_ = o.Store.UpdateRun(ctx, r)
 		o.emit(ctx, model.Event{SandboxID: id, RunID: r.ID, Type: model.EventRunDone, Data: string(model.RunCancelled)})
 	}
-	o.setRunning(id, "")
 	if final == model.StatusWaking {
 		return o.startPod(ctx, id)
 	}
@@ -711,7 +700,6 @@ func (o *Orchestrator) Delete(ctx context.Context, id string) error {
 	err = o.Store.DeleteSandbox(ctx, id)
 	o.mu.Lock()
 	delete(o.meta, id)
-	delete(o.running, id)
 	o.mu.Unlock()
 	return err
 }
@@ -797,7 +785,6 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 				r.AgentVersion = sb.AgentVersion
 				_ = o.Store.UpdateRun(ctx, r)
 			}
-			o.setRunning(sandboxID, r.ID)
 			o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunStart, Data: r.AgentVersion})
 			return r, nil
 		}
@@ -875,7 +862,6 @@ func (o *Orchestrator) FinishRun(ctx context.Context, sandboxID, runID string, e
 	if r.SandboxID != sandboxID {
 		return store.ErrNotFound
 	}
-	o.setRunning(sandboxID, "")
 	switch r.Status {
 	case model.RunCancelled, model.RunDone, model.RunFailed:
 		return nil // already settled: a retried /finish after a lost acknowledgement is a no-op
@@ -950,7 +936,6 @@ func (o *Orchestrator) CancelRun(ctx context.Context, sandboxID, runID string) (
 	if err := o.Store.UpdateRun(ctx, r); err != nil {
 		return nil, err
 	}
-	o.setRunning(sandboxID, "")
 	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventRunCancel})
 	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventRunDone, Data: string(model.RunCancelled)})
 	return r, nil
@@ -1222,7 +1207,6 @@ func (o *Orchestrator) failRun(ctx context.Context, sandboxID string, r *model.R
 		o.Log.Error("fail run", "run", r.ID, "err", err)
 		return
 	}
-	o.setRunning(sandboxID, "")
 	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunOutput, Data: "[control plane] run lost: " + reason})
 	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunDone, Data: string(model.RunFailed)})
 }
@@ -1288,10 +1272,14 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			}
 			continue
 		}
-		// The pod must still exist and be alive; Kubernetes may have evicted or killed it.
-		if _, _, err := o.Runtime.PodStatus(ctx, sb); err != nil {
+		// The pod must still exist and be alive; Kubernetes may have evicted or killed it. Only an
+		// observed fact counts: an API outage is logged and the sandbox left exactly as it is.
+		if _, _, err := o.Runtime.PodStatus(ctx, sb); err != nil && !podGone(err) {
+			o.Log.Warn("cannot observe pod, leaving the sandbox alone", "id", sb.ID, "pod", sb.PodName, "err", err)
+			continue
+		} else if err != nil {
 			reason := "pod disappeared"
-			if !errors.Is(err, ErrPodNotFound) {
+			if errors.Is(err, ErrPodTerminated) {
 				reason = "pod failed: " + err.Error()
 			}
 			o.Log.Warn("running sandbox lost its pod", "id", sb.ID, "pod", sb.PodName, "reason", reason)
@@ -1307,7 +1295,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			})
 			continue
 		}
-		if o.Policies != nil && o.Policies.Revoked(sb.Slug, sb.Tenant) {
+		if o.Policies != nil && o.Policies.Revoked(sb.Slug, sb.Tenant, sb.AdminGrant) {
 			// The policy repository revoked the slug from this tenant: the gateway already refuses
 			// every request; take the pod down too so nothing keeps running under rights it lost.
 			o.Log.Warn("tenant lost its slug, stopping sandbox", "id", sb.ID, "slug", sb.Slug, "tenant", sb.Tenant)

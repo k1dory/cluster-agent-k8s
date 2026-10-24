@@ -57,7 +57,7 @@ func (p *Postgres) Close() error { p.pool.Close(); return nil }
 
 const sandboxCols = `id, name, slug, owner, tenant, repo, idle_timeout, wake_on_preview, status, ip, instance,
 	pod_name, last_activity, created_at, expires_at, preview_port, preview_access, preview_host, error,
-	agent_version, desired_version, env_version, revision`
+	agent_version, desired_version, env_version, revision, admin_grant`
 
 func scanSandbox(row pgx.Row) (*model.Sandbox, error) {
 	var s model.Sandbox
@@ -65,7 +65,7 @@ func scanSandbox(row pgx.Row) (*model.Sandbox, error) {
 	var pAccess, pHost *string
 	err := row.Scan(&s.ID, &s.Name, &s.Slug, &s.Owner, &s.Tenant, &s.Repo, &s.IdleTimeout, &s.WakeOnPreview,
 		&s.Status, &s.IP, &s.Instance, &s.PodName, &s.LastActivity, &s.CreatedAt, &s.ExpiresAt, &pPort, &pAccess, &pHost, &s.Error,
-		&s.AgentVersion, &s.DesiredVersion, &s.EnvVersion, &s.Revision)
+		&s.AgentVersion, &s.DesiredVersion, &s.EnvVersion, &s.Revision, &s.AdminGrant)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -95,10 +95,10 @@ func (p *Postgres) CreateSandbox(ctx context.Context, s *model.Sandbox) error {
 	port, access, host := previewCols(s)
 	s.Revision = 1
 	_, err := p.pool.Exec(ctx, `INSERT INTO sandboxes (`+sandboxCols+`)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
 		s.PodName, s.LastActivity, s.CreatedAt, s.ExpiresAt, port, access, host, s.Error,
-		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision)
+		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision, s.AdminGrant)
 	return err
 }
 
@@ -339,11 +339,11 @@ func (p *Postgres) UpdateSandbox(ctx context.Context, s *model.Sandbox) error {
 	tag, err := p.pool.Exec(ctx, `UPDATE sandboxes SET name=$2, slug=$3, owner=$4, tenant=$5, repo=$6, idle_timeout=$7,
 		wake_on_preview=$8, status=$9, ip=$10, instance=$11, pod_name=$12, last_activity=GREATEST(last_activity, $13), expires_at=$14,
 		preview_port=$15, preview_access=$16, preview_host=$17, error=$18,
-		agent_version=$19, desired_version=$20, env_version=$21, revision=revision+1
+		agent_version=$19, desired_version=$20, env_version=$21, admin_grant=$23, revision=revision+1
 		WHERE id=$1 AND revision=$22`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
 		s.PodName, s.LastActivity, s.ExpiresAt, port, access, host, s.Error,
-		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision)
+		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision, s.AdminGrant)
 	if err != nil {
 		return err
 	}

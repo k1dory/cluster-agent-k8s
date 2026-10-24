@@ -130,20 +130,36 @@ func (s *Set) AllowedFor(slug, tenant string) bool {
 	return p.OwnedBy(tenant, s.Strict)
 }
 
-// Revoked reports that the policy applying to slug names tenants explicitly and tenant is not
-// among them: an agent already running under the slug loses its access (the gateway refuses,
-// the reconciler stops the pod). A policy without a tenants list never revokes, so admin-only
-// policies in strict mode keep working for the sandboxes the admin created.
-func (s *Set) Revoked(slug, tenant string) bool {
+// Revoked reports that a sandbox running under slug for tenant must lose its access. The
+// permission model has two grants:
+//
+//   - policy grant (adminGrant=false): the tenant was allowed by the policy repository at
+//     creation and stays allowed exactly as long as AllowedFor says so. Dropping the tenant from
+//     the list, emptying the list in strict mode, or deleting the slug's file all revoke.
+//   - admin grant (adminGrant=true): the admin created the sandbox for a slug the tenant does
+//     not own. The grant is the admin's decision, not the tenants list's, and lasts while a
+//     policy still applies to the slug (its own file; the default fallback in permissive mode).
+func (s *Set) Revoked(slug, tenant string, adminGrant bool) bool {
+	if !adminGrant {
+		return !s.AllowedFor(slug, tenant)
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	p, ok := s.bySlug[slug]
-	if !ok {
-		if p, ok = s.bySlug["default"]; !ok {
-			return false
+	if _, ok := s.bySlug[slug]; ok {
+		return false
+	}
+	_, hasDefault := s.bySlug["default"]
+	return s.Strict || !hasDefault
+}
+
+// HostInfo returns the gateway host entry for name (lower-case, no port).
+func (s *Set) HostInfo(name string) (Host, bool) {
+	for _, h := range s.Hosts() {
+		if h.Name == name {
+			return h, true
 		}
 	}
-	return len(p.Tenants) > 0 && !p.OwnedBy(tenant, false)
+	return Host{}, false
 }
 
 // ContentHash identifies the policy content that applies to slug (own file or default), so a

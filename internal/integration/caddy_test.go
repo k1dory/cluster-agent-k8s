@@ -158,7 +158,7 @@ func TestRealCaddyGateway(t *testing.T) {
 	}})
 	az := &authz.Handler{Policies: pols, Secrets: secrets.Static{"shared/forgejo": "forgejo-injected"}, Checker: reg, Toucher: orch, Recorder: orch,
 		Quiet: map[string]bool{"api.sandbox.internal": true}}
-	gw := httptest.NewServer((&httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, MCP: &mcpproxy.Handler{Authz: az}}).Routes())
+	gw := httptest.NewServer((&httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, MCP: &mcpproxy.Handler{Authz: az, Hosts: pols}}).Routes())
 	defer gw.Close()
 	sandboxdAddr := strings.TrimPrefix(gw.URL, "http://")
 

@@ -88,7 +88,7 @@ func (h *Handler) Decide(ctx context.Context, r *http.Request, host, method, p s
 	}
 	// Ownership is re-checked on every request: when a policy's tenants list changes in git,
 	// agents that already run under the slug lose their access at once, not at their next wake.
-	if h.Policies.Revoked(id.Slug, id.Tenant) {
+	if h.Policies.Revoked(id.Slug, id.Tenant, id.AdminGrant) {
 		d.Code, d.Reason = http.StatusForbidden, "policy: tenant "+id.Tenant+" no longer owns slug "+id.Slug
 		return d
 	}
