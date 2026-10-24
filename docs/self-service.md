@@ -16,7 +16,7 @@ From here on the tenant works with its own key. It issues one per pipeline or pe
 them, revokes a leaked one, and the admin is not in the loop:
 
 ```sh
-export SANDBOXCTL_TOKEN=sbk_…
+export SANDBOXD_TOKEN=sbk_…                                 # sandboxctl reads SANDBOXD_URL and SANDBOXD_TOKEN
 sandboxctl keys create -name ci -ttl 720h
 sandboxctl keys rotate key_3f2a9c1e7b04 -grace 1h           # both secrets work for an hour
 sandboxctl keys revoke key_3f2a9c1e7b04                     # refused on the very next request
@@ -36,15 +36,20 @@ replaces or revokes it without asking:
 printf '%s' "$ANTHROPIC_API_KEY" | sandboxctl credentials set anthropic   # the value: stdin or -file, never argv
 sandboxctl credentials list                                               # name, version, fingerprint, who, when
 sandboxctl credentials set anthropic -file ./new-key.txt                 # replace: version 2 on the next request
-sandboxctl credentials remove anthropic                                   # revoke: the next request fails at the gateway
+sandboxctl credentials remove anthropic                                   # revoke: gone on the next request (see below)
 ```
 
 `PUT /v1/credentials/{name}` with `{"value": …}`, `GET` (metadata only, a `fingerprint` of the
 value to tell which one is loaded), `DELETE`. The value is encrypted at rest under the server's
 `credentials.key` and exists in clear only inside the gateway's decision for that tenant.
-`secret:NAME` references in connections and policies resolve from these credentials first, then
-from the operator's provider, so a tenant may override what the operator configured under the
-same name, and the operator's provider keeps serving everything the tenant did not bring.
+`secret:NAME` references in connections and policies resolve in this order: the tenant's own
+credential, a shared one of the same name (the admin's), the operator's provider. So a tenant
+may override what the operator configured under the same name, and the operator's provider
+keeps serving everything the tenant did not bring. Removing a credential takes the tenant's
+value out of that chain on the next request: if nothing else carries the name, the request that
+needs it fails at the gateway (502, nothing partial is sent); if a shared or operator credential
+of the same name exists, that one is used again. A key the tenant wants gone everywhere is
+removed where it lives.
 
 ## 2. The admin decides what the tenant may reach
 

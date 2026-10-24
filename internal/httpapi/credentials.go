@@ -55,7 +55,10 @@ func (p *Platform) credentialRoutes(mux *http.ServeMux) {
 		var req struct {
 			Value string `json:"value"`
 		}
-		if err := decodeStrict(r, &req); err != nil {
+		// The body limit is on the JSON, which carries the value escaped (up to six bytes per
+		// byte) inside a wrapper: a value of exactly MaxValue bytes must pass, the service then
+		// judges the value itself.
+		if err := decodeStrict(w, r, &req, 6*credentials.MaxValue+1024); err != nil {
 			writeErr(w, http.StatusBadRequest, err)
 			return
 		}

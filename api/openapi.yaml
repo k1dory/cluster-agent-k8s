@@ -880,7 +880,9 @@ paths:
       parameters: [{ $ref: "#/components/parameters/scope" }]
       responses:
         "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/Credential" } } } } }
-        "503": { description: "credentials.key is not configured", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "503": { $ref: "#/components/responses/CredentialsDisabled" }
   /v1/credentials/{name}:
     parameters:
       - { name: name, in: path, required: true, schema: { type: string } }
@@ -890,7 +892,10 @@ paths:
       summary: One credential's metadata
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
         "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/CredentialsDisabled" }
     put:
       tags: [tenancy]
       summary: Add or replace the credential (the value goes in here and never comes out)
@@ -908,15 +913,25 @@ paths:
       responses:
         "200": { description: Replaced, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
         "201": { description: Added, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
-        "400": { $ref: "#/components/responses/Error" }
+        "400": { description: "Malformed JSON, unknown field, trailing data, or a body over the limit (the value itself may be up to 65536 bytes)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
         "422": { description: "Bad name or empty / oversized value", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/CredentialsDisabled" }
     delete:
       tags: [tenancy]
-      summary: Revoke the credential
-      description: The next request that needs it fails at the gateway (502, nothing partial is sent); the operator's provider, if it has the name, shows through again.
+      summary: Remove the credential
+      description: |
+        Takes the tenant's value out of the resolution chain on the next request. References
+        then fall through to a shared credential of the same name, then the operator's provider;
+        only when none carries the name does the next request that needs it fail at the gateway
+        (502, nothing partial is sent).
       responses:
-        "204": { description: Revoked }
+        "204": { description: Removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
         "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/CredentialsDisabled" }
   /v1/tenants/{tenant}/keys:
     parameters: [{ name: tenant, in: path, required: true, schema: { type: string } }]
     get:
@@ -925,7 +940,9 @@ paths:
       description: The admin reads every tenant's keys; a tenant principal (key, static token or OIDC user) reads its own tenant's.
       responses:
         "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/APIKey" } } } } }
-        "403": { $ref: "#/components/responses/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "503": { $ref: "#/components/responses/KeysDisabled" }
     post:
       tags: [tenancy]
       summary: Issue a key for the tenant (the secret is in this response only)
@@ -946,9 +963,11 @@ paths:
                 ttl: { type: string, example: 720h }
       responses:
         "201": { description: The key with its secret, content: { application/json: { schema: { $ref: "#/components/schemas/IssuedKey" } } } }
-        "400": { $ref: "#/components/responses/Error" }
-        "403": { $ref: "#/components/responses/Error" }
+        "400": { description: "Malformed JSON, unknown field, trailing data or a bad duration", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
         "422": { description: "Bad name or ttl", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/KeysDisabled" }
   /v1/tenants/{tenant}/keys/{id}:
     parameters:
       - { name: tenant, in: path, required: true, schema: { type: string } }
@@ -958,14 +977,20 @@ paths:
       summary: One key (another tenant's key is 404)
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/APIKey" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
         "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/KeysDisabled" }
     delete:
       tags: [tenancy]
       summary: Revoke the key now
-      description: The next request with the key is refused on every replica; revoking a revoked key is fine.
+      description: The next request with the key is refused on every replica; revoking a revoked key is fine (the earlier time stands).
       responses:
         "204": { description: Revoked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
         "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/KeysDisabled" }
   /v1/tenants/{tenant}/keys/{id}/rotate:
     parameters:
       - { name: tenant, in: path, required: true, schema: { type: string } }
@@ -989,8 +1014,12 @@ paths:
                 grace: { type: string, example: 1h }
       responses:
         "201": { description: The new key with its secret; `replaces` names the old one, content: { application/json: { schema: { $ref: "#/components/schemas/IssuedKey" } } } }
+        "400": { description: "Malformed JSON, unknown field, trailing data or a bad duration", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
         "404": { $ref: "#/components/responses/Error" }
         "422": { description: "The key is revoked or expired, or a duration is negative", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/KeysDisabled" }
   /v1/whoami:
     get:
       tags: [sandboxes]
@@ -1372,6 +1401,26 @@ components:
       description: Error
       headers:
         X-Request-Id: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: "No bearer token, or one that is unknown, revoked or expired (`bad token`); every authenticated route answers it"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ScopeForbidden:
+      description: "The token is scoped to another tenant (a tenant principal named a tenant that is not its own)"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    CredentialsDisabled:
+      description: "credentials.key is not configured on the server: the credentials API is off"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    KeysDisabled:
+      description: "The server has no API key service"
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
