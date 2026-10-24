@@ -867,6 +867,80 @@ paths:
         "404": { description: "Unknown apply, item or revision", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "409": { description: "The state moved since the plan", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "422": { description: "invalid_plan (a document no longer validates under the caller's rights) or nothing_to_roll_back; the rollback is included", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/tenants/{tenant}/keys:
+    parameters: [{ name: tenant, in: path, required: true, schema: { type: string } }]
+    get:
+      tags: [tenancy]
+      summary: A tenant's API keys (never their secrets)
+      description: The admin reads every tenant's keys; a tenant principal (key, static token or OIDC user) reads its own tenant's.
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/APIKey" } } } } }
+        "403": { $ref: "#/components/responses/Error" }
+    post:
+      tags: [tenancy]
+      summary: Issue a key for the tenant (the secret is in this response only)
+      description: |
+        The admin bootstraps a tenant with its first key; the tenant then issues its own (one per
+        pipeline or person). `ttl` is a Go duration (`720h`); empty means no expiry, capped by the
+        server's `api_keys.max_ttl`. The secret is `sbk_<id>_<random>`; the store keeps a hash.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: { type: string, description: "1-64 characters: who or what holds the key" }
+                ttl: { type: string, example: 720h }
+      responses:
+        "201": { description: The key with its secret, content: { application/json: { schema: { $ref: "#/components/schemas/IssuedKey" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "422": { description: "Bad name or ttl", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/tenants/{tenant}/keys/{id}:
+    parameters:
+      - { name: tenant, in: path, required: true, schema: { type: string } }
+      - { name: id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [tenancy]
+      summary: One key (another tenant's key is 404)
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/APIKey" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [tenancy]
+      summary: Revoke the key now
+      description: The next request with the key is refused on every replica; revoking a revoked key is fine.
+      responses:
+        "204": { description: Revoked }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/tenants/{tenant}/keys/{id}/rotate:
+    parameters:
+      - { name: tenant, in: path, required: true, schema: { type: string } }
+      - { name: id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [tenancy]
+      summary: Replace the key with a new secret
+      description: |
+        Issues a new key with the same tenant and name and retires this one: at once when `grace`
+        is empty, else after `grace` so the holder can switch over. `ttl` is the new key's
+        lifetime (empty: this key's remaining one). A revoked or expired key cannot be rotated.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                ttl: { type: string, example: 720h }
+                grace: { type: string, example: 1h }
+      responses:
+        "201": { description: The new key with its secret; `replaces` names the old one, content: { application/json: { schema: { $ref: "#/components/schemas/IssuedKey" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { description: "The key is revoked or expired, or a duration is negative", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/whoami:
     get:
       tags: [sandboxes]
@@ -1375,6 +1449,26 @@ components:
         created_at: { type: string, format: date-time }
         deleted_at: { type: string, format: date-time, description: "Set once the item was deleted; the revision stays as history and cannot be referenced" }
         source: { $ref: "#/components/schemas/Source" }
+    APIKey:
+      type: object
+      description: A tenant API key; the secret is never part of it
+      properties:
+        id: { type: string, example: key_3f2a9c1e7b04 }
+        tenant: { type: string }
+        name: { type: string }
+        created_by: { type: string, description: "The principal that issued it (admin-token, key:<id>, an OIDC subject)" }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+        revoked_at: { type: string, format: date-time }
+        rotated_to: { type: string, description: "The key that replaced this one" }
+        last_used_at: { type: string, format: date-time, description: "Recorded at most once a minute" }
+    IssuedKey:
+      allOf:
+        - { $ref: "#/components/schemas/APIKey" }
+        - type: object
+          properties:
+            secret: { type: string, description: "sbk_<id>_<random>: shown here and never again" }
+            replaces: { type: string, description: "rotate only: the key this one replaces" }
     Source:
       type: object
       description: Provenance of a revision (set when an apply wrote it; absent on one written through this API), or of an apply's documents

@@ -54,6 +54,8 @@ data:
       gateway: "127.0.0.1:8081"
       ingress: "127.0.0.1:8082"
     api_token: "${SANDBOXD_API_TOKEN}"
+    api_keys:
+      max_ttl: "0"
     database_url: "${DATABASE_URL}"
     policies_dir: /etc/sandbox/policies
     policies_strict: false
@@ -322,7 +324,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: agent-sandbox-0.1.0
       annotations:
-        checksum/config: b76f4375519e453586c208bf6f857144de119ae75653fe36ed17635a5f25f5a8
+        checksum/config: 8d40d2a2200d8d7962f50d183ebe963f8480b88aa6c25370ad4e9c4c50352157
     spec:
       serviceAccountName: agent-sandbox-sandboxd
       hostNetwork: true

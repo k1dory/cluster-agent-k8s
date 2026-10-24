@@ -25,6 +25,7 @@ type Memory struct {
 	tenants   map[string]*sync.Mutex
 	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
 	applies   map[string]*model.Apply
+	apiKeys   map[string]*model.APIKey
 	nextInst  int
 	nextEvent int64
 }
@@ -41,6 +42,7 @@ func NewMemory() *Memory {
 		tenants:   map[string]*sync.Mutex{},
 		catalog:   map[string][]*model.CatalogItem{},
 		applies:   map[string]*model.Apply{},
+		apiKeys:   map[string]*model.APIKey{},
 	}
 }
 
@@ -884,5 +886,72 @@ func (m *Memory) ListApplies(_ context.Context, tenant string, limit int) ([]*mo
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
+	return out, nil
+}
+
+// --- api keys ---------------------------------------------------------------------------
+
+func cloneKey(k *model.APIKey) *model.APIKey {
+	c := *k
+	for _, p := range []**time.Time{&c.ExpiresAt, &c.RevokedAt, &c.LastUsedAt} {
+		if *p != nil {
+			t := **p
+			*p = &t
+		}
+	}
+	return &c
+}
+
+func (m *Memory) CreateAPIKey(_ context.Context, k *model.APIKey) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, dup := m.apiKeys[k.ID]; dup {
+		return fmt.Errorf("%w: api key %s exists", ErrConflict, k.ID)
+	}
+	if k.CreatedAt.IsZero() {
+		k.CreatedAt = time.Now()
+	}
+	m.apiKeys[k.ID] = cloneKey(k)
+	return nil
+}
+
+func (m *Memory) GetAPIKey(_ context.Context, id string) (*model.APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.apiKeys[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return cloneKey(k), nil
+}
+
+func (m *Memory) UpdateAPIKey(_ context.Context, k *model.APIKey) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.apiKeys[k.ID]
+	if !ok {
+		return ErrNotFound
+	}
+	c := cloneKey(k)
+	c.Tenant, c.Hash, c.CreatedAt, c.CreatedBy = cur.Tenant, cur.Hash, cur.CreatedAt, cur.CreatedBy
+	m.apiKeys[k.ID] = c
+	return nil
+}
+
+func (m *Memory) ListAPIKeys(_ context.Context, tenant string) ([]*model.APIKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.APIKey
+	for _, k := range m.apiKeys {
+		if tenant == "" || k.Tenant == tenant {
+			out = append(out, cloneKey(k))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out, nil
 }

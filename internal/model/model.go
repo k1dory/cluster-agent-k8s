@@ -356,6 +356,30 @@ type ApplyStep struct {
 	Error            string `json:"error,omitempty"`
 }
 
+// APIKey is a tenant-scoped credential for the platform API, created, rotated and revoked
+// through the API itself (no configuration or manifest change). Only a hash of the secret is
+// stored; the secret is shown once, at creation or rotation.
+type APIKey struct {
+	ID         string     `json:"id"`
+	Tenant     string     `json:"tenant"`
+	Name       string     `json:"name"`
+	Hash       string     `json:"-"` // sha256 of the secret, hex
+	CreatedBy  string     `json:"created_by,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
+	RotatedTo  string     `json:"rotated_to,omitempty"` // the key that replaced this one
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+}
+
+// Active reports a key that authenticates at t: not revoked, not expired.
+func (k *APIKey) Active(t time.Time) bool {
+	if k.RevokedAt != nil && !k.RevokedAt.After(t) {
+		return false
+	}
+	return k.ExpiresAt == nil || k.ExpiresAt.After(t)
+}
+
 // Apply and step statuses.
 const (
 	ApplyRunning  = "running"

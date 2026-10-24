@@ -50,6 +50,9 @@ const usage = `sandboxctl <command> [flags]
   revisions agent|environment|connection|binding <name> [-tenant t]
   remove   agent|environment|connection|binding <name> [-tenant t]
   settings <tenant> [-revisions | -reset]     a tenant's quotas and allowed environments (admin writes with apply)
+  keys     list [-tenant t] | create -tenant t -name n [-ttl 720h] | rotate <id> [-tenant t] [-grace 1h] [-ttl d]
+           | revoke <id> [-tenant t]        tenant API keys (sbk_…): the secret is printed once; a tenant key
+                                           manages its own tenant's keys, the admin every tenant's
   list     [-tenant t] [-owner o] [-slug s] [-status running] [-n 100] [-after cursor]
   get      <sandbox>
   update   <sandbox> [-idle 600] [-ttl 0] [-wake-on-preview=true] [-repo url]
@@ -416,6 +419,65 @@ func (c *cli) run(cmd string, args []string) error {
 		}
 		if a.Status != model.ApplyDone {
 			os.Exit(3)
+		}
+	case "keys":
+		sub := need(pos, 0, "list|create|rotate|revoke")
+		tenant := fs.String("tenant", "", "tenant (default: the one your key or token is scoped to)")
+		name := fs.String("name", "", "create: a name for the key (the pipeline or person that holds it)")
+		ttl := fs.String("ttl", "", "create/rotate: lifetime, e.g. 720h (default: none, or the server's cap)")
+		grace := fs.String("grace", "", "rotate: how long the old key keeps working, e.g. 1h (default: revoked at once)")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(flags)
+		scope := *tenant
+		if scope == "" {
+			var who struct {
+				Tenant string `json:"tenant"`
+				Admin  bool   `json:"admin"`
+			}
+			if err := c.do("GET", "/v1/whoami", nil, &who); err != nil {
+				return err
+			}
+			if who.Admin {
+				return errors.New("keys: -tenant is required with the admin token")
+			}
+			scope = who.Tenant
+		}
+		base := "/v1/tenants/" + url.PathEscape(scope) + "/keys"
+		switch sub {
+		case "list":
+			var list []model.APIKey
+			if err := c.do("GET", base, nil, &list); err != nil {
+				return err
+			}
+			if *asJSON {
+				printJSON(list)
+				return nil
+			}
+			printKeys(list)
+		case "create":
+			if *name == "" {
+				return errors.New("keys create: -name is required")
+			}
+			var k issuedKey
+			if err := c.do("POST", base, map[string]any{"name": *name, "ttl": *ttl}, &k); err != nil {
+				return err
+			}
+			printIssued(k, *asJSON)
+		case "rotate":
+			id := need(pos, 1, "key id")
+			var k issuedKey
+			if err := c.do("POST", base+"/"+url.PathEscape(id)+"/rotate", map[string]any{"ttl": *ttl, "grace": *grace}, &k); err != nil {
+				return err
+			}
+			printIssued(k, *asJSON)
+		case "revoke":
+			id := need(pos, 1, "key id")
+			if err := c.do("DELETE", base+"/"+url.PathEscape(id), nil, nil); err != nil {
+				return err
+			}
+			fmt.Println("revoked", id)
+		default:
+			return fmt.Errorf("keys: unknown subcommand %q", sub)
 		}
 	case "drift":
 		tenant := fs.String("tenant", "", "scope (admin)")
@@ -994,6 +1056,57 @@ func rollbackExitCode(rb apply.Rollback) int {
 		return 3
 	}
 	return 0
+}
+
+// issuedKey is the create/rotate response: the key and, once, its secret.
+type issuedKey struct {
+	model.APIKey
+	Secret   string `json:"secret"`
+	Replaces string `json:"replaces,omitempty"`
+}
+
+func printKeys(list []model.APIKey) {
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tNAME\tSTATE\tCREATED\tBY\tEXPIRES\tLAST USED")
+	now := time.Now()
+	for _, k := range list {
+		state := "active"
+		switch {
+		case k.RevokedAt != nil:
+			state = "revoked"
+		case k.ExpiresAt != nil && !k.ExpiresAt.After(now):
+			state = "expired"
+		case k.RotatedTo != "":
+			state = "rotating → " + k.RotatedTo
+		}
+		expires, last := "-", "-"
+		if k.ExpiresAt != nil {
+			expires = k.ExpiresAt.Format(time.RFC3339)
+		}
+		if k.LastUsedAt != nil {
+			last = k.LastUsedAt.Format(time.RFC3339)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", k.ID, k.Name, state, k.CreatedAt.Format(time.RFC3339), k.CreatedBy, expires, last)
+	}
+	tw.Flush()
+}
+
+// printIssued shows a new key. The secret goes to stdout alone when the output is not JSON,
+// so `sandboxctl keys create … | tee` or a CI secret store gets exactly the token.
+func printIssued(k issuedKey, asJSON bool) {
+	if asJSON {
+		printJSON(k)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "key %s (%s) for tenant %s", k.ID, k.Name, k.Tenant)
+	if k.ExpiresAt != nil {
+		fmt.Fprintf(os.Stderr, ", expires %s", k.ExpiresAt.Format(time.RFC3339))
+	}
+	if k.Replaces != "" {
+		fmt.Fprintf(os.Stderr, ", replaces %s", k.Replaces)
+	}
+	fmt.Fprintln(os.Stderr, "; the secret is shown once:")
+	fmt.Println(k.Secret)
 }
 
 func printDrift(rep drift.Report) {

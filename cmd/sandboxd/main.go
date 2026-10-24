@@ -27,6 +27,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"agent-sandbox/internal/apikeys"
 	"agent-sandbox/internal/app"
 	"agent-sandbox/internal/authz"
 	"agent-sandbox/internal/ca"
@@ -335,6 +336,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 		tokenTenants[t.Token] = t.Tenant
 	}
 	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken, Tenants: tokenTenants,
+		Keys:    &apikeys.Service{Store: st, MaxTTL: cfg.APIKeys.MaxTTL},
 		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Log: log.With("log", "api")}
 	services.Install(platform)
 	if cfg.OIDC != nil {
@@ -346,7 +348,8 @@ func serve(cfgPath string, log *slog.Logger) error {
 		log.Info("oidc enabled", "issuer", cfg.OIDC.Issuer, "ttl_from_token", cfg.OIDC.TTLFromToken)
 	}
 	if cfg.APIToken == "" && len(tokenTenants) == 0 && cfg.OIDC == nil {
-		return errors.New("no api_token, api_tokens or oidc configured: nobody could call the API")
+		// Tenant keys are issued through the API, so somebody must be able to call it first.
+		return errors.New("no api_token, api_tokens or oidc configured: nobody could call the API to issue tenant keys")
 	}
 	gw := &httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, Log: log.With("log", "gateway-api"),
 		MCP: &mcpproxy.Handler{Authz: az, Hosts: pols, Log: log.With("log", "mcp")}}

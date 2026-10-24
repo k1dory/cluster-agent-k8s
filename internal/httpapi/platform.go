@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"agent-sandbox/api"
+	"agent-sandbox/internal/apikeys"
 	"agent-sandbox/internal/apply"
 	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
@@ -53,6 +54,8 @@ type Platform struct {
 	Applier        *apply.Controller // POST /v1/apply, /v1/applies; nil disables
 	Token          string            // admin token: every tenant, every sandbox
 	Tenants        map[string]string // tenant-scoped tokens: token → tenant
+	// Keys authenticates tenant API keys issued through the API (sbk_…); nil disables them.
+	Keys *apikeys.Service
 	// Verifier checks bearer tokens that are not static ones (OIDC JWTs). nil disables.
 	Verifier TokenVerifier
 	// TTLFromToken caps the lifetime of sandboxes created with a short-lived token (and so
@@ -134,6 +137,7 @@ func (p *Platform) Routes() http.Handler {
 	p.configRoutes(mux)
 	mux.HandleFunc("POST /v1/rollouts", p.auth(p.rollout))
 	mux.HandleFunc("GET /v1/version", p.auth(p.version))
+	p.keyRoutes(mux)
 	mux.HandleFunc("GET /v1/whoami", p.auth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, principalOf(r))
 	}))
@@ -226,7 +230,7 @@ func SafeNext(next string) string {
 // token is confined to its tenant's sandboxes, runs, events, usage and trace.
 func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if p.Token == "" && len(p.Tenants) == 0 && p.Verifier == nil {
+		if p.Token == "" && len(p.Tenants) == 0 && p.Verifier == nil && p.Keys == nil {
 			writeErr(w, http.StatusServiceUnavailable, errors.New("no API tokens and no OIDC configured"))
 			return
 		}
@@ -239,6 +243,18 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 			if subtle.ConstantTimeCompare(got, []byte(tok)) == 1 && pr == nil {
 				pr = &Principal{Tenant: tenant, Subject: "tenant-token"}
 			}
+		}
+		if pr == nil && p.Keys != nil && apikeys.IsKey(string(got)) {
+			k, err := p.Keys.Authenticate(r.Context(), string(got))
+			if err != nil {
+				if errors.Is(err, apikeys.ErrBadKey) {
+					writeErr(w, http.StatusUnauthorized, errors.New("bad token"))
+				} else {
+					writeErr(w, http.StatusInternalServerError, fmt.Errorf("api key: %w", err))
+				}
+				return
+			}
+			pr = &Principal{Tenant: k.Tenant, Subject: "key:" + k.ID, Expires: k.ExpiresAt}
 		}
 		if pr == nil && p.Verifier != nil && strings.Count(string(got), ".") == 2 {
 			v, err := p.Verifier.Verify(r.Context(), string(got))

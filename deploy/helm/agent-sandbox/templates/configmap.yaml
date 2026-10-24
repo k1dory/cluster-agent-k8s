@@ -16,6 +16,8 @@ data:
       gateway: "127.0.0.1:8081"
       ingress: "127.0.0.1:8082"
     api_token: "${SANDBOXD_API_TOKEN}"
+    api_keys:
+      max_ttl: {{ .Values.sandboxd.apiKeys.maxTTL | quote }}
     database_url: "${DATABASE_URL}"
     policies_dir: /etc/sandbox/policies
     policies_strict: {{ .Values.sandboxd.policiesStrict }}
