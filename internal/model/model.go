@@ -1,7 +1,10 @@
 // Package model holds the data types shared by the store, orchestrator and API.
 package model
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // SandboxStatus is the lifecycle state of a sandbox.
 type SandboxStatus string
@@ -30,6 +33,45 @@ type Preview struct {
 	Host   string `json:"host"`
 }
 
+// Launch is the resolved set of parameters a sandbox's pods start with: the environment
+// profile's revision rendered at creation time and kept on the sandbox, so every wake and
+// rollout of this sandbox uses the same configuration whatever the catalogue says later.
+type Launch struct {
+	Image                string            `json:"image"`
+	HarnessCommand       string            `json:"harness_command,omitempty"`
+	HarnessResumeCommand string            `json:"harness_resume_command,omitempty"`
+	ResumePrompt         string            `json:"resume_prompt,omitempty"`
+	Model                string            `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
+	Instructions         string            `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
+	Env                  map[string]string `json:"env,omitempty"`
+	CPURequest           string            `json:"cpu_request,omitempty"`
+	CPULimit             string            `json:"cpu_limit,omitempty"`
+	MemoryRequest        string            `json:"memory_request,omitempty"`
+	MemoryLimit          string            `json:"memory_limit,omitempty"`
+	VolumeSize           string            `json:"volume_size,omitempty"`
+	RuntimeClass         string            `json:"runtime_class,omitempty"`
+}
+
+// CatalogItem is one revision of a catalogue resource: an AgentDefinition or an
+// EnvironmentProfile. Revisions are append-only; the latest is the current one. Tenant "" is
+// a shared item the admin manages and every tenant may reference.
+type CatalogItem struct {
+	Kind        string          `json:"kind"`
+	Tenant      string          `json:"tenant"`
+	Name        string          `json:"name"`
+	Revision    int             `json:"revision"`
+	Description string          `json:"description,omitempty"`
+	Spec        json.RawMessage `json:"spec"`
+	CreatedBy   string          `json:"created_by,omitempty"`
+	CreatedAt   time.Time       `json:"created_at"`
+}
+
+// Catalogue kinds.
+const (
+	KindAgent       = "AgentDefinition"
+	KindEnvironment = "EnvironmentProfile"
+)
+
 // Sandbox is one agent workspace: a persistent volume plus, while awake, one pod.
 //
 // Versions: AgentVersion is the agent image the current (or last) pod runs; DesiredVersion is
@@ -51,16 +93,24 @@ type Sandbox struct {
 	PodName       string        `json:"pod_name,omitempty"`
 	// AdminGrant: the admin created this sandbox for a slug its tenant does not own. The grant
 	// lives in the agent certificate and in policy.Set.Revoked; see there for what ends it.
-	AdminGrant     bool       `json:"admin_grant,omitempty"`
-	AgentVersion   string     `json:"agent_version"`
-	DesiredVersion string     `json:"desired_version,omitempty"`
-	EnvVersion     string     `json:"env_version,omitempty"`
-	Revision       int64      `json:"revision"`
-	LastActivity   time.Time  `json:"last_activity"`
-	CreatedAt      time.Time  `json:"created_at"`
-	ExpiresAt      *time.Time `json:"expires_at,omitempty"` // when set, the sandbox is deleted after this time
-	Preview        *Preview   `json:"preview,omitempty"`
-	Error          string     `json:"error,omitempty"`
+	AdminGrant bool `json:"admin_grant,omitempty"`
+	// Catalogue references resolved at creation: which AgentDefinition and EnvironmentProfile
+	// revisions this sandbox was built from, and the Launch rendered from them. Empty for
+	// sandboxes created with a bare slug.
+	AgentRef            string     `json:"agent_ref,omitempty"`
+	AgentRevision       int        `json:"agent_revision,omitempty"`
+	EnvironmentRef      string     `json:"environment_ref,omitempty"`
+	EnvironmentRevision int        `json:"environment_revision,omitempty"`
+	Launch              *Launch    `json:"launch,omitempty"`
+	AgentVersion        string     `json:"agent_version"`
+	DesiredVersion      string     `json:"desired_version,omitempty"`
+	EnvVersion          string     `json:"env_version,omitempty"`
+	Revision            int64      `json:"revision"`
+	LastActivity        time.Time  `json:"last_activity"`
+	CreatedAt           time.Time  `json:"created_at"`
+	ExpiresAt           *time.Time `json:"expires_at,omitempty"` // when set, the sandbox is deleted after this time
+	Preview             *Preview   `json:"preview,omitempty"`
+	Error               string     `json:"error,omitempty"`
 }
 
 // IdleDuration returns the idle timeout as a duration.
@@ -119,8 +169,14 @@ type Run struct {
 	Status    RunStatus `json:"status"`
 	ExitCode  int       `json:"exit_code"`
 	Usage     Usage     `json:"usage"`
-	// AgentVersion is the agent image that executed the run (set when the run is claimed).
-	AgentVersion string `json:"agent_version,omitempty"`
+	// AgentVersion is the agent image that executed the run (set when the run is claimed), and
+	// the catalogue revisions the sandbox was running under at that moment. They never change
+	// afterwards: a definition updated mid-run does not touch the run.
+	AgentVersion        string `json:"agent_version,omitempty"`
+	AgentRef            string `json:"agent_ref,omitempty"`
+	AgentRevision       int    `json:"agent_revision,omitempty"`
+	EnvironmentRef      string `json:"environment_ref,omitempty"`
+	EnvironmentRevision int    `json:"environment_revision,omitempty"`
 	// ResumeOf names the run this one continues after a forced rollout interrupted it.
 	ResumeOf string `json:"resume_of,omitempty"`
 	// Session is the harness's own conversation id (Claude Code `session_id`, Codex thread id),

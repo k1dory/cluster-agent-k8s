@@ -1,0 +1,14 @@
+# AgentDefinition: which policy the agent runs under, which environment, what it is told.
+# Apply:  sandboxctl apply -f examples/catalog/agent-backend.yaml
+# Create: sandboxctl create -name shop -owner alice -agent backend
+kind: AgentDefinition
+name: backend
+description: Backend developer for the shop services
+spec:
+  policy: backend-dev               # policies/backend-dev.yaml; the tenant must own it (tenants: list)
+  environment: python-dev           # latest revision at creation time; "python-dev@3" pins one
+  repo: https://git.example.com/org/shop.git
+  instructions: |
+    You work on the shop backend. Keep changes small, run the tests before pushing,
+    and open a pull request on a branch named agent/<task>.
+  connections: []                   # named connections (MCP servers, keys): step 4

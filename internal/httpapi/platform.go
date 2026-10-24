@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"agent-sandbox/api"
+	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/events"
 	"agent-sandbox/internal/ingress"
 	"agent-sandbox/internal/model"
@@ -37,6 +38,7 @@ type Platform struct {
 	Policies *policy.Set
 	Ingress  *ingress.Handler
 	Pricing  usage.Pricing
+	Catalog  *catalog.Service  // AgentDefinitions / EnvironmentProfiles; nil disables /v1/agents and /v1/environments
 	Token    string            // admin token: every tenant, every sandbox
 	Tenants  map[string]string // tenant-scoped tokens: token → tenant
 	// Verifier checks bearer tokens that are not static ones (OIDC JWTs). nil disables.
@@ -110,6 +112,7 @@ func (p *Platform) Routes() http.Handler {
 	}))
 	mux.HandleFunc("GET /v1/usage", p.auth(p.usage))
 	mux.HandleFunc("GET /v1/trace", p.auth(p.trace))
+	p.catalogRoutes(mux)
 	mux.HandleFunc("POST /v1/rollouts", p.auth(p.rollout))
 	mux.HandleFunc("GET /v1/version", p.auth(p.version))
 	mux.HandleFunc("GET /v1/whoami", p.auth(func(w http.ResponseWriter, r *http.Request) {
@@ -381,6 +384,12 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 	req.Admin = pr.admin()
 	if p.TTLFromToken {
 		req.ExpiresBefore = pr.expiresBefore()
+	}
+	if req.AgentRef != "" {
+		if err := p.resolveAgentRef(r, &req); err != nil {
+			writeCatalogErr(w, err)
+			return
+		}
 	}
 	sb, err := p.Orch.Create(r.Context(), req)
 	if err != nil && sb == nil {

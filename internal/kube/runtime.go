@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -93,6 +95,42 @@ func (c PodConfig) ImageFor(sb *model.Sandbox) string {
 	return c.Image
 }
 
+// effective merges the sandbox's launch (its environment profile, rendered at creation) over
+// the configured defaults: every launch parameter the profile sets wins, the rest stays global.
+func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
+	e := c
+	e.Image = c.ImageFor(sb)
+	l := sb.Launch
+	if l == nil {
+		return e
+	}
+	pick := func(dst *string, v string) {
+		if v != "" {
+			*dst = v
+		}
+	}
+	pick(&e.HarnessCommand, l.HarnessCommand)
+	pick(&e.HarnessResumeCommand, l.HarnessResumeCommand)
+	pick(&e.ResumePrompt, l.ResumePrompt)
+	pick(&e.CPURequest, l.CPURequest)
+	pick(&e.CPULimit, l.CPULimit)
+	pick(&e.MemoryRequest, l.MemoryRequest)
+	pick(&e.MemoryLimit, l.MemoryLimit)
+	pick(&e.VolumeSize, l.VolumeSize)
+	pick(&e.RuntimeClassName, l.RuntimeClass)
+	if len(l.Env) > 0 {
+		env := map[string]string{}
+		for k, v := range c.Env {
+			env[k] = v
+		}
+		for k, v := range l.Env {
+			env[k] = v
+		}
+		e.Env = env
+	}
+	return e
+}
+
 // Annotation carrying the agent image on the pod, so `kubectl get pod -o yaml` tells the version.
 const AnnotationVersion = "agent-sandbox.io/agent-version"
 
@@ -129,7 +167,7 @@ func (r *Runtime) labels(sb *model.Sandbox) map[string]string {
 
 // EnsureVolume creates the workspace PVC if it does not exist.
 func (r *Runtime) EnsureVolume(ctx context.Context, sb *model.Sandbox) error {
-	size := r.Cfg.VolumeSize
+	size := r.Cfg.effective(sb).VolumeSize
 	if size == "" {
 		size = "10Gi"
 	}
@@ -153,7 +191,7 @@ func (r *Runtime) EnsureVolume(ctx context.Context, sb *model.Sandbox) error {
 // CreatePod builds the hardened agent pod. The pod has a single interface, provided by
 // Multus as its default network, so there is no cluster network, no Service, no CoreDNS.
 func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, error) {
-	c := r.Cfg
+	c := r.Cfg.effective(sb)
 	requests := corev1.ResourceList{}
 	limits := corev1.ResourceList{}
 	setQ := func(rl corev1.ResourceList, name corev1.ResourceName, v, def string) {
@@ -183,12 +221,21 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 		{Name: "HARNESS_CMD", Value: c.HarnessCommand},
 		{Name: "HARNESS_RESUME_CMD", Value: c.HarnessResumeCommand},
 		{Name: "SANDBOX_RESUME_PROMPT", Value: c.ResumePrompt},
-		{Name: "SANDBOX_AGENT_VERSION", Value: c.ImageFor(sb)},
+		{Name: "SANDBOX_AGENT_VERSION", Value: c.Image},
 		{Name: "SANDBOX_ENV_VERSION", Value: sb.EnvVersion},
+		{Name: "SANDBOX_AGENT_REF", Value: sb.AgentRef},
+		{Name: "SANDBOX_AGENT_REVISION", Value: strconv.Itoa(sb.AgentRevision)},
+		{Name: "SANDBOX_ENVIRONMENT_REF", Value: sb.EnvironmentRef},
+		{Name: "SANDBOX_ENVIRONMENT_REVISION", Value: strconv.Itoa(sb.EnvironmentRevision)},
 	}
-	image := c.ImageFor(sb)
-	for k, v := range c.Env {
-		env = append(env, corev1.EnvVar{Name: k, Value: v})
+	image := c.Image
+	keys := make([]string, 0, len(c.Env))
+	for k := range c.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		env = append(env, corev1.EnvVar{Name: k, Value: c.Env[k]})
 	}
 	secCtx := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false),

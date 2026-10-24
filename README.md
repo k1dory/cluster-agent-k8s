@@ -24,7 +24,8 @@ rollouts, with static tokens or OIDC. Several `sandboxd` replicas can share one 
 
 ```
 cmd/sandboxd        control plane binary (+ `sandboxd policy validate|test|render`)
-cmd/sandboxctl      CLI over the API: create, run, watch, say, cancel, sleep, wake, preview, rollout, version, delete
+cmd/sandboxctl      CLI over the API: create, run, watch, say, cancel, sleep, wake, preview, rollout, version, apply, delete
+examples/catalog/   a working EnvironmentProfile + AgentDefinition pair (YAML, same schema as the API)
 cmd/agent-init      pod init container: key + CSR → Registrar → certificate, client-cert config
 cmd/agent-runner    pod main process: long-polls runs, executes the harness, streams output
 api/openapi.yaml    API spec (served at /openapi.yaml, Swagger UI at /docs)
@@ -34,7 +35,8 @@ deploy/helm/        Helm chart: gateway on a cluster node (mode node) or cluster
 deploy/k8s/         the same, rendered to plain manifests for kubectl apply (-k)
 deploy/ansible/     playbooks: cluster.yaml (manifests, Secret, node label, token) and gateway.yaml (the VM)
 images/             Dockerfiles for sandboxd, the agent image, an optional Caddy build with a DNS module
-internal/           policy, gateway (Caddy render/push, DNS), identity, ca, registrar, authz, orchestrator, kube, ingress, store, httpapi, oidc, secrets
+internal/           policy, gateway (Caddy render/push, DNS), identity, ca, registrar, authz, orchestrator, kube, ingress, store, httpapi, oidc, secrets,
+                    catalog (versioned AgentDefinitions / EnvironmentProfiles), mcpproxy
 internal/integration  the gateway path end to end on a real Caddy (make integration)
 ```
 
@@ -173,6 +175,33 @@ rebuilt on every bootstrap attempt, so a root published after the pod started is
 harness inside it; a checkout whose origin differs from the sandbox's `repo` is moved aside and
 the right repository cloned, never silently reused.
 `make smoke-image` runs the shipped image's pieces in Docker; CI builds both images on every PR.
+
+### Agents and environments as versioned configuration
+
+Two catalogue resources describe what runs, per tenant (the admin also keeps shared ones):
+
+- **EnvironmentProfile**: image, harness command, model and its client settings, resources,
+  workspace size, lifecycle defaults, runtime class, extra environment.
+- **AgentDefinition**: the policy slug (ownership is checked), the environment (`name`, or
+  `name@N` to pin a revision), the repository, the instructions, and connection names for step 4.
+
+The same document is a YAML file for `sandboxctl apply -f` and a JSON body for
+`PUT /v1/environments/{name}` and `PUT /v1/agents/{name}`; unknown fields are errors. Every write
+appends a revision, `expected_revision` makes it conditional (409 on a stale base), history is at
+`/revisions`. A sandbox is created with `agent_ref` instead of a slug: it takes the policy,
+repository and lifecycle defaults from the agent, the environment is rendered into a `launch`
+that stays on the sandbox, and `agent_revision` / `environment_revision` say what it was built
+from. Every run records the revisions it was claimed under. Changing a definition changes
+nothing that already exists: new sandboxes get the new revisions, running ones keep theirs.
+Tenants see their own items and the shared ones; another tenant's are not found. See
+`examples/catalog/` for a working pair of documents.
+
+```sh
+sandboxctl apply -f examples/catalog/environment-python.yaml
+sandboxctl apply -f examples/catalog/agent-backend.yaml
+sandboxctl create -name shop -owner alice -agent backend
+sandboxctl revisions environment python-dev
+```
 
 ### Agent versions and rollouts
 

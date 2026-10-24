@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ type Memory struct {
 	idem      map[string]*Idempotent
 	blobs     map[string][]byte
 	tenants   map[string]*sync.Mutex
+	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
 	nextInst  int
 	nextEvent int64
 }
@@ -32,7 +34,91 @@ func NewMemory() *Memory {
 		idem:      map[string]*Idempotent{},
 		blobs:     map[string][]byte{},
 		tenants:   map[string]*sync.Mutex{},
+		catalog:   map[string][]*model.CatalogItem{},
 	}
+}
+
+func catalogKey(kind, tenant, name string) string { return kind + "|" + tenant + "|" + name }
+
+func cloneItem(it *model.CatalogItem) *model.CatalogItem {
+	c := *it
+	c.Spec = append([]byte(nil), it.Spec...)
+	return &c
+}
+
+func (m *Memory) PutItem(_ context.Context, it *model.CatalogItem, expected int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := catalogKey(it.Kind, it.Tenant, it.Name)
+	revs := m.catalog[k]
+	latest := 0
+	if len(revs) > 0 {
+		latest = revs[len(revs)-1].Revision
+	}
+	if expected >= 0 && expected != latest {
+		return fmt.Errorf("%w: latest revision is %d, expected %d", ErrConflict, latest, expected)
+	}
+	it.Revision = latest + 1
+	it.CreatedAt = time.Now()
+	m.catalog[k] = append(revs, cloneItem(it))
+	return nil
+}
+
+func (m *Memory) GetItem(_ context.Context, kind, tenant, name string, revision int) (*model.CatalogItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	revs := m.catalog[catalogKey(kind, tenant, name)]
+	if len(revs) == 0 {
+		return nil, ErrNotFound
+	}
+	if revision == 0 {
+		return cloneItem(revs[len(revs)-1]), nil
+	}
+	for _, r := range revs {
+		if r.Revision == revision {
+			return cloneItem(r), nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (m *Memory) ListItems(_ context.Context, kind, tenant string) ([]*model.CatalogItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.CatalogItem
+	for _, revs := range m.catalog {
+		if len(revs) == 0 || revs[0].Kind != kind || revs[0].Tenant != tenant {
+			continue
+		}
+		out = append(out, cloneItem(revs[len(revs)-1]))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *Memory) ListRevisions(_ context.Context, kind, tenant, name string) ([]*model.CatalogItem, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	revs := m.catalog[catalogKey(kind, tenant, name)]
+	if len(revs) == 0 {
+		return nil, ErrNotFound
+	}
+	out := make([]*model.CatalogItem, 0, len(revs))
+	for _, r := range revs {
+		out = append(out, cloneItem(r))
+	}
+	return out, nil
+}
+
+func (m *Memory) DeleteItem(_ context.Context, kind, tenant, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := catalogKey(kind, tenant, name)
+	if len(m.catalog[k]) == 0 {
+		return ErrNotFound
+	}
+	delete(m.catalog, k)
+	return nil
 }
 
 // WithTenantLock serialises per tenant within this process (one process is all a memory store has).
@@ -76,6 +162,16 @@ func cloneSandbox(s *model.Sandbox) *model.Sandbox {
 	if s.Preview != nil {
 		p := *s.Preview
 		c.Preview = &p
+	}
+	if s.Launch != nil {
+		l := *s.Launch
+		if s.Launch.Env != nil {
+			l.Env = map[string]string{}
+			for k, v := range s.Launch.Env {
+				l.Env[k] = v
+			}
+		}
+		c.Launch = &l
 	}
 	return &c
 }

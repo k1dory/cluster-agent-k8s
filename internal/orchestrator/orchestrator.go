@@ -192,10 +192,17 @@ type CreateRequest struct {
 	WakeOnPreview *bool  `json:"wake_on_preview,omitempty"`
 	TTL           *int   `json:"ttl,omitempty"`           // seconds until the sandbox is deleted; 0/absent = keep
 	AgentVersion  string `json:"agent_version,omitempty"` // version name (tenants) or image ref (admin); "" = default
+	// AgentRef creates the sandbox from a catalogue AgentDefinition ("name" or "name@N"): the API
+	// resolves it into Slug, Repo, lifecycle defaults, AgentVersion and the fields below.
+	AgentRef string `json:"agent_ref,omitempty"`
 
-	// Set by the API from the caller's credentials, never from the body.
-	Admin         bool      `json:"-"`
-	ExpiresBefore time.Time `json:"-"` // hard cap on expires_at (an OIDC token's lifetime)
+	// Set by the API from the caller's credentials and the catalogue, never from the body.
+	Admin               bool          `json:"-"`
+	ExpiresBefore       time.Time     `json:"-"` // hard cap on expires_at (an OIDC token's lifetime)
+	AgentRevision       int           `json:"-"`
+	EnvironmentRef      string        `json:"-"`
+	EnvironmentRevision int           `json:"-"`
+	Launch              *model.Launch `json:"-"`
 }
 
 // UpdateRequest is the input of PATCH /sandboxes/{id}; nil fields are left alone.
@@ -258,15 +265,21 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 		}
 		adminGrant = true // the admin overrides ownership; recorded, carried in the certificate
 	}
-	version, err := o.Cfg.ResolveVersion(req.AgentVersion, req.Admin)
-	if err != nil {
-		return nil, err
+	version := req.AgentVersion
+	var err error
+	if req.Launch == nil {
+		// Bare slug creation: the version name is resolved here. With a launch attached, the
+		// catalogue already resolved the environment's image under its author's rights.
+		if version, err = o.Cfg.ResolveVersion(req.AgentVersion, req.Admin); err != nil {
+			return nil, err
+		}
 	}
 	now := time.Now()
 	sb := &model.Sandbox{
 		ID: newID("sb"), Name: req.Name, Slug: req.Slug, Owner: req.Owner, Tenant: req.Tenant, Repo: req.Repo,
 		IdleTimeout: int(o.Cfg.DefaultIdleTimeout.Seconds()), WakeOnPreview: true, AgentVersion: version, AdminGrant: adminGrant,
-		Status: model.StatusCreating, LastActivity: now, CreatedAt: now,
+		AgentRef: req.AgentRef, AgentRevision: req.AgentRevision, EnvironmentRef: req.EnvironmentRef, EnvironmentRevision: req.EnvironmentRevision,
+		Launch: req.Launch, Status: model.StatusCreating, LastActivity: now, CreatedAt: now,
 	}
 	if req.IdleTimeout != nil {
 		if *req.IdleTimeout < 0 {
@@ -366,6 +379,10 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 			}
 			if s.AgentVersion == "" {
 				s.AgentVersion = o.Cfg.DefaultAgentVersion
+			}
+			if s.Launch != nil && s.AgentVersion != "" {
+				// A rollout moves the sandbox to another image; the rest of the launch stays.
+				s.Launch.Image = s.AgentVersion
 			}
 			if o.Cfg.EnvVersion != nil {
 				s.EnvVersion = o.Cfg.EnvVersion(s)
@@ -781,8 +798,10 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 		}
 		r, err := o.Store.ClaimQueuedRun(ctx, sandboxID, time.Now())
 		if err == nil {
-			if sb, err := o.Store.GetSandbox(ctx, sandboxID); err == nil && sb.AgentVersion != "" {
-				r.AgentVersion = sb.AgentVersion
+			// The run records what it executes under; later catalogue changes never touch it.
+			if sb, err := o.Store.GetSandbox(ctx, sandboxID); err == nil {
+				r.AgentVersion, r.AgentRef, r.AgentRevision = sb.AgentVersion, sb.AgentRef, sb.AgentRevision
+				r.EnvironmentRef, r.EnvironmentRevision = sb.EnvironmentRef, sb.EnvironmentRevision
 				_ = o.Store.UpdateRun(ctx, r)
 			}
 			o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunStart, Data: r.AgentVersion})

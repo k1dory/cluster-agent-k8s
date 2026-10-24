@@ -112,8 +112,26 @@ type EventCount struct {
 var ErrNotFound = errors.New("not found")
 
 // ErrConflict is returned by UpdateSandbox when the row changed since it was read (the
-// revision in the record is stale). Callers reload and reapply their change.
-var ErrConflict = errors.New("sandbox changed concurrently")
+// revision in the record is stale), and by PutItem when the expected revision is not the
+// latest. Callers reload and reapply their change.
+var ErrConflict = errors.New("changed concurrently")
+
+// Catalog is the narrow interface the configuration catalogue needs: append-only revisions
+// of named items per tenant. Memory and Postgres implement it next to Store.
+type Catalog interface {
+	// PutItem appends a revision. expected: -1 accepts any current state, 0 requires that the
+	// item does not exist, N requires the latest revision to be N (ErrConflict otherwise).
+	// The stored revision and time are written back into it.
+	PutItem(ctx context.Context, it *model.CatalogItem, expected int) error
+	// GetItem returns revision n (0 = latest) of an item; ErrNotFound when absent.
+	GetItem(ctx context.Context, kind, tenant, name string, revision int) (*model.CatalogItem, error)
+	// ListItems returns the latest revision of every item of kind in tenant (tenant "" = shared).
+	ListItems(ctx context.Context, kind, tenant string) ([]*model.CatalogItem, error)
+	// ListRevisions returns every revision of an item, oldest first.
+	ListRevisions(ctx context.Context, kind, tenant, name string) ([]*model.CatalogItem, error)
+	// DeleteItem removes every revision of an item.
+	DeleteItem(ctx context.Context, kind, tenant, name string) error
+}
 
 // Lease is a held leadership lock. Ping fails once the lock is lost (connection gone), at
 // which point the holder must stop acting as leader. Release gives the lock up.
@@ -192,6 +210,9 @@ type Store interface {
 	// ReleaseIdempotent drops a reservation whose request failed, so a retry may run.
 	ReleaseIdempotent(ctx context.Context, key string) error
 	GetIdempotent(ctx context.Context, key string) (*Idempotent, error)
+
+	// The catalogue uses only this part (see Catalog); the full Store embeds it for wiring.
+	Catalog
 
 	Close() error
 }
