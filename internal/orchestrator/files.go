@@ -107,36 +107,60 @@ func (o *Orchestrator) FS(ctx context.Context, sandboxID string, req model.FSReq
 }
 
 // PendingFS lists the file requests of a sandbox after event id after that have no answer
-// yet (runner side). Requests older than ten minutes are not worth answering: the caller
-// stopped waiting long ago.
+// yet (runner side). Pages of requests are walked until an unanswered one is found or the
+// stream ends, so a long history of answered requests never hides a new one. Requests older
+// than ten minutes are not worth answering: the caller stopped waiting long ago.
 func (o *Orchestrator) PendingFS(ctx context.Context, sandboxID string, after int64) ([]*model.Event, error) {
+	const page = 100
 	since := time.Now().Add(-10 * time.Minute)
-	reqs, err := o.Store.QueryEvents(ctx, store.Filter{SandboxID: sandboxID, AfterID: after, Types: []string{model.EventFSRequest}, From: since, Limit: 100})
-	if err != nil {
-		return nil, err
-	}
-	if len(reqs) == 0 {
-		return nil, nil
-	}
-	done, err := o.Store.QueryEvents(ctx, store.Filter{SandboxID: sandboxID, AfterID: reqs[0].ID, Types: []string{model.EventFSResult}, From: since, Limit: 500})
-	if err != nil {
-		return nil, err
-	}
-	answered := map[string]bool{}
-	for _, e := range done {
-		var res model.FSResult
-		if json.Unmarshal([]byte(e.Data), &res) == nil {
-			answered[res.Request] = true
-		}
-	}
 	var out []*model.Event
-	for _, e := range reqs {
-		var req model.FSRequest
-		if json.Unmarshal([]byte(e.Data), &req) == nil && !answered[req.ID] {
-			out = append(out, e)
+	var answered map[string]bool
+	for {
+		reqs, err := o.Store.QueryEvents(ctx, store.Filter{SandboxID: sandboxID, AfterID: after, Types: []string{model.EventFSRequest}, From: since, Limit: page})
+		if err != nil {
+			return nil, err
 		}
+		if len(reqs) == 0 {
+			return out, nil
+		}
+		if answered == nil {
+			if answered, err = o.answeredFS(ctx, sandboxID, reqs[0].ID, since); err != nil {
+				return nil, err
+			}
+		}
+		for _, e := range reqs {
+			var req model.FSRequest
+			if json.Unmarshal([]byte(e.Data), &req) == nil && !answered[req.ID] {
+				out = append(out, e)
+			}
+		}
+		if len(reqs) < page {
+			return out, nil
+		}
+		after = reqs[len(reqs)-1].ID
 	}
-	return out, nil
+}
+
+// answeredFS collects the ids of requests answered after event id from.
+func (o *Orchestrator) answeredFS(ctx context.Context, sandboxID string, from int64, since time.Time) (map[string]bool, error) {
+	const page = 500
+	answered := map[string]bool{}
+	for {
+		done, err := o.Store.QueryEvents(ctx, store.Filter{SandboxID: sandboxID, AfterID: from, Types: []string{model.EventFSResult}, From: since, Limit: page})
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range done {
+			var res model.FSResult
+			if json.Unmarshal([]byte(e.Data), &res) == nil {
+				answered[res.Request] = true
+			}
+		}
+		if len(done) < page {
+			return answered, nil
+		}
+		from = done[len(done)-1].ID
+	}
 }
 
 // AnswerFS records the pod's answer to a file request.

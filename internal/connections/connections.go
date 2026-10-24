@@ -174,46 +174,6 @@ func appendUnique(xs []string, x string) []string {
 	return append(xs, x)
 }
 
-// HeadersFor is the gateway side: the headers of the sandbox's connections that name host,
-// secrets expanded from the sandbox tenant's own. The identity's tenant must be the sandbox's.
-// A connection the sandbox names but which no longer exists adds nothing (the policy still
-// decides the request); a reference that cannot be resolved is an error (nothing is sent).
-func (s *Service) HeadersFor(ctx context.Context, sandboxID, tenant, host string) (map[string]string, error) {
-	if s.Sandboxes == nil || sandboxID == "" {
-		return nil, nil
-	}
-	sb, err := s.Sandboxes.GetSandbox(ctx, sandboxID)
-	if errors.Is(err, store.ErrNotFound) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if sb.Tenant != tenant {
-		return nil, fmt.Errorf("identity tenant %q is not the sandbox's %q", tenant, sb.Tenant)
-	}
-	var out map[string]string
-	for _, ref := range sb.Connections {
-		sp, h, err := s.Headers(ctx, sb.Tenant, ref)
-		if errors.Is(err, store.ErrNotFound) {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("connection %s: %w", ref, err)
-		}
-		if sp.Host != host {
-			continue
-		}
-		if out == nil {
-			out = map[string]string{}
-		}
-		for k, v := range h {
-			out[k] = v
-		}
-	}
-	return out, nil
-}
-
 // Get returns one connection visible from tenant (own, else shared); revision 0 = latest.
 func (s *Service) Get(ctx context.Context, tenant, name string, revision int) (*model.CatalogItem, error) {
 	return res.Lookup(ctx, s.Store, model.KindConnection, tenant, res.Ref{Name: name, Rev: revision})
@@ -240,6 +200,9 @@ func (s *Service) Delete(ctx context.Context, tenant, name string) error {
 
 // Canonical resolves a reference ("name" or "shared/name"; revisions cannot be pinned) from
 // tenant's scope and returns the form that names it unambiguously.
+
+// Canonical resolves a reference ("name" or "shared/name"; revisions cannot be pinned) from
+// tenant's scope and returns the form that names it unambiguously.
 func (s *Service) Canonical(ctx context.Context, tenant, ref string) (string, error) {
 	r, err := res.ParseRef(ref)
 	if err != nil {
@@ -259,27 +222,89 @@ func (s *Service) Canonical(ctx context.Context, tenant, ref string) (string, er
 // gateway adds, secrets expanded from tenant's own secrets. For the gateway only: the result
 // must never reach an API response or the trace.
 func (s *Service) Headers(ctx context.Context, tenant, ref string) (*Spec, map[string]string, error) {
+	sp, err := s.spec(ctx, tenant, ref)
+	if err != nil {
+		return nil, nil, err
+	}
+	out, err := s.expand(ctx, tenant, sp)
+	return sp, out, err
+}
+
+// spec looks a connection up from tenant's scope without touching any secret.
+func (s *Service) spec(ctx context.Context, tenant, ref string) (*Spec, error) {
 	r, err := res.ParseRef(ref)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", res.ErrInvalid, err)
+		return nil, fmt.Errorf("%w: %v", res.ErrInvalid, err)
 	}
 	it, err := res.Lookup(ctx, s.Store, model.KindConnection, tenant, r)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	var sp Spec
 	if err := res.DecodeStrict(it.Spec, &sp); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+	return &sp, nil
+}
+
+// expand resolves the secret references of a connection's headers.
+func (s *Service) expand(ctx context.Context, tenant string, sp *Spec) (map[string]string, error) {
 	out := map[string]string{}
 	for name, tpl := range sp.Headers {
 		v, err := secrets.Expand(ctx, s.Secrets, tenant, tpl)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		out[http.CanonicalHeaderKey(name)] = v
 	}
-	return &sp, out, nil
+	return out, nil
+}
+
+// HeadersFor is the gateway side: the headers of the sandbox's connections that name host,
+// secrets expanded from the sandbox tenant's own. The identity's tenant must be the sandbox's.
+// Only the connections for this host are resolved: a secret that is missing for one service
+// never stands in the way of requests to another (the control plane's own API included). A
+// connection the sandbox names but which no longer exists adds nothing (the policy still
+// decides the request); a reference for this host that cannot be resolved is an error, so
+// nothing partial is sent.
+func (s *Service) HeadersFor(ctx context.Context, sandboxID, tenant, host string) (map[string]string, error) {
+	if s.Sandboxes == nil || sandboxID == "" {
+		return nil, nil
+	}
+	sb, err := s.Sandboxes.GetSandbox(ctx, sandboxID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if sb.Tenant != tenant {
+		return nil, fmt.Errorf("identity tenant %q is not the sandbox's %q", tenant, sb.Tenant)
+	}
+	var out map[string]string
+	for _, ref := range sb.Connections {
+		sp, err := s.spec(ctx, sb.Tenant, ref)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("connection %s: %w", ref, err)
+		}
+		if sp.Host != host {
+			continue
+		}
+		h, err := s.expand(ctx, sb.Tenant, sp)
+		if err != nil {
+			return nil, fmt.Errorf("connection %s: %w", ref, err)
+		}
+		if out == nil {
+			out = map[string]string{}
+		}
+		for k, v := range h {
+			out[k] = v
+		}
+	}
+	return out, nil
 }
 
 func marshal(sp Spec) ([]byte, error) {
