@@ -24,12 +24,14 @@ import (
 
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/plan"
 )
 
 const usage = `sandboxctl <command> [flags]
 
   create   -name shop (-slug backend-dev | -agent backend[@3]) -owner alice [-tenant t] [-repo url] [-idle 3600]
            [-ttl 86400] [-wake-on-preview=false] [-version stable] [-key idempotency-key]
+  plan     -f file.yaml [-tenant t] [-json]         validate a bundle (--- separated documents) and show what apply would change; writes nothing
   apply    -f file.yaml [-tenant t] [-expected 3]   put AgentDefinitions / EnvironmentProfiles / Connections /
            PolicyBindings / TenantSettings (new revisions; --- separates documents, applied in order)
   get      agent|environment|connection|binding <name> [-revision N] [-tenant t]
@@ -346,6 +348,38 @@ func (c *cli) run(cmd string, args []string) error {
 			}
 			fmt.Printf("%s %s/%s: revision %d\n", out.Kind, out.Tenant, out.Name, out.Revision)
 		}
+	case "plan":
+		file := fs.String("f", "", "YAML file: one document, or several separated by ---")
+		tenant := fs.String("tenant", "", "default scope for documents without a tenant (admin)")
+		asJSON := fs.Bool("json", false, "print the plan as JSON")
+		_ = fs.Parse(flags)
+		if *file == "" {
+			return errors.New("plan: -f is required")
+		}
+		raw, err := os.ReadFile(*file)
+		if err != nil {
+			return err
+		}
+		docs, err := catalog.ParseYAMLAll(raw)
+		if err != nil {
+			return err
+		}
+		q := ""
+		if *tenant != "" {
+			q = "?tenant=" + url.QueryEscape(*tenant)
+		}
+		var out plan.Plan
+		if err := c.do("POST", "/v1/plan"+q, map[string]any{"documents": docs}, &out); err != nil {
+			return err
+		}
+		if *asJSON {
+			printJSON(out)
+		} else {
+			printPlan(out)
+		}
+		if !out.Valid {
+			os.Exit(2)
+		}
 	case "settings":
 		revisions := fs.Bool("revisions", false, "show the history")
 		reset := fs.Bool("reset", false, "return the tenant to the server defaults (admin)")
@@ -643,6 +677,43 @@ func catalogPath(noun string) string {
 func kindPath(kind string) string {
 	return map[string]string{model.KindAgent: "agents", model.KindEnvironment: "environments",
 		model.KindConnection: "connections", model.KindBinding: "bindings"}[kind]
+}
+
+func printPlan(p plan.Plan) {
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "ACTION\tKIND\tTENANT\tNAME\tREVISION\tCHANGES")
+	for _, c := range p.Changes {
+		detail := ""
+		switch {
+		case len(c.Errors) > 0:
+			detail = strings.Join(c.Errors, "; ")
+		case c.Action == plan.ActionNoop:
+			detail = "-"
+		default:
+			parts := make([]string, 0, len(c.Diff))
+			for _, f := range c.Diff {
+				switch {
+				case f.From == nil:
+					parts = append(parts, fmt.Sprintf("+%s=%v", f.Path, f.To))
+				case f.To == nil:
+					parts = append(parts, fmt.Sprintf("-%s", f.Path))
+				default:
+					parts = append(parts, fmt.Sprintf("%s: %v -> %v", f.Path, f.From, f.To))
+				}
+			}
+			detail = strings.Join(parts, ", ")
+		}
+		rev := fmt.Sprintf("%d -> %d", c.CurrentRevision, c.CurrentRevision+1)
+		if c.Action == plan.ActionNoop || c.Action == plan.ActionInvalid {
+			rev = fmt.Sprint(c.CurrentRevision)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n", c.Action, c.Kind, c.Tenant, c.Name, rev, detail)
+	}
+	tw.Flush()
+	for _, e := range p.Errors {
+		fmt.Println("bundle:", e)
+	}
+	fmt.Printf("bundle %s: %d to create, %d to update, %d unchanged, %d invalid\n", p.Bundle, p.Summary.Create, p.Summary.Update, p.Summary.Noop, p.Summary.Invalid)
 }
 
 func printRevisions(revs []model.CatalogItem) {

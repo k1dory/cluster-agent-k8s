@@ -9,20 +9,14 @@ import (
 	"agent-sandbox/internal/secrets"
 )
 
-func secretsWith(keys ...string) secrets.Static {
-	st := secrets.Static{}
-	for _, k := range keys {
-		st[k] = "ghp_example"
-	}
-	return st
-}
-
 // The shipped connection, binding and settings examples apply as they are through the API.
 func TestShippedConfigExamples(t *testing.T) {
 	s, _ := configStack(t)
 	api := s.platform.URL
 	s.p.Tenants["acme-tok"] = "acme"
-	s.p.Connections.Secrets = secretsWith("acme/github-token")
+	// The provider is shared by the connections service and the planner: add to it in place.
+	sec := s.p.Connections.Secrets.(secrets.Static)
+	sec["acme/github-token"], sec["alice/github-token"] = "ghp_example", "ghp_example"
 	for _, tc := range []struct{ file, token, path string }{
 		{"connection-github.yaml", "acme-tok", "/v1/connections/github"},
 		{"binding-backend.yaml", "t0k", "/v1/bindings/backend-dev?tenant=acme"},
@@ -49,5 +43,14 @@ func TestShippedConfigExamples(t *testing.T) {
 	}
 	if q := s.p.TenantSettings.QuotaFor("acme"); q.MaxSandboxes != 20 || !s.p.TenantSettings.EnvironmentAllowed("acme", "shared/base") || s.p.TenantSettings.EnvironmentAllowed("acme", "other") {
 		t.Fatalf("example settings: %+v", q)
+	}
+	// The example bundle plans cleanly for a tenant that may use the policy.
+	raw, err := os.ReadFile("../../examples/catalog/bundle.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, body := call(t, "POST", api+"/v1/plan", "alice-tok", string(raw), map[string]string{"Content-Type": "application/yaml"})
+	if resp.StatusCode != 200 || !strings.Contains(string(body), `"valid":true`) {
+		t.Fatalf("example bundle plan: %d %s", resp.StatusCode, body)
 	}
 }

@@ -1,0 +1,29 @@
+# A bundle: several documents applied as one change set. `sandboxctl plan -f` validates the
+# whole bundle (an agent may name the environment and the connection it ships with), checks
+# the caller's authority over every document, and shows what apply would change without
+# changing anything; `sandboxctl apply -f` applies the documents in order.
+kind: EnvironmentProfile
+name: python-dev
+description: Python service work on Claude Code
+spec:
+  image: stable
+  harness:
+    command: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose'
+  resources: {cpu_request: 500m, cpu_limit: "2", memory_request: 2Gi, memory_limit: 6Gi, volume_size: 20Gi}
+  lifecycle: {idle_timeout: 1800}
+---
+kind: Connection
+name: github
+spec:
+  type: http
+  host: api.github.com
+  headers:
+    Authorization: Bearer secret:github-token
+---
+kind: AgentDefinition
+name: backend
+spec:
+  policy: backend-dev
+  environment: python-dev
+  repo: https://git.example.com/org/shop.git
+  connections: [github]

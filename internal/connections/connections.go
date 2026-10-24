@@ -67,7 +67,19 @@ func New(st store.Catalog, sec secrets.Provider, sbs Sandboxes) *Service {
 }
 
 // Put validates a document and appends it as a new revision in tenant's scope.
-func (s *Service) Put(ctx context.Context, tenant string, d *res.Document, _ bool, who string) (*model.CatalogItem, error) {
+func (s *Service) Put(ctx context.Context, tenant string, d *res.Document, admin bool, who string) (*model.CatalogItem, error) {
+	it, err := s.Validate(ctx, tenant, d, admin, who)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Store.PutItem(ctx, it, d.Expected()); err != nil {
+		return nil, err
+	}
+	return it, s.refresh(ctx)
+}
+
+// Validate checks a document and returns the item it would become, without writing.
+func (s *Service) Validate(ctx context.Context, tenant string, d *res.Document, _ bool, who string) (*model.CatalogItem, error) {
 	if err := res.CheckDocument(d, model.KindConnection); err != nil {
 		return nil, err
 	}
@@ -101,11 +113,7 @@ func (s *Service) Put(ctx context.Context, tenant string, d *res.Document, _ boo
 	if err != nil {
 		return nil, err
 	}
-	it := &model.CatalogItem{Kind: model.KindConnection, Tenant: tenant, Name: d.Name, Description: d.Description, Spec: spec, CreatedBy: who}
-	if err := s.Store.PutItem(ctx, it, d.Expected()); err != nil {
-		return nil, err
-	}
-	return it, s.refresh(ctx)
+	return &model.CatalogItem{Kind: model.KindConnection, Tenant: tenant, Name: d.Name, Description: d.Description, Spec: spec, CreatedBy: who}, nil
 }
 
 func (s *Service) refresh(ctx context.Context) error {

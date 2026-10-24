@@ -139,6 +139,19 @@ type Service struct {
 // tenant is the scope the caller works in ("" = shared, admin only); admin relaxes what an
 // image may name and lets the policy be one the tenant does not own.
 func (s *Service) Put(ctx context.Context, kind, tenant string, d *Document, admin bool, who string) (*model.CatalogItem, error) {
+	it, err := s.Validate(ctx, kind, tenant, d, admin, who)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Store.PutItem(ctx, it, d.Expected()); err != nil {
+		return nil, err
+	}
+	return it, nil
+}
+
+// Validate checks a document against the catalogue (references are looked up in Store) and
+// returns the item it would become, canonical spec included, without writing anything.
+func (s *Service) Validate(ctx context.Context, kind, tenant string, d *Document, admin bool, who string) (*model.CatalogItem, error) {
 	if err := res.CheckDocument(d, kind); err != nil {
 		return nil, err
 	}
@@ -146,11 +159,7 @@ func (s *Service) Put(ctx context.Context, kind, tenant string, d *Document, adm
 	if err != nil {
 		return nil, err
 	}
-	it := &model.CatalogItem{Kind: kind, Tenant: tenant, Name: d.Name, Description: d.Description, Spec: spec, CreatedBy: who}
-	if err := s.Store.PutItem(ctx, it, d.Expected()); err != nil {
-		return nil, err
-	}
-	return it, nil
+	return &model.CatalogItem{Kind: kind, Tenant: tenant, Name: d.Name, Description: d.Description, Spec: spec, CreatedBy: who}, nil
 }
 
 // validate decodes the spec strictly, checks it and returns it re-encoded in canonical form.

@@ -1,0 +1,425 @@
+// Package plan validates a bundle of configuration documents against the platform and reports
+// what applying it would change, without changing anything. It is the first half of the apply
+// controller: the whole bundle is checked at once (documents may depend on each other), the
+// caller's authority over every document is verified, each document is compared with the
+// current revision into a stable field diff, and the revision apply must find is recorded, so
+// a later apply can refuse a bundle planned against a state that moved.
+package plan
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"agent-sandbox/internal/bindings"
+	"agent-sandbox/internal/catalog"
+	"agent-sandbox/internal/connections"
+	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/policy"
+	res "agent-sandbox/internal/resource"
+	"agent-sandbox/internal/secrets"
+	"agent-sandbox/internal/store"
+	"agent-sandbox/internal/tenants"
+)
+
+// Actions a change can carry.
+const (
+	ActionCreate  = "create"
+	ActionUpdate  = "update"
+	ActionNoop    = "noop"
+	ActionInvalid = "invalid"
+)
+
+// Deps is what the planner validates against: the live store (read only) and the same
+// policy set, image catalogue, secrets and quota defaults the running services use.
+type Deps struct {
+	Store    store.Catalog
+	Policies *policy.Set
+	Images   catalog.Images
+	Secrets  secrets.Provider
+	Defaults func(tenant string) tenants.Quota
+	Now      func() time.Time
+}
+
+// Scope is who plans: a tenant (confined to its own scope and the kinds it may write) or the
+// admin, whose documents default to Tenant when they name none ("" = shared).
+type Scope struct {
+	Tenant  string
+	Admin   bool
+	Subject string
+}
+
+// FieldChange is one leaf of the canonical spec that differs ("description" for the item's
+// description). From is absent for an added field, To for a removed one.
+type FieldChange struct {
+	Path string `json:"path"`
+	From any    `json:"from,omitempty"`
+	To   any    `json:"to,omitempty"`
+}
+
+// Change is the plan for one document.
+type Change struct {
+	Kind   string `json:"kind"`
+	Tenant string `json:"tenant"`
+	Name   string `json:"name"`
+	Action string `json:"action"`
+	// CurrentRevision is the live revision the document was compared with (0: none).
+	// ExpectedRevision is what apply must find for this change to be the one planned here: the
+	// current revision (apply refuses the change otherwise).
+	CurrentRevision  int           `json:"current_revision"`
+	ExpectedRevision int           `json:"expected_revision"`
+	Diff             []FieldChange `json:"diff,omitempty"`
+	Errors           []string      `json:"errors,omitempty"`
+}
+
+// Plan is the result for a bundle: deterministic for the same documents and the same state.
+type Plan struct {
+	// Bundle fingerprints the canonical documents (not the state): the same files give the same
+	// value, whatever the current revisions.
+	Bundle  string   `json:"bundle"`
+	Valid   bool     `json:"valid"`
+	Changes []Change `json:"changes"`
+	Errors  []string `json:"errors,omitempty"` // bundle-level: duplicates, unknown kinds
+	Summary Summary  `json:"summary"`
+}
+
+// Summary counts the actions.
+type Summary struct {
+	Create  int `json:"create"`
+	Update  int `json:"update"`
+	Noop    int `json:"noop"`
+	Invalid int `json:"invalid"`
+}
+
+// kindRank is the apply order: what others depend on comes first.
+var kindRank = map[string]int{
+	model.KindEnvironment:    0,
+	model.KindConnection:     1,
+	model.KindTenantSettings: 2,
+	model.KindBinding:        3,
+	model.KindAgent:          4,
+}
+
+type entry struct {
+	doc    *res.Document
+	tenant string
+	key    string
+	change *Change
+	item   *model.CatalogItem // candidate after validation
+}
+
+// Plan validates docs as one bundle under scope and reports the changes. Nothing is written.
+func (d Deps) Plan(ctx context.Context, docs []*res.Document, scope Scope) (*Plan, error) {
+	now := d.Now
+	if now == nil {
+		now = time.Now
+	}
+	p := &Plan{}
+	var entries []*entry
+	seen := map[string]int{}
+	for i, doc := range docs {
+		c := &Change{Kind: doc.Kind, Name: doc.Name, Tenant: scope.Tenant}
+		e := &entry{doc: doc, change: c, tenant: scope.Tenant}
+		if doc.Tenant != nil {
+			e.tenant, c.Tenant = *doc.Tenant, *doc.Tenant
+		}
+		entries = append(entries, e)
+		if _, known := kindRank[doc.Kind]; !known {
+			if doc.Kind == "" {
+				c.Errors = append(c.Errors, "kind is required")
+			} else {
+				c.Errors = append(c.Errors, fmt.Sprintf("unknown kind %q", doc.Kind))
+			}
+			continue
+		}
+		if doc.Kind == model.KindTenantSettings && doc.Name == "" {
+			doc.Name, c.Name = tenants.Name, tenants.Name
+		}
+		// Authority.
+		if doc.Tenant != nil && !scope.Admin && *doc.Tenant != scope.Tenant {
+			c.Errors = append(c.Errors, fmt.Sprintf("token is scoped to tenant %q, document names %q", scope.Tenant, *doc.Tenant))
+		}
+		if !scope.Admin && (doc.Kind == model.KindBinding || doc.Kind == model.KindTenantSettings) {
+			c.Errors = append(c.Errors, doc.Kind+" is written by the admin only")
+		}
+		if !scope.Admin && e.tenant == "" {
+			c.Errors = append(c.Errors, "shared items are written by the admin only")
+		}
+		e.key = doc.Kind + "|" + e.tenant + "|" + doc.Name
+		if j, dup := seen[e.key]; dup {
+			p.Errors = append(p.Errors, fmt.Sprintf("documents %d and %d both describe %s %s/%s", j+1, i+1, doc.Kind, e.tenant, doc.Name))
+		}
+		seen[e.key] = i
+	}
+	// The bundle as the services would see it after apply: every document is visible to the
+	// others' validation, so an agent may name an environment or a connection the same bundle
+	// introduces. Canonical specs replace the raw ones as validation proceeds in apply order.
+	ov := &overlay{base: d.Store, pending: map[string]*model.CatalogItem{}}
+	for _, e := range entries {
+		if len(e.change.Errors) == 0 {
+			ov.pending[e.key] = &model.CatalogItem{Kind: e.doc.Kind, Tenant: e.tenant, Name: e.doc.Name, Description: e.doc.Description, Spec: e.doc.Spec}
+		}
+	}
+	tset := tenants.New(ov, d.Defaults)
+	bind := bindings.New(ov, d.Policies)
+	bind.Now = now
+	for name, r := range map[string]interface{ Refresh(context.Context) error }{"tenant settings": tset, "bindings": bind} {
+		if err := r.Refresh(ctx); err != nil {
+			return nil, fmt.Errorf("plan: load %s: %w", name, err)
+		}
+	}
+	guard := &bindings.Guard{Set: d.Policies, Bindings: bind}
+	conns := connections.New(ov, d.Secrets, nil)
+	cat := &catalog.Service{Store: ov, Images: d.Images, Policies: guard, Connections: conns, Tenants: tset}
+
+	order := append([]*entry(nil), entries...)
+	sort.SliceStable(order, func(i, j int) bool { return kindRank[order[i].doc.Kind] < kindRank[order[j].doc.Kind] })
+	for _, e := range order {
+		if len(e.change.Errors) > 0 {
+			continue
+		}
+		var err error
+		switch e.doc.Kind {
+		case model.KindEnvironment, model.KindAgent:
+			e.item, err = cat.Validate(ctx, e.doc.Kind, e.tenant, e.doc, scope.Admin, scope.Subject)
+		case model.KindConnection:
+			e.item, err = conns.Validate(ctx, e.tenant, e.doc, scope.Admin, scope.Subject)
+		case model.KindBinding:
+			e.item, err = bind.Validate(ctx, e.tenant, e.doc, scope.Admin, scope.Subject)
+		case model.KindTenantSettings:
+			e.item, err = tset.Validate(ctx, e.tenant, e.doc, scope.Subject)
+		}
+		if err != nil {
+			e.change.Errors = append(e.change.Errors, err.Error())
+			delete(ov.pending, e.key) // an invalid document is not something others may depend on
+			continue
+		}
+		ov.pending[e.key] = e.item
+	}
+	// Compare each candidate with the live state.
+	for _, e := range entries {
+		c := e.change
+		if _, known := kindRank[e.doc.Kind]; !known {
+			c.Action = ActionInvalid
+			continue
+		}
+		cur, err := d.Store.GetItem(ctx, e.doc.Kind, e.tenant, e.doc.Name, 0)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+		if cur != nil {
+			c.CurrentRevision = cur.Revision
+		}
+		c.ExpectedRevision = c.CurrentRevision
+		if e.doc.ExpectedRevision != nil && *e.doc.ExpectedRevision != c.CurrentRevision {
+			c.Errors = append(c.Errors, fmt.Sprintf("%s: expected_revision %d, but the current revision is %d", res.ErrConflict, *e.doc.ExpectedRevision, c.CurrentRevision))
+		}
+		if len(c.Errors) > 0 {
+			c.Action = ActionInvalid
+			continue
+		}
+		var from, to map[string]any
+		if cur != nil {
+			from = flatten(cur.Spec, cur.Description)
+		}
+		to = flatten(e.item.Spec, e.item.Description)
+		c.Diff = diff(from, to)
+		switch {
+		case cur == nil:
+			c.Action = ActionCreate
+		case len(c.Diff) == 0:
+			c.Action = ActionNoop
+		default:
+			c.Action = ActionUpdate
+		}
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		a, b := entries[i], entries[j]
+		if kindRank[a.doc.Kind] != kindRank[b.doc.Kind] {
+			return kindRank[a.doc.Kind] < kindRank[b.doc.Kind]
+		}
+		if a.tenant != b.tenant {
+			return a.tenant < b.tenant
+		}
+		return a.doc.Name < b.doc.Name
+	})
+	h := sha256.New()
+	for _, e := range entries {
+		p.Changes = append(p.Changes, *e.change)
+		switch e.change.Action {
+		case ActionCreate:
+			p.Summary.Create++
+		case ActionUpdate:
+			p.Summary.Update++
+		case ActionNoop:
+			p.Summary.Noop++
+		default:
+			p.Summary.Invalid++
+		}
+		spec := canonical(e.doc.Spec)
+		if e.item != nil {
+			spec = canonical(e.item.Spec)
+		}
+		fmt.Fprintf(h, "%s|%s|%s\n%s\n%s\n", e.doc.Kind, e.tenant, e.doc.Name, e.doc.Description, spec)
+	}
+	p.Bundle = hex.EncodeToString(h.Sum(nil))[:16]
+	p.Valid = len(p.Errors) == 0 && p.Summary.Invalid == 0
+	return p, nil
+}
+
+// canonical renders JSON with sorted keys and no insignificant whitespace.
+func canonical(raw json.RawMessage) string {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return strings.TrimSpace(string(raw))
+	}
+	b, _ := json.Marshal(v) // encoding/json sorts map keys
+	return string(b)
+}
+
+// flatten turns a spec (and the description) into path → leaf value.
+func flatten(spec json.RawMessage, description string) map[string]any {
+	out := map[string]any{}
+	if description != "" {
+		out["description"] = description
+	}
+	var v any
+	if err := json.Unmarshal(spec, &v); err != nil {
+		out["spec"] = strings.TrimSpace(string(spec))
+		return out
+	}
+	walk("spec", v, out)
+	return out
+}
+
+func walk(path string, v any, out map[string]any) {
+	switch x := v.(type) {
+	case map[string]any:
+		// An empty object says nothing (a struct field rendered as {}): no leaf.
+		for k, sub := range x {
+			walk(path+"."+k, sub, out)
+		}
+	case []any:
+		if len(x) == 0 {
+			out[path] = []any{}
+			return
+		}
+		for i, sub := range x {
+			walk(path+"["+strconv.Itoa(i)+"]", sub, out)
+		}
+	default:
+		out[path] = v
+	}
+}
+
+// diff lists the leaves that differ between from and to, in path order.
+func diff(from, to map[string]any) []FieldChange {
+	paths := map[string]bool{}
+	for k := range from {
+		paths[k] = true
+	}
+	for k := range to {
+		paths[k] = true
+	}
+	keys := make([]string, 0, len(paths))
+	for k := range paths {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var out []FieldChange
+	for _, k := range keys {
+		f, inFrom := from[k]
+		t, inTo := to[k]
+		if inFrom && inTo && reflect.DeepEqual(f, t) {
+			continue
+		}
+		out = append(out, FieldChange{Path: k, From: f, To: t})
+	}
+	return out
+}
+
+// overlay is the store as it would be after the bundle applied: the bundle's documents are
+// the latest revisions of their items; everything else is read from the base. Writes are
+// refused: planning changes nothing.
+type overlay struct {
+	base    store.Catalog
+	pending map[string]*model.CatalogItem // kind|tenant|name → candidate
+}
+
+var errReadOnly = errors.New("plan: the store is read-only while planning")
+
+func (o *overlay) PutItem(context.Context, *model.CatalogItem, int) error   { return errReadOnly }
+func (o *overlay) DeleteItem(context.Context, string, string, string) error { return errReadOnly }
+
+func (o *overlay) GetItem(ctx context.Context, kind, tenant, name string, revision int) (*model.CatalogItem, error) {
+	if p, ok := o.pending[kind+"|"+tenant+"|"+name]; ok {
+		cur, err := o.base.GetItem(ctx, kind, tenant, name, 0)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return nil, err
+		}
+		next := 1
+		if cur != nil {
+			next = cur.Revision + 1
+		}
+		if revision == 0 || revision == next {
+			c := *p
+			c.Revision = next
+			return &c, nil
+		}
+	}
+	return o.base.GetItem(ctx, kind, tenant, name, revision)
+}
+
+func (o *overlay) ListItems(ctx context.Context, kind, tenant string) ([]*model.CatalogItem, error) {
+	list, err := o.base.ListItems(ctx, kind, tenant)
+	if err != nil {
+		return nil, err
+	}
+	return o.merge(list, func(it *model.CatalogItem) bool { return it.Kind == kind && it.Tenant == tenant }), nil
+}
+
+func (o *overlay) ListKind(ctx context.Context, kind string) ([]*model.CatalogItem, error) {
+	list, err := o.base.ListKind(ctx, kind)
+	if err != nil {
+		return nil, err
+	}
+	return o.merge(list, func(it *model.CatalogItem) bool { return it.Kind == kind }), nil
+}
+
+func (o *overlay) ListRevisions(ctx context.Context, kind, tenant, name string) ([]*model.CatalogItem, error) {
+	return o.base.ListRevisions(ctx, kind, tenant, name)
+}
+
+func (o *overlay) merge(list []*model.CatalogItem, match func(*model.CatalogItem) bool) []*model.CatalogItem {
+	byKey := map[string]*model.CatalogItem{}
+	for _, it := range list {
+		byKey[it.Kind+"|"+it.Tenant+"|"+it.Name] = it
+	}
+	for k, p := range o.pending {
+		if match(p) {
+			c := *p
+			if cur, ok := byKey[k]; ok {
+				c.Revision = cur.Revision + 1
+			} else {
+				c.Revision = 1
+			}
+			byKey[k] = &c
+		}
+	}
+	out := make([]*model.CatalogItem, 0, len(byKey))
+	for _, it := range byKey {
+		out = append(out, it)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Tenant < out[j].Tenant || out[i].Tenant == out[j].Tenant && out[i].Name < out[j].Name
+	})
+	return out
+}
