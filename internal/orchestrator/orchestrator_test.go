@@ -46,10 +46,9 @@ func TestLifecycle(t *testing.T) {
 	if err != nil || got.ID != run.ID || got.Status != model.RunRunning {
 		t.Fatalf("NextRun: %v %+v", err, got)
 	}
-	// Idle timer must not kill a sandbox with a run in progress.
-	sb, _ = o.Get(ctx, sb.ID)
-	sb.LastActivity = time.Now().Add(-time.Hour)
-	_ = o.Store.UpdateSandbox(ctx, sb)
+	// Idle timer must not kill a sandbox with a run in progress (last activity never moves
+	// backwards in the store, so the one-second idle timeout is simply waited out).
+	time.Sleep(1100 * time.Millisecond)
 	o.Reconcile(ctx)
 	if sb, _ = o.Get(ctx, sb.ID); sb.Status != model.StatusRunning {
 		t.Fatalf("sandbox with running run must stay up, got %s", sb.Status)
@@ -106,6 +105,13 @@ func TestVersionsAndRollouts(t *testing.T) {
 		EnvVersion: func(sb *model.Sandbox) string { return "env-" + sb.AgentVersion },
 	}, nil)
 	o.Policies = onlyAcme{}
+	rctx, stop := context.WithCancel(ctx)
+	defer stop()
+	go o.Run(rctx) // the reconciler applies deferred rollouts; the memory store always leads
+	deadline0 := time.Now().Add(2 * time.Second)
+	for !o.Leading() && time.Now().Before(deadline0) {
+		time.Sleep(5 * time.Millisecond)
+	}
 
 	// Ownership: backend-dev belongs to acme.
 	if _, err := o.Create(ctx, CreateRequest{Name: "x", Slug: "backend-dev", Owner: "bob", Tenant: "evil"}); err == nil || !errorsIs(err, ErrForbidden) {

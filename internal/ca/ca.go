@@ -274,11 +274,16 @@ type Blobs interface {
 // BlobName is the store key of the shared agent CA.
 const BlobName = "agent-ca"
 
-// LoadOrCreateShared returns the CA every replica shares: generated once by whoever gets to
-// the store first, read by everyone else.
+// LoadOrCreateShared returns the agent CA every replica shares: generated once by whoever gets
+// to the store first, read by everyone else.
 func LoadOrCreateShared(ctx context.Context, st Blobs) (*CA, error) {
-	data, err := st.GetOrCreateBlob(ctx, BlobName, func() ([]byte, error) {
-		c, err := Generate("agent-sandbox agent CA", 10*365*24*time.Hour)
+	return LoadOrCreateSharedNamed(ctx, st, BlobName, "agent-sandbox agent CA")
+}
+
+// LoadOrCreateSharedNamed is LoadOrCreateShared for any CA kept under blob name with cn.
+func LoadOrCreateSharedNamed(ctx context.Context, st Blobs, name, cn string) (*CA, error) {
+	data, err := st.GetOrCreateBlob(ctx, name, func() ([]byte, error) {
+		c, err := Generate(cn, 10*365*24*time.Hour)
 		if err != nil {
 			return nil, err
 		}
@@ -288,4 +293,24 @@ func LoadOrCreateShared(ctx context.Context, st Blobs) (*CA, error) {
 		return nil, err
 	}
 	return ParseBundle(data)
+}
+
+// WriteTo stores the CA as <dir>/<base>.crt and <dir>/<base>.key (0600) for a program that
+// reads PEM files (Caddy's pki root) and returns both paths.
+func (c *CA) WriteTo(dir, base string) (certPath, keyPath string, err error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", err
+	}
+	keyDER, err := x509.MarshalECPrivateKey(c.key.(*ecdsa.PrivateKey))
+	if err != nil {
+		return "", "", err
+	}
+	certPath, keyPath = filepath.Join(dir, base+".crt"), filepath.Join(dir, base+".key")
+	if err := os.WriteFile(certPath, c.pem, 0o644); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		return "", "", err
+	}
+	return certPath, keyPath, nil
 }

@@ -4,7 +4,6 @@ package kube
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 
@@ -18,6 +17,7 @@ import (
 	"k8s.io/utils/ptr"
 
 	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/orchestrator"
 )
 
 // Labels placed on agent pods; the Registrar reads them back during bootstrap.
@@ -261,7 +261,7 @@ func (r *Runtime) PodStatus(ctx context.Context, sb *model.Sandbox) (bool, strin
 	}
 	pod, err := r.Client.CoreV1().Pods(r.Cfg.Namespace).Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
-		return false, "", errors.New("pod not found")
+		return false, "", orchestrator.ErrPodNotFound
 	}
 	if err != nil {
 		return false, "", err

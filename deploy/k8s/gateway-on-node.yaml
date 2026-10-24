@@ -166,7 +166,7 @@ data:
           x-api-key: "secret:anthropic"
 ---
 # Agent CA key (ca.source file) and rendered Caddyfile. Losing the CA key means re-issuing every
-# identity: back it up. With ca.source db the key lives in Postgres and this volume is scratch.
+# identity: back it up. With ca.source db both CAs live in Postgres and no claim is created.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

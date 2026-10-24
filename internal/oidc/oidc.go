@@ -113,7 +113,8 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (httpapi.Principal, e
 	if err := tok.Claims(&claims); err != nil {
 		return httpapi.Principal{}, err
 	}
-	pr := httpapi.Principal{Subject: tok.Subject, Expires: tok.Expiry}
+	exp := tok.Expiry
+	pr := httpapi.Principal{Subject: tok.Subject, Expires: &exp}
 	pr.Admin = contains(claims[v.cfg.AdminClaim], v.cfg.AdminValue)
 	pr.Tenant = v.tenantOf(claims)
 	if pr.Tenant == "" && !pr.Admin {

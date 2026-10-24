@@ -36,6 +36,12 @@ func TestRender(t *testing.T) {
 			t.Errorf("rendered Caddyfile lacks %q", want)
 		}
 	}
+	cfg.RootCert, cfg.RootKey = "/var/lib/sandboxd/gateway-root.crt", "/var/lib/sandboxd/gateway-root.key"
+	shared, err := Render(cfg, testSet().Hosts(), c.PEM())
+	if err != nil || !strings.Contains(shared, "cert /var/lib/sandboxd/gateway-root.crt") || !strings.Contains(shared, "key /var/lib/sandboxd/gateway-root.key") {
+		t.Fatalf("shared gateway root must land in the pki block: %v", err)
+	}
+	cfg.RootCert, cfg.RootKey = "", ""
 	if path, err := exec.LookPath("caddy"); err == nil {
 		cmd := exec.Command(path, "validate", "--adapter", "caddyfile", "--config", "/dev/stdin")
 		cmd.Stdin = strings.NewReader(out)

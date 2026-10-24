@@ -30,6 +30,14 @@ spec:
       {{- with .Values.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if gt (int .Values.gateway.replicas) 1 }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels: {{- include "agent-sandbox.selector" . | nindent 18 }}
+      {{- end }}
       securityContext:
         seccompProfile: { type: RuntimeDefault }
       containers:
@@ -50,6 +58,10 @@ spec:
             - { name: config, mountPath: /etc/caddy/Caddyfile, subPath: Caddyfile.bootstrap, readOnly: true }
             - { name: caddy-data, mountPath: /data }
             - { name: caddy-config, mountPath: /config }
+            {{- if eq .Values.sandboxd.ca.source "db" }}
+            # the gateway root sandboxd writes from the database; Caddy signs its sites under it
+            - { name: var, mountPath: /var/lib/sandboxd, readOnly: true }
+            {{- end }}
         - name: sandboxd
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -79,19 +91,29 @@ spec:
           configMap: { name: {{ include "agent-sandbox.fullname" . }}-config }
         - name: policies
           configMap: { name: {{ include "agent-sandbox.fullname" . }}-policies }
+        {{- if eq .Values.sandboxd.ca.source "db" }}
+        # Nothing on disk is precious with the CAs in the database: scratch volumes, so replicas
+        # schedule on any gateway node without a ReadWriteOnce claim pinning them.
+        - name: var
+          emptyDir: {}
+        - name: caddy-data
+          emptyDir: {}
+        {{- else }}
         - name: var
           persistentVolumeClaim: { claimName: {{ include "agent-sandbox.fullname" . }}-var }
         - name: caddy-data
           persistentVolumeClaim: { claimName: {{ include "agent-sandbox.fullname" . }}-caddy }
+        {{- end }}
         - name: caddy-config
           emptyDir: {}
         {{- if .Values.tenantSecretsSecret }}
         - name: tenant-secrets
           secret: { secretName: {{ .Values.tenantSecretsSecret }} }
         {{- end }}
+{{- if ne .Values.sandboxd.ca.source "db" }}
 ---
 # Agent CA key (ca.source file) and rendered Caddyfile. Losing the CA key means re-issuing every
-# identity: back it up. With ca.source db the key lives in Postgres and this volume is scratch.
+# identity: back it up. With ca.source db both CAs live in Postgres and no claim is created.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -114,4 +136,5 @@ spec:
   resources:
     requests:
       storage: {{ .Values.caStorage }}
+{{- end }}
 {{- end }}

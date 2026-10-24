@@ -140,7 +140,13 @@ func (r *Registrar) Bootstrap(ctx context.Context, token string, req BootstrapRe
 	// The orchestrator may be writing the same row (pod name, status): reload and retry on conflict.
 	for attempt := 0; ; attempt++ {
 		sb.Instance = n
-		sb.PodName = pod.Name
+		if sb.PodName != "" && sb.PodName != pod.Name {
+			// The orchestrator already named a newer pod (a rollout replaced this one while it was
+			// still starting): keep its name, the identity we issue is retired with the old pod anyway.
+			r.log().Warn("bootstrap from a pod that is no longer current", "pod", pod.Name, "current", sb.PodName, "sandbox", sb.ID)
+		} else {
+			sb.PodName = pod.Name
+		}
 		err := r.Store.UpdateSandbox(ctx, sb)
 		if err == nil {
 			break

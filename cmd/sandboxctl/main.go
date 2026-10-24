@@ -355,7 +355,13 @@ func (c *cli) run(cmd string, args []string) error {
 			Selected int    `json:"selected"`
 			Targeted int    `json:"targeted"`
 			Items    []struct {
-				Sandbox, Slug, From, Mode, Reason, RunID, ResumeID string
+				Sandbox  string `json:"sandbox"`
+				Slug     string `json:"slug"`
+				From     string `json:"from"`
+				Mode     string `json:"mode"`
+				Reason   string `json:"reason"`
+				RunID    string `json:"run_id"`
+				ResumeID string `json:"resume_id"`
 			} `json:"items"`
 		}
 		if err := c.do("POST", "/v1/rollouts", req, &out); err != nil {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -67,6 +68,7 @@ type Config struct {
 		IP            string        `yaml:"ip"`             // gateway address on the sandbox VLAN
 		CaddyAdmin    string        `yaml:"caddy_admin"`    // http://127.0.0.1:2019; "" = render only
 		CaddyfileOut  string        `yaml:"caddyfile_out"`  // rendered copy for inspection
+		RootDir       string        `yaml:"root_dir"`       // ca.source db: where the shared gateway root is written for Caddy (default: dir of caddyfile_out)
 		DNSListen     string        `yaml:"dns_listen"`     // "10.77.77.1:53"; "" disables the built-in DNS
 		APIHost       string        `yaml:"api_host"`       // default api.sandbox.internal
 		RegistrarHost string        `yaml:"registrar_host"` // default registrar.sandbox.internal
@@ -243,6 +245,12 @@ func Load(path string) (*Config, error) {
 	}
 	if g.SyncEvery == 0 {
 		g.SyncEvery = 5 * time.Second
+	}
+	if g.RootDir == "" && g.CaddyfileOut != "" {
+		g.RootDir = filepath.Dir(g.CaddyfileOut)
+	}
+	if c.CA.Source == "db" && g.CaddyAdmin != "" && g.RootDir == "" {
+		return nil, fmt.Errorf("%s: ca.source db with a managed Caddy needs gateway.root_dir (or caddyfile_out) so every replica's Caddy uses the shared root", path)
 	}
 	if c.Kube.GatewayIP == "" {
 		c.Kube.GatewayIP = g.IP

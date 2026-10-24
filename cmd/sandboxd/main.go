@@ -131,6 +131,18 @@ func serve(cfgPath string, log *slog.Logger) error {
 
 	// Gateway: push Caddy config, learn Caddy's root, serve DNS.
 	gwCfg := gatewayConfig(cfg)
+	if cfg.CA.Source == "db" && cfg.Gateway.RootDir != "" {
+		// One gateway root for every replica: Caddy signs its site certificates under it, so an
+		// agent bootstrapped through one replica trusts the others.
+		root, err := ca.LoadOrCreateSharedNamed(ctx, st, "gateway-ca", "agent-sandbox gateway root")
+		if err != nil {
+			return fmt.Errorf("gateway root (db): %w", err)
+		}
+		if gwCfg.RootCert, gwCfg.RootKey, err = root.WriteTo(cfg.Gateway.RootDir, "gateway-root"); err != nil {
+			return fmt.Errorf("gateway root: %w", err)
+		}
+		log.Info("gateway root shared through the database", "dir", cfg.Gateway.RootDir)
+	}
 	if cfg.Gateway.CaddyAdmin != "" || cfg.Gateway.CaddyfileOut != "" {
 		syncer := &gateway.Syncer{Cfg: gwCfg, Policies: pols, AgentCA: agentCA.PEM(), Log: log.With("log", "gateway")}
 		go syncer.Run(ctx, cfg.Gateway.SyncEvery)
@@ -210,9 +222,11 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 
 	hub := events.New()
-	// Events appended by other replicas reach this process's SSE clients through the store.
-	if l, ok := st.(store.EventListener); ok {
-		go l.ListenEvents(ctx, func(e *model.Event) { hub.Publish(*e) })
+	// Events appended by any replica (this one included) reach the SSE clients through the store,
+	// so the orchestrator does not publish locally as well.
+	listener, hasListener := st.(store.EventListener)
+	if hasListener {
+		go listener.ListenEvents(ctx, func(e *model.Event) { hub.Publish(*e) })
 	}
 	// The environment version: everything that shapes a pod besides the task. A change here
 	// shows as drift between a sandbox's env_version and GET /v1/version.
@@ -237,6 +251,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 		DefaultAgentVersion: cfg.Agent.Default, Versions: cfg.Agent.Versions, EnvVersion: envVersion,
 	}, log)
 	orch.Policies = pols
+	orch.ListenerPublishes = hasListener
 	go orch.Run(ctx) // reconciler on the replica holding the lease
 
 	var secretProvider secrets.Provider = secrets.Static{}

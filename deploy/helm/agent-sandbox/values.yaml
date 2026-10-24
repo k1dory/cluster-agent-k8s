@@ -9,9 +9,10 @@
 gateway:
   mode: node
   # replicas > 1 needs: several labelled gateway nodes (one Caddy + sandboxd per node, a VIP or
-  # DNS round-robin in front of them), Postgres (database_url) and ca.source db, so every replica
-  # signs identities with the same key. The reconciler runs on the replica holding the lease;
-  # writes are revision-checked, quotas are decided under a shared lock.
+  # DNS round-robin in front of them), Postgres (database_url) and sandboxd.ca.source db, so every
+  # replica signs agent identities with one key and every Caddy issues site certificates under one
+  # shared gateway root. The reconciler runs on the replica holding the lease; writes are
+  # revision-checked, quotas are decided under a shared lock.
   replicas: 1
   nodeSelector:
     agent-sandbox.io/gateway: "true"

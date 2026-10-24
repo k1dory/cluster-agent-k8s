@@ -21,11 +21,23 @@ var migrations string
 // Postgres is the production Store.
 type Postgres struct {
 	pool *pgxpool.Pool
+	// lockers bounds how many WithTenantLock calls hold a pool connection at once, so the
+	// queries they run through other connections always have some left (half the pool).
+	lockers chan struct{}
 }
 
-// OpenPostgres connects and applies the schema (idempotent).
+// OpenPostgres connects and applies the schema (idempotent). Unless the URL sets pool_max_conns,
+// the pool holds up to 16 connections; the leadership lease and the event listener use
+// dedicated connections outside the pool.
 func OpenPostgres(ctx context.Context, url string) (*Postgres, error) {
-	pool, err := pgxpool.New(ctx, url)
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, err
+	}
+	if !strings.Contains(url, "pool_max_conns") && cfg.MaxConns < 16 {
+		cfg.MaxConns = 16
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -33,7 +45,12 @@ func OpenPostgres(ctx context.Context, url string) (*Postgres, error) {
 		pool.Close()
 		return nil, err
 	}
-	return &Postgres{pool: pool}, nil
+	return &Postgres{pool: pool, lockers: make(chan struct{}, max(1, int(cfg.MaxConns)/2))}, nil
+}
+
+// dedicated opens a connection outside the pool for long-held session state (locks, LISTEN).
+func (p *Postgres) dedicated(ctx context.Context) (*pgx.Conn, error) {
+	return pgx.ConnectConfig(ctx, p.pool.Config().ConnConfig.Copy())
 }
 
 func (p *Postgres) Close() error { p.pool.Close(); return nil }
@@ -88,6 +105,12 @@ func (p *Postgres) CreateSandbox(ctx context.Context, s *model.Sandbox) error {
 // WithTenantLock holds a transaction-scoped advisory lock keyed by the tenant while fn runs.
 // Other replicas calling it for the same tenant wait; the lock goes with the transaction.
 func (p *Postgres) WithTenantLock(ctx context.Context, tenant string, fn func(ctx context.Context) error) error {
+	select {
+	case p.lockers <- struct{}{}:
+		defer func() { <-p.lockers }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -103,7 +126,7 @@ func (p *Postgres) WithTenantLock(ctx context.Context, tenant string, fn func(ct
 }
 
 type pgLease struct {
-	conn *pgxpool.Conn
+	conn *pgx.Conn
 	name string
 	once sync.Once
 }
@@ -120,24 +143,25 @@ func (l *pgLease) Release() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_, _ = l.conn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext($1))`, l.name)
-		l.conn.Release()
+		_ = l.conn.Close(ctx)
 	})
 }
 
-// TryLead takes a session-level advisory lock on a dedicated connection. The lock is held as
-// long as the connection lives, so a crashed replica loses leadership automatically.
+// TryLead takes a session-level advisory lock on a dedicated connection (outside the pool, so
+// it never starves request handlers). The lock is held as long as the connection lives, so a
+// crashed replica loses leadership automatically.
 func (p *Postgres) TryLead(ctx context.Context, name string) (Lease, bool, error) {
-	conn, err := p.pool.Acquire(ctx)
+	conn, err := p.dedicated(ctx)
 	if err != nil {
 		return nil, false, err
 	}
 	var got bool
 	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock(hashtext($1))`, name).Scan(&got); err != nil {
-		conn.Release()
+		_ = conn.Close(ctx)
 		return nil, false, err
 	}
 	if !got {
-		conn.Release()
+		_ = conn.Close(ctx)
 		return nil, false, nil
 	}
 	return &pgLease{conn: conn, name: name}, true, nil
@@ -185,11 +209,15 @@ func (p *Postgres) ListenEvents(ctx context.Context, fn func(e *model.Event)) {
 }
 
 func (p *Postgres) listenOnce(ctx context.Context, last *int64, fn func(e *model.Event)) error {
-	conn, err := p.pool.Acquire(ctx)
+	conn, err := p.dedicated(ctx)
 	if err != nil {
 		return err
 	}
-	defer conn.Release()
+	defer func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = conn.Close(cctx)
+	}()
 	if _, err := conn.Exec(ctx, `LISTEN `+eventsChannel); err != nil {
 		return err
 	}
@@ -214,7 +242,7 @@ func (p *Postgres) listenOnce(ctx context.Context, last *int64, fn func(e *model
 	for {
 		// A timeout keeps the loop polling slowly even if a NOTIFY is lost.
 		wctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		_, err := conn.Conn().WaitForNotification(wctx)
+		_, err := conn.WaitForNotification(wctx)
 		cancel()
 		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
 			return err

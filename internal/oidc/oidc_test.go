@@ -64,7 +64,7 @@ func TestVerify(t *testing.T) {
 	}
 	ctx := context.Background()
 	pr, err := v.Verify(ctx, idp.token(t, map[string]any{"groups": []string{"dev", "sandbox-tenant:acme"}}, time.Hour))
-	if err != nil || pr.Tenant != "acme" || pr.Admin || pr.Subject != "u1" || time.Until(pr.Expires) < 50*time.Minute {
+	if err != nil || pr.Tenant != "acme" || pr.Admin || pr.Subject != "u1" || pr.Expires == nil || time.Until(*pr.Expires) < 50*time.Minute {
 		t.Fatalf("tenant token: %+v %v", pr, err)
 	}
 	pr, err = v.Verify(ctx, idp.token(t, map[string]any{"roles": []string{"sandbox-admin"}}, time.Hour))

@@ -11,6 +11,7 @@ services:
       - ./Caddyfile.bootstrap:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+      - sandboxd_var:/var/lib/sandboxd:ro   # ca.source db: the shared gateway root sandboxd writes
     environment:
       # DNS-provider credentials for the preview wildcard, if gateway.preview_tls uses a dns module
       # (then build Caddy with that module: see images/caddy/Dockerfile.example).

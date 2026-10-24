@@ -121,7 +121,10 @@ func (m *Memory) UpdateSandbox(_ context.Context, s *model.Sandbox) error {
 	}
 	s.Revision++
 	c := cloneSandbox(s)
-	c.LastActivity = s.LastActivity
+	// Like Postgres (GREATEST): a Touch that landed after the caller's read is not rolled back.
+	if cur.LastActivity.After(c.LastActivity) {
+		c.LastActivity = cur.LastActivity
+	}
 	m.sandboxes[s.ID] = c
 	return nil
 }

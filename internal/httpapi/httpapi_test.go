@@ -622,7 +622,8 @@ func (fakeVerifier) Verify(_ context.Context, tok string) (Principal, error) {
 		return Principal{}, errors.New("not a token we know")
 	}
 	secs, _ := strconv.Atoi(parts[2])
-	pr := Principal{Subject: "user@" + parts[1], Expires: time.Now().Add(time.Duration(secs) * time.Second)}
+	exp := time.Now().Add(time.Duration(secs) * time.Second)
+	pr := Principal{Subject: "user@" + parts[1], Expires: &exp}
 	if parts[1] == "admin" {
 		pr.Admin = true
 	} else {
@@ -678,7 +679,7 @@ func TestOwnershipVersionsAndRollouts(t *testing.T) {
 	resp, body = call(t, "GET", api+"/v1/whoami", "jwt.carol.600", nil, nil)
 	var who Principal
 	_ = json.Unmarshal(body, &who)
-	if resp.StatusCode != 200 || who.Tenant != "carol" || who.Admin || who.Subject != "user@carol" || time.Until(who.Expires) < 9*time.Minute {
+	if resp.StatusCode != 200 || who.Tenant != "carol" || who.Admin || who.Subject != "user@carol" || who.Expires == nil || time.Until(*who.Expires) < 9*time.Minute {
 		t.Fatalf("whoami via oidc: %d %s", resp.StatusCode, body)
 	}
 	if resp, _ := call(t, "GET", api+"/v1/whoami", "jwt.bad", nil, nil); resp.StatusCode != 401 {
@@ -689,6 +690,14 @@ func TestOwnershipVersionsAndRollouts(t *testing.T) {
 	_ = json.Unmarshal(body, &c1)
 	if resp.StatusCode != 201 || c1.Tenant != "carol" || c1.ExpiresAt == nil || time.Until(*c1.ExpiresAt) > 11*time.Minute {
 		t.Fatalf("oidc create must cap ttl at the token's expiry: %d %+v", resp.StatusCode, c1)
+	}
+	resp, body = call(t, "PATCH", api+"/v1/sandboxes/"+c1.ID, "jwt.carol.600", map[string]any{"ttl": 86400}, nil)
+	_ = json.Unmarshal(body, &c1)
+	if resp.StatusCode != 200 || c1.ExpiresAt == nil || time.Until(*c1.ExpiresAt) > 11*time.Minute {
+		t.Fatalf("PATCH must not extend past the token's expiry: %d %+v", resp.StatusCode, c1)
+	}
+	if resp, _ := call(t, "GET", api+"/v1/whoami", "t0k", nil, nil); resp.StatusCode != 200 {
+		t.Fatal("whoami with the admin token")
 	}
 	if resp, _ := call(t, "GET", api+"/v1/sandboxes/"+a1.ID, "jwt.carol.600", nil, nil); resp.StatusCode != 403 {
 		t.Fatalf("oidc tenant on alice's sandbox: %d", resp.StatusCode)

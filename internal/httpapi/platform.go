@@ -51,10 +51,18 @@ type Platform struct {
 // Principal is who is calling: the admin (every tenant) or one tenant. Expires is set for
 // credentials with a lifetime of their own (OIDC tokens); zero for static tokens.
 type Principal struct {
-	Tenant  string    `json:"tenant"`
-	Admin   bool      `json:"admin"`
-	Subject string    `json:"subject,omitempty"`
-	Expires time.Time `json:"expires,omitempty"`
+	Tenant  string     `json:"tenant"`
+	Admin   bool       `json:"admin"`
+	Subject string     `json:"subject,omitempty"`
+	Expires *time.Time `json:"expires,omitempty"`
+}
+
+// expiresBefore is the cap an expiring credential puts on what it creates (zero: none).
+func (pr Principal) expiresBefore() time.Time {
+	if pr.Expires == nil {
+		return time.Time{}
+	}
+	return *pr.Expires
 }
 
 func (pr Principal) admin() bool { return pr.Admin }
@@ -131,7 +139,7 @@ func (p *Platform) rollout(w http.ResponseWriter, r *http.Request) {
 func (p *Platform) version(w http.ResponseWriter, r *http.Request) {
 	cfg := p.Orch.Cfg
 	envs := map[string]string{}
-	if p.Policies != nil {
+	if p.Policies != nil && cfg.EnvVersion != nil {
 		for _, slug := range p.Policies.Slugs() {
 			envs[slug] = cfg.EnvVersion(&model.Sandbox{Slug: slug, AgentVersion: cfg.DefaultAgentVersion})
 		}
@@ -371,8 +379,8 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 		req.Tenant = pr.Tenant
 	}
 	req.Admin = pr.admin()
-	if p.TTLFromToken && !pr.Expires.IsZero() {
-		req.ExpiresBefore = pr.Expires
+	if p.TTLFromToken {
+		req.ExpiresBefore = pr.expiresBefore()
 	}
 	sb, err := p.Orch.Create(r.Context(), req)
 	if err != nil && sb == nil {
@@ -398,6 +406,9 @@ func (p *Platform) update(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
+	}
+	if p.TTLFromToken {
+		req.ExpiresBefore = principalOf(r).expiresBefore()
 	}
 	sb, err := p.Orch.Update(r.Context(), r.PathValue("id"), req)
 	if err != nil {

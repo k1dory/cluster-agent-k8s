@@ -2,7 +2,6 @@ package orchestrator
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 
@@ -54,7 +53,7 @@ func (f *FakeRuntime) PodStatus(_ context.Context, sb *model.Sandbox) (bool, str
 	defer f.mu.Unlock()
 	ip, ok := f.pods[sb.ID]
 	if !ok {
-		return false, "", errors.New("pod not found")
+		return false, "", ErrPodNotFound
 	}
 	return true, ip, nil
 }
