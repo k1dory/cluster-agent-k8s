@@ -10,11 +10,19 @@
 # checkout ownership are real; the platform is the shipped binary behind HTTP; the steps are the
 # templates' text, not a copy. What it cannot do: stop an apply half-way (no fault injection in
 # the shipped binary); that path is the in-process test's.
+#
+# The Docker daemon must be on this host and see this host's files: the templates' own steps
+# bind-mount the checkout (`docker run -v "$PWD:/w"`), and so does this script, from a work
+# directory inside the checkout, never the private /tmp of a job container. A daemon elsewhere
+# (a docker-in-docker service reached over TCP) fails the probe below with the reason, never
+# silently. Published ports are reached at the daemon's bridge address, not at localhost, which
+# in a job container is the container's own.
 set -euo pipefail
 SANDBOXD_IMAGE=${1:-${SANDBOXD_IMAGE:-agent-sandbox/sandboxd:ci}}
 SANDBOXCTL_IMAGE=${2:-${SANDBOXCTL_IMAGE:-agent-sandbox/sandboxctl:ci}}
 here=$(cd "$(dirname "$0")/.." && pwd)
-work=$(mktemp -d)
+mkdir -p "$here/.ci"
+work=$(mktemp -d "$here/.ci/e2e.XXXXXX")
 port=18080
 admin=admin-e2e-token
 acme=acme-e2e-token
@@ -28,6 +36,15 @@ cleanup() {
 trap cleanup EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 python3 -c 'import yaml' 2>/dev/null || fail "python3 with PyYAML is required to read the workflow"
+docker info >/dev/null 2>&1 || fail "no Docker daemon answers (DOCKER_HOST=${DOCKER_HOST:-unset})"
+# The daemon sees this host's files, or nothing here can work.
+echo probe > "$work/probe"
+seen=$(docker run --rm -v "$work/probe:/probe:ro" --entrypoint cat "$SANDBOXCTL_IMAGE" /probe 2>/dev/null || true)
+[ "$seen" = probe ] || fail "the Docker daemon does not see this host's files (DOCKER_HOST=${DOCKER_HOST:-unset}): the templates' steps bind-mount the checkout, so this check needs a daemon on this host, not a docker-in-docker service"
+# The daemon's bridge address is where its published ports are reachable from this host, from
+# a job container on that bridge, and from the containers the templates start.
+bridge=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
+[ -n "$bridge" ] || fail "the Docker daemon has no bridge network gateway"
 
 # --- the platform -----------------------------------------------------------------------------
 mkdir -p "$work/var/secrets" "$work/var/ca"
@@ -46,13 +63,12 @@ preview: { domain: preview.localhost, ticket_key: e2e }
 CFG
 docker run -d --name sandboxd-e2e --network host \
   -v "$work/sandboxd.yaml:/etc/sandbox/sandboxd.yaml:ro" -v "$work/var:/var/lib/sandboxd" "$SANDBOXD_IMAGE" >/dev/null
-for _ in $(seq 1 100); do curl -fs "http://127.0.0.1:$port/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
-curl -fs "http://127.0.0.1:$port/healthz" >/dev/null || fail "sandboxd did not start"
-# The sandboxctl container reaches the host through the bridge gateway, as the templates run it
-# (no --network host there; a real SANDBOXD_URL is a routable address).
-bridge=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}')
-api="http://127.0.0.1:$port"
-export SANDBOXD_URL="http://$bridge:$port" SANDBOXD_TOKEN=$acme SANDBOXCTL_IMAGE SANDBOX_TENANT=""
+api="http://$bridge:$port"
+for _ in $(seq 1 100); do curl -fs "$api/healthz" >/dev/null 2>&1 && break; sleep 0.2; done
+curl -fs "$api/healthz" >/dev/null || fail "sandboxd did not start, or is not reachable at $api"
+# The sandboxctl container reaches it through the same address, as the templates run it (no
+# --network host there; a real SANDBOXD_URL is a routable address).
+export SANDBOXD_URL="$api" SANDBOXD_TOKEN=$acme SANDBOXCTL_IMAGE SANDBOX_TENANT=""
 docker run --rm -e SANDBOXD_URL -e SANDBOXD_TOKEN "$SANDBOXCTL_IMAGE" drift >/dev/null || fail "the sandboxctl image cannot reach sandboxd at $SANDBOXD_URL"
 echo "sandboxd $SANDBOXD_IMAGE up; sandboxctl $SANDBOXCTL_IMAGE reaches it at $SANDBOXD_URL"
 

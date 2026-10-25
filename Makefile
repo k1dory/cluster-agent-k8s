@@ -30,7 +30,7 @@ ci-build:
 	go build ./... && hack/ci/versions.sh verify && echo "ci: build: ok"
 
 ci-vet:
-	go vet ./... && gofmt -l . | (! grep .) && echo "ci: vet: ok"
+	hack/ci/vet.sh
 
 # Every regression test, under the race detector, on the in-memory store.
 ci-unit:
