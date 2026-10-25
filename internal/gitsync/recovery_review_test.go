@@ -65,11 +65,11 @@ func TestReviewResolveFailurePreservesInterruptedTransition(t *testing.T) {
 
 type reviewDropSuccessfulHook struct{ store.Store }
 
-func (s reviewDropSuccessfulHook) RecordGitHookIf(ctx context.Context, tenant, name string, hook model.GitHook, job string, attempt int) (bool, error) {
+func (s reviewDropSuccessfulHook) RecordGitHookIf(ctx context.Context, tenant, name string, hook model.GitHook, job string, run int) (bool, error) {
 	if hook.Outcome == model.GitSyncDone {
 		return false, errors.New("temporary failure saving the final hook result")
 	}
-	return s.Store.RecordGitHookIf(ctx, tenant, name, hook, job, attempt)
+	return s.Store.RecordGitHookIf(ctx, tenant, name, hook, job, run)
 }
 
 // The first failed attempt already left a non-empty hook outcome. If the final
@@ -108,7 +108,7 @@ type reviewPendingHookBarrier struct {
 	armed   atomic.Bool
 }
 
-func (s *reviewPendingHookBarrier) RecordGitHookIf(ctx context.Context, tenant, name string, hook model.GitHook, job string, attempt int) (bool, error) {
+func (s *reviewPendingHookBarrier) RecordGitHookIf(ctx context.Context, tenant, name string, hook model.GitHook, job string, run int) (bool, error) {
 	if hook.Outcome == model.GitSyncError && s.armed.Swap(false) {
 		close(s.entered)
 		select {
@@ -117,7 +117,7 @@ func (s *reviewPendingHookBarrier) RecordGitHookIf(ctx context.Context, tenant, 
 			return false, ctx.Err()
 		}
 	}
-	return s.Store.RecordGitHookIf(ctx, tenant, name, hook, job, attempt)
+	return s.Store.RecordGitHookIf(ctx, tenant, name, hook, job, run)
 }
 
 // Scheduling a retry releases the job before the old attempt writes its hook.

@@ -161,7 +161,8 @@ type GitHook struct {
 	Number   int       `json:"number,omitempty"`   // the pull/merge request number
 	Delivery string    `json:"delivery,omitempty"` // the provider's delivery id
 	Job      string    `json:"job,omitempty"`      // the persisted job that carries the action out
-	Attempt  int       `json:"attempt,omitempty"`  // the job's attempt this outcome is from (0: the acceptance)
+	Run      int       `json:"run,omitempty"`      // the job's execution this outcome is from (GitJob.Run; 0: the acceptance)
+	Attempt  int       `json:"attempt,omitempty"`  // that execution's number within the job's current budget of MaxAttempts
 	Outcome  string    `json:"outcome,omitempty"`  // done | invalid | stopped | error | ignored | superseded
 	Error    string    `json:"error,omitempty"`
 	At       time.Time `json:"at"`
@@ -183,12 +184,13 @@ const (
 type GitJob struct {
 	ID         string     `json:"id"`
 	Tenant     string     `json:"tenant"`
-	Name       string     `json:"name"`     // the repository
-	Action     string     `json:"action"`   // sync | plan
-	Delivery   string     `json:"delivery"` // provider + delivery id: the same delivery is never two jobs
-	Payload    []byte     `json:"payload"`  // the delivery, reduced (gitsync.Delivery)
-	Status     string     `json:"status"`   // pending | running | done | failed
-	Attempts   int        `json:"attempts"`
+	Name       string     `json:"name"`            // the repository
+	Action     string     `json:"action"`          // sync | plan
+	Delivery   string     `json:"delivery"`        // provider + delivery id: the same delivery is never two jobs
+	Payload    []byte     `json:"payload"`         // the delivery, reduced (gitsync.Delivery)
+	Status     string     `json:"status"`          // pending | running | done | failed
+	Attempts   int        `json:"attempts"`        // executions within the current budget; reset when a redelivery requeues the job
+	Run        int        `json:"run"`             // executions ever: one more per claim, never reset; the identity of an execution's writes
 	Owner      string     `json:"owner,omitempty"` // the replica running it
 	LeaseUntil *time.Time `json:"lease_until,omitempty"`
 	Outcome    string     `json:"outcome,omitempty"`

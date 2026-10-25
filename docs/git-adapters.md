@@ -230,9 +230,10 @@ went and changes nothing; of one whose job gave up, or waits for its next attemp
 again now with its attempts reset, which is the way to run a delivery the platform could not
 handle at the time; of one due or running, names the job. The delivery, the decision, the job and the outcome
 land in the `hook` half of `gitrepo status`, which follows the delivery accepted last and its
-latest attempt (an older job that ran late never writes over a newer delivery's summary, an
-earlier attempt never over a later one's; a job's final outcome shows even when its last write
-was lost), and every delivery, plan and sync is an event (`git.hook`, `git.plan`,
+latest execution (an older job that ran late never writes over a newer delivery's summary, an
+earlier execution never over a later one's, a requeue's executions included: attempts start
+over with the new budget, the execution count never does; a job's final outcome shows even
+when its last write was lost), and every delivery, plan and sync is an event (`git.hook`, `git.plan`,
 `git.sync`) on the tenant's event stream, so a SOC or SRE integration can follow them without
 polling.
 

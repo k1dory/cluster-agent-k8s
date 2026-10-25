@@ -1793,7 +1793,8 @@ components:
         number: { type: integer, description: "The pull or merge request number" }
         delivery: { type: string, description: "The provider's delivery id" }
         job: { type: string, description: "The persisted job carrying the action out (a redelivery names the same job)" }
-        attempt: { type: integer, description: "The job's attempt this outcome is from; absent on the acceptance" }
+        run: { type: integer, description: "The job's execution this outcome is from, counted for good (a redelivery that requeues the job starts attempts over, never runs); absent on the acceptance" }
+        attempt: { type: integer, description: "That execution's number within the job's current budget of five; absent on the acceptance" }
         outcome: { type: string, enum: [done, invalid, stopped, error, ignored, superseded], description: "Absent while the action runs or waits for its next attempt; superseded: a delivery whose commit the ref or the pull request had already moved past, so nothing was written or published; error with a reason naming the next attempt: the job runs again" }
         error: { type: string }
         at: { type: string, format: date-time }

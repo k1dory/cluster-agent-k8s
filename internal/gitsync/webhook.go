@@ -345,6 +345,10 @@ func (s *Service) redelivered(ctx context.Context, it *model.CatalogItem, h *mod
 		if job.Status == model.GitJobPending {
 			h.Reason = "a redelivery: the job waited for its next attempt (" + job.Error + ") and runs now"
 		}
+		// The acceptance fences the executions before it: a late write of the execution that
+		// gave up or waited (its retry was granted, its record delayed) must not land over this
+		// acceptance or over the execution the requeue starts, which is the next run.
+		h.Run = job.Run + 1
 		if err := s.Store.RecordGitHook(ctx, it.Tenant, it.Name, *h); err != nil {
 			return nil, err
 		}
@@ -434,7 +438,7 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 	fail := func(msg string) {
 		fin, cancel := s.finishContext(ctx)
 		defer cancel()
-		if err := s.jobs().FinishGitJob(fin, job.ID, s.owner(), job.Attempts, model.GitJobFailed, model.GitSyncError, msg); err != nil && s.Log != nil {
+		if err := s.jobs().FinishGitJob(fin, job.ID, s.owner(), job.Run, model.GitJobFailed, model.GitSyncError, msg); err != nil && s.Log != nil {
 			s.Log.Warn("git job: finish", "job", job.ID, "err", err)
 		}
 	}
@@ -456,7 +460,7 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 	// The documents are applied with the repository's authority: the tenant's for a tenant's
 	// repository, the admin's for a shared one. The subject names the provider.
 	scope := plan.Scope{Tenant: it.Tenant, Admin: it.Tenant == "", Subject: "webhook:" + d.Provider}
-	done := model.GitHook{Provider: d.Provider, Event: d.Event, Ref: d.Ref, Commit: d.After, Delivery: d.ID, Job: job.ID, Attempt: job.Attempts, Action: job.Action, At: s.now()}
+	done := model.GitHook{Provider: d.Provider, Event: d.Event, Ref: d.Ref, Commit: d.After, Delivery: d.ID, Job: job.ID, Run: job.Run, Attempt: job.Attempts, Action: job.Action, At: s.now()}
 	if d.PR != nil {
 		done.Number, done.Commit = d.PR.Number, d.PR.HeadSHA
 	}
@@ -507,12 +511,13 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 }
 
 // conclude moves the job on (done or failed, or pending again at retryAt) and records how the
-// attempt went in the hook half of the record, under a context of its own. The job first: it
-// checks owner and attempt, so a late attempt another replica took over writes nothing, not
-// even the record. The record then, only while it still carries this job and no later attempt
-// of it has written: a delivery accepted meanwhile, or a later attempt's outcome, keeps its
-// summary (the condition is the store's, in one statement), and a job that ended without
-// reaching the record still shows its outcome (Status completes the hook from the job).
+// execution went in the hook half of the record, under a context of its own. The job first:
+// it checks owner and run, so a late execution another replica took over writes nothing, not
+// even the record. The record then, only while it still carries this job and no later
+// execution of it has written: a delivery accepted meanwhile, or a later execution's outcome
+// (a requeue's included: attempts start over, runs never do), keeps its summary (the condition
+// is the store's, in one statement), and a job that ended without reaching the record still
+// shows its outcome (Status completes the hook from the job).
 func (s *Service) conclude(ctx context.Context, it *model.CatalogItem, job *model.GitJob, done *model.GitHook, status string, retryAt time.Time) {
 	fin, cancel := s.finishContext(ctx)
 	defer cancel()
@@ -524,7 +529,7 @@ func (s *Service) conclude(ctx context.Context, it *model.CatalogItem, job *mode
 			return // the holder's outcome counts
 		}
 	}
-	if _, err := s.Store.RecordGitHookIf(fin, it.Tenant, it.Name, *done, job.ID, job.Attempts); err != nil && s.Log != nil {
+	if _, err := s.Store.RecordGitHookIf(fin, it.Tenant, it.Name, *done, job.ID, job.Run); err != nil && s.Log != nil {
 		s.Log.Error("git hook: record outcome", "tenant", it.Tenant, "repository", it.Name, "err", err)
 	}
 	s.emit(fin, it, "git.hook", done)
@@ -532,9 +537,9 @@ func (s *Service) conclude(ctx context.Context, it *model.CatalogItem, job *mode
 
 func (s *Service) move(ctx context.Context, job *model.GitJob, status string, done *model.GitHook, retryAt time.Time) error {
 	if status == model.GitJobPending {
-		return s.jobs().RetryGitJob(ctx, job.ID, s.owner(), job.Attempts, retryAt, done.Error)
+		return s.jobs().RetryGitJob(ctx, job.ID, s.owner(), job.Run, retryAt, done.Error)
 	}
-	return s.jobs().FinishGitJob(ctx, job.ID, s.owner(), job.Attempts, status, done.Outcome, done.Error)
+	return s.jobs().FinishGitJob(ctx, job.ID, s.owner(), job.Run, status, done.Outcome, done.Error)
 }
 
 // backoff is the wait before the attempt after the given one.

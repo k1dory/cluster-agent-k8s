@@ -380,21 +380,21 @@ type ctxStore struct {
 	down atomic.Bool
 }
 
-func (w *ctxStore) FinishGitJob(ctx context.Context, id, owner string, attempt int, status, outcome, errMsg string) error {
+func (w *ctxStore) FinishGitJob(ctx context.Context, id, owner string, run int, status, outcome, errMsg string) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if w.down.Load() {
 		return errors.New("the database is down")
 	}
-	return w.Store.FinishGitJob(ctx, id, owner, attempt, status, outcome, errMsg)
+	return w.Store.FinishGitJob(ctx, id, owner, run, status, outcome, errMsg)
 }
 
-func (w *ctxStore) RetryGitJob(ctx context.Context, id, owner string, attempt int, notBefore time.Time, errMsg string) error {
+func (w *ctxStore) RetryGitJob(ctx context.Context, id, owner string, run int, notBefore time.Time, errMsg string) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	return w.Store.RetryGitJob(ctx, id, owner, attempt, notBefore, errMsg)
+	return w.Store.RetryGitJob(ctx, id, owner, run, notBefore, errMsg)
 }
 
 func (w *ctxStore) RecordGitHook(ctx context.Context, tenant, name string, h model.GitHook) error {
@@ -523,7 +523,7 @@ type deadlineStore struct {
 	left []time.Duration
 }
 
-func (w *deadlineStore) FinishGitJob(ctx context.Context, id, owner string, attempt int, status, outcome, errMsg string) error {
+func (w *deadlineStore) FinishGitJob(ctx context.Context, id, owner string, run int, status, outcome, errMsg string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -532,7 +532,7 @@ func (w *deadlineStore) FinishGitJob(ctx context.Context, id, owner string, atte
 		w.left = append(w.left, time.Until(d))
 		w.mu.Unlock()
 	}
-	return w.Store.FinishGitJob(ctx, id, owner, attempt, status, outcome, errMsg)
+	return w.Store.FinishGitJob(ctx, id, owner, run, status, outcome, errMsg)
 }
 
 // pausingFetcher takes its time: a Git read longer than the finishing window would allow.
@@ -631,12 +631,12 @@ type gatedStore struct {
 	once    sync.Once
 }
 
-func (w *gatedStore) FinishGitJob(ctx context.Context, id, owner string, attempt int, status, outcome, errMsg string) error {
+func (w *gatedStore) FinishGitJob(ctx context.Context, id, owner string, run int, status, outcome, errMsg string) error {
 	if id == w.job {
 		w.once.Do(func() { close(w.entered) })
 		<-w.release
 	}
-	return w.Store.FinishGitJob(ctx, id, owner, attempt, status, outcome, errMsg)
+	return w.Store.FinishGitJob(ctx, id, owner, run, status, outcome, errMsg)
 }
 
 // A delivery accepted while an older job is ending keeps the record: the job's outcome is
@@ -727,15 +727,15 @@ type hookStore struct {
 	once    sync.Once
 }
 
-func (w *hookStore) RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string, attempt int) (bool, error) {
+func (w *hookStore) RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string, run int) (bool, error) {
 	if w.lose.Load() {
 		return false, errors.New("the database went away")
 	}
-	if held := int(w.hold.Load()); held != 0 && attempt == held {
+	if held := int(w.hold.Load()); held != 0 && h.Attempt == held {
 		w.once.Do(func() { close(w.entered) })
 		<-w.release
 	}
-	return w.Store.RecordGitHookIf(ctx, tenant, name, h, job, attempt)
+	return w.Store.RecordGitHookIf(ctx, tenant, name, h, job, run)
 }
 
 // A job that ended is the truth about how it went: when the record was left at an earlier
@@ -810,5 +810,87 @@ func TestALateRecordOfAnEarlierAttemptNeverReplacesALaterOne(t *testing.T) {
 	}
 	if job, _ := st.GetGitJob(ctx, h.Job); job.Status != model.GitJobDone || job.Attempts != 2 {
 		t.Fatalf("job: %+v", job)
+	}
+}
+
+// runGate holds the record write of one execution (by run) until released.
+type runGate struct {
+	store.Store
+	run     int
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *runGate) RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string, run int) (bool, error) {
+	if run == w.run {
+		w.once.Do(func() { close(w.entered) })
+		<-w.release
+	}
+	return w.Store.RecordGitHookIf(ctx, tenant, name, h, job, run)
+}
+
+// A redelivery requeues the job with a fresh budget of attempts, so the execution before it
+// and the one after share an attempt number; the execution count never starts over, and the
+// record is fenced by it: the late error of the execution before the redelivery never lands
+// over the success of the one after, without any clock being moved.
+func TestARedeliveryFencesThePreviousExecutionsSummary(t *testing.T) {
+	ctx := context.Background()
+	fetch := &flakyFetcher{refFetcher: &refFetcher{auth: "tok", heads: map[string]string{"main": sha1}, files: map[string]map[string][]byte{sha1: {"bundles/a.yaml": []byte(envYAML("x"))}}}}
+	one, st, _ := hookService(t, fetch)
+	gate := &runGate{Store: st, run: 1, entered: make(chan struct{}), release: make(chan struct{})}
+	one.Store, one.Inline = gate, false
+	fetch.fails.Store(1)
+	body := pushBody(sha1)
+	hdr := githubHeaders("push", "s3cret", body)
+	h, err := one.Hook(ctx, "acme", "config", hdr, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		_, _ = one.RunOnce(ctx) // run 1, attempt 1: an error, the retry granted, its record held
+	}()
+	select {
+	case <-gate.entered:
+	case <-time.After(5 * time.Second):
+		close(gate.release)
+		t.Fatal("the first execution did not reach its record")
+	}
+	if job, _ := st.GetGitJob(ctx, h.Job); job.Status != model.GitJobPending || job.Attempts != 1 || job.Run != 1 {
+		t.Fatalf("the first execution must be waiting for its retry: %+v", job)
+	}
+	// The provider redelivers: the job is requeued (attempts start over) and runs at once on
+	// another instance, to success: run 2, attempt 1.
+	two := *one
+	two.Replica, two.Inline = "two", true
+	again, err := two.Hook(ctx, "acme", "config", hdr, body)
+	if err != nil || again.Job != h.Job || again.Outcome != model.GitSyncDone || again.Run != 2 || again.Attempt != 1 {
+		t.Fatalf("the redelivery: %v %+v", err, again)
+	}
+	if job, _ := st.GetGitJob(ctx, h.Job); job.Status != model.GitJobDone || job.Attempts != 1 || job.Run != 2 {
+		t.Fatalf("the job after the redelivery: %+v", job)
+	}
+	// The first execution's record arrives late: refused by the fence.
+	close(gate.release)
+	<-finished
+	raw, _ := st.GetGitSync(ctx, "acme", "config")
+	if raw.Hook.Job != h.Job || raw.Hook.Outcome != model.GitSyncDone || raw.Hook.Run != 2 || raw.Hook.Attempt != 1 || raw.Hook.Error != "" {
+		t.Fatalf("the execution before the redelivery wrote over the one after it: %+v", raw.Hook)
+	}
+	// The same execution may write its outcome again (idempotent), and a newer delivery's
+	// acceptance still fences every execution of the older job.
+	if ok, err := st.RecordGitHookIf(ctx, "acme", "config", *raw.Hook, h.Job, 2); err != nil || !ok {
+		t.Fatalf("the same execution again: %v %v", ok, err)
+	}
+	fetch.heads["main"] = sha2
+	fetch.files[sha2] = map[string][]byte{"bundles/a.yaml": []byte(envYAML("y"))}
+	newer := deliver(t, one, "push", pushBody(sha2))
+	if ok, _ := st.RecordGitHookIf(ctx, "acme", "config", *raw.Hook, h.Job, 2); ok {
+		t.Fatal("an older job wrote over a newer delivery's acceptance")
+	}
+	if g, _ := st.GetGitSync(ctx, "acme", "config"); g.Hook.Job != newer.Job {
+		t.Fatalf("record: %+v", g.Hook)
 	}
 }

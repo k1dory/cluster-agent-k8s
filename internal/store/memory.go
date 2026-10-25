@@ -1112,11 +1112,11 @@ func (m *Memory) RecordGitHook(_ context.Context, tenant, name string, h model.G
 	return nil
 }
 
-func (m *Memory) RecordGitHookIf(_ context.Context, tenant, name string, h model.GitHook, job string, attempt int) (bool, error) {
+func (m *Memory) RecordGitHookIf(_ context.Context, tenant, name string, h model.GitHook, job string, run int) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	g := m.gitSync(tenant, name)
-	if g.Hook != nil && (g.Hook.Job != job || g.Hook.Attempt > attempt) {
+	if g.Hook != nil && (g.Hook.Job != job || g.Hook.Run > run) {
 		return false, nil
 	}
 	g.Hook = &h
@@ -1176,25 +1176,26 @@ func (m *Memory) ClaimGitJob(_ context.Context, owner string, now time.Time, lea
 	until := now.Add(lease)
 	pick.Status, pick.Owner, pick.LeaseUntil, pick.UpdatedAt = model.GitJobRunning, owner, &until, now
 	pick.Attempts++
+	pick.Run++
 	return cloneGitJob(pick), nil
 }
 
-// held returns the job when it is running under owner's attempt, else the conflict.
-func (m *Memory) held(id, owner string, attempt int) (*model.GitJob, error) {
+// held returns the job when it is running under owner's execution, else the conflict.
+func (m *Memory) held(id, owner string, run int) (*model.GitJob, error) {
 	j, ok := m.gitJobs[id]
 	if !ok {
 		return nil, ErrNotFound
 	}
-	if j.Owner != owner || j.Status != model.GitJobRunning || j.Attempts != attempt {
-		return nil, fmt.Errorf("%w: job %s is %s, attempt %d, owned by %q", ErrConflict, id, j.Status, j.Attempts, j.Owner)
+	if j.Owner != owner || j.Status != model.GitJobRunning || j.Run != run {
+		return nil, fmt.Errorf("%w: job %s is %s, run %d, owned by %q", ErrConflict, id, j.Status, j.Run, j.Owner)
 	}
 	return j, nil
 }
 
-func (m *Memory) FinishGitJob(_ context.Context, id, owner string, attempt int, status, outcome, errMsg string) error {
+func (m *Memory) FinishGitJob(_ context.Context, id, owner string, run int, status, outcome, errMsg string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	j, err := m.held(id, owner, attempt)
+	j, err := m.held(id, owner, run)
 	if err != nil {
 		return err
 	}
@@ -1202,10 +1203,10 @@ func (m *Memory) FinishGitJob(_ context.Context, id, owner string, attempt int, 
 	return nil
 }
 
-func (m *Memory) RetryGitJob(_ context.Context, id, owner string, attempt int, notBefore time.Time, errMsg string) error {
+func (m *Memory) RetryGitJob(_ context.Context, id, owner string, run int, notBefore time.Time, errMsg string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	j, err := m.held(id, owner, attempt)
+	j, err := m.held(id, owner, run)
 	if err != nil {
 		return err
 	}
