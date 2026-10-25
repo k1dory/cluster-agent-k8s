@@ -160,7 +160,8 @@ type GitHook struct {
 	Commit   string    `json:"commit,omitempty"`   // the commit it named (head of the push or of the pull request)
 	Number   int       `json:"number,omitempty"`   // the pull/merge request number
 	Delivery string    `json:"delivery,omitempty"` // the provider's delivery id
-	Outcome  string    `json:"outcome,omitempty"`  // done | invalid | stopped | error | ignored
+	Job      string    `json:"job,omitempty"`      // the persisted job that carries the action out
+	Outcome  string    `json:"outcome,omitempty"`  // done | invalid | stopped | error | ignored | superseded
 	Error    string    `json:"error,omitempty"`
 	At       time.Time `json:"at"`
 }
@@ -171,6 +172,36 @@ const (
 	HookActionPlan    = "plan"
 	HookActionIgnored = "ignored"
 	HookIgnored       = "ignored"
+	HookSuperseded    = "superseded" // a push delivery whose head the ref had already moved past
+)
+
+// GitJob is a webhook action waiting to run or running: persisted when the delivery is
+// accepted, claimed by one replica at a time under a lease, finished with an outcome. A replica
+// that dies mid-way leaves a job whose lease lapses, and another replica picks it up; the work
+// itself (a sync, a plan comment) is idempotent, so a repeat is harmless.
+type GitJob struct {
+	ID         string     `json:"id"`
+	Tenant     string     `json:"tenant"`
+	Name       string     `json:"name"`     // the repository
+	Action     string     `json:"action"`   // sync | plan
+	Delivery   string     `json:"delivery"` // provider + delivery id: the same delivery is never two jobs
+	Payload    []byte     `json:"payload"`  // the delivery, reduced (gitsync.Delivery)
+	Status     string     `json:"status"`   // pending | running | done | failed
+	Attempts   int        `json:"attempts"`
+	Owner      string     `json:"owner,omitempty"` // the replica running it
+	LeaseUntil *time.Time `json:"lease_until,omitempty"`
+	Outcome    string     `json:"outcome,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+}
+
+// GitJob statuses.
+const (
+	GitJobPending = "pending"
+	GitJobRunning = "running"
+	GitJobDone    = "done"
+	GitJobFailed  = "failed"
 )
 
 // GitCheck is the last check: the ref's head, or why it could not be read.

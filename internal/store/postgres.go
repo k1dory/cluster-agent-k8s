@@ -1249,3 +1249,77 @@ func decodeGitSync(doc []byte, g *model.GitSync) error {
 	}
 	return nil
 }
+
+// --- Git webhook jobs ---------------------------------------------------------------------------
+
+const gitJobCols = `id, tenant, name, action, delivery, payload, status, attempts, owner, lease_until, outcome, error, created_at, updated_at`
+
+func scanGitJob(row pgx.Row) (*model.GitJob, error) {
+	var j model.GitJob
+	err := row.Scan(&j.ID, &j.Tenant, &j.Name, &j.Action, &j.Delivery, &j.Payload, &j.Status, &j.Attempts, &j.Owner, &j.LeaseUntil, &j.Outcome, &j.Error, &j.CreatedAt, &j.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &j, nil
+}
+
+func (p *Postgres) EnqueueGitJob(ctx context.Context, j *model.GitJob) error {
+	now := time.Now()
+	j.Status, j.CreatedAt, j.UpdatedAt = model.GitJobPending, now, now
+	tag, err := p.pool.Exec(ctx, `INSERT INTO git_jobs (id, tenant, name, action, delivery, payload, status, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8) ON CONFLICT (tenant, name, delivery) DO NOTHING`,
+		j.ID, j.Tenant, j.Name, j.Action, j.Delivery, j.Payload, j.Status, now)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: delivery %s already has a job", ErrConflict, j.Delivery)
+	}
+	return nil
+}
+
+// ClaimGitJob: one statement picks the oldest waiting job and leases it; SKIP LOCKED keeps two
+// replicas from picking the same row.
+func (p *Postgres) ClaimGitJob(ctx context.Context, owner string, now time.Time, lease time.Duration) (*model.GitJob, error) {
+	return scanGitJob(p.pool.QueryRow(ctx, `WITH pick AS (
+			SELECT id FROM git_jobs
+			WHERE status = 'pending' OR (status = 'running' AND lease_until IS NOT NULL AND lease_until <= $2)
+			ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED)
+		UPDATE git_jobs SET status = 'running', owner = $1, lease_until = $3, attempts = attempts + 1, updated_at = $2
+		FROM pick WHERE git_jobs.id = pick.id RETURNING `+qualified("git_jobs", gitJobCols), owner, now, now.Add(lease)))
+}
+
+func (p *Postgres) FinishGitJob(ctx context.Context, id, owner, status, outcome, errMsg string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE git_jobs SET status=$3, outcome=$4, error=$5, lease_until=NULL, updated_at=now()
+		WHERE id=$1 AND owner=$2 AND status='running'`, id, owner, status, outcome, errMsg)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := p.GetGitJob(ctx, id); err != nil {
+			return err
+		}
+		return fmt.Errorf("%w: job %s is no longer running under %q", ErrConflict, id, owner)
+	}
+	return nil
+}
+
+func (p *Postgres) GetGitJob(ctx context.Context, id string) (*model.GitJob, error) {
+	return scanGitJob(p.pool.QueryRow(ctx, `SELECT `+gitJobCols+` FROM git_jobs WHERE id=$1`, id))
+}
+
+func (p *Postgres) GetGitJobByDelivery(ctx context.Context, tenant, name, delivery string) (*model.GitJob, error) {
+	return scanGitJob(p.pool.QueryRow(ctx, `SELECT `+gitJobCols+` FROM git_jobs WHERE tenant=$1 AND name=$2 AND delivery=$3`, tenant, name, delivery))
+}
+
+// qualified prefixes every column of a comma-separated list with the table name.
+func qualified(table, cols string) string {
+	parts := strings.Split(cols, ",")
+	for i, c := range parts {
+		parts[i] = table + "." + strings.TrimSpace(c)
+	}
+	return strings.Join(parts, ", ")
+}

@@ -91,7 +91,7 @@ func newService(t *testing.T, fetch Fetcher) (*Service, *breaking) {
 	planner := plan.Deps{Store: st, Policies: pols, Images: images{}, Secrets: sec}
 	applier := &apply.Controller{Store: st, Planner: planner, Replica: "r1"}
 	repos := gitrepo.New(st, sec)
-	return &Service{Store: st, Repos: repos, Secrets: sec, Fetch: fetch, Applier: applier}, st
+	return &Service{Store: st, Jobs: st, Lock: st.WithTenantLock, Repos: repos, Secrets: sec, Fetch: fetch, Applier: applier, Replica: "r1"}, st
 }
 
 func register(t *testing.T, s *Service, tenant, name, yaml string) {

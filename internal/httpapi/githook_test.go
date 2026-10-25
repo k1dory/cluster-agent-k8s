@@ -147,7 +147,8 @@ func TestGitWebhookRouteSyncsAndPlans(t *testing.T) {
 	if resp.StatusCode != 200 || h.Action != model.HookActionIgnored || !strings.Contains(h.Reason, "another ref") {
 		t.Fatalf("other branch: %d %s", resp.StatusCode, body)
 	}
-	// Events on the tenant's stream: one git.hook per delivery handled, a git.sync, a git.plan.
+	// Events on the tenant's stream: git.hook when a delivery is accepted and when its job ends
+	// (two acted on, one ignored: five), a git.sync, a git.plan.
 	evs, err := s.orch.Store.QueryEvents(context.Background(), store.Filter{Tenant: "alice", Types: []string{"git.hook", "git.sync", "git.plan"}, Limit: 100})
 	if err != nil {
 		t.Fatal(err)
@@ -159,7 +160,7 @@ func TestGitWebhookRouteSyncsAndPlans(t *testing.T) {
 			t.Fatalf("event key: %+v", e)
 		}
 	}
-	if types["git.hook"] != 3 || types["git.sync"] != 1 || types["git.plan"] != 1 {
+	if types["git.hook"] != 5 || types["git.sync"] != 1 || types["git.plan"] != 1 {
 		t.Fatalf("events: %v", types)
 	}
 	// A repository without a webhook secret: deliveries are not found, nothing recorded.

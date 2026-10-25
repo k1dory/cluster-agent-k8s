@@ -84,16 +84,17 @@ func Wire(ctx context.Context, d Deps) (*Services, error) {
 		Planner:  planner,
 		Applier:  applier,
 		GitRepos: svc.GitRepos,
-		GitSync: &gitsync.Service{Store: d.Store, Repos: svc.GitRepos, Secrets: d.Secrets, Fetch: fetch, Applier: applier,
-			Reporter: gitsync.RESTReporter{}, Emit: emitter(d), Log: d.Log},
+		GitSync: &gitsync.Service{Store: d.Store, Jobs: d.Store, Lock: d.Store.WithTenantLock, Repos: svc.GitRepos, Secrets: d.Secrets, Fetch: fetch, Applier: applier,
+			Reporter: gitsync.RESTReporter{}, Emit: emitter(d), Replica: replica, Log: d.Log},
 	}, nil
 }
 
-// Watch runs the snapshot refresh loops until ctx ends.
+// Watch runs the snapshot refresh loops and the webhook job worker until ctx ends.
 func (s *Services) Watch(ctx context.Context, log *slog.Logger) {
 	go s.Bindings.Watch(ctx, log)
 	go s.Tenants.Watch(ctx, log)
 	go s.Connections.Watch(ctx, log)
+	go s.GitSync.Run(ctx)
 }
 
 // API is what the services are installed on (httpapi.Platform).

@@ -143,48 +143,59 @@ func (r RESTReporter) call(ctx context.Context, t Target, method, path string, b
 	return data, nil
 }
 
-func (r RESTReporter) UpsertComment(ctx context.Context, t Target, body string) error {
-	switch t.Provider {
-	case ProviderGitHub:
-		list := fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100", t.Repo, t.Number)
-		data, err := r.call(ctx, t, http.MethodGet, list, nil)
+// maxPages bounds the comment listing (100 per page): a request with more comments than that
+// gets a new comment rather than an unbounded walk.
+const maxPages = 50
+
+// findMarked walks the pages of a comment listing and returns the id of the platform's comment
+// (the one opening with the marker), or 0.
+func (r RESTReporter) findMarked(ctx context.Context, t Target, list string) (int64, error) {
+	for page := 1; page <= maxPages; page++ {
+		data, err := r.call(ctx, t, http.MethodGet, fmt.Sprintf("%s&page=%d", list, page), nil)
 		if err != nil {
-			return err
+			return 0, err
 		}
-		var comments []struct {
+		var items []struct {
 			ID   int64  `json:"id"`
 			Body string `json:"body"`
 		}
-		if err := json.Unmarshal(data, &comments); err != nil {
-			return fmt.Errorf("comments: %w", err)
+		if err := json.Unmarshal(data, &items); err != nil {
+			return 0, fmt.Errorf("comments: %w", err)
 		}
-		for _, c := range comments {
+		for _, c := range items {
 			if strings.HasPrefix(c.Body, render.Marker) {
-				_, err := r.call(ctx, t, http.MethodPatch, fmt.Sprintf("/repos/%s/issues/comments/%d", t.Repo, c.ID), map[string]string{"body": body})
-				return err
+				return c.ID, nil
 			}
+		}
+		if len(items) < 100 {
+			return 0, nil
+		}
+	}
+	return 0, nil
+}
+
+func (r RESTReporter) UpsertComment(ctx context.Context, t Target, body string) error {
+	switch t.Provider {
+	case ProviderGitHub:
+		id, err := r.findMarked(ctx, t, fmt.Sprintf("/repos/%s/issues/%d/comments?per_page=100", t.Repo, t.Number))
+		if err != nil {
+			return err
+		}
+		if id != 0 {
+			_, err := r.call(ctx, t, http.MethodPatch, fmt.Sprintf("/repos/%s/issues/comments/%d", t.Repo, id), map[string]string{"body": body})
+			return err
 		}
 		_, err = r.call(ctx, t, http.MethodPost, fmt.Sprintf("/repos/%s/issues/%d/comments", t.Repo, t.Number), map[string]string{"body": body})
 		return err
 	case ProviderGitLab:
 		project := url.PathEscape(t.Repo)
-		list := fmt.Sprintf("/projects/%s/merge_requests/%d/notes?per_page=100", project, t.Number)
-		data, err := r.call(ctx, t, http.MethodGet, list, nil)
+		id, err := r.findMarked(ctx, t, fmt.Sprintf("/projects/%s/merge_requests/%d/notes?per_page=100", project, t.Number))
 		if err != nil {
 			return err
 		}
-		var notes []struct {
-			ID   int64  `json:"id"`
-			Body string `json:"body"`
-		}
-		if err := json.Unmarshal(data, &notes); err != nil {
-			return fmt.Errorf("notes: %w", err)
-		}
-		for _, n := range notes {
-			if strings.HasPrefix(n.Body, render.Marker) {
-				_, err := r.call(ctx, t, http.MethodPut, fmt.Sprintf("/projects/%s/merge_requests/%d/notes/%d", project, t.Number, n.ID), map[string]string{"body": body})
-				return err
-			}
+		if id != 0 {
+			_, err := r.call(ctx, t, http.MethodPut, fmt.Sprintf("/projects/%s/merge_requests/%d/notes/%d", project, t.Number, id), map[string]string{"body": body})
+			return err
 		}
 		_, err = r.call(ctx, t, http.MethodPost, fmt.Sprintf("/projects/%s/merge_requests/%d/notes", project, t.Number), map[string]string{"body": body})
 		return err

@@ -152,3 +152,87 @@ func TestGitSyncLegacyFlatRecordsAreReadAndMigrated(t *testing.T) {
 		t.Fatalf("a check after the migration: %+v", got)
 	}
 }
+
+// Webhook jobs: one job per delivery, claimed oldest first by one owner under a lease, taken
+// over once the lease lapsed, finished by its holder only; the same contract in memory and in
+// PostgreSQL.
+func TestGitJobContract(t *testing.T) {
+	stores := map[string]Store{"memory": NewMemory()}
+	if dsn := postgresDSNForGitSync(t); dsn != "" {
+		stores["postgres"] = reviewOpenPostgres(t, dsn)
+	}
+	for name, st := range stores {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			if _, err := st.ClaimGitJob(ctx, "one", now, time.Minute); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("claim with no job: %v", err)
+			}
+			a := &model.GitJob{ID: "gitjob_a", Tenant: "acme", Name: "config", Action: "sync", Delivery: "github:d-1", Payload: []byte(`{"after":"aaaa"}`)}
+			if err := st.EnqueueGitJob(ctx, a); err != nil || a.Status != model.GitJobPending {
+				t.Fatalf("enqueue: %v %+v", err, a)
+			}
+			time.Sleep(2 * time.Millisecond)
+			b := &model.GitJob{ID: "gitjob_b", Tenant: "acme", Name: "config", Action: "plan", Delivery: "github:d-2", Payload: []byte(`{}`)}
+			if err := st.EnqueueGitJob(ctx, b); err != nil {
+				t.Fatal(err)
+			}
+			// The same delivery again is a conflict, and findable.
+			dup := &model.GitJob{ID: "gitjob_dup", Tenant: "acme", Name: "config", Action: "sync", Delivery: "github:d-1", Payload: []byte(`{}`)}
+			if err := st.EnqueueGitJob(ctx, dup); !errors.Is(err, ErrConflict) {
+				t.Fatalf("duplicate delivery: %v", err)
+			}
+			if j, err := st.GetGitJobByDelivery(ctx, "acme", "config", "github:d-1"); err != nil || j.ID != "gitjob_a" {
+				t.Fatalf("by delivery: %v %+v", err, j)
+			}
+			// Another repository may carry the same delivery id.
+			if err := st.EnqueueGitJob(ctx, &model.GitJob{ID: "gitjob_c", Tenant: "acme", Name: "other", Action: "sync", Delivery: "github:d-1", Payload: []byte(`{}`)}); err != nil {
+				t.Fatalf("same delivery, other repository: %v", err)
+			}
+			// Claims: oldest first, one owner each, with a lease.
+			j1, err := st.ClaimGitJob(ctx, "one", now, time.Minute)
+			if err != nil || j1.ID != "gitjob_a" || j1.Status != model.GitJobRunning || j1.Owner != "one" || j1.Attempts != 1 || j1.LeaseUntil == nil || !j1.LeaseUntil.Equal(now.Add(time.Minute)) || string(j1.Payload) != `{"after":"aaaa"}` {
+				t.Fatalf("first claim: %v %+v", err, j1)
+			}
+			j2, err := st.ClaimGitJob(ctx, "two", now, time.Minute)
+			if err != nil || j2.ID == j1.ID || j2.Owner != "two" {
+				t.Fatalf("second claim: %v %+v", err, j2)
+			}
+			j3, err := st.ClaimGitJob(ctx, "two", now, time.Minute)
+			if err != nil || j3.ID != "gitjob_c" {
+				t.Fatalf("third claim: %v %+v", err, j3)
+			}
+			if _, err := st.ClaimGitJob(ctx, "three", now, time.Minute); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("every job leased: %v", err)
+			}
+			// A lapsed lease is claimable again (attempt 2); the former holder can no longer finish.
+			j1b, err := st.ClaimGitJob(ctx, "three", now.Add(2*time.Minute), time.Minute)
+			if err != nil || j1b.ID != "gitjob_a" || j1b.Owner != "three" || j1b.Attempts != 2 {
+				t.Fatalf("takeover: %v %+v", err, j1b)
+			}
+			if err := st.FinishGitJob(ctx, "gitjob_a", "one", model.GitJobDone, "done", ""); !errors.Is(err, ErrConflict) {
+				t.Fatalf("the former holder finishing: %v", err)
+			}
+			if err := st.FinishGitJob(ctx, "gitjob_a", "three", model.GitJobDone, "done", ""); err != nil {
+				t.Fatalf("the holder finishing: %v", err)
+			}
+			got, err := st.GetGitJob(ctx, "gitjob_a")
+			if err != nil || got.Status != model.GitJobDone || got.Outcome != "done" || got.LeaseUntil != nil || got.Attempts != 2 {
+				t.Fatalf("finished job: %v %+v", err, got)
+			}
+			// Done jobs are never claimed again; a failed one neither.
+			if err := st.FinishGitJob(ctx, "gitjob_b", "two", model.GitJobFailed, "error", "boom"); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.FinishGitJob(ctx, "gitjob_c", "two", model.GitJobDone, "done", ""); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.ClaimGitJob(ctx, "four", now.Add(time.Hour), time.Minute); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("finished jobs claimed: %v", err)
+			}
+			if _, err := st.GetGitJob(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("unknown job: %v", err)
+			}
+		})
+	}
+}

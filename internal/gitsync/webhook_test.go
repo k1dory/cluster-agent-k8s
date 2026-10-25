@@ -12,7 +12,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"agent-sandbox/internal/gitsync/gittest"
 	"agent-sandbox/internal/model"
@@ -27,10 +29,14 @@ func signGitHub(secret string, body []byte) string {
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
+// Delivery ids are unique per delivery, as the providers' are; a test that wants a redelivery
+// reuses a header set.
+var deliveries atomic.Int64
+
 func githubHeaders(event, secret string, body []byte) http.Header {
 	h := http.Header{}
 	h.Set("X-GitHub-Event", event)
-	h.Set("X-GitHub-Delivery", "d-1")
+	h.Set("X-GitHub-Delivery", fmt.Sprintf("d-%d", deliveries.Add(1)))
 	h.Set("X-Hub-Signature-256", signGitHub(secret, body))
 	return h
 }
@@ -38,7 +44,7 @@ func githubHeaders(event, secret string, body []byte) http.Header {
 func gitlabHeaders(event, secret string) http.Header {
 	h := http.Header{}
 	h.Set("X-Gitlab-Event", event)
-	h.Set("X-Gitlab-Event-UUID", "u-1")
+	h.Set("X-Gitlab-Event-UUID", fmt.Sprintf("u-%d", deliveries.Add(1)))
 	h.Set("X-Gitlab-Token", secret)
 	return h
 }
@@ -46,7 +52,7 @@ func gitlabHeaders(event, secret string) http.Header {
 func TestParseDeliveryAndVerify(t *testing.T) {
 	push := []byte(`{"ref":"refs/heads/main","after":"` + sha1 + `","repository":{"clone_url":"https://git.example.com/acme/config.git","html_url":"https://git.example.com/acme/config"}}`)
 	d, err := ParseDelivery(githubHeaders("push", "s", push), push)
-	if err != nil || d.Provider != ProviderGitHub || d.Event != EventPush || d.Ref != "refs/heads/main" || d.After != sha1 || d.ID != "d-1" {
+	if err != nil || d.Provider != ProviderGitHub || d.Event != EventPush || d.Ref != "refs/heads/main" || d.After != sha1 || !strings.HasPrefix(d.ID, "d-") {
 		t.Fatalf("github push: %v %+v", err, d)
 	}
 	deleted := []byte(`{"ref":"refs/heads/main","after":"0000000000000000000000000000000000000000","deleted":true,"repository":{"clone_url":"https://git.example.com/acme/config.git"}}`)
@@ -63,7 +69,7 @@ func TestParseDeliveryAndVerify(t *testing.T) {
 	}
 	glPush := []byte(`{"object_kind":"push","ref":"refs/heads/main","after":"` + sha1 + `","project":{"web_url":"https://gitlab.example/acme/config","http_url":"https://gitlab.example/acme/config.git"}}`)
 	d, err = ParseDelivery(gitlabHeaders("Push Hook", "s"), glPush)
-	if err != nil || d.Provider != ProviderGitLab || d.Event != EventPush || d.After != sha1 || d.ID != "u-1" {
+	if err != nil || d.Provider != ProviderGitLab || d.Event != EventPush || d.After != sha1 || !strings.HasPrefix(d.ID, "u-") {
 		t.Fatalf("gitlab push: %v %+v", err, d)
 	}
 	mr := []byte(`{"object_kind":"merge_request","object_attributes":{"iid":3,"action":"update","last_commit":{"id":"` + sha1 + `"}},"project":{"web_url":"https://gitlab.example/acme/config"}}`)
@@ -240,7 +246,8 @@ func TestHookSyncsOnPushPlansOnPullRequestAndIgnoresTheRest(t *testing.T) {
 	if err != nil || a.Subject != "webhook:github" || a.Admin {
 		t.Fatalf("the apply of a webhook sync: %v %+v", err, a)
 	}
-	// Events: git.hook per delivery, git.plan for the plan, git.sync for the sync.
+	// Events: git.hook when a delivery is accepted (with its job) and again with its outcome,
+	// git.plan for the plan, git.sync for the sync.
 	types := map[string]int{}
 	for _, e := range events {
 		types[e.Type]++
@@ -248,7 +255,7 @@ func TestHookSyncsOnPushPlansOnPullRequestAndIgnoresTheRest(t *testing.T) {
 			t.Fatalf("event scope: %+v", e)
 		}
 	}
-	if types["git.hook"] != 2 || types["git.plan"] != 1 || types["git.sync"] != 1 {
+	if types["git.hook"] != 4 || types["git.plan"] != 1 || types["git.sync"] != 1 {
 		t.Fatalf("events: %v", types)
 	}
 	// Ignored deliveries: another branch, a deleted ref, a closed pull request, another
@@ -499,5 +506,274 @@ func TestHookPlansAPullRequestHeadFromARealServer(t *testing.T) {
 	it, err := st.GetItem(ctx, model.KindEnvironment, "acme", "py", 0)
 	if err != nil || it.Source == nil || it.Source.Commit != base || strings.Contains(string(it.Spec), "debug") {
 		t.Fatalf("synced item: %v %+v", err, it)
+	}
+}
+
+// Deliveries arrive in any order. A push delivery handled after a newer head was applied is
+// superseded (nothing written, the newer state stays); a push delivery whose head has moved on
+// syncs the ref's current head, not the commit it named.
+func TestLatePushNeverRollsBackANewerHead(t *testing.T) {
+	ctx := context.Background()
+	old := "kind: EnvironmentProfile\nname: py\nspec: {image: stable}\n"
+	newer := "kind: EnvironmentProfile\nname: py\nspec: {image: stable, env: {LOG: debug}}\n"
+	fetch := &refFetcher{auth: "tok", heads: map[string]string{"main": sha2},
+		files: map[string]map[string][]byte{sha1: {"bundles/a.yaml": []byte(old)}, sha2: {"bundles/a.yaml": []byte(newer)}}}
+	s, st := newService(t, fetch)
+	s.Secrets = secrets.Static{"acme/repo-token": "tok", "acme/hook-secret": "s3cret"}
+	s.Repos.Secrets = s.Secrets
+	s.Inline = true
+	register(t, s, "acme", "config", "kind: GitRepository\nname: config\nspec: {url: https://git.example.com/acme/config.git, ref: main, paths: ['bundles/*.yaml'], credential: repo-token, webhook_secret: hook-secret}\n")
+	// The head is sha2; the delivery for sha1 (an older push) arrives first: the current head is
+	// what gets synced, with a note; nothing of sha1 is applied.
+	pushOld := []byte(`{"ref":"refs/heads/main","after":"` + sha1 + `","repository":{"clone_url":"https://git.example.com/acme/config.git"}}`)
+	h, err := s.Hook(ctx, "acme", "config", githubHeaders("push", "s3cret", pushOld), pushOld)
+	if err != nil || h.Outcome != model.GitSyncDone || h.Commit != sha2 || !strings.Contains(h.Reason, "head is "+sha2) {
+		t.Fatalf("old push with a newer head: %v %+v", err, h)
+	}
+	it, _ := st.GetItem(ctx, model.KindEnvironment, "acme", "py", 0)
+	if it == nil || it.Source.Commit != sha2 || !strings.Contains(string(it.Spec), "debug") {
+		t.Fatalf("the newer head was not what got applied: %+v", it)
+	}
+	// The same old delivery again (a redelivery with another id): superseded, no revision.
+	hdr := githubHeaders("push", "s3cret", pushOld)
+	hdr.Set("X-GitHub-Delivery", "d-late")
+	h, err = s.Hook(ctx, "acme", "config", hdr, pushOld)
+	if err != nil || h.Outcome != model.HookSuperseded {
+		t.Fatalf("late old push: %v %+v", err, h)
+	}
+	if n := revs(t, st, model.KindEnvironment, "acme", "py"); n != 1 {
+		t.Fatalf("a late push wrote: %d revisions", n)
+	}
+	// The ref is force-moved back to sha1: the head is what the repository declares, so a
+	// push delivery now syncs sha1 (a new revision with the older content, by the repository's
+	// own decision, with its commit on it).
+	fetch.heads["main"] = sha1
+	hdr.Set("X-GitHub-Delivery", "d-force")
+	if h, err := s.Hook(ctx, "acme", "config", hdr, pushOld); err != nil || h.Outcome != model.GitSyncDone || h.Commit != sha1 {
+		t.Fatalf("after a force push: %v %+v", err, h)
+	}
+	if it, _ := st.GetItem(ctx, model.KindEnvironment, "acme", "py", 0); it.Source.Commit != sha1 {
+		t.Fatalf("the declared head after a force push: %+v", it.Source)
+	}
+}
+
+// slowFetcher blocks Resolve until released: a job caught mid-way.
+type slowFetcher struct {
+	*refFetcher
+	release chan struct{}
+}
+
+func (f *slowFetcher) Resolve(ctx context.Context, r Remote) (string, error) {
+	select {
+	case <-f.release:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	return f.refFetcher.Resolve(ctx, r)
+}
+
+// An accepted delivery is a persisted job: a redelivery is the same job; a job the replica that
+// accepted it never ran (it died) is claimed by another replica; one whose lease lapsed mid-way
+// is taken over; two replicas never run one job at once.
+func TestJobsSurviveTheReplicaThatAcceptedThem(t *testing.T) {
+	ctx := context.Background()
+	env := "kind: EnvironmentProfile\nname: py\nspec: {image: stable}\n"
+	fetch := &refFetcher{auth: "tok", heads: map[string]string{"main": sha1}, files: map[string]map[string][]byte{sha1: {"bundles/a.yaml": []byte(env)}}}
+	one, st := newService(t, fetch)
+	one.Secrets = secrets.Static{"acme/repo-token": "tok", "acme/hook-secret": "s3cret"}
+	one.Repos.Secrets = one.Secrets
+	one.Replica, one.Inline = "one", false // accepts, never runs: the replica that dies
+	register(t, one, "acme", "config", "kind: GitRepository\nname: config\nspec: {url: https://git.example.com/acme/config.git, ref: main, paths: ['bundles/*.yaml'], credential: repo-token, webhook_secret: hook-secret}\n")
+	push := []byte(`{"ref":"refs/heads/main","after":"` + sha1 + `","repository":{"clone_url":"https://git.example.com/acme/config.git"}}`)
+	hdr := githubHeaders("push", "s3cret", push)
+	h, err := one.Hook(ctx, "acme", "config", hdr, push)
+	if err != nil || h.Job == "" || h.Outcome != "" {
+		t.Fatalf("accepted delivery: %v %+v", err, h)
+	}
+	// The provider redelivers (same delivery id): the same job, nothing enqueued twice; a new
+	// delivery of the same push is a job of its own.
+	if again, err := one.Hook(ctx, "acme", "config", hdr, push); err != nil || again.Job != h.Job || !strings.Contains(again.Reason, "redelivery") {
+		t.Fatalf("redelivery: %v %+v", err, again)
+	}
+	if n := revs(t, st, model.KindEnvironment, "acme", "py"); n != 0 {
+		t.Fatal("nothing should have run yet")
+	}
+	// Another replica on the same store runs it.
+	two := *one
+	two.Replica = "two"
+	if ran, err := two.RunOnce(ctx); err != nil || !ran {
+		t.Fatalf("replica two claims the job: %v %v", ran, err)
+	}
+	job, err := st.GetGitJob(ctx, h.Job)
+	if err != nil || job.Status != model.GitJobDone || job.Outcome != model.GitSyncDone || job.Owner != "two" || job.Attempts != 1 {
+		t.Fatalf("job after replica two: %v %+v", err, job)
+	}
+	if ran, _ := two.RunOnce(ctx); ran {
+		t.Fatal("a done job was claimed again")
+	}
+	g, _ := one.Status(ctx, plan.Scope{Tenant: "acme"}, "config")
+	if g.Hook == nil || g.Hook.Outcome != model.GitSyncDone || g.Hook.Job != h.Job || g.Sync == nil || g.Sync.Commit != sha1 {
+		t.Fatalf("status after the job: %+v", g)
+	}
+	// A job caught mid-way: replica one claims it and stalls; once its lease lapses, replica
+	// two takes it over and finishes; one's late finish is refused (conflict), and the item
+	// was written once.
+	slow := &slowFetcher{refFetcher: fetch, release: make(chan struct{})}
+	fetch.heads["main"] = sha2
+	fetch.files[sha2] = map[string][]byte{"bundles/a.yaml": []byte(env + "---\nkind: EnvironmentProfile\nname: go\nspec: {image: stable}\n")}
+	push2 := []byte(`{"ref":"refs/heads/main","after":"` + sha2 + `","repository":{"clone_url":"https://git.example.com/acme/config.git"}}`)
+	h2, err := one.Hook(ctx, "acme", "config", githubHeaders("push", "s3cret", push2), push2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stalled := *one
+	stalled.Fetch, stalled.Lease, stalled.Replica = slow, 50*time.Millisecond, "stalled"
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		_, _ = stalled.RunOnce(ctx) // blocks in Resolve until released; its lease lapses meanwhile
+	}()
+	time.Sleep(120 * time.Millisecond)
+	if ran, err := two.RunOnce(ctx); err != nil || !ran {
+		t.Fatalf("replica two takes over a lapsed lease: %v %v", ran, err)
+	}
+	close(slow.release)
+	<-finished
+	job, _ = st.GetGitJob(ctx, h2.Job)
+	if job.Status != model.GitJobDone || job.Owner != "two" || job.Attempts != 2 {
+		t.Fatalf("job after the takeover: %+v", job)
+	}
+	if n := revs(t, st, model.KindEnvironment, "acme", "go"); n != 1 {
+		t.Fatalf("the taken-over job's item was written %d times", n)
+	}
+}
+
+// Two bundle files where the second names what the first introduces: planned as one bundle,
+// the pull request plan is valid (a sync applies the files in order), with a section per file.
+func TestPullRequestPlanSeesEarlierFilesOfTheSameHead(t *testing.T) {
+	ctx := context.Background()
+	fetch := &refFetcher{auth: "tok", heads: map[string]string{"refs/pull/7/head": sha2}, files: map[string]map[string][]byte{sha2: {
+		"bundles/10-env.yaml":   []byte("kind: EnvironmentProfile\nname: py\nspec: {image: stable}\n"),
+		"bundles/20-agent.yaml": []byte("kind: AgentDefinition\nname: backend\nspec: {policy: backend-dev, environment: py}\n"),
+	}}}
+	s, _ := newService(t, fetch)
+	s.Secrets = secrets.Static{"acme/repo-token": "tok", "acme/hook-secret": "s3cret"}
+	s.Repos.Secrets = s.Secrets
+	rep := &fakeReporter{}
+	s.Reporter, s.Inline = rep, true
+	register(t, s, "acme", "config", "kind: GitRepository\nname: config\nspec: {url: https://git.example.com/acme/config.git, ref: main, paths: ['bundles/*.yaml'], credential: repo-token, webhook_secret: hook-secret}\n")
+	pr := []byte(`{"action":"opened","number":7,"pull_request":{"number":7,"head":{"sha":"` + sha2 + `"}},"repository":{"clone_url":"https://git.example.com/acme/config.git"}}`)
+	h, err := s.Hook(ctx, "acme", "config", githubHeaders("pull_request", "s3cret", pr), pr)
+	if err != nil || h.Outcome != model.GitSyncDone {
+		t.Fatalf("plan across files: %v %+v", err, h)
+	}
+	body := rep.comments["github acme/config #7"][0]
+	if strings.Count(body, render.Marker) != 2 || !strings.Contains(body, "`bundles/10-env.yaml`") || !strings.Contains(body, "`bundles/20-agent.yaml`") || strings.Contains(body, "❌") || !strings.Contains(body, "| ➕ create | AgentDefinition | acme | `backend` |") {
+		t.Fatalf("two sections, both valid:\n%s", body)
+	}
+	if st := rep.statuses["github acme/config #7"]; len(st) != 1 || !strings.HasPrefix(st[0], "success: plan: 2 to apply") {
+		t.Fatalf("status: %q", st)
+	}
+	// The same item in two files is a bundle-level error, shown with the first section.
+	fetch.files[sha2]["bundles/30-dup.yaml"] = []byte("kind: EnvironmentProfile\nname: py\nspec: {image: stable}\n")
+	hdr := githubHeaders("pull_request", "s3cret", pr)
+	hdr.Set("X-GitHub-Delivery", "d-2")
+	if h, err := s.Hook(ctx, "acme", "config", hdr, pr); err != nil || h.Outcome != model.GitSyncInvalid {
+		t.Fatalf("duplicate across files: %v %+v", err, h)
+	}
+	if body := rep.comments["github acme/config #7"][1]; !strings.Contains(body, "both describe") {
+		t.Fatalf("the duplicate is not reported:\n%s", body)
+	}
+}
+
+// failingReporter refuses comments but takes statuses.
+type failingReporter struct {
+	fakeReporter
+}
+
+func (f *failingReporter) UpsertComment(context.Context, Target, string) error {
+	return errors.New("comments are disabled (HTTP 403)")
+}
+
+// A comment that cannot be posted does not keep the commit status from being set: a failing
+// plan still turns the pull request red, and the hook records the comment error.
+func TestStatusIsSetEvenWhenTheCommentFails(t *testing.T) {
+	ctx := context.Background()
+	fetch := &refFetcher{auth: "tok", heads: map[string]string{"refs/pull/7/head": sha2},
+		files: map[string]map[string][]byte{sha2: {"bundles/a.yaml": []byte("kind: PolicyBinding\nname: backend-dev\nspec: {}\n")}}}
+	s, _ := newService(t, fetch)
+	s.Secrets = secrets.Static{"acme/repo-token": "tok", "acme/hook-secret": "s3cret"}
+	s.Repos.Secrets = s.Secrets
+	rep := &failingReporter{}
+	s.Reporter, s.Inline = rep, true
+	register(t, s, "acme", "config", "kind: GitRepository\nname: config\nspec: {url: https://git.example.com/acme/config.git, ref: main, paths: ['bundles/*.yaml'], credential: repo-token, webhook_secret: hook-secret}\n")
+	pr := []byte(`{"action":"opened","number":7,"pull_request":{"number":7,"head":{"sha":"` + sha2 + `"}},"repository":{"clone_url":"https://git.example.com/acme/config.git"}}`)
+	h, err := s.Hook(ctx, "acme", "config", githubHeaders("pull_request", "s3cret", pr), pr)
+	if err != nil || h.Outcome != model.GitSyncError || !strings.Contains(h.Error, "comments are disabled") {
+		t.Fatalf("comment failure: %v %+v", err, h)
+	}
+	if st := rep.statuses["github acme/config #7"]; len(st) != 1 || !strings.HasPrefix(st[0], "failure: plan: a bundle is not valid") {
+		t.Fatalf("the status must be set regardless: %q", st)
+	}
+}
+
+// Comment listings are paged: the platform's comment on page two is updated, not duplicated.
+func TestReporterFindsItsCommentBeyondTheFirstPage(t *testing.T) {
+	type call struct{ method, path string }
+	var mu sync.Mutex
+	var calls []call
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		calls = append(calls, call{r.Method, r.URL.String()})
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == "GET":
+			page := r.URL.Query().Get("page")
+			var list []map[string]any
+			switch page {
+			case "1":
+				for i := 0; i < 100; i++ {
+					list = append(list, map[string]any{"id": i + 1, "body": fmt.Sprintf("human comment %d", i)})
+				}
+			case "2":
+				list = append(list, map[string]any{"id": 777, "body": render.Marker + "\nold plan"})
+			}
+			_ = json.NewEncoder(w).Encode(list)
+		default:
+			fmt.Fprint(w, `{}`)
+		}
+	}))
+	defer srv.Close()
+	rep := RESTReporter{Client: srv.Client()}
+	for _, t2 := range []Target{
+		{Provider: ProviderGitHub, APIBase: srv.URL, Repo: "acme/config", Number: 7, Token: "x"},
+		{Provider: ProviderGitLab, APIBase: srv.URL, Repo: "acme/config", Number: 7, Token: "x"},
+	} {
+		mu.Lock()
+		calls = nil
+		mu.Unlock()
+		if err := rep.UpsertComment(context.Background(), t2, render.Marker+"\nnew plan"); err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		var posts, updates, pages int
+		for _, c := range calls {
+			switch {
+			case c.method == "GET":
+				pages++
+			case c.method == "POST":
+				posts++
+			case c.method == "PATCH" || c.method == "PUT":
+				updates++
+				if !strings.HasSuffix(c.path, "777") {
+					t.Fatalf("%s: updated the wrong comment: %s", t2.Provider, c.path)
+				}
+			}
+		}
+		mu.Unlock()
+		if pages != 2 || posts != 0 || updates != 1 {
+			t.Fatalf("%s: pages %d posts %d updates %d (%+v)", t2.Provider, pages, posts, updates, calls)
+		}
 	}
 }
