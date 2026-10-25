@@ -1,4 +1,6 @@
-# Policy-as-Code gate: every change to policies/ must validate and pass the expectations.
+# Policy-as-Code gate on its own: every change to policies/ must validate, pass the expectations
+# and render a gateway configuration Caddy accepts. The same target as the `unit` job of ci.yaml
+# runs (`make ci-policy`, docs/ci-contract.md); this workflow only triggers it on the paths.
 name: policies
 on:
   pull_request:
@@ -13,19 +15,4 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go build -o /tmp/sandboxd ./cmd/sandboxd
-      - run: /tmp/sandboxd policy validate policies
-      - run: /tmp/sandboxd policy test policies -f policies/tests.yaml
-      - name: render the gateway config the way production will see it and validate it with Caddy
-        run: |
-          cat > /tmp/render.yaml <<CFG
-          policies_dir: policies
-          ca: { dir: /tmp/ca }
-          runtime: fake
-          gateway: { ip: 10.77.77.1, caddy_admin: "http://127.0.0.1:2019" }
-          preview: { domain: preview.example.com }
-          CFG
-          /tmp/sandboxd policy render -config /tmp/render.yaml > /tmp/Caddyfile
-          curl -sSfL -o /tmp/caddy.tgz "https://github.com/caddyserver/caddy/releases/download/v2.10.0/caddy_2.10.0_linux_amd64.tar.gz"
-          tar -C /tmp -xzf /tmp/caddy.tgz caddy
-          /tmp/caddy validate --adapter caddyfile --config /tmp/Caddyfile
+      - run: make ci-policy

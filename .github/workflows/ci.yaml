@@ -1,35 +1,45 @@
-# Build, vet, unit tests, policy gate, chart lint, and the gateway path on a real Caddy for
-# every supported Caddy minor (the gateway configuration is generated for Caddy 2.8+:
-# trust_pool inline needs 2.8, Caddy 1 is end of life).
+# The product CI under the shared contract (docs/ci-contract.md): every check is a Make target
+# (`make ci-<group>`, implemented once in the Makefile and hack/ci), and this file only selects
+# events, arranges the jobs, prepares the runner's tools and services, maps the runner's context
+# to the targets' explicit inputs and calls them. .forgejo/workflows/ci.yaml and .gitlab-ci.yml
+# call the same targets; `make ci` runs the whole required set on a developer's machine.
 name: ci
 on:
   pull_request:
   push:
     branches: [main]
 jobs:
+  versions:
+    # The matrices and service versions, read from hack/ci/versions.env (the one definition)
+    # instead of being copied into this file.
+    runs-on: ubuntu-latest
+    outputs:
+      caddy: ${{ steps.v.outputs.caddy }}
+      postgres: ${{ steps.v.outputs.postgres }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: hack/ci/versions.sh github >> "$GITHUB_OUTPUT"
   unit:
+    # Build, formatting and vet, every regression test under the race detector, the policy gate.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go build ./...
-      - run: go vet ./... && test -z "$(gofmt -l .)"
-      # Every regression test, under the race detector: the apply controller, the chat
-      # continuity and the store contract on the in-memory store run here on every PR.
-      - run: go test ./... -count=1 -race
-      - run: go run ./cmd/sandboxd policy validate policies
-      - run: go run ./cmd/sandboxd policy test policies -f policies/tests.yaml
+      - run: make ci-build
+      - run: make ci-vet
+      - run: make ci-unit
+      - run: make ci-policy
   postgres:
-    # The store contract on a real PostgreSQL: fresh schema, upgrade from earlier schemas,
-    # concurrent writers across two pools, revision numbers never reused, apply steps that
-    # refuse a stale noop or a changed history. SANDBOX_TEST_REQUIRE_EXTERNAL turns the
-    # "no database configured" skip into a failure so a broken service cannot pass silently.
+    # The store and Git job contracts on a real PostgreSQL; the service is mapped to the
+    # target's input, SANDBOX_TEST_POSTGRES_URL.
+    needs: versions
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        image: ${{ needs.versions.outputs.postgres }}
         env:
           POSTGRES_USER: sandbox
           POSTGRES_PASSWORD: sandbox
@@ -42,98 +52,39 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test ./internal/store/ -count=1 -race -v
+      - run: make ci-postgres
         env:
           SANDBOX_TEST_POSTGRES_URL: postgres://sandbox:sandbox@127.0.0.1:5432/sandbox_test?sslmode=disable
-          SANDBOX_TEST_REQUIRE_EXTERNAL: "1"
   caddy:
+    # The gateway on a real Caddy, one job per supported version (the target downloads it).
+    needs: versions
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        caddy: ["2.8.4", "2.9.1", "2.10.0"]
+        caddy: ${{ fromJSON(needs.versions.outputs.caddy) }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: install caddy ${{ matrix.caddy }}
-        run: |
-          curl -sSfL -o /tmp/caddy.tgz "https://github.com/caddyserver/caddy/releases/download/v${{ matrix.caddy }}/caddy_${{ matrix.caddy }}_linux_amd64.tar.gz"
-          tar -C /tmp -xzf /tmp/caddy.tgz caddy
-          /tmp/caddy version
-      - name: gateway end to end (render, push, bootstrap, mTLS, policy, injection, agent API)
-        run: CADDY_BIN=/tmp/caddy SANDBOX_TEST_REQUIRE_EXTERNAL=1 go test ./internal/integration/ -count=1 -v
-      - name: the rendered Caddyfile also passes `caddy validate`
-        run: |
-          cat > /tmp/render.yaml <<CFG
-          policies_dir: policies
-          ca: { dir: /tmp/ca }
-          runtime: fake
-          gateway: { ip: 10.77.77.1, caddy_admin: "http://127.0.0.1:2019" }
-          preview: { domain: preview.example.com }
-          CFG
-          go run ./cmd/sandboxd policy render -config /tmp/render.yaml > /tmp/Caddyfile
-          /tmp/caddy validate --adapter caddyfile --config /tmp/Caddyfile
+      - run: make ci-caddy CADDY_VERSION=${{ matrix.caddy }}
   helm:
+    # Chart lint and the rendered manifests (the target downloads the pinned Helm).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: azure/setup-helm@v4
-        with:
-          version: v3.16.4
-      - run: make helm-lint
-      - name: rendered manifests are up to date
-        run: make manifests && git diff --exit-code deploy/k8s
+      - run: make ci-helm
   images:
+    # The three images and what they carry, on the runner's Docker.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: build the agent image
-        run: docker build -f images/agent/Dockerfile -t agent-sandbox/agent:ci .
-      - name: build the control plane image and check what it carries (git for GitRepository syncs, nonroot)
-        run: |
-          docker build -f images/sandboxd/Dockerfile -t agent-sandbox/sandboxd:ci .
-          docker run --rm --entrypoint git agent-sandbox/sandboxd:ci --version
-          test "$(docker run --rm --entrypoint id agent-sandbox/sandboxd:ci -u)" = 65532
-      - name: build the sandboxctl image for CI jobs (the Git adapters) and run it once
-        run: |
-          docker build -f images/sandboxd/Dockerfile --target sandboxctl -t agent-sandbox/sandboxctl:ci .
-          docker run --rm agent-sandbox/sandboxctl:ci 2>&1 | head -3
-          docker run --rm --entrypoint sh agent-sandbox/sandboxctl:ci -c 'command -v curl jq git >/dev/null && echo tools-present'
-      - name: the image reads a checkout owned by another user (the CI case) and records its SHA
-        run: |
-          # The runner's checkout is owned by the runner, the image runs as uid 1000: without the
-          # image's safe.directory Git refuses it, and apply would have no commit to record.
-          test "$(stat -c %u .)" != 1000
-          docker run --rm -v "$PWD:/w" -w /w --entrypoint git agent-sandbox/sandboxctl:ci rev-parse HEAD | grep -qx "$GITHUB_SHA"
-          # apply -require-commit reads the source before it asks the platform: with none
-          # reachable, a clean checkout fails at the request (exit 1, a marker block, no
-          # -require-commit complaint); a modified file fails on the missing SHA.
-          ctl() { docker run --rm -v "$PWD:/w" -w /w -e SANDBOXD_URL=http://127.0.0.1:9 -e SANDBOXD_TOKEN=x agent-sandbox/sandboxctl:ci "$@" 2>&1; }
-          set +e
-          out=$(ctl apply -f examples/catalog/bundle.yaml -require-commit -markdown); code=$?
-          echo "$out"
-          [ "$code" -eq 1 ] && echo "$out" | grep -q '<!-- agent-sandbox -->' && ! echo "$out" | grep -q 'require-commit' || exit 1
-          echo "# touched" >> examples/catalog/bundle.yaml
-          out=$(ctl apply -f examples/catalog/bundle.yaml -require-commit -markdown); code=$?
-          echo "$out"
-          [ "$code" -eq 1 ] && echo "$out" | grep -q 'require-commit: no commit SHA' || exit 1
-          git checkout -- examples/catalog/bundle.yaml
-      - name: smoke test the shipped agent image (user, tools, netlock, agent-init, agent-runner)
-        run: hack/smoke-image.sh agent-sandbox/agent:ci
-      - name: network lock on an isolated Docker network (pod ↔ pod denied, gateway ↔ pod allowed both ways)
-        run: python3 hack/test-netlock.py agent-sandbox/agent:ci
-
-  # The Git adapters on a real runner: the control plane from its image, sandboxctl from its
-  # image, a runner-owned checkout, the templates' own shell (GitHub steps and GitLab scripts).
+      - run: make ci-images
   git-adapter-e2e:
+    # The Git adapters on a real runner: plan → merge → SHA → drift → guarded re-run → dirty
+    # refusal → GitLab jobs, from the images.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: build the control plane and sandboxctl images
-        run: |
-          docker build -f images/sandboxd/Dockerfile -t agent-sandbox/sandboxd:ci .
-          docker build -f images/sandboxd/Dockerfile --target sandboxctl -t agent-sandbox/sandboxctl:ci .
-      - name: plan → merge → SHA → drift → guarded re-run → dirty refusal → GitLab jobs
-        run: hack/e2e-git-adapter.sh agent-sandbox/sandboxd:ci agent-sandbox/sandboxctl:ci
+      - run: make ci-e2e-git

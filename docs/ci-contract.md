@@ -1,7 +1,7 @@
 # Shared CI contract
 
-Status: accepted. This is the required design for future CI changes; adoption across all
-providers is still in progress.
+Status: accepted and implemented for the common commands and the three adapters; see
+*Adoption* for what has been verified where.
 
 **Checks are implemented once. GitHub, GitLab, Forgejo and local development invoke the same
 commands. A fix to a check is made in one place.**
@@ -62,13 +62,48 @@ events and report delivery; they do not implement another apply engine.
 - Provider parity is accepted after runs on GitHub, GitLab and Forgejo and a local run using
   the shared commands. Any unverified provider or missing prerequisite is stated explicitly.
 
+## Common commands
+
+The shared implementation is the `Makefile` and `hack/ci/`. Each group is one target that ends
+with the line `ci: <group>: ok` and exits non-zero otherwise; a tool or service it needs and
+cannot find is a failure. `make ci` runs the full required set in order; `make ci-fast` runs
+the subset a developer runs before pushing and says so in its last line.
+
+| Target | Checks | Inputs and prerequisites |
+|---|---|---|
+| `ci-build` | `go build ./...`; the version copies a provider file must carry match `hack/ci/versions.env` and `go.mod` | Go (`go.mod`'s version) |
+| `ci-vet` | `go vet`, `gofmt` | Go |
+| `ci-unit` | every test under the race detector, in-memory store | Go |
+| `ci-policy` | policies validate, expectations pass, the rendered gateway configuration passes `caddy validate` | Go; `CADDY_BIN`, else the newest supported Caddy is downloaded |
+| `ci-postgres` | store, Git job and record contracts, the database-taking tests of `internal/gitsync` | `SANDBOX_TEST_POSTGRES_URL` (required; the provider maps its service to it) |
+| `ci-caddy` | the gateway end to end on a real Caddy and `caddy validate`, per supported version | `CADDY_VERSION=x.y.z` for one version (a provider's matrix), `CADDY_BIN` for a binary of yours, else every version in `versions.env` is downloaded |
+| `ci-helm` | chart lint in both layouts; `deploy/k8s` is what the chart renders | `HELM`, else the pinned Helm is downloaded |
+| `ci-images` | the three images build; git and nonroot in the control plane; sandboxctl's tools, a checkout owned by another user, `-require-commit`; the agent image's smoke test and network lock | Docker (a daemon; the CLI is downloaded when missing), python3; `IMAGE_PREFIX`, `IMAGE_TAG` |
+| `ci-e2e-git` | the Git adapters end to end from the images (`hack/e2e-git-adapter.sh`) | Docker, python3 with PyYAML; `IMAGE_PREFIX`, `IMAGE_TAG` |
+| `ci-versions` | prints the shared versions | |
+
+Versions and matrices (Caddy, Helm, PostgreSQL, the docker CLI) are defined once in
+`hack/ci/versions.env`; `hack/ci/versions.sh github` turns them into job outputs, so a
+workflow's matrix is read from that file rather than copied. Where a provider file cannot read
+it (GitLab's service and job images are literals), `ci-build` verifies the copy.
+
+The provider files call the targets and nothing else: `.github/workflows/ci.yaml` and
+`policies.yaml`, `.forgejo/workflows/ci.yaml` and `policies.yaml`, `.gitlab-ci.yml`. They
+select events, arrange jobs, set up Go, start the PostgreSQL service and, for the Docker
+groups, a daemon, and map those to the inputs above.
+
 ## Adoption
 
-At adoption of this contract, GitHub has the full product CI, Forgejo has a policy workflow,
-and GitLab has a configuration-repository template under `deploy/git/gitlab/`. That template
-does not build or test this product. Existing Make targets also do not yet cover the complete
-CI command set through one common entry point.
+Implemented: the common targets and scripts above; GitHub, Forgejo and GitLab adapters that
+call them; the GitHub policies workflow and its Forgejo twin on `make ci-policy`.
 
-Implementation must extract the shared commands from the existing checks, make GitHub invoke
-them, and add the full GitLab and Forgejo adapters. This document records the agreement;
-it does not claim that this migration has already been implemented or verified.
+Verified at adoption (2026-10-25):
+
+- GitHub: the full set runs on every pull request and on `main` (the `ci` workflow).
+- Local, in a container without a Docker daemon: `ci-build`, `ci-vet`, `ci-unit`, `ci-policy`,
+  `ci-postgres` (PostgreSQL 16), `ci-caddy` (2.8.4, 2.9.1, 2.10.0 downloaded), `ci-helm`
+  (v3.16.4 downloaded) pass; `ci-images` and `ci-e2e-git` fail with "no daemon answers", as
+  required (never a pass).
+- Not verified on their runners: Forgejo and GitLab. Their files parse and call the same
+  targets; the runner labels (`docker`, `docker-host`), the Docker-in-Docker service and the
+  Forgejo `services:` support are to be confirmed on a real instance before parity is claimed.
