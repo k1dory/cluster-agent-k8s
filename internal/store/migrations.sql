@@ -208,3 +208,14 @@ CREATE TABLE IF NOT EXISTS git_syncs (
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant, name)
 );
+
+-- Records written before the record had two halves kept check and sync fields at the root.
+-- Each half missing in the new form is built from those fields (a half already written in the
+-- new form wins), then the root fields go. Idempotent: a converted record has no root field.
+UPDATE git_syncs SET doc =
+    (doc - 'tenant' - 'name' - 'head' - 'checked_at' - 'check_error' - 'commit' - 'bundles' - 'status' - 'error' - 'synced_at' - 'updated_at')
+    || CASE WHEN doc ? 'check' OR NOT (doc ? 'checked_at') THEN '{}'::jsonb
+            ELSE jsonb_build_object('check', jsonb_strip_nulls(jsonb_build_object('head', doc->'head', 'at', doc->'checked_at', 'error', doc->'check_error'))) END
+    || CASE WHEN doc ? 'sync' OR NOT (doc ? 'synced_at') THEN '{}'::jsonb
+            ELSE jsonb_build_object('sync', jsonb_strip_nulls(jsonb_build_object('commit', doc->'commit', 'bundles', doc->'bundles', 'status', doc->'status', 'error', doc->'error', 'at', doc->'synced_at'))) END
+WHERE doc ?| array['checked_at', 'synced_at', 'head', 'commit', 'status', 'bundles', 'check_error', 'tenant', 'name', 'updated_at'];

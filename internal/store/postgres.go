@@ -1210,9 +1210,38 @@ func (p *Postgres) GetGitSync(ctx context.Context, tenant, name string) (*model.
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(doc, g); err != nil {
+	if err := decodeGitSync(doc, g); err != nil {
 		return nil, err
 	}
 	g.Tenant, g.Name = tenant, name
 	return g, nil
+}
+
+// decodeGitSync reads a record in the two-half form, and also one written before the halves
+// existed (fields at the root, as an older replica still writes during a rolling upgrade):
+// a half absent in the new form is taken from the root fields, a half present wins.
+func decodeGitSync(doc []byte, g *model.GitSync) error {
+	if err := json.Unmarshal(doc, g); err != nil {
+		return err
+	}
+	var flat struct {
+		Head       string                `json:"head"`
+		CheckedAt  *time.Time            `json:"checked_at"`
+		CheckError string                `json:"check_error"`
+		Commit     string                `json:"commit"`
+		Bundles    []model.GitSyncBundle `json:"bundles"`
+		Status     string                `json:"status"`
+		Error      string                `json:"error"`
+		SyncedAt   *time.Time            `json:"synced_at"`
+	}
+	if err := json.Unmarshal(doc, &flat); err != nil {
+		return nil // not the flat form either way; the new form was read above
+	}
+	if g.Check == nil && flat.CheckedAt != nil {
+		g.Check = &model.GitCheck{Head: flat.Head, At: *flat.CheckedAt, Error: flat.CheckError}
+	}
+	if g.Sync == nil && flat.SyncedAt != nil {
+		g.Sync = &model.GitSyncResult{Commit: flat.Commit, Bundles: flat.Bundles, Status: flat.Status, Error: flat.Error, At: *flat.SyncedAt}
+	}
+	return nil
 }

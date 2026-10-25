@@ -249,10 +249,15 @@ func TestGitRepositoryRegisterCheckSyncAndRepeat(t *testing.T) {
 	// truncated document and an oversized body are refused, and nothing is fetched or applied.
 	seen := len(git.seen)
 	for body, want := range map[string]int{
-		`{"commit":"` + shaA + `"} trailing`:             400,
-		`{"commit":"` + shaA + `"}{"commit":"x"}`:        400,
-		`{"commit":"` + shaA + `"`:                       400,
-		`[]`:                                             400,
+		`{"commit":"` + shaA + `"} trailing`:      400,
+		`{"commit":"` + shaA + `"}{"commit":"x"}`: 400,
+		`{"commit":"` + shaA + `"`:                400,
+		`[]`:                                      400,
+		`null`:                                    400,
+		`{"commit":null}`:                         400,
+		`{"commit":123}`:                          400,
+		`{"commit":["` + shaA + `"]}`:             400,
+		`"` + shaA + `"`:                          400,
 		`{"commit":"` + strings.Repeat("a", 5000) + `"}`: 413,
 	} {
 		if resp, got := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", body, map[string]string{"Content-Type": "application/json"}); resp.StatusCode != want {
