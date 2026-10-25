@@ -181,10 +181,11 @@ type GitSyncs interface {
 	RecordGitCheck(ctx context.Context, tenant, name string, c model.GitCheck) error
 	RecordGitSync(ctx context.Context, tenant, name string, r model.GitSyncResult) error
 	RecordGitHook(ctx context.Context, tenant, name string, h model.GitHook) error
-	// RecordGitHookIf writes the hook half only while the record's hook is absent or belongs
-	// to job (the delivery accepted last is still that one), atomically; false when another
-	// delivery was accepted meanwhile and the record keeps its summary.
-	RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string) (bool, error)
+	// RecordGitHookIf writes the hook half only while the record's hook is absent, or belongs
+	// to job (the delivery accepted last is still that one) and is from attempt or an earlier
+	// one, atomically; false when another delivery was accepted meanwhile, or a later attempt
+	// of the job already wrote, and the record keeps its summary.
+	RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string, attempt int) (bool, error)
 	// GetGitSync returns the record; ErrNotFound when the repository was never checked or synced.
 	GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error)
 }

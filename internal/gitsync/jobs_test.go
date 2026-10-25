@@ -681,3 +681,134 @@ func TestAFinishNeverWritesOverADeliveryAcceptedMeanwhile(t *testing.T) {
 		t.Fatalf("the second job's outcome: %+v", g.Hook)
 	}
 }
+
+// A sync that cannot read the head names no desired state: the transition on record, an
+// unfinished one included, stays what it is, and the next sync of that commit continues the
+// same applies rather than starting a generation whose plan refuses what was already written.
+func TestAnUnreadableHeadKeepsTheUnfinishedTransition(t *testing.T) {
+	ctx := context.Background()
+	bundle := "kind: EnvironmentProfile\nname: py\nexpected_revision: 0\nspec: {image: stable}\n---\nkind: AgentDefinition\nname: backend\nexpected_revision: 0\nspec: {policy: backend-dev, environment: py}\n"
+	base := &refFetcher{auth: "tok", heads: map[string]string{"main": sha1}, files: map[string]map[string][]byte{sha1: {"bundles/a.yaml": []byte(bundle)}}}
+	fetch := &flakyFetcher{refFetcher: base}
+	s, st, _ := hookService(t, fetch)
+	scope := plan.Scope{Tenant: "acme", Subject: "alice"}
+	st.arm("backend")
+	g, err := s.Sync(ctx, scope, "config", "")
+	if !errors.Is(err, ErrStopped) || g.Sync.Generation != 0 || g.Sync.Bundles[0].Apply == "" {
+		t.Fatalf("the first attempt stops at the agent: %v %+v", err, g.Sync)
+	}
+	stopped := g.Sync.Bundles[0].Apply
+	st.arm("")
+	// The head cannot be read for a while: the attempt is recorded against the transition.
+	fetch.fails.Store(1)
+	g, err = s.Sync(ctx, scope, "config", "")
+	if !errors.Is(err, ErrRead) || g.Sync.Status != model.GitSyncError || g.Sync.Commit != sha1 || g.Sync.Generation != 0 {
+		t.Fatalf("an unreadable head must keep the transition on record: %v %+v", err, g.Sync)
+	}
+	g, err = s.Sync(ctx, scope, "config", "")
+	if err != nil || g.Sync.Status != model.GitSyncDone || g.Sync.Generation != 0 || g.Sync.Bundles[0].Apply != stopped {
+		t.Fatalf("the same commit must continue the stopped apply: %v %+v", err, g.Sync)
+	}
+	for kind, name := range map[string]string{model.KindEnvironment: "py", model.KindAgent: "backend"} {
+		if it, err := st.GetItem(ctx, kind, "acme", name, 0); err != nil || it.Revision != 1 {
+			t.Fatalf("%s after the continuation: %v %+v", name, err, it)
+		}
+	}
+}
+
+// hookStore can lose the write of a hook outcome, and hold the write of one attempt's outcome
+// until released: the window between a job moving on and its record.
+type hookStore struct {
+	store.Store
+	lose    atomic.Bool
+	hold    atomic.Int32 // the attempt whose record is held (0: none)
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *hookStore) RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string, attempt int) (bool, error) {
+	if w.lose.Load() {
+		return false, errors.New("the database went away")
+	}
+	if held := int(w.hold.Load()); held != 0 && attempt == held {
+		w.once.Do(func() { close(w.entered) })
+		<-w.release
+	}
+	return w.Store.RecordGitHookIf(ctx, tenant, name, h, job, attempt)
+}
+
+// A job that ended is the truth about how it went: when the record was left at an earlier
+// attempt's error because the last attempt's write was lost, the status shows the job's outcome.
+func TestStatusShowsTheTerminalOutcomeOverAnEarlierAttempts(t *testing.T) {
+	ctx := context.Background()
+	fetch := &flakyFetcher{refFetcher: &refFetcher{auth: "tok", heads: map[string]string{"main": sha1}, files: map[string]map[string][]byte{sha1: {"bundles/a.yaml": []byte(envYAML("x"))}}}}
+	s, st, _ := hookService(t, fetch)
+	w := &hookStore{Store: st}
+	s.Store = w
+	now := time.Now()
+	s.Now = func() time.Time { return now }
+	fetch.fails.Store(1)
+	h := deliver(t, s, "push", pushBody(sha1))
+	if h.Outcome != model.GitSyncError || h.Attempt != 1 {
+		t.Fatalf("first attempt: %+v", h)
+	}
+	w.lose.Store(true)
+	now = now.Add(31 * time.Second)
+	if ran, err := s.RunOnce(ctx); err != nil || !ran {
+		t.Fatalf("the retry: %v %v", ran, err)
+	}
+	w.lose.Store(false)
+	if raw, _ := st.GetGitSync(ctx, "acme", "config"); raw.Hook.Outcome != model.GitSyncError || raw.Hook.Attempt != 1 {
+		t.Fatalf("the fixture must leave the record at the first attempt: %+v", raw.Hook)
+	}
+	g, err := s.Status(ctx, plan.Scope{Tenant: "acme"}, "config")
+	if err != nil || g.Hook.Outcome != model.GitSyncDone || g.Hook.Error != "" || g.Hook.Reason != "" || g.Hook.Attempt != 2 || g.Hook.Job != h.Job {
+		t.Fatalf("the status must show the job's outcome over the earlier attempt's: %v %+v", err, g.Hook)
+	}
+}
+
+// An earlier attempt's record written late never replaces a later attempt's: the write is
+// conditional on the attempt in the store, not only on the job.
+func TestALateRecordOfAnEarlierAttemptNeverReplacesALaterOne(t *testing.T) {
+	ctx := context.Background()
+	fetch := &flakyFetcher{refFetcher: &refFetcher{auth: "tok", heads: map[string]string{"main": sha1}, files: map[string]map[string][]byte{sha1: {"bundles/a.yaml": []byte(envYAML("x"))}}}}
+	one, st, _ := hookService(t, fetch)
+	w := &hookStore{Store: st, entered: make(chan struct{}), release: make(chan struct{})}
+	w.hold.Store(1)
+	one.Store, one.Inline = w, false
+	now := time.Now()
+	one.Now = func() time.Time { return now }
+	fetch.fails.Store(1)
+	h := deliver(t, one, "push", pushBody(sha1))
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		_, _ = one.RunOnce(ctx) // attempt 1: an error, the job put back for a retry, its record held
+	}()
+	select {
+	case <-w.entered:
+	case <-time.After(5 * time.Second):
+		close(w.release)
+		t.Fatal("the first attempt did not reach its record")
+	}
+	// Meanwhile the retry is due and another replica runs it to success.
+	now = now.Add(31 * time.Second)
+	two := *one
+	two.Replica = "two"
+	if ran, err := two.RunOnce(ctx); err != nil || !ran {
+		t.Fatalf("attempt 2: %v %v", ran, err)
+	}
+	if raw, _ := st.GetGitSync(ctx, "acme", "config"); raw.Hook.Outcome != model.GitSyncDone || raw.Hook.Attempt != 2 {
+		t.Fatalf("attempt 2 must be on record: %+v", raw.Hook)
+	}
+	close(w.release)
+	<-finished
+	raw, _ := st.GetGitSync(ctx, "acme", "config")
+	if raw.Hook.Job != h.Job || raw.Hook.Outcome != model.GitSyncDone || raw.Hook.Attempt != 2 || raw.Hook.Reason != "" {
+		t.Fatalf("the late record of attempt 1 replaced attempt 2's: %+v", raw.Hook)
+	}
+	if job, _ := st.GetGitJob(ctx, h.Job); job.Status != model.GitJobDone || job.Attempts != 2 {
+		t.Fatalf("job: %+v", job)
+	}
+}
