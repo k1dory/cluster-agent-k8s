@@ -180,11 +180,14 @@ run_gitlab() { # job → $code
   set -e
   echo "--- gitlab $1: exit $code"; cat "$work/step.out"
 }
-v3="${v2/with logs/with logs, on GitLab}"
-sha3=$(commit "$v3" "gitlab")
+# The third commit moves the guards along with the state v2 left (environment at 3, agent at 2)
+# and changes the agent's description only.
+v3=$(printf '%s' "$v2" | sed -e 's/^expected_revision: 2$/expected_revision: 3/' -e 's/^expected_revision: 1$/expected_revision: 2/' -e 's/with logs/with logs, on GitLab/')
+sha3=$(commit "$v3
+" "gitlab")
 export CI_COMMIT_SHA=$sha3
 run_gitlab plan; [ "$code" -eq 0 ] || fail "gitlab plan exit $code"
-grep -q "1 to create, 1 to update\|0 to create, 1 to update" "$work/step.out" || fail "gitlab plan content"
+grep -q "0 to create, 1 to update, 1 unchanged" "$work/step.out" || fail "gitlab plan content"
 run_gitlab apply; [ "$code" -eq 0 ] || fail "gitlab apply exit $code"
 get /v1/agents/backend | jq -e --arg sha "$sha3" '.source.commit == $sha and .source.repo == "https://gitlab.example/acme/config"' >/dev/null || fail "gitlab apply source: $(get /v1/agents/backend | jq -c .source)"
 run_gitlab apply; [ "$code" -eq 0 ] || fail "gitlab apply re-run exit $code"
