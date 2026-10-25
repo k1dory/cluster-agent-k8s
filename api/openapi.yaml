@@ -761,6 +761,37 @@ paths:
         "403": { description: "The token is scoped to another tenant (`forbidden`), or a tenant reading a shared repository's status", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "404": { description: "Unknown repository, or never checked nor synced", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { description: "Git repositories are disabled", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /hooks/git/{tenant}/{name}:
+    post:
+      tags: [git]
+      summary: A GitHub or GitLab webhook delivery for a registered GitRepository (no bearer token)
+      description: |
+        The provider tells the platform what happened and the platform does what the CI templates
+        would, with nothing installed in the repository but the webhook: a push to the followed
+        ref syncs its head (`action: sync`); an opened, updated or reopened pull (merge) request
+        gets the plan of its head as one comment (updated per push, found by the marker line) and
+        a commit status `agent-sandbox/plan` (`action: plan`); anything else is recorded as
+        ignored with the reason. The delivery is authenticated by its signature against the
+        repository's `webhook_secret` (GitHub `X-Hub-Signature-256`, GitLab `X-Gitlab-Token`) and
+        must name the registered repository. The action runs in the background with the
+        repository's authority; its outcome lands in the `hook` half of the status.
+      security: []
+      parameters:
+        - { name: tenant, in: path, required: true, schema: { type: string }, description: "The repository's tenant; `-` for the shared scope" }
+        - { $ref: "#/components/parameters/catalogName" }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: "The provider's payload, as sent" }
+      responses:
+        "202": { description: The platform acts on the delivery (sync or plan started), content: { application/json: { schema: { $ref: "#/components/schemas/GitHook" } } } }
+        "200": { description: Recorded as ignored (`reason` says why), content: { application/json: { schema: { $ref: "#/components/schemas/GitHook" } } } }
+        "400": { description: "No provider header, or a payload that does not parse", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { description: "The signature does not match the repository's webhook secret", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: "No such repository, or one without a `webhook_secret`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { description: "Payload over 2 MiB", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: "Git repositories are disabled, or the webhook secret cannot be resolved", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/bindings:
     get:
       tags: [tenancy]
@@ -1695,7 +1726,8 @@ components:
         url: { type: string, description: "https URL of the repository, without user information (http for a loopback host only)" }
         ref: { type: string, description: "Branch or tag the platform follows; never a SHA" }
         paths: { type: array, items: { type: string }, minItems: 1, maxItems: 32, description: "Bundle files relative to the root; path patterns (*, ?, [...] within a segment) select several; applied in path order" }
-        credential: { type: string, description: "Name of the secret that opens the repository (a token, or user:token): a tenant credential (BYOK) or an operator secret. Empty for a public repository" }
+        credential: { type: string, description: "Name of the secret that opens the repository (a token, or user:token): a tenant credential (BYOK) or an operator secret. Empty for a public repository. The same token posts pull request comments and statuses when the webhook is configured" }
+        webhook_secret: { type: string, description: "Name of the secret the provider signs its webhook deliveries with. Empty: no webhook is accepted for this repository" }
     GitRepositoryDocument:
       type: object
       properties:
@@ -1735,7 +1767,23 @@ components:
             status: { type: string, enum: [done, invalid, stopped, error] }
             error: { type: string }
             at: { type: string, format: date-time }
+        hook: { $ref: "#/components/schemas/GitHook" }
         updated_at: { type: string, format: date-time }
+    GitHook:
+      type: object
+      description: The last webhook delivery handled for the repository
+      properties:
+        provider: { type: string, enum: [github, gitlab] }
+        event: { type: string, description: "push, pull_request, merge_request, or the provider's name of an event the platform ignores" }
+        action: { type: string, enum: [sync, plan, ignored] }
+        reason: { type: string, description: "Why the delivery was ignored" }
+        ref: { type: string }
+        commit: { type: string }
+        number: { type: integer, description: "The pull or merge request number" }
+        delivery: { type: string, description: "The provider's delivery id" }
+        outcome: { type: string, enum: [done, invalid, stopped, error, ignored], description: "Absent while the action runs" }
+        error: { type: string }
+        at: { type: string, format: date-time }
     GitSyncError:
       type: object
       description: A check or sync that did not succeed, with the record

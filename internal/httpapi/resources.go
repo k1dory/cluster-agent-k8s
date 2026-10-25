@@ -325,6 +325,7 @@ func (p *Platform) configRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/gitrepos/{name}/check", p.auth(p.gitCheck))
 	mux.HandleFunc("POST /v1/gitrepos/{name}/sync", p.auth(p.gitSyncRepo))
 	mux.HandleFunc("GET /v1/gitrepos/{name}/status", p.auth(p.gitStatus))
+	mux.HandleFunc("POST /hooks/git/{tenant}/{name}", p.gitHook) // signed by the provider, not a bearer route
 	mux.HandleFunc("POST /v1/apply", p.auth(p.applyBundle))
 	mux.HandleFunc("GET /v1/applies", p.auth(p.listApplies))
 	mux.HandleFunc("GET /v1/applies/{id}", p.auth(p.getApply))

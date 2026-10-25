@@ -144,8 +144,34 @@ type GitSync struct {
 	Name      string         `json:"name"`
 	Check     *GitCheck      `json:"check,omitempty"`
 	Sync      *GitSyncResult `json:"sync,omitempty"`
+	Hook      *GitHook       `json:"hook,omitempty"` // the last webhook delivery handled
 	UpdatedAt time.Time      `json:"updated_at"`
 }
+
+// GitHook is the last webhook delivery the platform handled for the repository: what the
+// provider sent, what the platform did with it and how it went. The third half of the record,
+// written on its own like the other two.
+type GitHook struct {
+	Provider string    `json:"provider"`           // github | gitlab
+	Event    string    `json:"event"`              // push | pull_request | merge_request | <other, ignored>
+	Action   string    `json:"action,omitempty"`   // what the platform did: sync | plan | ignored
+	Reason   string    `json:"reason,omitempty"`   // why it was ignored, or how the action went
+	Ref      string    `json:"ref,omitempty"`      // the ref the delivery named
+	Commit   string    `json:"commit,omitempty"`   // the commit it named (head of the push or of the pull request)
+	Number   int       `json:"number,omitempty"`   // the pull/merge request number
+	Delivery string    `json:"delivery,omitempty"` // the provider's delivery id
+	Outcome  string    `json:"outcome,omitempty"`  // done | invalid | stopped | error | ignored
+	Error    string    `json:"error,omitempty"`
+	At       time.Time `json:"at"`
+}
+
+// Webhook actions and outcomes (GitHook.Action / Outcome).
+const (
+	HookActionSync    = "sync"
+	HookActionPlan    = "plan"
+	HookActionIgnored = "ignored"
+	HookIgnored       = "ignored"
+)
 
 // GitCheck is the last check: the ref's head, or why it could not be read.
 type GitCheck struct {

@@ -1200,6 +1200,10 @@ func (p *Postgres) RecordGitSync(ctx context.Context, tenant, name string, r mod
 	return p.recordGitHalf(ctx, tenant, name, "sync", r)
 }
 
+func (p *Postgres) RecordGitHook(ctx context.Context, tenant, name string, h model.GitHook) error {
+	return p.recordGitHalf(ctx, tenant, name, "hook", h)
+}
+
 func (p *Postgres) GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error) {
 	var doc []byte
 	g := &model.GitSync{Tenant: tenant, Name: name}

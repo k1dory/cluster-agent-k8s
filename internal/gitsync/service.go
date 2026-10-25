@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
+	"sync"
 	"time"
 
 	"agent-sandbox/internal/apply"
@@ -32,10 +34,21 @@ var (
 type Service struct {
 	Store   store.GitSyncs
 	Repos   *gitrepo.Service
-	Secrets secrets.Provider // resolves spec.credential; nil: credentials are unavailable
+	Secrets secrets.Provider // resolves spec.credential and spec.webhook_secret; nil: unavailable
 	Fetch   Fetcher
 	Applier *apply.Controller
 	Now     func() time.Time
+	// Webhooks (see webhook.go): Reporter posts plans on pull requests; Emit publishes
+	// git.hook, git.sync and git.plan events (nil: none); HookTimeout bounds a background
+	// action (default 10 minutes); Inline runs the action in the request (tests).
+	Reporter    Reporter
+	Emit        func(ctx context.Context, e model.Event)
+	HookTimeout time.Duration
+	Inline      bool
+	Log         *slog.Logger
+
+	locksMu sync.Mutex
+	locks   map[string]*sync.Mutex // one per repository: a sync and a plan never interleave
 }
 
 func (s *Service) now() time.Time {
@@ -162,6 +175,7 @@ func (s *Service) Sync(ctx context.Context, scope plan.Scope, name, commit strin
 		if perr := s.Store.RecordGitSync(ctx, it.Tenant, it.Name, result); perr != nil {
 			return nil, perr
 		}
+		s.emit(ctx, it, "git.sync", result)
 		g, rerr := s.record(ctx, it)
 		g.Sync = &result
 		if checked != nil {

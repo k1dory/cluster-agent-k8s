@@ -16,6 +16,7 @@ import (
 	"agent-sandbox/internal/connections"
 	"agent-sandbox/internal/gitrepo"
 	"agent-sandbox/internal/gitsync"
+	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/orchestrator"
 	"agent-sandbox/internal/plan"
 	"agent-sandbox/internal/policy"
@@ -83,7 +84,8 @@ func Wire(ctx context.Context, d Deps) (*Services, error) {
 		Planner:  planner,
 		Applier:  applier,
 		GitRepos: svc.GitRepos,
-		GitSync:  &gitsync.Service{Store: d.Store, Repos: svc.GitRepos, Secrets: d.Secrets, Fetch: fetch, Applier: applier},
+		GitSync: &gitsync.Service{Store: d.Store, Repos: svc.GitRepos, Secrets: d.Secrets, Fetch: fetch, Applier: applier,
+			Reporter: gitsync.RESTReporter{}, Emit: emitter(d), Log: d.Log},
 	}, nil
 }
 
@@ -123,4 +125,20 @@ func (l limits) SlugQuota(slug, tenant string) orchestrator.Quota {
 		return orchestrator.Quota{MaxSandboxes: b.MaxSandboxes, MaxAwake: b.MaxAwake}
 	}
 	return orchestrator.Quota{}
+}
+
+// emitter records an event in the store and publishes it on the hub, the way the orchestrator
+// does for sandbox events (the hub is fed by the store's listener instead when one runs).
+func emitter(d Deps) func(context.Context, model.Event) {
+	return func(ctx context.Context, e model.Event) {
+		if err := d.Store.AppendEvent(ctx, &e); err != nil {
+			if d.Log != nil {
+				d.Log.Error("append event", "type", e.Type, "err", err)
+			}
+			return
+		}
+		if d.Orch != nil && d.Orch.Hub != nil && !d.Orch.ListenerPublishes {
+			d.Orch.Hub.Publish(e)
+		}
+	}
 }

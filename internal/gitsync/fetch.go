@@ -155,7 +155,13 @@ func (c CLI) workdir() (string, func(), error) {
 // Resolve and Files share, so a branch and a tag of the same name cannot make a check report
 // one commit and a sync fetch another.
 func (c CLI) lookup(ctx context.Context, dir string, r Remote) (name, sha string, err error) {
-	out, err := c.run(ctx, dir, r, "ls-remote", "--", r.URL, "refs/heads/"+r.Ref, "refs/tags/"+r.Ref, "refs/tags/"+r.Ref+"^{}")
+	want := []string{"refs/heads/" + r.Ref, "refs/tags/" + r.Ref, "refs/tags/" + r.Ref + "^{}"}
+	if strings.HasPrefix(r.Ref, "refs/") {
+		// A full name (a pull request's refs/pull/N/head, a merge request's
+		// refs/merge-requests/N/head): that ref and nothing else.
+		want = []string{r.Ref, r.Ref + "^{}"}
+	}
+	out, err := c.run(ctx, dir, r, append([]string{"ls-remote", "--", r.URL}, want...)...)
 	if err != nil {
 		return "", "", err
 	}
@@ -164,6 +170,15 @@ func (c CLI) lookup(ctx context.Context, dir string, r Remote) (name, sha string
 		if sha, name, ok := strings.Cut(l, "\t"); ok {
 			refs[strings.TrimSpace(name)] = strings.TrimSpace(sha)
 		}
+	}
+	if strings.HasPrefix(r.Ref, "refs/") {
+		if sha := refs[r.Ref+"^{}"]; shaRe.MatchString(sha) {
+			return r.Ref, sha, nil
+		}
+		if sha := refs[r.Ref]; shaRe.MatchString(sha) {
+			return r.Ref, sha, nil
+		}
+		return "", "", fmt.Errorf("%w: %s", ErrNoRef, r.Ref)
 	}
 	if sha := refs["refs/heads/"+r.Ref]; shaRe.MatchString(sha) {
 		return "refs/heads/" + r.Ref, sha, nil

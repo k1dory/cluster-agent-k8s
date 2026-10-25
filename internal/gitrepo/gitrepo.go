@@ -36,7 +36,14 @@ type Spec struct {
 	Paths []string `yaml:"paths" json:"paths"`
 	// Credential names the secret that opens the repository: a token, or `user:token`. Empty
 	// for a public repository. Resolved from the tenant's credentials, then the shared ones.
+	// The same token posts the plan comments and commit statuses of pull requests when the
+	// repository's webhook is configured, so it needs that scope too.
 	Credential string `yaml:"credential,omitempty" json:"credential,omitempty"`
+	// WebhookSecret names the secret the provider signs its deliveries with (GitHub's webhook
+	// secret, GitLab's secret token). Empty: the platform accepts no webhook for this
+	// repository. With it, a push to the ref syncs and a pull request gets its plan as a
+	// comment, without any workflow in the repository.
+	WebhookSecret string `yaml:"webhook_secret,omitempty" json:"webhook_secret,omitempty"`
 }
 
 var (
@@ -97,13 +104,16 @@ func (s *Service) Validate(ctx context.Context, tenant string, d *res.Document, 
 			return nil, fmt.Errorf("%w: spec.paths[%d]: %v", res.ErrInvalid, i, err)
 		}
 	}
-	if sp.Credential != "" {
-		if !credentialRe.MatchString(sp.Credential) {
-			return nil, fmt.Errorf("%w: spec.credential must be a secret name, not a value", res.ErrInvalid)
+	for field, name := range map[string]string{"credential": sp.Credential, "webhook_secret": sp.WebhookSecret} {
+		if name == "" {
+			continue
+		}
+		if !credentialRe.MatchString(name) {
+			return nil, fmt.Errorf("%w: spec.%s must be a secret name, not a value", res.ErrInvalid, field)
 		}
 		if s.Secrets != nil {
-			if _, err := s.Secrets.Get(ctx, tenant, sp.Credential); err != nil {
-				return nil, fmt.Errorf("%w: spec.credential: secret %q is not available to tenant %q", res.ErrInvalid, sp.Credential, tenant)
+			if _, err := s.Secrets.Get(ctx, tenant, name); err != nil {
+				return nil, fmt.Errorf("%w: spec.%s: secret %q is not available to tenant %q", res.ErrInvalid, field, name, tenant)
 			}
 		}
 	}

@@ -170,8 +170,40 @@ credential travels as a request header set through the environment of that one g
 never in the URL, the command line or a file. Each read works in an empty temporary repository
 with its own, empty Git configuration.
 
-What this does not do yet: react to pushes. A sync is explicit (an API call, a CI step that
-calls it, a schedule); events and the pull-request adapters come next.
+### The webhook: plan on pull request, sync on push, with nothing in the repository
+
+Add `webhook_secret: config-hook` to the registration (the name of a credential holding the
+secret the provider will sign with) and point the repository's webhook at
+`POST https://<platform>/hooks/git/<tenant>/config` (`-` as the tenant for a shared
+repository), content type JSON, events *push* and *pull request* (GitHub) or *push* and
+*merge request* (GitLab), the same secret on the provider's side. From then on:
+
+- a push to the followed ref syncs its head, exactly as `sandboxctl gitrepo sync` would
+  (one apply per bundle under the stable key, `source.commit` on every revision, nothing
+  written twice when the same head is pushed again);
+- a pull request opened, updated or reopened gets the plan of its head as one comment
+  (the same Markdown the CI template posts, updated in place on every push, found by the
+  marker line) and a commit status `agent-sandbox/plan`: success when every bundle is valid,
+  failure when one is not, error when the repository could not be read. The head is fetched
+  from the request's own ref (`refs/pull/N/head`, `refs/merge-requests/N/head`), the comment
+  and the status are posted with the repository's `credential` to the API of the registered
+  repository's host, never to an address the delivery names;
+- everything else (another branch, a deleted ref, a closed request, an event the platform
+  does not act on, a delivery naming another repository) is recorded as ignored with the
+  reason.
+
+A delivery is accepted only when its signature matches the secret (GitHub's
+`X-Hub-Signature-256`, GitLab's `X-Gitlab-Token`); a repository without `webhook_secret`
+accepts none. The action runs in the background with the repository's authority (a tenant's
+repository does what the tenant may); the delivery, the decision and the outcome land in the
+`hook` half of `gitrepo status`, and every delivery, plan and sync is an event (`git.hook`,
+`git.plan`, `git.sync`) on the tenant's event stream, so a SOC or SRE integration can follow
+them without polling.
+
+The CI templates and the webhook are two ways to the same controller; a repository may use
+either. The templates need Docker and a secret in the repository and show the plan in the
+job log too; the webhook needs the platform reachable from the provider and nothing in the
+repository.
 
 ## What the adapters do not do
 

@@ -75,6 +75,25 @@ func (s *Server) Commit(t *testing.T, files map[string]string, msg string) strin
 	return strings.TrimSpace(Git(t, s.Work, "rev-parse", "HEAD"))
 }
 
+// CommitOn writes files, commits them on the current branch and pushes the commit to the given
+// remote ref (refs/pull/1/head for a pull request head, or a branch name); returns the SHA.
+func (s *Server) CommitOn(t *testing.T, branch string, files map[string]string, msg, remoteRef string) string {
+	t.Helper()
+	for name, content := range files {
+		p := filepath.Join(s.Work, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	Git(t, s.Work, "add", "-A")
+	Git(t, s.Work, "commit", "-q", "--allow-empty", "-m", msg)
+	Git(t, s.Work, "push", "-q", "origin", branch+":"+remoteRef)
+	return strings.TrimSpace(Git(t, s.Work, "rev-parse", "HEAD"))
+}
+
 // Close stops the server (the test's cleanup does it too).
 func (s *Server) Close() { s.srv.Close() }
 

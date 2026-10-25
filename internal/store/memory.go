@@ -1061,6 +1061,10 @@ func cloneGitSync(g *model.GitSync) *model.GitSync {
 		ck := *g.Check
 		c.Check = &ck
 	}
+	if g.Hook != nil {
+		h := *g.Hook
+		c.Hook = &h
+	}
 	if g.Sync != nil {
 		sy := *g.Sync
 		sy.Bundles = make([]model.GitSyncBundle, len(g.Sync.Bundles))
@@ -1096,6 +1100,13 @@ func (m *Memory) RecordGitSync(_ context.Context, tenant, name string, r model.G
 	defer m.mu.Unlock()
 	copied := cloneGitSync(&model.GitSync{Sync: &r})
 	m.gitSync(tenant, name).Sync = copied.Sync
+	return nil
+}
+
+func (m *Memory) RecordGitHook(_ context.Context, tenant, name string, h model.GitHook) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.gitSync(tenant, name).Hook = &h
 	return nil
 }
 

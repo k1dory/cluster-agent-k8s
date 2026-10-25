@@ -338,8 +338,10 @@ A repository of bundles drives all of this through pull requests alone: `sandbox
 platform reads the repository itself: a `GitRepository` registered through the API (URL, ref,
 bundle paths, a credential by reference) is checked and synced on request, each bundle applied
 through the same controller under a key of repository, commit and path, so no workflow is
-installed per repository. The scenario of one settings change as one pull request, both ways:
-[docs/git-adapters.md](docs/git-adapters.md).
+installed per repository. With a `webhook_secret` the repository's own webhook drives it: a push
+to the ref syncs, a pull or merge request gets its plan as a comment and a commit status, and
+every delivery, plan and sync is an event on the tenant's stream. The scenario of one settings
+change as one pull request, all three ways: [docs/git-adapters.md](docs/git-adapters.md).
 
 ### Agent versions and rollouts
 

@@ -12,6 +12,7 @@ import (
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/plan"
 	"agent-sandbox/internal/resource"
+	"agent-sandbox/internal/store"
 )
 
 // Git repositories: the catalogue routes (/v1/gitrepos, see resourceRoutes) register them; the
@@ -128,4 +129,44 @@ func writeGitSync(w http.ResponseWriter, g *model.GitSync, err error) {
 		code, label = http.StatusInternalServerError, "error"
 	}
 	writeJSON(w, code, map[string]any{"error": err.Error(), "code": label, "sync": g})
+}
+
+// hookBodyLimit bounds a webhook payload (GitHub's run to a few hundred KB).
+const hookBodyLimit = 2 << 20
+
+// gitHook is POST /hooks/git/{tenant}/{name}: a GitHub or GitLab webhook delivery for a
+// registered repository ("-" for the shared scope). No bearer token: the delivery is
+// authenticated by its signature against the repository's webhook secret. 202 when the
+// platform acts on it (a sync or a plan runs in the background; the outcome lands in the
+// repository's status), 200 when it is recorded as ignored.
+func (p *Platform) gitHook(w http.ResponseWriter, r *http.Request) {
+	if p.GitSync == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("gitrepos disabled"))
+		return
+	}
+	tenant := r.PathValue("tenant")
+	if tenant == "-" {
+		tenant = ""
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, hookBodyLimit))
+	if err != nil {
+		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("body: at most %d bytes", hookBodyLimit))
+		return
+	}
+	h, err := p.GitSync.Hook(r.Context(), tenant, r.PathValue("name"), r.Header, body)
+	switch {
+	case err == nil:
+		writeJSON(w, gitsync.HookHTTPStatus(h), h)
+	case errors.Is(err, gitsync.ErrBadSignature):
+		writeErr(w, http.StatusUnauthorized, err)
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, resource.ErrNotFound):
+		// An unknown repository and one without a webhook answer alike: nothing to learn here.
+		writeErr(w, http.StatusNotFound, errors.New("no such webhook"))
+	case errors.Is(err, gitsync.ErrCredential):
+		writeErr(w, http.StatusServiceUnavailable, err)
+	case errors.Is(err, resource.ErrInvalid):
+		writeErr(w, http.StatusBadRequest, err)
+	default:
+		writeErr(w, http.StatusInternalServerError, err)
+	}
 }

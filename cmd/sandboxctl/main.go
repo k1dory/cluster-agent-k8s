@@ -1432,7 +1432,26 @@ func printGitSync(g model.GitSync) {
 		}
 		tw.Flush()
 	}
-	if g.Check == nil && g.Sync == nil {
+	if g.Hook != nil {
+		fmt.Printf("hook     %s  %s %s → %s", g.Hook.At.Format(time.RFC3339), g.Hook.Provider, g.Hook.Event, g.Hook.Action)
+		if g.Hook.Commit != "" {
+			fmt.Printf("  commit %s", g.Hook.Commit)
+		}
+		if g.Hook.Number != 0 {
+			fmt.Printf("  #%d", g.Hook.Number)
+		}
+		if g.Hook.Outcome != "" {
+			fmt.Printf("  %s", g.Hook.Outcome)
+		}
+		if g.Hook.Reason != "" {
+			fmt.Printf("  (%s)", g.Hook.Reason)
+		}
+		if g.Hook.Error != "" {
+			fmt.Printf("  %s", g.Hook.Error)
+		}
+		fmt.Println()
+	}
+	if g.Check == nil && g.Sync == nil && g.Hook == nil {
 		fmt.Println("never checked or synced")
 	}
 }

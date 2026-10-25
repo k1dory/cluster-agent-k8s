@@ -153,6 +153,8 @@ func TestGitRepositoryRegisterCheckSyncAndRepeat(t *testing.T) {
 		`{"spec":{"url":"https://git.example.com/a.git","ref":"main","paths":["../b.yaml"]}}`,
 		`{"spec":{"url":"https://git.example.com/a.git","ref":"main","paths":[]}}`,
 		`{"spec":{"url":"https://git.example.com/a.git","ref":"main","paths":["b.yaml"],"credential":"ghp_averyrealtoken:with:colons"}}`,
+		`{"spec":{"url":"https://git.example.com/a.git","ref":"main","paths":["b.yaml"],"webhook_secret":"missing"}}`,
+		`{"spec":{"url":"https://git.example.com/a.git","ref":"main","paths":["b.yaml"],"webhook_secret":"a value with spaces"}}`,
 	} {
 		if code, _ := putDoc(t, api, "alice-tok", "gitrepos", "bad", bad); code != 422 {
 			t.Errorf("accepted %s: %d", bad, code)
