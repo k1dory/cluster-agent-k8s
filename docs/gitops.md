@@ -29,8 +29,10 @@ records the commit only when the bytes it applies are exactly what `HEAD` holds 
 assume-unchanged or skip-worktree makes lie): a SHA in the catalogue always names exactly the
 content that was applied. A modified, staged or untracked file is applied with a warning and
 without a commit; `-repo`, `-ref`, `-commit`, `-path` override the detection, `-no-git` records
-nothing. `-require-commit` turns the warning into a refusal: a CI job applies with the merge
-commit's SHA or not at all. A checkout Git cannot read is an error, not a plain file: a container
+nothing, and excludes `-repo`, `-ref`, `-commit`, `-path` and `-require-commit` (a SHA that
+would not be sent is not a source). `-require-commit` turns the warning into a refusal and is
+checked on the source that goes out, not on the flags: a CI job applies with the merge commit's
+SHA or not at all. A checkout Git cannot read is an error, not a plain file: a container
 running as another user than the one that cloned sees `detected dubious ownership`, and applying
 silently without the SHA would lose the provenance (the sandboxctl image marks every directory
 safe, because reading CI checkouts is what it is for).

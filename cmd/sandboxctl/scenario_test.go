@@ -266,3 +266,96 @@ func TestScenarioPullRequestMergeDriftAndResumeUnderAStableKey(t *testing.T) {
 		t.Fatalf("an apply under the moved fingerprint exists: %s", a2.ID)
 	}
 }
+
+// A bundle with expected_revision re-plans as invalid against the state its own first attempt
+// wrote (0 for "must not exist" once step 1 created the item; 1 once it was updated). The
+// re-run of the merge job must still continue that apply: the decision is the controller's,
+// which knows the apply and adjusts the expectation of the steps it already did. Four cases:
+// a partial and a finished apply, with expected_revision 0 and 1.
+func TestScenarioRerunWithExpectedRevisionReachesTheController(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required")
+	}
+	srv, st := realPlatform(t)
+	api, tok := srv.URL, "acme-tok"
+	repo := t.TempDir()
+	run(t, repo, "init", "-q", "-b", "main")
+	if err := os.MkdirAll(filepath.Join(repo, "bundles"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(repo, "bundles", "acme.yaml")
+	commit := func(content, msg string) string {
+		if err := os.WriteFile(bundle, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		run(t, repo, "add", ".")
+		run(t, repo, "commit", "-q", "-m", msg)
+		return run(t, repo, "rev-parse", "HEAD")
+	}
+	applyArgs := func(sha string, extra ...string) []string {
+		return append([]string{"apply", "-f", "bundles/acme.yaml", "-ref", "main", "-key", "bundles/acme.yaml@" + sha, "-require-commit", "-markdown"}, extra...)
+	}
+	// v1: both documents must not exist yet (expected_revision 0); the agent's step fails.
+	v1 := "kind: EnvironmentProfile\nname: py\nexpected_revision: 0\nspec: {image: stable}\n---\nkind: AgentDefinition\nname: backend\nexpected_revision: 0\nspec: {policy: backend-dev, environment: py}\n"
+	sha1 := commit(v1, "create, guarded")
+	st.arm("backend")
+	out, errOut, code := ctlChild(t, repo, api, tok, nil, applyArgs(sha1)...)
+	if code != 3 || !strings.Contains(out, "### Apply ❌ failed") {
+		t.Fatalf("partial apply: exit %d\n%s%s", code, out, errOut)
+	}
+	id := applyID.FindStringSubmatch(out)[1]
+	// The plan of the same bundle is now invalid (py exists, expected 0): the pull request
+	// check would say so, and so would the previous CLI, which never reached the controller.
+	if out, _, code := ctlChild(t, repo, api, tok, nil, "plan", "-f", "bundles/acme.yaml"); code != 2 {
+		t.Fatalf("precondition: the re-plan should be invalid now: exit %d\n%s", code, out)
+	}
+	st.arm("")
+	out, errOut, code = ctlChild(t, repo, api, tok, nil, applyArgs(sha1)...)
+	if code != 0 || !strings.Contains(out, "### Apply ✅ done · `"+id+"`") || !strings.Contains(out, "| 2 | AgentDefinition | acme | `backend` | ➕ create | done | 1 | - |") {
+		t.Fatalf("re-run of the partial apply with expected_revision 0: exit %d\n%s%s", code, out, errOut)
+	}
+	// Finished apply, same key, same bundle: the same apply again, nothing written, exit 0.
+	out, errOut, code = ctlChild(t, repo, api, tok, nil, applyArgs(sha1)...)
+	if code != 0 || !strings.Contains(out, "### Apply ✅ done · `"+id+"`") {
+		t.Fatalf("re-run of the finished apply with expected_revision 0: exit %d\n%s%s", code, out, errOut)
+	}
+	var revs []model.CatalogItem
+	if apiGet(t, api, tok, "/v1/environments/py/revisions", &revs) != 200 || len(revs) != 1 {
+		t.Fatalf("re-runs wrote: %d revisions", len(revs))
+	}
+	// v2: both at revision 1 (expected_revision 1); the agent's step fails again.
+	v2 := "kind: EnvironmentProfile\nname: py\nexpected_revision: 1\nspec: {image: stable, env: {LOG: debug}}\n---\nkind: AgentDefinition\nname: backend\nexpected_revision: 1\ndescription: with logs\nspec: {policy: backend-dev, environment: py}\n"
+	sha2 := commit(v2, "update, guarded")
+	st.arm("backend")
+	out, errOut, code = ctlChild(t, repo, api, tok, nil, applyArgs(sha2)...)
+	if code != 3 || !strings.Contains(out, "| 1 | EnvironmentProfile | acme | `py` | ✏️ update | done | 2 | - |") {
+		t.Fatalf("partial update: exit %d\n%s%s", code, out, errOut)
+	}
+	id2 := applyID.FindStringSubmatch(out)[1]
+	st.arm("")
+	for i := 0; i < 2; i++ { // the continuation, then the finished apply again
+		out, errOut, code = ctlChild(t, repo, api, tok, nil, applyArgs(sha2)...)
+		if code != 0 || !strings.Contains(out, "### Apply ✅ done · `"+id2+"`") || !strings.Contains(out, "| 2 | AgentDefinition | acme | `backend` | ✏️ update | done | 2 | - |") {
+			t.Fatalf("re-run %d with expected_revision 1: exit %d\n%s%s", i+1, code, out, errOut)
+		}
+	}
+	if apiGet(t, api, tok, "/v1/environments/py/revisions", &revs) != 200 || len(revs) != 2 {
+		t.Fatalf("re-runs wrote: %d revisions", len(revs))
+	}
+	// The controller's checks still hold on a continuation: the same key with another bundle
+	// is a conflict, and an outside change to a done step's item stops it.
+	if out, errOut, code := ctlChild(t, repo, api, tok, nil, "apply", "-f", "bundles/acme.yaml", "-no-git", "-key", "bundles/acme.yaml@"+sha1); code != 1 || !strings.Contains(errOut, "different bundle") {
+		t.Fatalf("another bundle under a used key: exit %d\n%s%s", code, out, errOut)
+	}
+	// A genuinely new, invalid bundle under a new key is refused by the controller with its
+	// plan, rendered here as the plan (exit 2), never applied.
+	v3 := "kind: EnvironmentProfile\nname: py\nexpected_revision: 0\nspec: {image: stable}\n"
+	sha3 := commit(v3, "stale guard")
+	out, errOut, code = ctlChild(t, repo, api, tok, nil, applyArgs(sha3)...)
+	if code != 2 || !strings.HasPrefix(out, Marker+"\n### Plan ❌ invalid · `bundles/acme.yaml`") || !strings.Contains(out, "expected") {
+		t.Fatalf("new invalid bundle under a new key: exit %d\n%s%s", code, out, errOut)
+	}
+	if apiGet(t, api, tok, "/v1/environments/py/revisions", &revs) != 200 || len(revs) != 2 {
+		t.Fatalf("a refused apply wrote: %d revisions", len(revs))
+	}
+}

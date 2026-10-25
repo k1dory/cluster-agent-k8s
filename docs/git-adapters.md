@@ -24,7 +24,12 @@ another with the admin token. Both use the same workflow file.
 - `sandboxctl apply -key <path>@<commit> -require-commit`: how the templates apply. The key is
   stable for the bundle at that commit, so re-running a job whose apply stopped half-way
   continues the same apply from the failed step instead of starting another (the default key,
-  the plan fingerprint, is bound to the state and moves once half the steps are applied).
+  the plan fingerprint, is bound to the state and moves once half the steps are applied). With
+  a key, whether the bundle may be applied or continued is the controller's decision alone: a
+  bundle with `expected_revision` re-plans as invalid against the state its own first attempt
+  wrote, and the re-run still reaches the controller, which knows the apply and continues it
+  under its own checks (same bundle, current rights, no outside change to a done step). The
+  CLI pronounces on the plan itself only without a key, where nothing could be continued.
   `-require-commit` fails the job rather than apply without the merge commit's SHA: a file that
   differs from the commit, a checkout Git cannot read.
 - The `sandboxctl` image (`make images`, target `sandboxctl`): the binary with sh, curl, jq and

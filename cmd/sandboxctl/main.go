@@ -41,8 +41,9 @@ const usage = `sandboxctl <command> [flags]
            transaction per step, continued by key after any failure (apply -resume <id> continues a stopped one;
            CI passes a stable -key such as path@commit, so a re-run continues the same apply)
            apply records where the bundle came from: the Git commit the file matches is detected (-repo,
-           -ref, -commit, -path override it; -no-git records nothing); a dirty file is applied without a SHA,
-           -require-commit refuses to apply without one; a checkout Git cannot read is an error
+           -ref, -commit, -path override it; -no-git records nothing and excludes them); a dirty file is
+           applied without a SHA, -require-commit refuses to apply without one; a checkout Git cannot read
+           is an error. Whether a bundle may be applied or continued is decided by the platform, not here
   applies  [-tenant t] [-json]              applies of the scope, newest first; applies <id> shows one
   drift    [-tenant t] [-json|-markdown]    items changed or deleted outside apply since an apply wrote them;
            drift -f bundle.yaml shows what the bundle would change (Git versus the platform), writing nothing
@@ -166,13 +167,24 @@ func (c *cli) doH(method, path string, body any, out any, hdr map[string]string)
 			}
 			msg += "]"
 		}
-		return resp.Header, errors.New(msg)
+		return resp.Header, &apiError{Status: resp.StatusCode, Code: e.Code, Message: msg, Body: data}
 	}
 	if out != nil && len(data) > 0 {
 		return resp.Header, json.Unmarshal(data, out)
 	}
 	return resp.Header, nil
 }
+
+// apiError is a refused request: the status, the platform's error code and the body, so a
+// caller can read what the platform attached (the plan of a refused apply).
+type apiError struct {
+	Status  int
+	Code    string
+	Message string
+	Body    []byte
+}
+
+func (e *apiError) Error() string { return e.Message }
 
 func printJSON(v any) {
 	b, _ := json.MarshalIndent(v, "", "  ")
@@ -358,7 +370,7 @@ func (c *cli) run(cmd string, args []string) error {
 		fs.StringVar(&src.Ref, "ref", "", "source: branch or tag (default: detected)")
 		fs.StringVar(&src.Commit, "commit", "", "source: the commit the bundle file matches (default: detected, only when the file is clean)")
 		fs.StringVar(&src.Path, "path", "", "source: bundle path in the repository (default: detected)")
-		noGit := fs.Bool("no-git", false, "record no source")
+		noGit := fs.Bool("no-git", false, "record no source (conflicts with -repo/-ref/-commit/-path and -require-commit)")
 		requireCommit := fs.Bool("require-commit", false, "refuse to apply without a commit SHA (CI: the checkout must be a clean, readable work tree)")
 		_ = fs.Parse(flags)
 		var a model.Apply
@@ -1239,16 +1251,30 @@ func (e *invalidPlan) Error() string {
 	return fmt.Sprintf("the bundle is not valid (%d invalid)", e.plan.Summary.Invalid)
 }
 
-// submitApply attaches the bundle's Git source, plans it and submits it under the key. The
-// source is read before the platform is asked, so a checkout Git cannot read fails on its own
-// terms, not behind a request error.
-func (c *cli) submitApply(file, tenant, key string, src bundleSource, noGit, requireCommit bool, a *model.Apply) error {
+// submitApply attaches the bundle's Git source, plans it for the fingerprint and submits it
+// under the key. With a key, whether the submission may proceed is the controller's decision
+// alone: a bundle that re-plans as invalid against the state its own first attempt wrote (a
+// document with expected_revision, after a partial or a finished apply) continues under its
+// key there, with the controller's own checks of the bundle, the rights and outside changes;
+// a new apply with an invalid plan is refused there, with the plan, and rendered here. Without
+// a key the plan's verdict is final: the default key is this plan's fingerprint, which no
+// earlier apply can carry once the state moved, so there is nothing to continue and nothing
+// is submitted. The source is read before the platform is asked, so a checkout Git cannot
+// read fails on its own terms, not behind a request error.
+func (c *cli) submitApply(file, tenant, key string, flags bundleSource, noGit, requireCommit bool, a *model.Apply) error {
+	if noGit && flags != (bundleSource{}) {
+		return errors.New("apply: -no-git records no source; drop it or drop -repo/-ref/-commit/-path")
+	}
+	if noGit && requireCommit {
+		return errors.New("apply: -no-git records no source, -require-commit needs one; use one or the other")
+	}
 	raw, docs, err := loadBundle(file)
 	if err != nil {
 		return err
 	}
 	body := map[string]any{"documents": docs, "key": key}
-	why := "-no-git records no source" // for -require-commit: why there is no SHA
+	var sent bundleSource // what the platform will record
+	why := "the file is not in a Git work tree with a commit"
 	if !noGit {
 		detected, ok, dirty, err := gitSource(file, raw)
 		if err != nil {
@@ -1256,38 +1282,46 @@ func (c *cli) submitApply(file, tenant, key string, src bundleSource, noGit, req
 			// "dubious ownership"): applying without a SHA would silently lose the provenance.
 			return fmt.Errorf("source of %s: %w (fix the checkout, pass -commit, or -no-git to record no source)", file, err)
 		}
-		switch {
-		case !ok:
-			why = "the file is not in a Git work tree with a commit"
-		case dirty:
+		if ok && dirty {
 			why = "the file is not what HEAD holds for it (modified, staged or untracked)"
-			if src.Commit == "" {
+			if flags.Commit == "" {
 				fmt.Fprintf(os.Stderr, "warning: %s is not what HEAD holds for it: applied without a commit SHA\n", file)
 			}
 		}
-		src = mergeSource(src, detected)
+		merged := mergeSource(flags, detected)
 		// Never send a credential, even one pasted into -repo.
-		ms := model.Source{Repo: src.Repo, Ref: src.Ref, Commit: src.Commit, Path: src.Path}
+		ms := model.Source{Repo: merged.Repo, Ref: merged.Ref, Commit: merged.Commit, Path: merged.Path}
 		if err := apply.CleanSource(&ms); err != nil {
 			return err
 		}
-		src = bundleSource{Repo: ms.Repo, Ref: ms.Ref, Commit: ms.Commit, Path: ms.Path}
-		if src != (bundleSource{}) {
-			body["source"] = src
+		sent = bundleSource{Repo: ms.Repo, Ref: ms.Ref, Commit: ms.Commit, Path: ms.Path}
+		if sent != (bundleSource{}) {
+			body["source"] = sent
 		}
 	}
-	if requireCommit && src.Commit == "" {
+	// The check is on the source that goes out, not on the flags.
+	if requireCommit && sent.Commit == "" {
 		return fmt.Errorf("-require-commit: no commit SHA for %s: %s", file, why)
 	}
 	var p plan.Plan
 	if err := c.do("POST", "/v1/plan"+tenantQuery(tenant), map[string]any{"documents": docs}, &p); err != nil {
 		return err
 	}
-	if !p.Valid {
+	if key == "" && !p.Valid {
 		return &invalidPlan{plan: p}
 	}
 	body["plan"] = p.Fingerprint
-	return c.do("POST", "/v1/apply"+tenantQuery(tenant), body, a)
+	err = c.do("POST", "/v1/apply"+tenantQuery(tenant), body, a)
+	var refused *apiError
+	if errors.As(err, &refused) && refused.Code == "invalid_plan" {
+		var out struct {
+			Plan *plan.Plan `json:"plan"`
+		}
+		if json.Unmarshal(refused.Body, &out) == nil && out.Plan != nil {
+			return &invalidPlan{plan: *out.Plan}
+		}
+	}
+	return err
 }
 
 // reportFailure returns err; with markdown set it first prints the failure as a marker block,
