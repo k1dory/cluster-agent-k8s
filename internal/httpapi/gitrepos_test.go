@@ -195,7 +195,7 @@ func TestGitRepositoryRegisterCheckSyncAndRepeat(t *testing.T) {
 	var a model.Apply
 	_, body = call(t, "GET", api+"/v1/applies/"+first, "alice-tok", nil, nil)
 	_ = json.Unmarshal(body, &a)
-	if a.Key != gitsync.Key("config", shaA, "bundles/acme.yaml") || a.Admin || a.Tenant != "alice" {
+	if a.Key != gitsync.Key("config", shaA, "bundles/acme.yaml", 0) || a.Admin || a.Tenant != "alice" {
 		t.Fatalf("apply record: %+v", a)
 	}
 	// The same commit again (explicitly): the same apply, no new revision.
@@ -215,8 +215,10 @@ func TestGitRepositoryRegisterCheckSyncAndRepeat(t *testing.T) {
 	if len(applies) != 1 {
 		t.Fatalf("a repeated sync created an apply: %d", len(applies))
 	}
-	// The ref moves: the next sync applies the new head under a new key; the old commit stays
-	// syncable (reachable from the ref) and still writes nothing.
+	// The ref moves: the next sync applies the new head under a new key (generation 1); the old
+	// commit stays syncable (reachable from the ref) and, as a return to an earlier state, is a
+	// transition of its own (generation 2): a new apply writes it, never the done apply of the
+	// first generation returned with the catalogue left at B.
 	git.repos["https://git.example.com/alice/config.git"].heads["main"] = shaB
 	git.repos["https://git.example.com/alice/config.git"].history["main"] = []string{shaA, shaB}
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil)
@@ -229,13 +231,27 @@ func TestGitRepositoryRegisterCheckSyncAndRepeat(t *testing.T) {
 	if env.Revision != 2 || env.Source.Commit != shaB {
 		t.Fatalf("environment after the second sync: rev %d %+v", env.Revision, env.Source)
 	}
-	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", map[string]string{"commit": shaA}, nil); resp.StatusCode != 200 || syncOf(t, body).Sync.Bundles[0].Apply != first {
+	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", map[string]string{"commit": shaA}, nil); resp.StatusCode != 200 || syncOf(t, body).Sync.Bundles[0].Apply == first || syncOf(t, body).Sync.Generation != 2 || syncOf(t, body).Sync.Bundles[0].Changes != 1 {
 		t.Fatalf("the old commit again: %d %s", resp.StatusCode, body)
 	}
 	_, body = call(t, "GET", api+"/v1/environments/py/revisions", "alice-tok", nil, nil)
 	_ = json.Unmarshal(body, &revs)
-	if len(revs) != 2 {
+	if len(revs) != 3 {
 		t.Fatalf("revisions after re-syncing the old commit: %d", len(revs))
+	}
+	_, body = call(t, "GET", api+"/v1/environments/py", "alice-tok", nil, nil)
+	_ = json.Unmarshal(body, &env)
+	if env.Revision != 3 || env.Source.Commit != shaA {
+		t.Fatalf("environment after going back to the old commit: rev %d %+v", env.Revision, env.Source)
+	}
+	// And the same old commit once more within that generation: the same apply, nothing written.
+	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", map[string]string{"commit": shaA}, nil); resp.StatusCode != 200 || syncOf(t, body).Sync.Generation != 2 {
+		t.Fatalf("the old commit a second time: %d %s", resp.StatusCode, body)
+	}
+	_, body = call(t, "GET", api+"/v1/environments/py/revisions", "alice-tok", nil, nil)
+	_ = json.Unmarshal(body, &revs)
+	if len(revs) != 3 {
+		t.Fatalf("a repeated sync within a generation wrote: %d revisions", len(revs))
 	}
 	// A commit that is not on the ref, a non-SHA, an unknown field in the body.
 	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", map[string]string{"commit": shaX}, nil); resp.StatusCode != 502 || !strings.Contains(string(body), "not reachable") {

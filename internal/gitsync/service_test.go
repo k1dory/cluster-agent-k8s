@@ -154,7 +154,7 @@ func TestSyncStopsAtAStoppedApplyAndContinuesItOnTheNextSyncOfTheCommit(t *testi
 		t.Fatalf("agent revisions after a third sync: %d", n)
 	}
 	// Applies carry the key of repository, commit and path.
-	a, err := st.GetApplyByKey(ctx, "acme", Key("config", sha1, "bundles/b-agent.yaml"))
+	a, err := st.GetApplyByKey(ctx, "acme", Key("config", sha1, "bundles/b-agent.yaml", 0))
 	if err != nil || a.ID != stopped || a.Attempt != 2 {
 		t.Fatalf("apply by key: %v %+v", err, a)
 	}

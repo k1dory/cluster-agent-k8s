@@ -776,9 +776,15 @@ paths:
         must name the registered repository. The action is a persisted job: one per delivery (a
         redelivery names the same job), claimed by one replica at a time under a lease and taken
         over by another when that replica dies; it runs with the repository's authority, under the
-        tenant's cross-replica lock, and its outcome lands in the `hook` half of the status. A push
-        syncs the ref's current head, never the commit the delivery named if the ref moved on, so a
-        delivery handled late cannot roll a newer state back (`superseded`).
+        tenant's cross-replica lock (syncs and plans alike), and its outcome lands in the `hook`
+        half of the status. A job acts on what the repository holds now: a push syncs the ref's
+        current head and a pull request plan is published for the request's current head only, so a
+        delivery handled late cannot roll a newer state back or land an older plan over a newer one
+        (`superseded`). A job that ends with an error (not an invalid bundle) runs again after 30s,
+        1m, 2m and 4m, five attempts in all, then fails; one that runs out of its lease is taken
+        over, up to the same five attempts. A redelivery of a delivery whose job ran reports its
+        outcome and changes nothing; of one whose job failed or waits for its next attempt, runs it
+        again now; of one due or running, names it.
       security: []
       parameters:
         - { name: tenant, in: path, required: true, schema: { type: string }, description: "The repository's tenant; `-` for the shared scope" }
@@ -1758,6 +1764,7 @@ components:
           description: The last sync attempt (absent until one ran), the failed ones included
           properties:
             commit: { type: string, description: "The commit synced (or attempted)" }
+            generation: { type: integer, description: "Counts the transitions of the desired state: moves on when a sync names another commit than the last one did, so a return to a commit synced before (a force push back) gets applies of its own; a repeat of the same commit finds its applies. Absent (0) for the first transition" }
             bundles:
               type: array
               items:
@@ -1780,13 +1787,13 @@ components:
         provider: { type: string, enum: [github, gitlab] }
         event: { type: string, description: "push, pull_request, merge_request, or the provider's name of an event the platform ignores" }
         action: { type: string, enum: [sync, plan, ignored] }
-        reason: { type: string, description: "Why the delivery was ignored" }
+        reason: { type: string, description: "Why the delivery was ignored, how a redelivery was treated, or a note on how the action went (the head the ref or the request has moved to, the attempt that failed and when the next runs)" }
         ref: { type: string }
         commit: { type: string }
         number: { type: integer, description: "The pull or merge request number" }
         delivery: { type: string, description: "The provider's delivery id" }
         job: { type: string, description: "The persisted job carrying the action out (a redelivery names the same job)" }
-        outcome: { type: string, enum: [done, invalid, stopped, error, ignored, superseded], description: "Absent while the action runs; superseded: a push delivery whose head the ref had already moved past" }
+        outcome: { type: string, enum: [done, invalid, stopped, error, ignored, superseded], description: "Absent while the action runs or waits for its next attempt; superseded: a delivery whose commit the ref or the pull request had already moved past, so nothing was written or published; error with a reason naming the next attempt: the job runs again" }
         error: { type: string }
         at: { type: string, format: date-time }
     GitSyncError:

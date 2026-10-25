@@ -1153,7 +1153,8 @@ func (m *Memory) ClaimGitJob(_ context.Context, owner string, now time.Time, lea
 	defer m.mu.Unlock()
 	var pick *model.GitJob
 	for _, j := range m.gitJobs {
-		waiting := j.Status == model.GitJobPending || (j.Status == model.GitJobRunning && j.LeaseUntil != nil && !j.LeaseUntil.After(now))
+		due := j.LeaseUntil == nil || !j.LeaseUntil.After(now)
+		waiting := (j.Status == model.GitJobPending && due) || (j.Status == model.GitJobRunning && j.LeaseUntil != nil && due)
 		if waiting && (pick == nil || j.CreatedAt.Before(pick.CreatedAt) || (j.CreatedAt.Equal(pick.CreatedAt) && j.ID < pick.ID)) {
 			pick = j
 		}
@@ -1167,17 +1168,52 @@ func (m *Memory) ClaimGitJob(_ context.Context, owner string, now time.Time, lea
 	return cloneGitJob(pick), nil
 }
 
-func (m *Memory) FinishGitJob(_ context.Context, id, owner, status, outcome, errMsg string) error {
+// held returns the job when it is running under owner's attempt, else the conflict.
+func (m *Memory) held(id, owner string, attempt int) (*model.GitJob, error) {
+	j, ok := m.gitJobs[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if j.Owner != owner || j.Status != model.GitJobRunning || j.Attempts != attempt {
+		return nil, fmt.Errorf("%w: job %s is %s, attempt %d, owned by %q", ErrConflict, id, j.Status, j.Attempts, j.Owner)
+	}
+	return j, nil
+}
+
+func (m *Memory) FinishGitJob(_ context.Context, id, owner string, attempt int, status, outcome, errMsg string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, err := m.held(id, owner, attempt)
+	if err != nil {
+		return err
+	}
+	j.Status, j.Outcome, j.Error, j.LeaseUntil, j.UpdatedAt = status, outcome, errMsg, nil, time.Now()
+	return nil
+}
+
+func (m *Memory) RetryGitJob(_ context.Context, id, owner string, attempt int, notBefore time.Time, errMsg string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, err := m.held(id, owner, attempt)
+	if err != nil {
+		return err
+	}
+	at := notBefore
+	j.Status, j.Outcome, j.Error, j.LeaseUntil, j.UpdatedAt = model.GitJobPending, "", errMsg, &at, time.Now()
+	return nil
+}
+
+func (m *Memory) RequeueGitJob(_ context.Context, id string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	j, ok := m.gitJobs[id]
 	if !ok {
 		return ErrNotFound
 	}
-	if j.Owner != owner || j.Status != model.GitJobRunning {
-		return fmt.Errorf("%w: job %s is %s, owned by %q", ErrConflict, id, j.Status, j.Owner)
+	if j.Status != model.GitJobFailed && j.Status != model.GitJobPending {
+		return fmt.Errorf("%w: job %s is %s, neither failed nor waiting", ErrConflict, id, j.Status)
 	}
-	j.Status, j.Outcome, j.Error, j.LeaseUntil, j.UpdatedAt = status, outcome, errMsg, nil, time.Now()
+	j.Status, j.Attempts, j.Outcome, j.Error, j.LeaseUntil, j.UpdatedAt = model.GitJobPending, 0, "", "", nil, time.Now()
 	return nil
 }
 

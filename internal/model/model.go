@@ -172,7 +172,7 @@ const (
 	HookActionPlan    = "plan"
 	HookActionIgnored = "ignored"
 	HookIgnored       = "ignored"
-	HookSuperseded    = "superseded" // a push delivery whose head the ref had already moved past
+	HookSuperseded    = "superseded" // a delivery whose commit the ref (or the pull request) had already moved past
 )
 
 // GitJob is a webhook action waiting to run or running: persisted when the delivery is
@@ -212,13 +212,17 @@ type GitCheck struct {
 }
 
 // GitSyncResult is the last sync attempt: the commit, one entry per bundle in apply order,
-// and the outcome.
+// and the outcome. Generation counts the transitions of the desired state: it moves on when
+// a sync names another commit than the last one did, so going back to a commit synced before
+// (a force push A → B → A) is a new transition with applies of its own, while a repeat of the
+// same commit (a retry, a continued stopped apply, a redelivery) finds the applies it had.
 type GitSyncResult struct {
-	Commit  string          `json:"commit,omitempty"`
-	Bundles []GitSyncBundle `json:"bundles,omitempty"`
-	Status  string          `json:"status"` // done | invalid | stopped | error
-	Error   string          `json:"error,omitempty"`
-	At      time.Time       `json:"at"`
+	Commit     string          `json:"commit,omitempty"`
+	Generation int             `json:"generation,omitempty"`
+	Bundles    []GitSyncBundle `json:"bundles,omitempty"`
+	Status     string          `json:"status"` // done | invalid | stopped | error
+	Error      string          `json:"error,omitempty"`
+	At         time.Time       `json:"at"`
 }
 
 // GitSync statuses.

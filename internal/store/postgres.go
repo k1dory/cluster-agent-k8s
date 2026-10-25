@@ -1282,27 +1282,63 @@ func (p *Postgres) EnqueueGitJob(ctx context.Context, j *model.GitJob) error {
 }
 
 // ClaimGitJob: one statement picks the oldest waiting job and leases it; SKIP LOCKED keeps two
-// replicas from picking the same row.
+// replicas from picking the same row. A pending job waits until its lease_until (a retry's
+// not-before) has passed; a running one until its lease lapsed.
 func (p *Postgres) ClaimGitJob(ctx context.Context, owner string, now time.Time, lease time.Duration) (*model.GitJob, error) {
 	return scanGitJob(p.pool.QueryRow(ctx, `WITH pick AS (
 			SELECT id FROM git_jobs
-			WHERE status = 'pending' OR (status = 'running' AND lease_until IS NOT NULL AND lease_until <= $2)
+			WHERE (status = 'pending' AND (lease_until IS NULL OR lease_until <= $2))
+			   OR (status = 'running' AND lease_until IS NOT NULL AND lease_until <= $2)
 			ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED)
 		UPDATE git_jobs SET status = 'running', owner = $1, lease_until = $3, attempts = attempts + 1, updated_at = $2
 		FROM pick WHERE git_jobs.id = pick.id RETURNING `+qualified("git_jobs", gitJobCols), owner, now, now.Add(lease)))
 }
 
-func (p *Postgres) FinishGitJob(ctx context.Context, id, owner, status, outcome, errMsg string) error {
-	tag, err := p.pool.Exec(ctx, `UPDATE git_jobs SET status=$3, outcome=$4, error=$5, lease_until=NULL, updated_at=now()
-		WHERE id=$1 AND owner=$2 AND status='running'`, id, owner, status, outcome, errMsg)
+// heldConflict is the error for a write by a holder the job no longer belongs to.
+func (p *Postgres) heldConflict(ctx context.Context, id, owner string, attempt int) error {
+	j, err := p.GetGitJob(ctx, id)
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("%w: job %s is %s, attempt %d, owned by %q (not running under %q, attempt %d)", ErrConflict, id, j.Status, j.Attempts, j.Owner, owner, attempt)
+}
+
+func (p *Postgres) FinishGitJob(ctx context.Context, id, owner string, attempt int, status, outcome, errMsg string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE git_jobs SET status=$4, outcome=$5, error=$6, lease_until=NULL, updated_at=now()
+		WHERE id=$1 AND owner=$2 AND attempts=$3 AND status='running'`, id, owner, attempt, status, outcome, errMsg)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		if _, err := p.GetGitJob(ctx, id); err != nil {
+		return p.heldConflict(ctx, id, owner, attempt)
+	}
+	return nil
+}
+
+func (p *Postgres) RetryGitJob(ctx context.Context, id, owner string, attempt int, notBefore time.Time, errMsg string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE git_jobs SET status='pending', outcome='', error=$5, lease_until=$4, updated_at=now()
+		WHERE id=$1 AND owner=$2 AND attempts=$3 AND status='running'`, id, owner, attempt, notBefore, errMsg)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return p.heldConflict(ctx, id, owner, attempt)
+	}
+	return nil
+}
+
+func (p *Postgres) RequeueGitJob(ctx context.Context, id string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE git_jobs SET status='pending', attempts=0, outcome='', error='', lease_until=NULL, updated_at=now()
+		WHERE id=$1 AND status IN ('failed', 'pending')`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		j, err := p.GetGitJob(ctx, id)
+		if err != nil {
 			return err
 		}
-		return fmt.Errorf("%w: job %s is no longer running under %q", ErrConflict, id, owner)
+		return fmt.Errorf("%w: job %s is %s, neither failed nor waiting", ErrConflict, id, j.Status)
 	}
 	return nil
 }

@@ -242,7 +242,7 @@ func TestHookSyncsOnPushPlansOnPullRequestAndIgnoresTheRest(t *testing.T) {
 	if g.Sync == nil || g.Sync.Commit != sha1 || g.Sync.Status != model.GitSyncDone || g.Hook == nil || g.Hook.Action != model.HookActionSync {
 		t.Fatalf("status after the push: %+v", g)
 	}
-	a, err := st.GetApplyByKey(ctx, "acme", Key("config", sha1, "bundles/a.yaml"))
+	a, err := st.GetApplyByKey(ctx, "acme", Key("config", sha1, "bundles/a.yaml", 0))
 	if err != nil || a.Subject != "webhook:github" || a.Admin {
 		t.Fatalf("the apply of a webhook sync: %v %+v", err, a)
 	}
