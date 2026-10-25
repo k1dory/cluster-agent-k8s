@@ -25,8 +25,8 @@ test "$(docker run --rm --entrypoint id "$sandboxd" -u)" = 65532 || ci_die "imag
 echo "== sandboxctl: runs, tools"
 # Without a command the binary prints its usage and exits non-zero: that it ran is the check.
 usage=$(docker run --rm "$ctl" 2>&1 || true)
-printf '%s\n' "$usage" | head -3
-printf '%s\n' "$usage" | grep -q 'sandboxctl <command>' || ci_die "images: the sandboxctl image did not run the binary"
+printf '%s\n' "${usage%%$'\n'*}"
+case "$usage" in *'sandboxctl <command>'*) ;; *) ci_die "images: the sandboxctl image did not run the binary: $usage" ;; esac
 tools=$(docker run --rm --entrypoint sh "$ctl" -c 'command -v curl jq git >/dev/null && echo tools-present' || true)
 [ "$tools" = tools-present ] || ci_die "images: sandboxctl lacks curl, jq or git"
 
@@ -45,12 +45,18 @@ ctl_apply() { docker run --rm -v "$vol:/w" -w /w -e SANDBOXD_URL=http://127.0.0.
 # the request (exit 1, a marker block, no -require-commit complaint); a modified file fails on
 # the missing SHA.
 set +e; out=$(ctl_apply); code=$?; set -e
-echo "$out"
-{ [ "$code" -eq 1 ] && echo "$out" | grep -q '<!-- agent-sandbox -->' && ! echo "$out" | grep -q 'require-commit'; } || ci_die "images: a clean checkout must fail at the request (exit 1) with a marker block and no -require-commit complaint; got exit $code"
+printf '%s\n' "$out"
+case "$code:$out" in
+  1:*'<!-- agent-sandbox -->'*) case "$out" in *require-commit*) ci_die "images: a clean checkout complained about -require-commit instead of failing at the request" ;; esac ;;
+  *) ci_die "images: a clean checkout must fail at the request (exit 1) with a marker block; got exit $code" ;;
+esac
 docker run --rm -v "$vol:/w" --user 0 --entrypoint sh "$ctl" -c 'echo "# touched" >> /w/examples/catalog/bundle.yaml'
 set +e; out=$(ctl_apply); code=$?; set -e
-echo "$out"
-{ [ "$code" -eq 1 ] && echo "$out" | grep -q 'require-commit: no commit SHA'; } || ci_die "images: a modified file must fail on the missing SHA; got exit $code"
+printf '%s\n' "$out"
+case "$code:$out" in
+  1:*'require-commit: no commit SHA'*) ;;
+  *) ci_die "images: a modified file must fail on the missing SHA; got exit $code" ;;
+esac
 
 echo "== agent image: smoke test and network lock"
 hack/smoke-image.sh "$agent"
