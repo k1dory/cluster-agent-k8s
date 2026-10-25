@@ -5,6 +5,8 @@
 #                        GITLAB_TOKEN (api scope), one note on the merge request updated per push;
 #                        an invalid bundle fails the job
 #   default branch     → apply every bundle with the commit as the source of every new revision
+#                        (a push only, never a schedule), under a key stable for the bundle at
+#                        that commit: retrying the job continues a stopped apply
 #   scheduled pipeline → drift
 #
 # CI/CD variables: SANDBOXD_URL, SANDBOXD_TOKEN (masked; a tenant key sbk_… or the admin token),
@@ -28,13 +30,16 @@ plan:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       changes: ["bundles/**"]
   script:
+    # The job shell stops at the first failing command, so every exit code is caught with
+    # `|| code=$?`: the note is posted (and the artifact kept) for an invalid bundle or an
+    # unreachable platform too, and the job fails afterwards with that code.
     - 'rc=0; : > plans.md'
     - |
       for f in bundles/*.yaml; do
-        /sandboxctl plan -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown >> plans.md; code=$?
+        code=0
+        /sandboxctl plan -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown >> plans.md || code=$?
         echo >> plans.md
-        [ "$code" -eq 2 ] && rc=2
-        [ "$code" -eq 1 ] && rc=1
+        if [ "$code" -ne 0 ]; then rc=$code; fi
       done
     - cat plans.md
     # One note per merge request, found by the marker line and updated on every push.
@@ -58,15 +63,21 @@ plan:
 apply:
   stage: deploy
   rules:
-    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    # A push to the default branch that touched a bundle. The pipeline source matters: on a
+    # scheduled pipeline `changes` is always true, and a schedule must never apply.
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       changes: ["bundles/**"]
   resource_group: sandbox-apply   # one apply at a time; each is continued by key anyway
   script:
+    # -require-commit: the job fails rather than apply without the commit's SHA; the key is the
+    # bundle at this commit, so retrying the job continues the same apply where it stopped.
     - 'rc=0; : > apply.md'
     - |
       for f in bundles/*.yaml; do
-        /sandboxctl apply -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -ref "$CI_COMMIT_BRANCH" -repo "$CI_PROJECT_URL" -markdown >> apply.md; code=$?
-        [ "$code" -ne 0 ] && rc=$code      # 2 invalid, 3 stopped (resume once fixed), 1 unreachable
+        code=0
+        /sandboxctl apply -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -ref "$CI_COMMIT_BRANCH" -repo "$CI_PROJECT_URL" -key "$f@$CI_COMMIT_SHA" -require-commit -markdown >> apply.md || code=$?
+        echo >> apply.md
+        if [ "$code" -ne 0 ]; then rc=$code; fi   # 2 invalid, 3 stopped (retry the job once fixed), 1 unreachable or no SHA
       done
     - cat apply.md
     - exit $rc
@@ -81,7 +92,7 @@ drift:
     - if: $CI_PIPELINE_SOURCE == "schedule"
   script:
     # exit 3 on drift: alert on the failed pipeline; the report is the artifact
-    - '/sandboxctl drift ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown > drift.md; rc=$?; cat drift.md; exit $rc'
+    - 'rc=0; /sandboxctl drift ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown > drift.md || rc=$?; cat drift.md; exit $rc'
   artifacts:
     when: always
     paths: [drift.md]

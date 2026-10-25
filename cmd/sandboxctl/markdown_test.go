@@ -22,7 +22,7 @@ func TestMarkdownRenderersForPullRequests(t *testing.T) {
 	markdownPlan(&buf, p, "bundles/acme.yaml")
 	out := buf.String()
 	for _, want := range []string{Marker, "### Plan ✅ valid · `bundles/acme.yaml`", "1 to create, 1 to update, 1 unchanged, 0 invalid", "plan `f1`",
-		"| ➕ create | EnvironmentProfile | acme | `py` | 0 → 1 |", "| ✏️ update | AgentDefinition | acme | `backend` | 2 → 3 | `spec.repo: a -> b|c` |",
+		"| ➕ create | EnvironmentProfile | acme | `py` | 0 → 1 |", "| ✏️ update | AgentDefinition | acme | `backend` | 2 → 3 | `spec.repo: a -> b\\|c` |",
 		"| · noop | Connection | - | `gh` | 1 | - |", "Merging applies exactly these changes"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("plan markdown lacks %q:\n%s", want, out)
