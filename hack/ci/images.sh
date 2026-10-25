@@ -32,11 +32,15 @@ tools=$(docker run --rm --entrypoint sh "$ctl" -c 'command -v curl jq git >/dev/
 
 echo "== sandboxctl: a checkout owned by another user is read and its SHA recorded"
 # A copy of the checkout owned by root in a volume: foreign to the image's uid 1000 whoever
-# owns the runner's checkout, so the case is the same on every runner and on a laptop.
+# owns the runner's checkout, so the case is the same on every runner and on a laptop. The
+# copy goes through the API (docker cp), never a bind mount: a daemon on another host (a
+# docker-in-docker service) sees none of this job's files.
 vol=agent-sandbox-ci-checkout-$$
 docker volume create "$vol" >/dev/null
-trap 'docker volume rm -f "$vol" >/dev/null 2>&1 || true' EXIT
-docker run --rm -v "$PWD:/src:ro" -v "$vol:/w" --user 0 --entrypoint sh "$ctl" -c 'cp -a /src/. /w/ && chown -R 0:0 /w'
+trap 'docker rm -f "$vol-copy" >/dev/null 2>&1 || true; docker volume rm -f "$vol" >/dev/null 2>&1 || true' EXIT
+docker create --name "$vol-copy" -v "$vol:/w" --user 0 --entrypoint sh "$ctl" -c 'chown -R 0:0 /w' >/dev/null
+docker cp . "$vol-copy:/w"
+docker start -a "$vol-copy" >/dev/null
 head=$(git rev-parse HEAD)
 seen=$(docker run --rm -v "$vol:/w" -w /w --entrypoint git "$ctl" rev-parse HEAD 2>&1 || true)
 [ "$seen" = "$head" ] || ci_die "images: git in the sandboxctl image does not read a checkout owned by another user: $seen"

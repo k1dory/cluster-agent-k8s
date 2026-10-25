@@ -2,11 +2,13 @@
 # Shared by the hack/ci scripts (docs/ci-contract.md): the versions, the tools downloaded once
 # into .ci/bin (or taken from the caller: CADDY_BIN, HELM, docker on PATH), and the one way a
 # check group reports: its last line is `ci: <group>: ok`; anything else, and a non-zero exit,
-# is a failure. A missing tool or service is a failure, never a pass.
+# is a failure. A missing tool or service is a failure, never a pass. CI_ROOT overrides the
+# module directory (the contract tests point the scripts at a module of their own).
 set -euo pipefail
-ci_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+ci_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ci_root=${CI_ROOT:-$(cd "$ci_dir/../.." && pwd)}
 # shellcheck source=versions.env
-. "$ci_root/hack/ci/versions.env"
+. "$ci_dir/versions.env"
 CI_BIN=${CI_BIN:-$ci_root/.ci/bin}
 mkdir -p "$CI_BIN"
 
