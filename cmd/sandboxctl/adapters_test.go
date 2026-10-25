@@ -136,8 +136,22 @@ func TestAdapterMarkdownOnFailurePaths(t *testing.T) {
 	}
 	mu.Lock()
 	if lastApplyBody != "" {
-		t.Errorf("an invalid plan reached /v1/apply: %s", lastApplyBody)
+		t.Errorf("an invalid plan without a key reached /v1/apply: %s", lastApplyBody)
 	}
+	mu.Unlock()
+	// With a key the controller decides (the bundle may be the continuation of an apply whose
+	// own first attempt made this plan invalid): the submission goes out, and a refusal with
+	// the plan is rendered as the plan.
+	set(200, `{"valid":false,"summary":{"invalid":1},"changes":[]}`, 422, `{"error":"the bundle is not valid: see the plan","code":"invalid_plan","plan":{"valid":false,"summary":{"invalid":1},"changes":[{"kind":"EnvironmentProfile","tenant":"acme","name":"py","action":"invalid","errors":["expected revision 0, found 1"]}]}}`)
+	out, _, code = ctlChild(t, repo, srv.URL, "t", nil, "apply", "-f", "bundles/acme.yaml", "-key", "k1", "-markdown")
+	if code != 2 || !strings.HasPrefix(out, Marker+"\n### Plan ❌ invalid · `bundles/acme.yaml`") || !strings.Contains(out, "expected revision 0, found 1") {
+		t.Errorf("refused apply under a key -markdown: exit %d\n%s", code, out)
+	}
+	mu.Lock()
+	if !strings.Contains(lastApplyBody, `"key":"k1"`) {
+		t.Errorf("an apply under a key must reach the controller: %s", lastApplyBody)
+	}
+	lastApplyBody = ""
 	mu.Unlock()
 
 	// -require-commit: a clean checkout applies with the SHA and the key; a modified file, a
@@ -169,6 +183,9 @@ func TestAdapterMarkdownOnFailurePaths(t *testing.T) {
 		{"modified", nil, []string{"apply", "-f", "bundles/acme.yaml", "-require-commit", "-markdown"}, "not what HEAD holds"},
 		{"foreign_owner", []string{"GIT_TEST_ASSUME_DIFFERENT_OWNER=1", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + isolateGitConfig(t)}, []string{"apply", "-f", "bundles/acme.yaml", "-markdown"}, "dubious ownership"},
 		{"no_git", nil, []string{"apply", "-f", "bundles/acme.yaml", "-require-commit", "-no-git", "-markdown"}, "-no-git records no source"},
+		// -commit names a SHA that -no-git would not send: contradictory, refused before anything.
+		{"no_git_with_commit", nil, []string{"apply", "-f", "bundles/acme.yaml", "-no-git", "-commit", head, "-require-commit", "-markdown"}, "-no-git records no source"},
+		{"no_git_with_repo", nil, []string{"apply", "-f", "bundles/acme.yaml", "-no-git", "-repo", "https://example.com/r.git", "-markdown"}, "drop -repo/-ref/-commit/-path"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
