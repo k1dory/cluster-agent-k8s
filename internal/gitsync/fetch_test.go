@@ -93,12 +93,23 @@ func TestCLIResolvesTagsToCommitsAndServesPublicRepositories(t *testing.T) {
 			t.Fatalf("files at tag %s: %v %v", tag, files, err)
 		}
 	}
-	// A branch and a tag of the same name: the branch wins, as git's own resolution does.
+	// A branch and a tag of the same name, pointing at different commits: Resolve and Files
+	// make the same choice (the branch), so the head a check reports is the head a sync fetches,
+	// and the branch's newer commit is not refused as unreachable.
 	sha2 := commit(map[string]string{"b.yaml": "kind: EnvironmentProfile\nname: py\nspec: {image: stable, env: {X: y}}\n"}, "two")
-	gittest.Git(t, work, "tag", "main-tag", sha)
-	gittest.Git(t, work, "push", "-q", "origin", "main-tag")
-	if head, err := cli.Resolve(ctx, Remote{URL: url, Ref: "main"}); err != nil || head != sha2 {
-		t.Fatalf("branch after a second commit: %q %v", head, err)
+	gittest.Git(t, work, "tag", "main", sha)
+	gittest.Git(t, work, "push", "-q", "origin", "refs/tags/main")
+	main := Remote{URL: url, Ref: "main"}
+	head, err := cli.Resolve(ctx, main)
+	if err != nil || head != sha2 {
+		t.Fatalf("branch shadowed by a tag of the same name: %q %v", head, err)
+	}
+	files, err := cli.Files(ctx, main, head, []string{"*.yaml"})
+	if err != nil || !strings.Contains(string(files["b.yaml"]), "X: y") {
+		t.Fatalf("files at the branch's head with a tag of the same name: %v %v", files, err)
+	}
+	if files, err := cli.Files(ctx, main, sha, []string{"*.yaml"}); err != nil || strings.Contains(string(files["b.yaml"]), "X: y") {
+		t.Fatalf("the older commit, reachable from the branch: %v %v", files, err)
 	}
 }
 

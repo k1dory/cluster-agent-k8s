@@ -19,7 +19,7 @@ func TestReviewGitRepoHTTPFailureCannotBecomeSuccess(t *testing.T) {
 				w.WriteHeader(http.StatusInternalServerError)
 				json.NewEncoder(w).Encode(map[string]any{
 					"error": "status persistence unavailable", "code": "error",
-					"sync": model.GitSync{Tenant: "acme", Name: "config", Head: "head", Commit: "head", Status: model.GitSyncDone},
+					"sync": model.GitSync{Tenant: "acme", Name: "config", Check: &model.GitCheck{Head: "head"}, Sync: &model.GitSyncResult{Commit: "head", Status: model.GitSyncDone}},
 				})
 			}))
 			defer srv.Close()

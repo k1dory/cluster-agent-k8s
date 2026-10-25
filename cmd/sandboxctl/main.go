@@ -558,14 +558,19 @@ func (c *cli) run(cmd string, args []string) error {
 		err := c.do(method, path+tenantQuery(*tenant), body, &g)
 		var refused *apiError
 		if errors.As(err, &refused) {
-			// The record travels with the refusal: show it, then exit by the outcome.
+			// The record travels with the refusal: show it, but the refusal stays the outcome
+			// (never exit 0 on an HTTP error, whatever the record says).
 			var out struct {
 				Sync *model.GitSync `json:"sync"`
 			}
 			if json.Unmarshal(refused.Body, &out) == nil && out.Sync != nil {
-				g = *out.Sync
-				err = nil
 				fmt.Fprintln(os.Stderr, "sandboxctl:", refused.Message)
+				if *asJSON {
+					printJSON(out.Sync)
+				} else {
+					printGitSync(*out.Sync)
+				}
+				os.Exit(gitSyncExitCode(sub, refused.Status, *out.Sync))
 			}
 		}
 		if err != nil {
@@ -576,7 +581,7 @@ func (c *cli) run(cmd string, args []string) error {
 		} else {
 			printGitSync(g)
 		}
-		os.Exit(gitSyncExitCode(sub, g))
+		os.Exit(gitSyncExitCode(sub, http.StatusOK, g))
 	case "drift":
 		tenant := fs.String("tenant", "", "scope (admin)")
 		file := fs.String("f", "", "bundle to compare the platform with (what apply would change); without it, the store-side report")
@@ -1403,22 +1408,22 @@ func mergeSource(flags, detected bundleSource) bundleSource {
 }
 
 func printGitSync(g model.GitSync) {
-	if g.CheckedAt != nil {
-		if g.CheckError != "" {
-			fmt.Printf("check    %s  error: %s\n", g.CheckedAt.Format(time.RFC3339), g.CheckError)
+	if g.Check != nil {
+		if g.Check.Error != "" {
+			fmt.Printf("check    %s  error: %s\n", g.Check.At.Format(time.RFC3339), g.Check.Error)
 		} else {
-			fmt.Printf("check    %s  head %s\n", g.CheckedAt.Format(time.RFC3339), g.Head)
+			fmt.Printf("check    %s  head %s\n", g.Check.At.Format(time.RFC3339), g.Check.Head)
 		}
 	}
-	if g.SyncedAt != nil {
-		fmt.Printf("sync     %s  %s  commit %s", g.SyncedAt.Format(time.RFC3339), g.Status, g.Commit)
-		if g.Error != "" {
-			fmt.Printf("  %s", g.Error)
+	if g.Sync != nil {
+		fmt.Printf("sync     %s  %s  commit %s", g.Sync.At.Format(time.RFC3339), g.Sync.Status, g.Sync.Commit)
+		if g.Sync.Error != "" {
+			fmt.Printf("  %s", g.Sync.Error)
 		}
 		fmt.Println()
 		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(tw, "PATH\tAPPLY\tSTATUS\tCHANGES\tERRORS")
-		for _, b := range g.Bundles {
+		for _, b := range g.Sync.Bundles {
 			apply := b.Apply
 			if apply == "" {
 				apply = "-"
@@ -1427,21 +1432,39 @@ func printGitSync(g model.GitSync) {
 		}
 		tw.Flush()
 	}
-	if g.CheckedAt == nil && g.SyncedAt == nil {
+	if g.Check == nil && g.Sync == nil {
 		fmt.Println("never checked or synced")
 	}
 }
 
-// gitSyncExitCode: check 0 when the ref resolved, 1 otherwise; sync 0 done, 2 a bundle
-// invalid, 3 an apply stopped, 1 the repository unreadable; status 0.
-func gitSyncExitCode(sub string, g model.GitSync) int {
+// gitSyncExitCode: the HTTP outcome first (an error answer is never exit 0, whatever the record
+// attached to it says): 422 is 2 for a sync (a bundle invalid), 409 is 3 (an apply stopped),
+// any other error 1. On 200: check 0 when the ref resolved, 1 otherwise; sync 0 when done, 2
+// invalid, 3 stopped, 1 unreadable; status 0.
+func gitSyncExitCode(sub string, httpStatus int, g model.GitSync) int {
+	if httpStatus >= 300 {
+		if sub == "sync" {
+			switch httpStatus {
+			case http.StatusUnprocessableEntity:
+				if g.Sync != nil && g.Sync.Status == model.GitSyncInvalid {
+					return 2
+				}
+			case http.StatusConflict:
+				return 3
+			}
+		}
+		return 1
+	}
 	switch sub {
 	case "check":
-		if g.CheckError != "" || g.Head == "" {
+		if g.Check == nil || g.Check.Error != "" || g.Check.Head == "" {
 			return 1
 		}
 	case "sync":
-		switch g.Status {
+		if g.Sync == nil {
+			return 1
+		}
+		switch g.Sync.Status {
 		case model.GitSyncDone:
 		case model.GitSyncInvalid:
 			return 2

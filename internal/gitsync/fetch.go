@@ -150,16 +150,14 @@ func (c CLI) workdir() (string, func(), error) {
 	return dir, func() { os.RemoveAll(dir) }, nil
 }
 
-// Resolve: ls-remote for the ref, preferring the branch, then the tag's peeled commit.
-func (c CLI) Resolve(ctx context.Context, r Remote) (string, error) {
-	dir, done, err := c.workdir()
-	if err != nil {
-		return "", err
-	}
-	defer done()
+// lookup asks the remote which full ref name r.Ref is and what it points at: the branch
+// (refs/heads/<ref>) before the tag (refs/tags/<ref>, peeled to its commit), the one choice
+// Resolve and Files share, so a branch and a tag of the same name cannot make a check report
+// one commit and a sync fetch another.
+func (c CLI) lookup(ctx context.Context, dir string, r Remote) (name, sha string, err error) {
 	out, err := c.run(ctx, dir, r, "ls-remote", "--", r.URL, "refs/heads/"+r.Ref, "refs/tags/"+r.Ref, "refs/tags/"+r.Ref+"^{}")
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	refs := map[string]string{}
 	for _, l := range strings.Split(strings.TrimSpace(string(out)), "\n") {
@@ -167,12 +165,27 @@ func (c CLI) Resolve(ctx context.Context, r Remote) (string, error) {
 			refs[strings.TrimSpace(name)] = strings.TrimSpace(sha)
 		}
 	}
-	for _, name := range []string{"refs/heads/" + r.Ref, "refs/tags/" + r.Ref + "^{}", "refs/tags/" + r.Ref} {
-		if sha := refs[name]; shaRe.MatchString(sha) {
-			return sha, nil
-		}
+	if sha := refs["refs/heads/"+r.Ref]; shaRe.MatchString(sha) {
+		return "refs/heads/" + r.Ref, sha, nil
 	}
-	return "", fmt.Errorf("%w: %s", ErrNoRef, r.Ref)
+	if sha := refs["refs/tags/"+r.Ref+"^{}"]; shaRe.MatchString(sha) {
+		return "refs/tags/" + r.Ref, sha, nil
+	}
+	if sha := refs["refs/tags/"+r.Ref]; shaRe.MatchString(sha) {
+		return "refs/tags/" + r.Ref, sha, nil
+	}
+	return "", "", fmt.Errorf("%w: %s", ErrNoRef, r.Ref)
+}
+
+// Resolve: the commit the ref points at (see lookup).
+func (c CLI) Resolve(ctx context.Context, r Remote) (string, error) {
+	dir, done, err := c.workdir()
+	if err != nil {
+		return "", err
+	}
+	defer done()
+	_, sha, err := c.lookup(ctx, dir, r)
+	return sha, err
 }
 
 // Files: a shallow fetch of the ref into an empty repository, deepened until the commit is
@@ -186,11 +199,16 @@ func (c CLI) Files(ctx context.Context, r Remote, commit string, patterns []stri
 		return nil, err
 	}
 	defer done()
+	// The same full ref name Resolve chose, so the head fetched here is the head checked there.
+	full, _, err := c.lookup(ctx, dir, r)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := c.run(ctx, dir, r, "init", "-q", "--bare", "repo"); err != nil {
 		return nil, err
 	}
 	repo := dir + "/repo"
-	if _, err := c.run(ctx, repo, r, "fetch", "-q", "--no-tags", "--depth=1", "--", r.URL, "+"+r.Ref+":refs/sync/head"); err != nil {
+	if _, err := c.run(ctx, repo, r, "fetch", "-q", "--no-tags", "--depth=1", "--", r.URL, "+"+full+":refs/sync/head"); err != nil {
 		if strings.Contains(err.Error(), "couldn't find remote ref") {
 			return nil, fmt.Errorf("%w: %s", ErrNoRef, r.Ref)
 		}
@@ -208,15 +226,12 @@ func (c CLI) Files(ctx context.Context, r Remote, commit string, patterns []stri
 		if i >= steps {
 			return nil, fmt.Errorf("%w: %s is not in the last %d commits of %s", ErrNotOnRef, commit, steps*100, r.Ref)
 		}
-		out, err := c.run(ctx, repo, r, "fetch", "-q", "--no-tags", "--deepen=100", "--", r.URL, "+"+r.Ref+":refs/sync/head")
-		if err != nil {
+		if _, err := c.run(ctx, repo, r, "fetch", "-q", "--no-tags", "--deepen=100", "--", r.URL, "+"+full+":refs/sync/head"); err != nil {
 			return nil, err
 		}
-		_ = out
-		if _, err := c.run(ctx, repo, r, "rev-parse", "--is-shallow-repository"); err == nil {
-			if b, _ := c.run(ctx, repo, r, "rev-parse", "--is-shallow-repository"); strings.TrimSpace(string(b)) == "false" && !onRef() {
-				return nil, fmt.Errorf("%w: %s", ErrNotOnRef, commit)
-			}
+		// The whole history fetched and the commit still absent: it is not on the ref.
+		if b, err := c.run(ctx, repo, r, "rev-parse", "--is-shallow-repository"); err == nil && strings.TrimSpace(string(b)) == "false" && !onRef() {
+			return nil, fmt.Errorf("%w: %s", ErrNotOnRef, commit)
 		}
 	}
 	out, err := c.run(ctx, repo, r, "ls-tree", "-r", "--name-only", "-z", commit)

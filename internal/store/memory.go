@@ -1057,27 +1057,45 @@ func (m *Memory) DeleteCredential(_ context.Context, tenant, name string) error 
 
 func cloneGitSync(g *model.GitSync) *model.GitSync {
 	c := *g
-	if g.CheckedAt != nil {
-		t := *g.CheckedAt
-		c.CheckedAt = &t
+	if g.Check != nil {
+		ck := *g.Check
+		c.Check = &ck
 	}
-	if g.SyncedAt != nil {
-		t := *g.SyncedAt
-		c.SyncedAt = &t
-	}
-	c.Bundles = make([]model.GitSyncBundle, len(g.Bundles))
-	for i, b := range g.Bundles {
-		b.Errors = append([]string(nil), b.Errors...)
-		c.Bundles[i] = b
+	if g.Sync != nil {
+		sy := *g.Sync
+		sy.Bundles = make([]model.GitSyncBundle, len(g.Sync.Bundles))
+		for i, b := range g.Sync.Bundles {
+			b.Errors = append([]string(nil), b.Errors...)
+			sy.Bundles[i] = b
+		}
+		c.Sync = &sy
 	}
 	return &c
 }
 
-func (m *Memory) PutGitSync(_ context.Context, g *model.GitSync) error {
+func (m *Memory) gitSync(tenant, name string) *model.GitSync {
+	key := tenant + "|" + name
+	g, ok := m.gitSyncs[key]
+	if !ok {
+		g = &model.GitSync{Tenant: tenant, Name: name}
+		m.gitSyncs[key] = g
+	}
+	g.UpdatedAt = time.Now()
+	return g
+}
+
+func (m *Memory) RecordGitCheck(_ context.Context, tenant, name string, c model.GitCheck) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	g.UpdatedAt = time.Now()
-	m.gitSyncs[g.Tenant+"|"+g.Name] = cloneGitSync(g)
+	m.gitSync(tenant, name).Check = &c
+	return nil
+}
+
+func (m *Memory) RecordGitSync(_ context.Context, tenant, name string, r model.GitSyncResult) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	copied := cloneGitSync(&model.GitSync{Sync: &r})
+	m.gitSync(tenant, name).Sync = copied.Sync
 	return nil
 }
 

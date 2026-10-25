@@ -134,24 +134,34 @@ const (
 	KindGitRepository  = "GitRepository"  // a Git repository of bundles the platform reads itself
 )
 
-// GitSync is the state of a GitRepository as the platform last saw it: the head its ref
-// resolved to on the last check, and what the last sync applied. One record per repository,
-// replaced on every check or sync; the history of what was written is in the applies and the
-// revisions, which carry the commit.
+// GitSync is the state of a GitRepository as the platform last saw it: the last check (the
+// ref's head) and the last sync (what was applied). The two halves are written independently
+// and atomically: a check never touches the sync half and a sync never touches the check half,
+// so a check racing a sync cannot erase the sync's commit and apply ids. One record per
+// repository; the history of what was written is in the applies and the revisions.
 type GitSync struct {
-	Tenant string `json:"tenant"`
-	Name   string `json:"name"`
-	// The last check: the ref's head, or why it could not be read.
-	Head       string     `json:"head,omitempty"`
-	CheckedAt  *time.Time `json:"checked_at,omitempty"`
-	CheckError string     `json:"check_error,omitempty"`
-	// The last sync: the commit, one entry per bundle in apply order, and the outcome.
-	Commit    string          `json:"commit,omitempty"`
-	Bundles   []GitSyncBundle `json:"bundles,omitempty"`
-	Status    string          `json:"status,omitempty"` // done | invalid | stopped | error
-	Error     string          `json:"error,omitempty"`
-	SyncedAt  *time.Time      `json:"synced_at,omitempty"`
-	UpdatedAt time.Time       `json:"updated_at"`
+	Tenant    string         `json:"tenant"`
+	Name      string         `json:"name"`
+	Check     *GitCheck      `json:"check,omitempty"`
+	Sync      *GitSyncResult `json:"sync,omitempty"`
+	UpdatedAt time.Time      `json:"updated_at"`
+}
+
+// GitCheck is the last check: the ref's head, or why it could not be read.
+type GitCheck struct {
+	Head  string    `json:"head,omitempty"`
+	At    time.Time `json:"at"`
+	Error string    `json:"error,omitempty"`
+}
+
+// GitSyncResult is the last sync attempt: the commit, one entry per bundle in apply order,
+// and the outcome.
+type GitSyncResult struct {
+	Commit  string          `json:"commit,omitempty"`
+	Bundles []GitSyncBundle `json:"bundles,omitempty"`
+	Status  string          `json:"status"` // done | invalid | stopped | error
+	Error   string          `json:"error,omitempty"`
+	At      time.Time       `json:"at"`
 }
 
 // GitSync statuses.

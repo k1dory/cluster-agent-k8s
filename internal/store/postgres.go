@@ -1180,29 +1180,39 @@ func (p *Postgres) DeleteCredential(ctx context.Context, tenant, name string) er
 
 // --- Git repositories: last known state -------------------------------------------------------
 
-func (p *Postgres) PutGitSync(ctx context.Context, g *model.GitSync) error {
-	g.UpdatedAt = time.Now()
-	doc, err := json.Marshal(g)
+// recordGitHalf writes one half of the record: the document is created with that half, or
+// its half is replaced in place (jsonb ||), the other half untouched, in one statement.
+func (p *Postgres) recordGitHalf(ctx context.Context, tenant, name, half string, v any) error {
+	doc, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	_, err = p.pool.Exec(ctx, `INSERT INTO git_syncs (tenant, name, doc, updated_at) VALUES ($1,$2,$3,$4)
-		ON CONFLICT (tenant, name) DO UPDATE SET doc=EXCLUDED.doc, updated_at=EXCLUDED.updated_at`, g.Tenant, g.Name, doc, g.UpdatedAt)
+	_, err = p.pool.Exec(ctx, `INSERT INTO git_syncs (tenant, name, doc, updated_at) VALUES ($1,$2,jsonb_build_object($3::text, $4::jsonb),now())
+		ON CONFLICT (tenant, name) DO UPDATE SET doc = git_syncs.doc || jsonb_build_object($3::text, $4::jsonb), updated_at = now()`, tenant, name, half, doc)
 	return err
+}
+
+func (p *Postgres) RecordGitCheck(ctx context.Context, tenant, name string, c model.GitCheck) error {
+	return p.recordGitHalf(ctx, tenant, name, "check", c)
+}
+
+func (p *Postgres) RecordGitSync(ctx context.Context, tenant, name string, r model.GitSyncResult) error {
+	return p.recordGitHalf(ctx, tenant, name, "sync", r)
 }
 
 func (p *Postgres) GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error) {
 	var doc []byte
-	err := p.pool.QueryRow(ctx, `SELECT doc FROM git_syncs WHERE tenant=$1 AND name=$2`, tenant, name).Scan(&doc)
+	g := &model.GitSync{Tenant: tenant, Name: name}
+	err := p.pool.QueryRow(ctx, `SELECT doc, updated_at FROM git_syncs WHERE tenant=$1 AND name=$2`, tenant, name).Scan(&doc, &g.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	var g model.GitSync
-	if err := json.Unmarshal(doc, &g); err != nil {
+	if err := json.Unmarshal(doc, g); err != nil {
 		return nil, err
 	}
-	return &g, nil
+	g.Tenant, g.Name = tenant, name
+	return g, nil
 }

@@ -120,21 +120,21 @@ func TestSyncStopsAtAStoppedApplyAndContinuesItOnTheNextSyncOfTheCommit(t *testi
 	scope := plan.Scope{Tenant: "acme", Subject: "alice"}
 	st.arm("backend")
 	g, err := s.Sync(ctx, scope, "config", "")
-	if !errors.Is(err, ErrStopped) || g.Status != model.GitSyncStopped || len(g.Bundles) != 2 || g.Bundles[0].Status != model.ApplyDone || g.Bundles[1].Status != model.ApplyFailed || g.Commit != sha1 || g.Head != sha1 {
+	if !errors.Is(err, ErrStopped) || g.Sync.Status != model.GitSyncStopped || len(g.Sync.Bundles) != 2 || g.Sync.Bundles[0].Status != model.ApplyDone || g.Sync.Bundles[1].Status != model.ApplyFailed || g.Sync.Commit != sha1 || g.Check == nil || g.Check.Head != sha1 {
 		t.Fatalf("stopped sync: %v %+v", err, g)
 	}
-	stopped := g.Bundles[1].Apply
+	stopped := g.Sync.Bundles[1].Apply
 	if n := revs(t, st, model.KindEnvironment, "acme", "go"); n != 1 {
 		t.Fatalf("the stopped apply's first step should have been written once: %d", n)
 	}
 	// The record is what Status returns.
-	if got, err := s.Status(ctx, scope, "config"); err != nil || got.Status != model.GitSyncStopped || got.Bundles[1].Apply != stopped {
+	if got, err := s.Status(ctx, scope, "config"); err != nil || got.Sync.Status != model.GitSyncStopped || got.Sync.Bundles[1].Apply != stopped {
 		t.Fatalf("status: %v %+v", err, got)
 	}
 	// Fixed: the same commit again continues the same applies; nothing is applied twice.
 	st.arm("")
 	g, err = s.Sync(ctx, scope, "config", sha1)
-	if err != nil || g.Status != model.GitSyncDone || g.Bundles[1].Apply != stopped || g.Bundles[1].Status != model.ApplyDone || g.Bundles[1].Changes != 2 {
+	if err != nil || g.Sync.Status != model.GitSyncDone || g.Sync.Bundles[1].Apply != stopped || g.Sync.Bundles[1].Status != model.ApplyDone || g.Sync.Bundles[1].Changes != 2 {
 		t.Fatalf("continued sync: %v %+v", err, g)
 	}
 	for _, name := range []string{"py", "go"} {
@@ -147,7 +147,7 @@ func TestSyncStopsAtAStoppedApplyAndContinuesItOnTheNextSyncOfTheCommit(t *testi
 		t.Fatalf("agent source: %v %+v", err, it)
 	}
 	// And once more: the same record, no writes.
-	if g, err := s.Sync(ctx, scope, "config", ""); err != nil || g.Bundles[0].Apply == "" || g.Bundles[1].Apply != stopped {
+	if g, err := s.Sync(ctx, scope, "config", ""); err != nil || g.Sync.Bundles[0].Apply == "" || g.Sync.Bundles[1].Apply != stopped {
 		t.Fatalf("third sync: %v %+v", err, g)
 	}
 	if n := revs(t, st, model.KindAgent, "acme", "backend"); n != 1 {
@@ -170,7 +170,7 @@ func TestSyncRefusesWhatTheTenantMayNotDoAndRecordsCredentialLoss(t *testing.T) 
 	scope := plan.Scope{Tenant: "acme", Subject: "alice"}
 	// The admin triggers it: still the tenant's authority, so the grant is refused.
 	g, err := s.Sync(ctx, plan.Scope{Tenant: "acme", Admin: true, Subject: "root"}, "config", "")
-	if !errors.Is(err, ErrInvalid) || g.Status != model.GitSyncInvalid || !strings.Contains(strings.Join(g.Bundles[0].Errors, " "), "admin only") {
+	if !errors.Is(err, ErrInvalid) || g.Sync.Status != model.GitSyncInvalid || !strings.Contains(strings.Join(g.Sync.Bundles[0].Errors, " "), "admin only") {
 		t.Fatalf("a grant in a tenant's repository: %v %+v", err, g)
 	}
 	if n := revs(t, st, model.KindBinding, "acme", "backend-dev"); n != 0 {
@@ -179,15 +179,15 @@ func TestSyncRefusesWhatTheTenantMayNotDoAndRecordsCredentialLoss(t *testing.T) 
 	// The credential disappears: ErrCredential, nothing fetched, the record says which name.
 	s.Secrets = secrets.Static{}
 	g, err = s.Check(ctx, scope, "config")
-	if !errors.Is(err, ErrCredential) || !strings.Contains(g.CheckError, `"repo-token"`) || strings.Contains(g.CheckError, "tok") && !strings.Contains(g.CheckError, "token") {
+	if !errors.Is(err, ErrCredential) || !strings.Contains(g.Check.Error, `"repo-token"`) || strings.Contains(g.Check.Error, "tok") && !strings.Contains(g.Check.Error, "token") {
 		t.Fatalf("check without the credential: %v %+v", err, g)
 	}
-	if g, err := s.Sync(ctx, scope, "config", ""); !errors.Is(err, ErrCredential) || g.Status != model.GitSyncError {
+	if g, err := s.Sync(ctx, scope, "config", ""); !errors.Is(err, ErrCredential) || g.Sync.Status != model.GitSyncError {
 		t.Fatalf("sync without the credential: %v %+v", err, g)
 	}
 	// A wrong credential is the server's refusal.
 	s.Secrets = secrets.Static{"acme/repo-token": "wrong"}
-	if g, err := s.Check(ctx, scope, "config"); !errors.Is(err, ErrRead) || !strings.Contains(g.CheckError, "401") {
+	if g, err := s.Check(ctx, scope, "config"); !errors.Is(err, ErrRead) || !strings.Contains(g.Check.Error, "401") {
 		t.Fatalf("check with a refused credential: %v %+v", err, g)
 	}
 	// Another tenant: not found; a shared repository: forbidden for the tenant.
@@ -210,4 +210,63 @@ func revs(t *testing.T, st store.Catalog, kind, tenant, name string) int {
 		t.Fatal(err)
 	}
 	return len(r)
+}
+
+// flakyReads fails GetGitSync while armed: a transient read of the status must cost nothing.
+type flakyReads struct {
+	store.Store
+	fail bool
+}
+
+func (f *flakyReads) GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error) {
+	if f.fail {
+		return nil, errors.New("connection reset")
+	}
+	return f.Store.GetGitSync(ctx, tenant, name)
+}
+
+// A check that runs after (or concurrently with) a sync never erases the sync's result, and a
+// transient failure to read the record does not either: each half is written on its own.
+func TestCheckNeverErasesTheSyncResult(t *testing.T) {
+	ctx := context.Background()
+	fetch := memFetcher{head: sha1, auth: "tok", files: map[string]map[string][]byte{sha1: {
+		"bundles/a.yaml": []byte("kind: EnvironmentProfile\nname: py\nspec: {image: stable}\n"),
+	}}}
+	s, st := newService(t, fetch)
+	flaky := &flakyReads{Store: st}
+	s.Store = flaky
+	register(t, s, "acme", "config", "kind: GitRepository\nname: config\nspec: {url: https://git.example.com/acme/config.git, ref: main, paths: ['bundles/*.yaml'], credential: repo-token}\n")
+	scope := plan.Scope{Tenant: "acme", Subject: "alice"}
+	g, err := s.Sync(ctx, scope, "config", "")
+	if err != nil || g.Sync.Status != model.GitSyncDone {
+		t.Fatalf("sync: %v %+v", err, g)
+	}
+	applied := g.Sync.Bundles[0].Apply
+	// Reads fail: the check still records its half (and says so), reports the read failure
+	// rather than an empty record, and the sync half is intact.
+	flaky.fail = true
+	g, err = s.Check(ctx, scope, "config")
+	if err == nil || !strings.Contains(err.Error(), "connection reset") || g == nil || g.Check == nil || g.Check.Head != sha1 {
+		t.Fatalf("check during a read outage: %v %+v", err, g)
+	}
+	flaky.fail = false
+	got, err := s.Status(ctx, scope, "config")
+	if err != nil || got.Sync == nil || got.Sync.Commit != sha1 || got.Sync.Bundles[0].Apply != applied || got.Check.Head != sha1 {
+		t.Fatalf("the check erased the sync result: %v %+v", err, got)
+	}
+	// Many checks and syncs at once: afterwards both halves are complete and consistent.
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func() { defer wg.Done(); _, _ = s.Check(ctx, scope, "config") }()
+		go func() { defer wg.Done(); _, _ = s.Sync(ctx, scope, "config", sha1) }()
+	}
+	wg.Wait()
+	got, err = s.Status(ctx, scope, "config")
+	if err != nil || got.Check == nil || got.Check.Head != sha1 || got.Sync == nil || got.Sync.Status != model.GitSyncDone || got.Sync.Bundles[0].Apply != applied {
+		t.Fatalf("after concurrent checks and syncs: %v %+v", err, got)
+	}
+	if n := revs(t, st, model.KindEnvironment, "acme", "py"); n != 1 {
+		t.Fatalf("concurrent syncs of one commit wrote %d revisions", n)
+	}
 }
