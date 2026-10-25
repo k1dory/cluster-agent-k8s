@@ -38,6 +38,11 @@ smoke-image: images
 	hack/smoke-image.sh $(REGISTRY)/agent:$(TAG)
 	python3 hack/test-netlock.py $(REGISTRY)/agent:$(TAG)
 
+# The Git adapters end to end: the control plane and sandboxctl from their images, a repository
+# of bundles, the workflow's own steps (see hack/e2e-git-adapter.sh).
+e2e-git-adapter: images
+	hack/e2e-git-adapter.sh $(REGISTRY)/sandboxd:$(TAG) $(REGISTRY)/sandboxctl:$(TAG)
+
 helm-lint:
 	cp policies/*.yaml deploy/helm/agent-sandbox/policies/ && rm -f deploy/helm/agent-sandbox/policies/tests.yaml
 	helm lint deploy/helm/agent-sandbox

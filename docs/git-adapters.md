@@ -142,8 +142,15 @@ retry: the same key and bundle continue the same apply, never redo it. Keep the 
 templates compute it (bundle path at the commit): a key that changes between runs would turn a
 re-run after a partial apply into a second apply.
 
-The scenario is a test: `TestScenarioPullRequestMergeDriftAndResumeUnderAStableKey` in
-`cmd/sandboxctl` runs the templates' commands against the real control plane (plan on the pull
-request, apply on merge with the SHA recorded, drift after a hand edit, an apply that stops at
-its second step and the re-run that completes it under the same key), and the template tests
-next to it run the workflows' shell against a stand-in for Docker.
+The scenario is a test, twice over. In process: `TestScenarioPullRequestMergeDriftAndResumeUnderAStableKey`
+in `cmd/sandboxctl` runs the templates' commands against the real control plane (plan on the
+pull request, apply on merge with the SHA recorded, drift after a hand edit, an apply that stops
+at its second step and the re-run that completes it under the same key, the same with
+`expected_revision` guards), and the template tests next to it run the workflows' shell against
+a stand-in for Docker. On a real runner: `hack/e2e-git-adapter.sh` (CI job `git-adapter-e2e`,
+`make e2e-git-adapter`) starts the control plane from its image, builds a repository of bundles
+owned by the runner's user, and runs the GitHub steps and the GitLab scripts verbatim with the
+sandboxctl image: plan, apply with the SHA on every revision, the re-run that writes nothing,
+drift after a hand edit, a guarded re-run, the refusal of a file that differs from its commit.
+Only a stopped apply is out of its reach (the shipped binary has no fault injection); that path
+is the in-process test's.

@@ -121,3 +121,16 @@ jobs:
         run: hack/smoke-image.sh agent-sandbox/agent:ci
       - name: network lock on an isolated Docker network (pod ↔ pod denied, gateway ↔ pod allowed both ways)
         run: python3 hack/test-netlock.py agent-sandbox/agent:ci
+
+  # The Git adapters on a real runner: the control plane from its image, sandboxctl from its
+  # image, a runner-owned checkout, the templates' own shell (GitHub steps and GitLab scripts).
+  git-adapter-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the control plane and sandboxctl images
+        run: |
+          docker build -f images/sandboxd/Dockerfile -t agent-sandbox/sandboxd:ci .
+          docker build -f images/sandboxd/Dockerfile --target sandboxctl -t agent-sandbox/sandboxctl:ci .
+      - name: plan → merge → SHA → drift → guarded re-run → dirty refusal → GitLab jobs
+        run: hack/e2e-git-adapter.sh agent-sandbox/sandboxd:ci agent-sandbox/sandboxctl:ci
