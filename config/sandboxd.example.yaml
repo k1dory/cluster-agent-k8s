@@ -6,6 +6,10 @@ listen:
 api_token: "${SANDBOXD_API_TOKEN}"
 # Tenant API keys are issued through the API (sandboxctl keys create -tenant acme -name ci);
 # max_ttl caps their lifetime (0 = keys may be permanent).
+# CI jobs exchange their provider's OIDC ID token for a short-lived tenant key under a CITrust
+# the tenant registered (docs/ci-auth.md); max_ttl caps the key lifetime a trust may grant (1h).
+# ci_auth:
+#   max_ttl: 1h
 api_keys:
   max_ttl: 0s
 # Static tenant-scoped tokens (optional, next to the keys): each sees only its own sandboxes.

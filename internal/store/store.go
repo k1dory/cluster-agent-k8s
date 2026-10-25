@@ -154,6 +154,9 @@ type APIKeys interface {
 	// expiring at `at`+grace (sooner if it already expires sooner). A revocation already
 	// recorded stands. ErrNotFound for an unknown key.
 	RetireAPIKey(ctx context.Context, id, rotatedTo string, at time.Time, grace time.Duration) error
+	// PruneTrustedAPIKeys deletes the keys a CITrust issued (Trust set) that expired before
+	// the given time: a CI job's key is of no interest once long gone. Returns how many.
+	PruneTrustedAPIKeys(ctx context.Context, expiredBefore time.Time) (int, error)
 	// ListAPIKeys returns a tenant's keys, newest first ("" = every tenant).
 	ListAPIKeys(ctx context.Context, tenant string) ([]*model.APIKey, error)
 }
@@ -189,6 +192,13 @@ type GitSyncs interface {
 	RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string, run int) (bool, error)
 	// GetGitSync returns the record; ErrNotFound when the repository was never checked or synced.
 	GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error)
+}
+
+// TokenUses records tokens that may be used once (a CI provider's ID token exchanged for a
+// key): UseToken records id until expiresAt and returns ErrConflict when it was recorded
+// already, on every replica alike. Expired records are dropped as a side effect.
+type TokenUses interface {
+	UseToken(ctx context.Context, id string, expiresAt time.Time) error
 }
 
 // GitJobs persists webhook actions (model.GitJob) so an accepted delivery survives the replica
@@ -341,6 +351,7 @@ type Store interface {
 	Credentials
 	GitSyncs
 	GitJobs
+	TokenUses
 
 	Close() error
 }

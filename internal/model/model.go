@@ -132,6 +132,7 @@ const (
 	KindBinding        = "PolicyBinding"  // the admin's grant of a policy slug to a tenant, with limits
 	KindTenantSettings = "TenantSettings" // a tenant's quotas and allowed environments (name "settings")
 	KindGitRepository  = "GitRepository"  // a Git repository of bundles the platform reads itself
+	KindCITrust        = "CITrust"        // what a CI provider asserts about a job, trusted to act as the tenant for minutes
 )
 
 // GitSync is the state of a GitRepository as the platform last saw it: the last check (the
@@ -492,6 +493,9 @@ type APIKey struct {
 	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
 	RotatedTo  string     `json:"rotated_to,omitempty"` // the key that replaced this one
 	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	// Trust names the CITrust that issued the key to a CI job (internal/ciauth): short-lived,
+	// never rotated, pruned once long expired. Empty for a key a person or the admin created.
+	Trust string `json:"trust,omitempty"`
 }
 
 // Credential is the metadata of a secret a tenant brought through the API (its own LLM key,

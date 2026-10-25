@@ -185,6 +185,13 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS api_keys_tenant ON api_keys (tenant, created_at DESC);
+-- trust names the CITrust that issued a key to a CI job (short-lived; pruned once long expired).
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS trust text NOT NULL DEFAULT '';
+-- Tokens used once (a CI provider's ID token exchanged for a key), until they expire anyway.
+CREATE TABLE IF NOT EXISTS token_uses (
+    id         text PRIMARY KEY,
+    expires_at timestamptz NOT NULL
+);
 
 -- Tenant-brought credentials (BYOK): ciphertext only; the server key never touches the database.
 CREATE TABLE IF NOT EXISTS credentials (

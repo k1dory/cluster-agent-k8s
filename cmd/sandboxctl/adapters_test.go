@@ -247,18 +247,21 @@ func githubStep(t *testing.T, doc map[string]any, job, name string) string {
 	return ""
 }
 
-// fakeDocker stands in for `docker run … IMAGE plan|apply|drift …`: it finds the bundle after -f
-// and behaves per its name; apply logs its arguments; drift reports drift.
+// fakeDocker stands in for `docker run … IMAGE plan|apply|drift|auth …`: it finds the bundle
+// after -f and behaves per its name; apply logs its arguments; drift reports drift; auth prints
+// an exchanged key (or fails when FAKE_AUTH_FAIL is set). Every call logs its arguments and the
+// key it ran with (`token=`), the way a real sandboxctl sees them.
 const fakeDocker = `#!/bin/bash
 f=""; prev=""; sub=""
 for a in "$@"; do
   [ "$prev" = "-f" ] && f="$a"
-  case "$a" in plan|apply|drift) [ -z "$sub" ] && sub="$a";; esac
+  case "$a" in plan|apply|drift|auth) [ -z "$sub" ] && sub="$a";; esac
   prev="$a"
 done
-echo "$*" >> "$FAKE_LOG"
+echo "$* token=$SANDBOXD_TOKEN" >> "$FAKE_LOG"
 case "$sub" in
   drift) printf '<!-- agent-sandbox -->\n### Drift ⚠️ 1 of 3 managed items\n'; exit 3;;
+  auth) [ -n "$FAKE_AUTH_FAIL" ] && { echo "sandboxctl: no trust accepts the token" >&2; exit 1; }; echo "key key_ci under trust github" >&2; echo "sbk_exchanged"; exit 0;;
 esac
 case "$f" in
   *broken*) echo "docker: image not found" >&2; exit 127;;
@@ -391,6 +394,85 @@ func gitlabScript(t *testing.T, doc map[string]any, job string) string {
 	}
 	// GitLab concatenates the lines into one script and runs it with set -e (sh in this image).
 	return "set -e\n" + strings.ReplaceAll(strings.Join(lines, "\n"), "/sandboxctl", "sandboxctl")
+}
+
+// gitlabJob is the job as GitLab runs it: the default before_script, then the job's script.
+func gitlabJob(t *testing.T, doc map[string]any, job string) string {
+	t.Helper()
+	var lines []string
+	for _, l := range doc["default"].(map[string]any)["before_script"].([]any) {
+		lines = append(lines, l.(string))
+	}
+	return strings.ReplaceAll(strings.Join(lines, "\n"), "/sandboxctl", "sandboxctl") + "\n" + gitlabScript(t, doc, job)
+}
+
+// Without a stored SANDBOXD_TOKEN a job exchanges the ID token its provider issued for a key
+// before the first call, and every call runs with that key; a refused exchange fails the job
+// before anything is planned. With a stored key, no exchange happens.
+func TestTemplatesExchangeTheIDTokenWithoutAStoredKey(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash is required")
+	}
+	_, github := readTemplate(t, filepath.Join("..", "..", "deploy", "git", "github", "sandbox-config.yml"))
+	_, gitlab := readTemplate(t, filepath.Join("..", "..", "deploy", "git", "gitlab", ".gitlab-ci.yml"))
+	if perms := github["permissions"].(map[string]any); perms["id-token"] != "write" {
+		t.Errorf("the GitHub workflow needs id-token: write for the OIDC token: %v", perms)
+	}
+	if aud := gitlab["default"].(map[string]any)["id_tokens"].(map[string]any)["SANDBOX_ID_TOKEN"].(map[string]any)["aud"]; aud != "$SANDBOXD_URL" {
+		t.Errorf("the GitLab ID token's audience is the platform's URL: %v", aud)
+	}
+	work := bundlesDir(t)
+	if err := os.Remove(filepath.Join(work, "bundles", "broken.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	env, _, log := shellEnv(t, work)
+	env = append(env, "SANDBOXD_TOKEN=", "SANDBOX_ID_TOKEN=idtoken", "ACTIONS_ID_TOKEN_REQUEST_URL=https://x/token", "ACTIONS_ID_TOKEN_REQUEST_TOKEN=rq")
+	for _, tc := range []struct {
+		name, shell, script, exchange string
+	}{
+		{"github plan", "bash", githubStep(t, github, "plan", "plan every bundle"), "auth ci -github token="},
+		{"github apply", "bash", githubStep(t, github, "apply", "apply every bundle with this commit as the source"), "auth ci -github token="},
+		{"github drift", "bash", githubStep(t, github, "drift", "what moved outside apply"), "auth ci -github token="},
+		{"gitlab plan", "sh", gitlabJob(t, gitlab, "plan"), "auth ci -token idtoken token="},
+		{"gitlab apply", "sh", gitlabJob(t, gitlab, "apply"), "auth ci -token idtoken token="},
+		{"gitlab drift", "sh", gitlabJob(t, gitlab, "drift"), "auth ci -token idtoken token="},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = os.Remove(log)
+			out, _ := runScript(t, tc.shell, work, tc.script, env)
+			args, _ := os.ReadFile(log)
+			lines := strings.Split(strings.TrimSpace(string(args)), "\n")
+			if len(lines) < 2 || !strings.HasSuffix(lines[0], tc.exchange) {
+				t.Fatalf("the exchange must be the first call, without a key:\n%s\n%s", args, out)
+			}
+			for _, l := range lines[1:] {
+				if !strings.HasSuffix(l, " token=sbk_exchanged") {
+					t.Errorf("a call without the exchanged key: %s", l)
+				}
+			}
+			if strings.Contains(out, "sbk_exchanged") && !strings.Contains(out, "::add-mask::sbk_exchanged") {
+				t.Errorf("the key must not reach the log unmasked:\n%s", out)
+			}
+			// The exchange refused: the job fails there, nothing is planned or applied.
+			_ = os.Remove(log)
+			if out, code := runScript(t, tc.shell, work, tc.script, append(env, "FAKE_AUTH_FAIL=1")); code != 1 || !strings.Contains(out, "no trust accepts the token") {
+				t.Errorf("a refused exchange must fail the job with 1: %d\n%s", code, out)
+			}
+			if args, _ := os.ReadFile(log); strings.Count(string(args), "\n") != 1 {
+				t.Errorf("nothing runs after a refused exchange:\n%s", args)
+			}
+			// A stored key is used as it is: no exchange.
+			_ = os.Remove(log)
+			runScript(t, tc.shell, work, tc.script, append(env, "SANDBOXD_TOKEN=stored"))
+			if args, _ := os.ReadFile(log); strings.Contains(string(args), "auth ci") || !strings.Contains(string(args), "token=stored") {
+				t.Errorf("a stored key is used without an exchange:\n%s", args)
+			}
+		})
+	}
+	// GitLab: the platform's URL is required before anything else (the audience of the ID token).
+	if out, code := runScript(t, "sh", work, gitlabJob(t, gitlab, "plan"), append(env, "SANDBOXD_URL=")); code != 1 || !strings.Contains(out, "SANDBOXD_URL is required") {
+		t.Errorf("GitLab without SANDBOXD_URL: %d\n%s", code, out)
+	}
 }
 
 func TestGitLabTemplatePostsTheNoteOnFailureAndNeverAppliesOnASchedule(t *testing.T) {

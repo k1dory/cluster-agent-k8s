@@ -9,6 +9,7 @@ import (
 
 	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
+	"agent-sandbox/internal/citrust"
 	"agent-sandbox/internal/connections"
 	"agent-sandbox/internal/gitrepo"
 	"agent-sandbox/internal/policy"
@@ -25,6 +26,8 @@ type Options struct {
 	Defaults  func(tenant string) tenants.Quota
 	Sandboxes connections.Sandboxes // the gateway side only (HeadersFor, RuleFor); nil for planning
 	Now       func() time.Time
+	// CITrustMaxTTL caps the key lifetime a CITrust may grant (0: one hour).
+	CITrustMaxTTL time.Duration
 }
 
 // Set is the assembled validators over one store.
@@ -35,6 +38,7 @@ type Set struct {
 	Guard       *bindings.Guard
 	Catalog     *catalog.Service
 	GitRepos    *gitrepo.Service
+	CITrusts    *citrust.Service
 }
 
 // Assemble builds the set over st. Snapshots are not loaded: the caller refreshes.
@@ -51,7 +55,7 @@ func Assemble(st store.Catalog, o Options) *Set {
 	conns.Hosts = HostPolicy{Repository: o.Policies, Settings: tset}
 	guard := &bindings.Guard{Set: o.Policies, Bindings: bind, Headers: conns}
 	cat := &catalog.Service{Store: st, Images: o.Images, Policies: guard, Connections: conns, Tenants: tset}
-	return &Set{Tenants: tset, Bindings: bind, Connections: conns, Guard: guard, Catalog: cat, GitRepos: gitrepo.New(st, o.Secrets)}
+	return &Set{Tenants: tset, Bindings: bind, Connections: conns, Guard: guard, Catalog: cat, GitRepos: gitrepo.New(st, o.Secrets), CITrusts: citrust.New(st, o.CITrustMaxTTL)}
 }
 
 // HostPolicy answers which hosts a connection may serve on its own: the repository's hosts are

@@ -1,0 +1,24 @@
+# A CITrust: what GitHub Actions asserts about a job of acme/config on main, trusted to act as
+# the tenant for ten minutes. The job needs no stored key: it exchanges the OIDC token GitHub
+# issues to it (`sandboxctl auth ci -github`) for a tenant key that expires. See docs/ci-auth.md.
+kind: CITrust
+name: github-config-main
+description: the apply job of acme/config, on main
+spec:
+  issuer: https://token.actions.githubusercontent.com
+  audience: https://sandbox.example.com        # what the job requests its token for (the platform's URL)
+  claims:
+    repository: acme/config
+    ref: refs/heads/main
+  ttl: 10m
+---
+# The same repository's pull requests: plans only need to read, and a pull request's ref is
+# refs/pull/<n>/merge; a pattern names them all.
+kind: CITrust
+name: github-config-prs
+spec:
+  issuer: https://token.actions.githubusercontent.com
+  audience: https://sandbox.example.com
+  claims:
+    repository: acme/config
+    ref: refs/pull/*/merge

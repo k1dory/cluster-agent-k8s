@@ -45,6 +45,9 @@ const usage = `sandboxctl <command> [flags]
            applied without a SHA, -require-commit refuses to apply without one; a checkout Git cannot read
            is an error. Whether a bundle may be applied or continued is decided by the platform, not here
   applies  [-tenant t] [-json]              applies of the scope, newest first; applies <id> shows one
+  auth     ci (-token <jwt> | -token-file <path> | -github [-audience a]) [-json]   a CI job trades its provider's
+           OIDC ID token for a tenant key that expires in minutes, under a CITrust the tenant registered
+           (set -f to register one); prints the key's secret on stdout: SANDBOXD_TOKEN=$(sandboxctl auth ci -github)
   gitrepo  check|sync|status <name> [-tenant t] [-commit sha] [-json]   a registered GitRepository (set -f to
            register): check resolves the ref, sync applies the head (or -commit) through the apply controller,
            one apply per bundle file under a key of repository, commit and path (a repeated sync writes nothing)
@@ -137,7 +140,9 @@ func (c *cli) doH(method, path string, body any, out any, hdr map[string]string)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	if c.token != "" { // auth ci runs without one
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -905,6 +910,36 @@ func (c *cli) run(cmd string, args []string) error {
 			return err
 		}
 		printJSON(out)
+	case "auth":
+		// The one call made without a key: the job's ID token in, a short-lived key out.
+		sub := need(pos, 0, "ci")
+		if sub != "ci" {
+			return fmt.Errorf("auth: unknown subcommand %q", sub)
+		}
+		token := fs.String("token", "", "the provider's OIDC ID token")
+		tokenFile := fs.String("token-file", "", "read the token from a file (- for stdin)")
+		github := fs.Bool("github", false, "fetch the token from GitHub Actions (ACTIONS_ID_TOKEN_REQUEST_URL and _TOKEN of the job; needs permissions: id-token: write)")
+		audience := fs.String("audience", "", "-github: the audience to request (default: SANDBOXD_URL, what the trust names)")
+		asJSON := fs.Bool("json", false, "print the key and its secret as JSON")
+		_ = fs.Parse(flags)
+		raw, err := c.idToken(*token, *tokenFile, *github, *audience)
+		if err != nil {
+			return err
+		}
+		var g ciGrant
+		if err := c.do("POST", "/v1/auth/ci", map[string]string{"token": raw}, &g); err != nil {
+			return err
+		}
+		if *asJSON {
+			printJSON(g)
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "key %s for tenant %s under trust %s (subject %s)", g.ID, g.Tenant, g.Trust, g.Subject)
+		if g.ExpiresAt != nil {
+			fmt.Fprintf(os.Stderr, ", expires %s", g.ExpiresAt.Format(time.RFC3339))
+		}
+		fmt.Fprintln(os.Stderr)
+		fmt.Println(g.Secret)
 	case "version":
 		var out map[string]any
 		if err := c.do("GET", "/v1/version", nil, &out); err != nil {
@@ -1065,6 +1100,8 @@ func catalogPath(noun string) string {
 		return "connections"
 	case "binding", "bindings":
 		return "bindings"
+	case "citrust", "citrusts", "trust", "trusts":
+		return model.KindCITrust
 	case "gitrepo", "gitrepos", "repository", "repositories":
 		return "gitrepos"
 	}
@@ -1092,7 +1129,7 @@ func kindOf(noun string) string {
 // kindPath maps a document kind to its API path ("" for kinds without a plain path).
 func kindPath(kind string) string {
 	return map[string]string{model.KindAgent: "agents", model.KindEnvironment: "environments",
-		model.KindConnection: "connections", model.KindBinding: "bindings", model.KindGitRepository: "gitrepos"}[kind]
+		model.KindConnection: "connections", model.KindBinding: "bindings", model.KindGitRepository: "gitrepos", model.KindCITrust: "citrusts"}[kind]
 }
 
 func printPlan(p plan.Plan) {
@@ -1169,6 +1206,69 @@ type issuedKey struct {
 	model.APIKey
 	Secret   string `json:"secret"`
 	Replaces string `json:"replaces,omitempty"`
+}
+
+// ciGrant is what POST /v1/auth/ci answers.
+type ciGrant struct {
+	model.APIKey
+	Secret  string `json:"secret"`
+	Subject string `json:"subject"`
+}
+
+// idToken resolves the ID token to exchange: given, read from a file or stdin, or fetched from
+// GitHub Actions' token service for the audience the trust names.
+func (c *cli) idToken(token, file string, github bool, audience string) (string, error) {
+	switch {
+	case token != "":
+		return strings.TrimSpace(token), nil
+	case file == "-":
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	case file != "":
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return "", err
+		}
+		return strings.TrimSpace(string(b)), nil
+	case github:
+		reqURL, reqToken := os.Getenv("ACTIONS_ID_TOKEN_REQUEST_URL"), os.Getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+		if reqURL == "" || reqToken == "" {
+			return "", errors.New("auth ci -github: ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN are not set: the job needs `permissions: id-token: write`, and the container the variables")
+		}
+		if audience == "" {
+			audience = c.base
+		}
+		u, err := url.Parse(reqURL)
+		if err != nil {
+			return "", err
+		}
+		q := u.Query()
+		q.Set("audience", audience)
+		u.RawQuery = q.Encode()
+		req, _ := http.NewRequest("GET", u.String(), nil)
+		req.Header.Set("Authorization", "bearer "+reqToken)
+		req.Header.Set("Accept", "application/json; api-version=2.0")
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("github token service: %w", err)
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		if resp.StatusCode != 200 {
+			return "", fmt.Errorf("github token service: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		}
+		var out struct {
+			Value string `json:"value"`
+		}
+		if err := json.Unmarshal(body, &out); err != nil || out.Value == "" {
+			return "", errors.New("github token service: no token in the response")
+		}
+		return out.Value, nil
+	}
+	return "", errors.New("auth ci: -token, -token-file or -github is required")
 }
 
 func printKeys(list []model.APIKey) {

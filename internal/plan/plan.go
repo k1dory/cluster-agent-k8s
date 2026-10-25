@@ -46,6 +46,8 @@ type Deps struct {
 	Secrets  secrets.Provider
 	Defaults func(tenant string) tenants.Quota
 	Now      func() time.Time
+	// CITrustMaxTTL caps what a CITrust may grant (services.Options).
+	CITrustMaxTTL time.Duration
 }
 
 // Scope is who plans: a tenant (confined to its own scope and the kinds it may write) or the
@@ -118,6 +120,7 @@ var kindRank = map[string]int{
 	model.KindBinding:        3,
 	model.KindAgent:          4,
 	model.KindGitRepository:  5,
+	model.KindCITrust:        6,
 }
 
 type entry struct {
@@ -188,7 +191,7 @@ func (d Deps) PlanItems(ctx context.Context, docs []*res.Document, scope Scope) 
 		}
 	}
 	// The same validators the API runs on a PUT, over the overlay instead of the live store.
-	svc := services.Assemble(ov, services.Options{Policies: d.Policies, Images: d.Images, Secrets: d.Secrets, Defaults: d.Defaults, Now: now})
+	svc := services.Assemble(ov, services.Options{Policies: d.Policies, Images: d.Images, Secrets: d.Secrets, Defaults: d.Defaults, Now: now, CITrustMaxTTL: d.CITrustMaxTTL})
 	tset, bind, conns, cat := svc.Tenants, svc.Bindings, svc.Connections, svc.Catalog
 
 	order := append([]*entry(nil), entries...)
@@ -215,6 +218,8 @@ func (d Deps) PlanItems(ctx context.Context, docs []*res.Document, scope Scope) 
 				e.item, err = tset.Validate(ctx, e.tenant, e.doc, scope.Subject)
 			case model.KindGitRepository:
 				e.item, err = svc.GitRepos.Validate(ctx, e.tenant, e.doc, scope.Admin, scope.Subject)
+			case model.KindCITrust:
+				e.item, err = svc.CITrusts.Validate(ctx, e.tenant, e.doc, scope.Admin, scope.Subject)
 			}
 			if err != nil {
 				e.change.Errors = append(e.change.Errors, err.Error())

@@ -425,6 +425,11 @@ session and, with `ttl_from_token`, the sandboxes it creates: their `expires_at`
 token's expiry and the agent certificates issued inside them cannot outlive the sandbox. Static
 `api_token` (the admin) and `api_tokens[]` keep working next to keys and OIDC.
 
+A CI job needs no stored key at all: a tenant registers a **CITrust** (kind `CITrust`: the
+provider's issuer, the audience, the repository and ref the token must name) and the job trades
+the OIDC ID token its provider issues to it for a tenant key that expires in minutes
+(`POST /v1/auth/ci`, `sandboxctl auth ci -github`). See [docs/ci-auth.md](docs/ci-auth.md).
+
 ### Bring your own key: tenant credentials through the API
 
 A tenant's LLM key, MCP token or Git credential no longer has to be placed in the secrets

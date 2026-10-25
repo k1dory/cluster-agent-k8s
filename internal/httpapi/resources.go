@@ -322,6 +322,12 @@ func (p *Platform) configRoutes(mux *http.ServeMux) {
 		}
 		return p.GitRepos
 	}, false)
+	p.resourceRoutes(mux, "citrusts", func() versioned {
+		if p.CITrusts == nil {
+			return nil
+		}
+		return p.CITrusts
+	}, false)
 	mux.HandleFunc("POST /v1/gitrepos/{name}/check", p.auth(p.gitCheck))
 	mux.HandleFunc("POST /v1/gitrepos/{name}/sync", p.auth(p.gitSyncRepo))
 	mux.HandleFunc("GET /v1/gitrepos/{name}/status", p.auth(p.gitStatus))
