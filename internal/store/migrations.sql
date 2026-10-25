@@ -198,3 +198,13 @@ CREATE TABLE IF NOT EXISTS credentials (
     updated_at  timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant, name)
 );
+
+-- Git repositories: the last check and the last sync of each GitRepository (model.GitSync);
+-- the applies and the revisions carry the history.
+CREATE TABLE IF NOT EXISTS git_syncs (
+    tenant     text NOT NULL DEFAULT '',
+    name       text NOT NULL,
+    doc        jsonb NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant, name)
+);

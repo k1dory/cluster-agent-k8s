@@ -17,6 +17,7 @@ import (
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/connections"
 	"agent-sandbox/internal/drift"
+	"agent-sandbox/internal/gitrepo"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/plan"
 	"agent-sandbox/internal/resource"
@@ -315,6 +316,15 @@ func (p *Platform) configRoutes(mux *http.ServeMux) {
 	}, true)
 	p.tenantSettingsRoutes(mux)
 	mux.HandleFunc("POST /v1/plan", p.auth(p.planBundle))
+	p.resourceRoutes(mux, "gitrepos", func() versioned {
+		if p.GitRepos == nil {
+			return nil
+		}
+		return p.GitRepos
+	}, false)
+	mux.HandleFunc("POST /v1/gitrepos/{name}/check", p.auth(p.gitCheck))
+	mux.HandleFunc("POST /v1/gitrepos/{name}/sync", p.auth(p.gitSyncRepo))
+	mux.HandleFunc("GET /v1/gitrepos/{name}/status", p.auth(p.gitStatus))
 	mux.HandleFunc("POST /v1/apply", p.auth(p.applyBundle))
 	mux.HandleFunc("GET /v1/applies", p.auth(p.listApplies))
 	mux.HandleFunc("GET /v1/applies/{id}", p.auth(p.getApply))
@@ -618,6 +628,7 @@ func parseBundle(contentType string, body []byte) ([]*resource.Document, error) 
 // Compile-time checks: the services fit the shared route shape.
 var (
 	_ versioned = (*connections.Service)(nil)
+	_ versioned = (*gitrepo.Service)(nil)
 	_ versioned = (*bindings.Service)(nil)
 )
 

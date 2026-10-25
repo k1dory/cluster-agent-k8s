@@ -23,7 +23,12 @@ COPY --from=build /out/sandboxctl /sandboxctl
 USER sandboxctl
 ENTRYPOINT ["/sandboxctl"]
 
-FROM gcr.io/distroless/static-debian12:nonroot
+# The control plane. It reads registered Git repositories with the git binary (kind
+# GitRepository, internal/gitsync), so the image carries git and CA roots and nothing else; the
+# process runs as nonroot (uid 65532, as the distroless image it replaced).
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates git \
+ && adduser -D -H -u 65532 -g nonroot nonroot
 COPY --from=build /out/sandboxd /sandboxd
 COPY --from=build /out/sandboxctl /sandboxctl
 COPY policies /etc/sandbox/policies

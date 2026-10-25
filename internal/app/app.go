@@ -14,6 +14,8 @@ import (
 	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/connections"
+	"agent-sandbox/internal/gitrepo"
+	"agent-sandbox/internal/gitsync"
 	"agent-sandbox/internal/orchestrator"
 	"agent-sandbox/internal/plan"
 	"agent-sandbox/internal/policy"
@@ -31,6 +33,8 @@ type Deps struct {
 	Orch     *orchestrator.Orchestrator
 	Log      *slog.Logger
 	Replica  string // this replica's name (lease owner for applies)
+	// Fetch reads registered Git repositories (nil: the git binary over HTTPS).
+	Fetch gitsync.Fetcher
 }
 
 // Services is the assembled set. Guard is what every ownership decision goes through.
@@ -42,6 +46,8 @@ type Services struct {
 	Catalog     *catalog.Service
 	Planner     plan.Deps         // validates bundles against the same store, policies, images and secrets
 	Applier     *apply.Controller // applies planned bundles, one step per transaction, continued by key
+	GitRepos    *gitrepo.Service  // registered repositories (kind GitRepository)
+	GitSync     *gitsync.Service  // checks and syncs them through Applier
 }
 
 // Wire builds the services, loads their snapshots and installs the guard and the quotas on the
@@ -65,12 +71,19 @@ func Wire(ctx context.Context, d Deps) (*Services, error) {
 	if replica == "" {
 		replica = fmt.Sprintf("replica-%d", time.Now().UnixNano())
 	}
+	applier := &apply.Controller{Store: d.Store, Planner: planner, Replica: replica, Log: d.Log,
+		Refresh: []func(context.Context) error{bind.Refresh, tset.Refresh, conns.Refresh}}
+	fetch := d.Fetch
+	if fetch == nil {
+		fetch = gitsync.CLI{}
+	}
 	return &Services{
 		Guard: guard, Bindings: bind, Tenants: tset, Connections: conns,
-		Catalog: svc.Catalog,
-		Planner: planner,
-		Applier: &apply.Controller{Store: d.Store, Planner: planner, Replica: replica, Log: d.Log,
-			Refresh: []func(context.Context) error{bind.Refresh, tset.Refresh, conns.Refresh}},
+		Catalog:  svc.Catalog,
+		Planner:  planner,
+		Applier:  applier,
+		GitRepos: svc.GitRepos,
+		GitSync:  &gitsync.Service{Store: d.Store, Repos: svc.GitRepos, Secrets: d.Secrets, Fetch: fetch, Applier: applier},
 	}, nil
 }
 
@@ -84,12 +97,14 @@ func (s *Services) Watch(ctx context.Context, log *slog.Logger) {
 // API is what the services are installed on (httpapi.Platform).
 type API interface {
 	SetServices(cat *catalog.Service, conns *connections.Service, bind *bindings.Service, tset *tenants.Service, planner *plan.Deps, applier *apply.Controller)
+	SetGit(repos *gitrepo.Service, sync *gitsync.Service)
 }
 
 // Install mounts the services on the API.
 func (s *Services) Install(p API) {
 	planner := s.Planner
 	p.SetServices(s.Catalog, s.Connections, s.Bindings, s.Tenants, &planner, s.Applier)
+	p.SetGit(s.GitRepos, s.GitSync)
 }
 
 // limits composes the orchestrator's quotas from tenant settings and policy bindings.

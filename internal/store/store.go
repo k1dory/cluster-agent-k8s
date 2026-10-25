@@ -172,6 +172,14 @@ type Credentials interface {
 	DeleteCredential(ctx context.Context, tenant, name string) error
 }
 
+// GitSyncs persists the last known state of each GitRepository (model.GitSync): one record
+// per (tenant, name), replaced whole.
+type GitSyncs interface {
+	PutGitSync(ctx context.Context, s *model.GitSync) error
+	// GetGitSync returns the record; ErrNotFound when the repository was never checked or synced.
+	GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error)
+}
+
 // Apply is model.Apply (aliased so the store's doc reads on its own).
 type Apply = model.Apply
 
@@ -291,6 +299,7 @@ type Store interface {
 	Applies
 	APIKeys
 	Credentials
+	GitSyncs
 
 	Close() error
 }

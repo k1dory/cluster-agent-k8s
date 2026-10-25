@@ -121,6 +121,55 @@ change to one file in the acme configuration repository.
    revert's plan shows the configuration going back, and its merge applies it with the revert's
    SHA.
 
+## Registering the repository instead of installing the workflow
+
+The templates above live in the configuration repository and need Docker, the sandboxctl
+image and a secret there. The platform can also read the repository itself: register it once
+as a `GitRepository` and ask the platform to check and sync it through the same API everything
+else goes through.
+
+```yaml
+kind: GitRepository
+name: config
+spec:
+  url: https://github.com/acme/config.git
+  ref: main
+  paths: ["bundles/*.yaml"]
+  credential: config-repo-token
+```
+
+- `sandboxctl credentials set config-repo-token` stores the token that opens the repository
+  (a tenant credential; the admin may use an operator secret). The registration names it and
+  is refused when it does not resolve; the sync resolves it again every time, so a revoked or
+  deleted credential stops the next sync with a clear error and nothing applied.
+- `sandboxctl set -f gitrepository.yaml` registers the repository: a versioned item like any
+  other, with its history, drift and rollback. `url` is https without user information (http
+  for a loopback host only, for tests), `ref` a branch or tag (never a SHA), `paths` the bundle
+  files or path patterns.
+- `sandboxctl gitrepo check config` (`POST /v1/gitrepos/config/check`) resolves the ref and
+  records its head, or why the repository could not be read (unreachable, credential refused,
+  ref missing). Exit 1 when it could not.
+- `sandboxctl gitrepo sync config [-commit <sha>]` (`POST /v1/gitrepos/config/sync`) reads
+  the bundle files at the commit (the ref's head by default; a pinned commit must be reachable
+  from the ref) and applies each through the apply controller, one apply per bundle file under
+  the key `git:config@<commit>:<path>`, with `source.commit` on every revision. The documents
+  are applied with the repository's authority: a tenant's repository can do what the tenant
+  can, the admin's shared repository what the admin can, whoever triggered the sync. Syncing
+  the same commit again finds the same applies and writes nothing; an apply that stopped is
+  continued by syncing that commit again. Exit codes as for `apply`: 0 done, 2 a bundle
+  invalid (nothing of it written), 3 an apply stopped, 1 the repository unreadable.
+- `sandboxctl gitrepo status config` (`GET /v1/gitrepos/config/status`) shows the last check
+  and the last sync: the head, the commit, one line per bundle with its apply id and status.
+
+The platform reads Git with the git binary over HTTPS (the control plane image carries it),
+so any server git talks to works: GitHub, GitLab, Gitea, a plain `git http-backend`. The
+credential travels as a request header set through the environment of that one git process,
+never in the URL, the command line or a file. Each read works in an empty temporary repository
+with its own, empty Git configuration.
+
+What this does not do yet: react to pushes. A sync is explicit (an API call, a CI step that
+calls it, a schedule); events and the pull-request adapters come next.
+
 ## What the adapters do not do
 
 - They do not store secrets in Git. Credentials go through `sandboxctl credentials set` (BYOK)

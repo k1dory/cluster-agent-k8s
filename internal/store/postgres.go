@@ -1177,3 +1177,32 @@ func (p *Postgres) DeleteCredential(ctx context.Context, tenant, name string) er
 	}
 	return nil
 }
+
+// --- Git repositories: last known state -------------------------------------------------------
+
+func (p *Postgres) PutGitSync(ctx context.Context, g *model.GitSync) error {
+	g.UpdatedAt = time.Now()
+	doc, err := json.Marshal(g)
+	if err != nil {
+		return err
+	}
+	_, err = p.pool.Exec(ctx, `INSERT INTO git_syncs (tenant, name, doc, updated_at) VALUES ($1,$2,$3,$4)
+		ON CONFLICT (tenant, name) DO UPDATE SET doc=EXCLUDED.doc, updated_at=EXCLUDED.updated_at`, g.Tenant, g.Name, doc, g.UpdatedAt)
+	return err
+}
+
+func (p *Postgres) GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error) {
+	var doc []byte
+	err := p.pool.QueryRow(ctx, `SELECT doc FROM git_syncs WHERE tenant=$1 AND name=$2`, tenant, name).Scan(&doc)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	var g model.GitSync
+	if err := json.Unmarshal(doc, &g); err != nil {
+		return nil, err
+	}
+	return &g, nil
+}
