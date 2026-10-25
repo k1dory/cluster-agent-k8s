@@ -131,7 +131,45 @@ const (
 	KindConnection     = "Connection"     // an external service an agent may use, credentials by reference
 	KindBinding        = "PolicyBinding"  // the admin's grant of a policy slug to a tenant, with limits
 	KindTenantSettings = "TenantSettings" // a tenant's quotas and allowed environments (name "settings")
+	KindGitRepository  = "GitRepository"  // a Git repository of bundles the platform reads itself
 )
+
+// GitSync is the state of a GitRepository as the platform last saw it: the head its ref
+// resolved to on the last check, and what the last sync applied. One record per repository,
+// replaced on every check or sync; the history of what was written is in the applies and the
+// revisions, which carry the commit.
+type GitSync struct {
+	Tenant string `json:"tenant"`
+	Name   string `json:"name"`
+	// The last check: the ref's head, or why it could not be read.
+	Head       string     `json:"head,omitempty"`
+	CheckedAt  *time.Time `json:"checked_at,omitempty"`
+	CheckError string     `json:"check_error,omitempty"`
+	// The last sync: the commit, one entry per bundle in apply order, and the outcome.
+	Commit    string          `json:"commit,omitempty"`
+	Bundles   []GitSyncBundle `json:"bundles,omitempty"`
+	Status    string          `json:"status,omitempty"` // done | invalid | stopped | error
+	Error     string          `json:"error,omitempty"`
+	SyncedAt  *time.Time      `json:"synced_at,omitempty"`
+	UpdatedAt time.Time       `json:"updated_at"`
+}
+
+// GitSync statuses.
+const (
+	GitSyncDone    = "done"    // every bundle applied
+	GitSyncInvalid = "invalid" // a bundle's plan was refused; nothing of it was written
+	GitSyncStopped = "stopped" // an apply did not finish (failed or conflict): continue by syncing the same commit again
+	GitSyncError   = "error"   // the repository could not be read (unreachable, refused, the commit not on the ref)
+)
+
+// GitSyncBundle is one bundle file of a sync.
+type GitSyncBundle struct {
+	Path    string   `json:"path"`
+	Apply   string   `json:"apply,omitempty"`   // the apply that wrote (or is writing) it
+	Status  string   `json:"status"`            // the apply's status, or "invalid"
+	Changes int      `json:"changes,omitempty"` // creates + updates of its plan
+	Errors  []string `json:"errors,omitempty"`
+}
 
 // Sandbox is one agent workspace: a persistent volume plus, while awake, one pod.
 //

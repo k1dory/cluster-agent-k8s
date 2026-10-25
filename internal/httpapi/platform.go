@@ -28,6 +28,8 @@ import (
 	"agent-sandbox/internal/connections"
 	"agent-sandbox/internal/credentials"
 	"agent-sandbox/internal/events"
+	"agent-sandbox/internal/gitrepo"
+	"agent-sandbox/internal/gitsync"
 	"agent-sandbox/internal/ingress"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/orchestrator"
@@ -53,6 +55,8 @@ type Platform struct {
 	TenantSettings *tenants.Service
 	Planner        *plan.Deps        // POST /v1/plan; nil disables
 	Applier        *apply.Controller // POST /v1/apply, /v1/applies; nil disables
+	GitRepos       *gitrepo.Service  // /v1/gitrepos; nil disables
+	GitSync        *gitsync.Service  // /v1/gitrepos/{name}/check|sync|status; nil disables
 	Token          string            // admin token: every tenant, every sandbox
 	Tenants        map[string]string // tenant-scoped tokens: token → tenant
 	// Keys authenticates tenant API keys issued through the API (sbk_…); nil disables them.
@@ -71,6 +75,11 @@ type Platform struct {
 // SetServices installs the configuration services (see internal/app).
 func (p *Platform) SetServices(cat *catalog.Service, conns *connections.Service, bind *bindings.Service, tset *tenants.Service, planner *plan.Deps, applier *apply.Controller) {
 	p.Catalog, p.Connections, p.Bindings, p.TenantSettings, p.Planner, p.Applier = cat, conns, bind, tset, planner, applier
+}
+
+// SetGit installs the Git repository services (see internal/app).
+func (p *Platform) SetGit(repos *gitrepo.Service, sync *gitsync.Service) {
+	p.GitRepos, p.GitSync = repos, sync
 }
 
 // Principal is who is calling: the admin (every tenant) or one tenant. Expires is set for

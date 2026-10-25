@@ -26,6 +26,7 @@ type Memory struct {
 	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
 	applies   map[string]*model.Apply
 	apiKeys   map[string]*model.APIKey
+	gitSyncs  map[string]*model.GitSync
 	creds     map[string]*memCredential // tenant|name
 	nextInst  int
 	nextEvent int64
@@ -44,6 +45,7 @@ func NewMemory() *Memory {
 		catalog:   map[string][]*model.CatalogItem{},
 		applies:   map[string]*model.Apply{},
 		apiKeys:   map[string]*model.APIKey{},
+		gitSyncs:  map[string]*model.GitSync{},
 		creds:     map[string]*memCredential{},
 	}
 }
@@ -1049,4 +1051,42 @@ func (m *Memory) DeleteCredential(_ context.Context, tenant, name string) error 
 	}
 	delete(m.creds, key)
 	return nil
+}
+
+// --- Git repositories: last known state -------------------------------------------------------
+
+func cloneGitSync(g *model.GitSync) *model.GitSync {
+	c := *g
+	if g.CheckedAt != nil {
+		t := *g.CheckedAt
+		c.CheckedAt = &t
+	}
+	if g.SyncedAt != nil {
+		t := *g.SyncedAt
+		c.SyncedAt = &t
+	}
+	c.Bundles = make([]model.GitSyncBundle, len(g.Bundles))
+	for i, b := range g.Bundles {
+		b.Errors = append([]string(nil), b.Errors...)
+		c.Bundles[i] = b
+	}
+	return &c
+}
+
+func (m *Memory) PutGitSync(_ context.Context, g *model.GitSync) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g.UpdatedAt = time.Now()
+	m.gitSyncs[g.Tenant+"|"+g.Name] = cloneGitSync(g)
+	return nil
+}
+
+func (m *Memory) GetGitSync(_ context.Context, tenant, name string) (*model.GitSync, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g, ok := m.gitSyncs[tenant+"|"+name]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return cloneGitSync(g), nil
 }

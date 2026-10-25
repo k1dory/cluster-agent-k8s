@@ -369,7 +369,12 @@ spec:
             - { name: config, mountPath: /etc/sandbox/sandboxd.yaml, subPath: sandboxd.yaml, readOnly: true }
             - { name: policies, mountPath: /etc/sandbox/policies, readOnly: true }
             - { name: var, mountPath: /var/lib/sandboxd }
+            # Scratch for reading registered Git repositories (kind GitRepository): each sync
+            # clones into a temporary directory under /tmp, read-only root or not.
+            - { name: tmp, mountPath: /tmp }
       volumes:
+        - name: tmp
+          emptyDir: {}
         - name: config
           configMap: { name: agent-sandbox-sandboxd-config }
         - name: policies

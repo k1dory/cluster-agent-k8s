@@ -630,6 +630,109 @@ paths:
       summary: History of a Connection, oldest first, deleted revisions included
       responses:
         "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/gitrepos:
+    get:
+      tags: [git]
+      summary: List GitRepositories visible in the scope (own + shared)
+      description: |
+        A GitRepository is a repository of bundles the platform reads itself: registering one
+        replaces installing a workflow in that repository. The platform checks the ref and syncs a
+        commit on request, through the same plan and apply the workflow would run (one apply per
+        bundle file, under a key of repository, commit and path). The credential that opens the
+        repository is a reference (`spec.credential`), never stored here.
+      parameters: [{ $ref: "#/components/parameters/scope" }]
+      responses:
+        "200": { description: Latest revisions, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/gitrepos/{name}:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [git]
+      summary: One GitRepository (latest, or ?revision=N)
+      parameters: [{ name: revision, in: query, schema: { type: integer, minimum: 1 } }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [git]
+      summary: Register or update a GitRepository (appends a revision)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/GitRepositoryDocument" }
+      responses:
+        "201": { description: Created (revision 1), content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "200": { description: New revision, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "403": { description: "Wrote into another scope", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "expected_revision is not the latest", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Invalid document: a URL with user information or a scheme other than https, a ref that is a SHA, a path that leaves the repository, a credential the tenant cannot resolve (the value is never echoed)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: [git]
+      summary: Delete a GitRepository (history kept; its applies and their revisions stay)
+      responses:
+        "204": { description: Deleted }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/gitrepos/{name}/revisions:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [git]
+      summary: History of a GitRepository, oldest first, deleted revisions included
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+  /v1/gitrepos/{name}/check:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    post:
+      tags: [git]
+      summary: Resolve the ref and record its head (reachability, credential, ref)
+      description: |
+        Reads the repository with its credential and records the ref's head. The record comes
+        back with the outcome: 200 with `head` set, 502 when the repository could not be read
+        (unreachable, the credential refused, the ref missing; `check_error` says which), 422 when
+        the credential named by the spec is not available any more. A tenant checks its own
+        repositories; a shared repository is the admin's.
+      responses:
+        "200": { description: The ref resolved, content: { application/json: { schema: { $ref: "#/components/schemas/GitSync" } } } }
+        "403": { description: "A tenant acting on a shared repository", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+        "422": { description: "The credential is not available", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
+        "502": { description: "The repository could not be read", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
+  /v1/gitrepos/{name}/sync:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    post:
+      tags: [git]
+      summary: Apply the bundles of one commit (the ref's head by default)
+      description: |
+        Reads the bundle files at the commit (which must be the ref's head or reachable from it)
+        and applies each through the apply controller under the key
+        `git:<repository>@<commit>:<path>`, in path order, with the repository's authority (a
+        tenant's repository does what the tenant may; the admin's shared repository what the admin
+        may). Syncing the same commit again finds the same applies and writes nothing; a sync whose
+        apply stopped is continued by syncing that commit again. The record comes back with the
+        outcome and one entry per bundle (apply id, status, changes).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                commit: { type: string, pattern: "^[0-9a-f]{40}$", description: "A commit reachable from the ref; empty for the head" }
+      responses:
+        "200": { description: Every bundle applied, content: { application/json: { schema: { $ref: "#/components/schemas/GitSync" } } } }
+        "403": { description: "A tenant acting on a shared repository", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { $ref: "#/components/responses/Error" }
+        "409": { description: "An apply did not finish (failed or conflict): sync the same commit again once the cause is fixed", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
+        "422": { description: "A bundle is not valid (nothing of it written), or the credential is not available, or the commit is not a SHA", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
+        "502": { description: "The repository could not be read (unreachable, credential refused, ref missing, commit not on the ref)", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
+  /v1/gitrepos/{name}/status:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [git]
+      summary: The last check and the last sync of a GitRepository
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/GitSync" } } } }
+        "404": { description: "Unknown repository, or never checked nor synced", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/bindings:
     get:
       tags: [tenancy]
@@ -1543,7 +1646,7 @@ components:
       type: object
       description: One revision of a catalogue resource
       properties:
-        kind: { type: string, enum: [AgentDefinition, EnvironmentProfile, Connection, PolicyBinding, TenantSettings] }
+        kind: { type: string, enum: [AgentDefinition, EnvironmentProfile, Connection, PolicyBinding, TenantSettings, GitRepository] }
         tenant: { type: string, description: "Empty for shared items; the grantee for a PolicyBinding; the tenant for TenantSettings" }
         name: { type: string }
         revision: { type: integer }
@@ -1556,6 +1659,54 @@ components:
         created_at: { type: string, format: date-time }
         deleted_at: { type: string, format: date-time, description: "Set once the item was deleted; the revision stays as history and cannot be referenced" }
         source: { $ref: "#/components/schemas/Source" }
+    GitRepositorySpec:
+      type: object
+      additionalProperties: false
+      required: [url, ref, paths]
+      properties:
+        url: { type: string, description: "https URL of the repository, without user information (http for a loopback host only)" }
+        ref: { type: string, description: "Branch or tag the platform follows; never a SHA" }
+        paths: { type: array, items: { type: string }, minItems: 1, maxItems: 32, description: "Bundle files relative to the root; path patterns (*, ?, [...] within a segment) select several; applied in path order" }
+        credential: { type: string, description: "Name of the secret that opens the repository (a token, or user:token): a tenant credential (BYOK) or an operator secret. Empty for a public repository" }
+    GitRepositoryDocument:
+      type: object
+      properties:
+        kind: { type: string, enum: [GitRepository] }
+        name: { type: string }
+        description: { type: string }
+        spec: { $ref: "#/components/schemas/GitRepositorySpec" }
+        expected_revision: { type: integer }
+    GitSync:
+      type: object
+      description: The last check and the last sync of a GitRepository, as the platform saw them
+      properties:
+        tenant: { type: string }
+        name: { type: string }
+        head: { type: string, description: "The ref's head at the last check" }
+        checked_at: { type: string, format: date-time }
+        check_error: { type: string, description: "Why the last check could not read the repository" }
+        commit: { type: string, description: "The commit of the last sync" }
+        bundles:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              apply: { type: string, description: "The apply that wrote (or is writing) the bundle" }
+              status: { type: string, description: "The apply's status (done, failed, conflict, running), or invalid" }
+              changes: { type: integer, description: "Creates + updates of its plan" }
+              errors: { type: array, items: { type: string } }
+        status: { type: string, enum: [done, invalid, stopped, error] }
+        error: { type: string }
+        synced_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    GitSyncError:
+      type: object
+      description: A check or sync that did not succeed, with the record
+      properties:
+        error: { type: string }
+        code: { type: string, enum: [unreachable, credential, invalid_plan, stopped, error] }
+        sync: { $ref: "#/components/schemas/GitSync" }
     Credential:
       type: object
       description: Metadata of a secret a tenant brought through the API; the value is never part of it
@@ -1790,7 +1941,7 @@ components:
       additionalProperties: false
       description: Any versioned resource document (the kind decides the spec schema)
       properties:
-        kind: { type: string, enum: [AgentDefinition, EnvironmentProfile, Connection, PolicyBinding, TenantSettings] }
+        kind: { type: string, enum: [AgentDefinition, EnvironmentProfile, Connection, PolicyBinding, TenantSettings, GitRepository] }
         tenant: { type: string }
         name: { type: string }
         description: { type: string }

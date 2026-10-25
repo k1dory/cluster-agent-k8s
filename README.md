@@ -334,8 +334,12 @@ restored revision says what it rolled back. See [docs/gitops.md](docs/gitops.md)
 A repository of bundles drives all of this through pull requests alone: `sandboxctl plan
 -markdown` is the pull request comment, the merge applies with the commit's SHA, a scheduled
 `drift -markdown` pages when the platform moved. Ready-made GitHub Actions and GitLab CI jobs
-(`deploy/git/`) run `sandboxctl` from its own image (`make images`, target `sandboxctl`). The
-scenario of one settings change as one pull request: [docs/git-adapters.md](docs/git-adapters.md).
+(`deploy/git/`) run `sandboxctl` from its own image (`make images`, target `sandboxctl`). Or the
+platform reads the repository itself: a `GitRepository` registered through the API (URL, ref,
+bundle paths, a credential by reference) is checked and synced on request, each bundle applied
+through the same controller under a key of repository, commit and path, so no workflow is
+installed per repository. The scenario of one settings change as one pull request, both ways:
+[docs/git-adapters.md](docs/git-adapters.md).
 
 ### Agent versions and rollouts
 

@@ -28,7 +28,7 @@ const (
 )
 
 // Kinds the report covers, in apply order.
-var Kinds = []string{model.KindEnvironment, model.KindConnection, model.KindTenantSettings, model.KindBinding, model.KindAgent}
+var Kinds = []string{model.KindEnvironment, model.KindConnection, model.KindTenantSettings, model.KindBinding, model.KindAgent, model.KindGitRepository}
 
 // Revision is one revision as the report shows it.
 type Revision struct {

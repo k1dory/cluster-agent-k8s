@@ -91,8 +91,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: build the agent image
         run: docker build -f images/agent/Dockerfile -t agent-sandbox/agent:ci .
-      - name: build the control plane image
-        run: docker build -f images/sandboxd/Dockerfile -t agent-sandbox/sandboxd:ci .
+      - name: build the control plane image and check what it carries (git for GitRepository syncs, nonroot)
+        run: |
+          docker build -f images/sandboxd/Dockerfile -t agent-sandbox/sandboxd:ci .
+          docker run --rm --entrypoint git agent-sandbox/sandboxd:ci --version
+          test "$(docker run --rm --entrypoint id agent-sandbox/sandboxd:ci -u)" = 65532
       - name: build the sandboxctl image for CI jobs (the Git adapters) and run it once
         run: |
           docker build -f images/sandboxd/Dockerfile --target sandboxctl -t agent-sandbox/sandboxctl:ci .

@@ -10,6 +10,7 @@ import (
 	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/connections"
+	"agent-sandbox/internal/gitrepo"
 	"agent-sandbox/internal/policy"
 	"agent-sandbox/internal/secrets"
 	"agent-sandbox/internal/store"
@@ -33,6 +34,7 @@ type Set struct {
 	Connections *connections.Service
 	Guard       *bindings.Guard
 	Catalog     *catalog.Service
+	GitRepos    *gitrepo.Service
 }
 
 // Assemble builds the set over st. Snapshots are not loaded: the caller refreshes.
@@ -49,7 +51,7 @@ func Assemble(st store.Catalog, o Options) *Set {
 	conns.Hosts = HostPolicy{Repository: o.Policies, Settings: tset}
 	guard := &bindings.Guard{Set: o.Policies, Bindings: bind, Headers: conns}
 	cat := &catalog.Service{Store: st, Images: o.Images, Policies: guard, Connections: conns, Tenants: tset}
-	return &Set{Tenants: tset, Bindings: bind, Connections: conns, Guard: guard, Catalog: cat}
+	return &Set{Tenants: tset, Bindings: bind, Connections: conns, Guard: guard, Catalog: cat, GitRepos: gitrepo.New(st, o.Secrets)}
 }
 
 // HostPolicy answers which hosts a connection may serve on its own: the repository's hosts are

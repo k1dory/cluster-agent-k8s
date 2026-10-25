@@ -45,6 +45,9 @@ const usage = `sandboxctl <command> [flags]
            applied without a SHA, -require-commit refuses to apply without one; a checkout Git cannot read
            is an error. Whether a bundle may be applied or continued is decided by the platform, not here
   applies  [-tenant t] [-json]              applies of the scope, newest first; applies <id> shows one
+  gitrepo  check|sync|status <name> [-tenant t] [-commit sha] [-json]   a registered GitRepository (set -f to
+           register): check resolves the ref, sync applies the head (or -commit) through the apply controller,
+           one apply per bundle file under a key of repository, commit and path (a repeated sync writes nothing)
   drift    [-tenant t] [-json|-markdown]    items changed or deleted outside apply since an apply wrote them;
            drift -f bundle.yaml shows what the bundle would change (Git versus the platform), writing nothing
   rollback (-apply <id> | agent|environment|connection <name> [-to N]) [-tenant t] [-plan] [-key k] [-json]
@@ -529,6 +532,51 @@ func (c *cli) run(cmd string, args []string) error {
 		default:
 			return fmt.Errorf("keys: unknown subcommand %q", sub)
 		}
+	case "gitrepo":
+		// check|sync|status of a registered repository (kind GitRepository; set/get/list/remove
+		// manage the registration like any other resource).
+		sub := need(pos, 0, "check|sync|status")
+		name := need(pos, 1, "name")
+		tenant := fs.String("tenant", "", "scope (admin: a tenant, or empty for the shared repositories)")
+		commit := fs.String("commit", "", "sync: this commit instead of the ref's head (must be reachable from the ref)")
+		asJSON := fs.Bool("json", false, "print JSON")
+		_ = fs.Parse(flags)
+		var method, path string
+		var body any
+		switch sub {
+		case "check":
+			method, path = "POST", "/v1/gitrepos/"+url.PathEscape(name)+"/check"
+		case "sync":
+			method, path = "POST", "/v1/gitrepos/"+url.PathEscape(name)+"/sync"
+			body = map[string]string{"commit": *commit}
+		case "status":
+			method, path = "GET", "/v1/gitrepos/"+url.PathEscape(name)+"/status"
+		default:
+			return fmt.Errorf("gitrepo: unknown subcommand %q", sub)
+		}
+		var g model.GitSync
+		err := c.do(method, path+tenantQuery(*tenant), body, &g)
+		var refused *apiError
+		if errors.As(err, &refused) {
+			// The record travels with the refusal: show it, then exit by the outcome.
+			var out struct {
+				Sync *model.GitSync `json:"sync"`
+			}
+			if json.Unmarshal(refused.Body, &out) == nil && out.Sync != nil {
+				g = *out.Sync
+				err = nil
+				fmt.Fprintln(os.Stderr, "sandboxctl:", refused.Message)
+			}
+		}
+		if err != nil {
+			return err
+		}
+		if *asJSON {
+			printJSON(g)
+		} else {
+			printGitSync(g)
+		}
+		os.Exit(gitSyncExitCode(sub, g))
 	case "drift":
 		tenant := fs.String("tenant", "", "scope (admin)")
 		file := fs.String("f", "", "bundle to compare the platform with (what apply would change); without it, the store-side report")
@@ -668,9 +716,9 @@ func (c *cli) run(cmd string, args []string) error {
 	case "revisions", "remove":
 		tenant := fs.String("tenant", "", "scope (admin: tenant or empty for shared)")
 		_ = fs.Parse(flags)
-		path := catalogPath(need(pos, 0, "agent|environment|connection|binding"))
+		path := catalogPath(need(pos, 0, "agent|environment|connection|binding|gitrepo"))
 		if path == "" {
-			return errors.New("expected agent, environment, connection or binding")
+			return errors.New("expected agent, environment, connection, binding or gitrepo")
 		}
 		q := ""
 		if *tenant != "" {
@@ -1012,6 +1060,8 @@ func catalogPath(noun string) string {
 		return "connections"
 	case "binding", "bindings":
 		return "bindings"
+	case "gitrepo", "gitrepos", "repository", "repositories":
+		return "gitrepos"
 	}
 	return ""
 }
@@ -1028,6 +1078,8 @@ func kindOf(noun string) string {
 		return model.KindConnection
 	case "bindings":
 		return model.KindBinding
+	case "gitrepos":
+		return model.KindGitRepository
 	}
 	return noun
 }
@@ -1035,7 +1087,7 @@ func kindOf(noun string) string {
 // kindPath maps a document kind to its API path ("" for kinds without a plain path).
 func kindPath(kind string) string {
 	return map[string]string{model.KindAgent: "agents", model.KindEnvironment: "environments",
-		model.KindConnection: "connections", model.KindBinding: "bindings"}[kind]
+		model.KindConnection: "connections", model.KindBinding: "bindings", model.KindGitRepository: "gitrepos"}[kind]
 }
 
 func printPlan(p plan.Plan) {
@@ -1348,6 +1400,58 @@ func mergeSource(flags, detected bundleSource) bundleSource {
 		flags.Path = detected.Path
 	}
 	return flags
+}
+
+func printGitSync(g model.GitSync) {
+	if g.CheckedAt != nil {
+		if g.CheckError != "" {
+			fmt.Printf("check    %s  error: %s\n", g.CheckedAt.Format(time.RFC3339), g.CheckError)
+		} else {
+			fmt.Printf("check    %s  head %s\n", g.CheckedAt.Format(time.RFC3339), g.Head)
+		}
+	}
+	if g.SyncedAt != nil {
+		fmt.Printf("sync     %s  %s  commit %s", g.SyncedAt.Format(time.RFC3339), g.Status, g.Commit)
+		if g.Error != "" {
+			fmt.Printf("  %s", g.Error)
+		}
+		fmt.Println()
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "PATH\tAPPLY\tSTATUS\tCHANGES\tERRORS")
+		for _, b := range g.Bundles {
+			apply := b.Apply
+			if apply == "" {
+				apply = "-"
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n", b.Path, apply, b.Status, b.Changes, strings.Join(b.Errors, "; "))
+		}
+		tw.Flush()
+	}
+	if g.CheckedAt == nil && g.SyncedAt == nil {
+		fmt.Println("never checked or synced")
+	}
+}
+
+// gitSyncExitCode: check 0 when the ref resolved, 1 otherwise; sync 0 done, 2 a bundle
+// invalid, 3 an apply stopped, 1 the repository unreadable; status 0.
+func gitSyncExitCode(sub string, g model.GitSync) int {
+	switch sub {
+	case "check":
+		if g.CheckError != "" || g.Head == "" {
+			return 1
+		}
+	case "sync":
+		switch g.Status {
+		case model.GitSyncDone:
+		case model.GitSyncInvalid:
+			return 2
+		case model.GitSyncStopped:
+			return 3
+		default:
+			return 1
+		}
+	}
+	return 0
 }
 
 func printRevisions(revs []model.CatalogItem) {

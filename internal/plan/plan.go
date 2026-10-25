@@ -117,6 +117,7 @@ var kindRank = map[string]int{
 	model.KindTenantSettings: 2,
 	model.KindBinding:        3,
 	model.KindAgent:          4,
+	model.KindGitRepository:  5,
 }
 
 type entry struct {
@@ -212,6 +213,8 @@ func (d Deps) PlanItems(ctx context.Context, docs []*res.Document, scope Scope) 
 				e.item, err = bind.Validate(ctx, e.tenant, e.doc, scope.Admin, scope.Subject)
 			case model.KindTenantSettings:
 				e.item, err = tset.Validate(ctx, e.tenant, e.doc, scope.Subject)
+			case model.KindGitRepository:
+				e.item, err = svc.GitRepos.Validate(ctx, e.tenant, e.doc, scope.Admin, scope.Subject)
 			}
 			if err != nil {
 				e.change.Errors = append(e.change.Errors, err.Error())

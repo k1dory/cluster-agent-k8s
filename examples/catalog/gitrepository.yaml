@@ -1,0 +1,14 @@
+# A GitRepository: the platform reads this repository's bundles itself, so the team installs no
+# workflow there. `sandboxctl set -f examples/catalog/gitrepository.yaml` registers it (the
+# credential went in first: `sandboxctl credentials set config-repo-token`), `sandboxctl gitrepo
+# check config` resolves the ref, `sandboxctl gitrepo sync config` applies the head through the
+# same plan and apply a pull request's merge would; `sandboxctl gitrepo sync config -commit <sha>`
+# pins a commit reachable from the ref. Syncing a commit again writes nothing.
+kind: GitRepository
+name: config
+description: acme's configuration repository
+spec:
+  url: https://github.com/acme/config.git
+  ref: main
+  paths: ["bundles/*.yaml"]
+  credential: config-repo-token   # a tenant credential (BYOK) or an operator secret; empty for a public repository
