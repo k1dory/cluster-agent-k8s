@@ -445,12 +445,30 @@ type overlay struct {
 	// fixed names the revision a pending item will really have (set once its action is
 	// known: a noop keeps the current revision); absent: the next number in the history.
 	fixed map[string]int
+	// applied are items an earlier bundle of the same sequence would have written, with the
+	// revision it would have given them (Virtual): the latest revision of their history here.
+	applied map[string]*model.CatalogItem
+}
+
+// Virtual returns Deps planning over the state the live store would be in once items were
+// written as their latest revisions: what a sequence of bundles applied one after the other
+// leaves behind. A pull request preview plans each bundle file over the items the files before
+// it would write, so it sees exactly what a sync, applying file by file, will see.
+func (d Deps) Virtual(items []*model.CatalogItem) Deps {
+	ov := &overlay{base: d.Store, pending: map[string]*model.CatalogItem{}, fixed: map[string]int{}, applied: map[string]*model.CatalogItem{}}
+	for _, it := range items {
+		if it != nil {
+			ov.applied[it.Kind+"|"+it.Tenant+"|"+it.Name] = it
+		}
+	}
+	d.Store = ov
+	return d
 }
 
 // nextRevision is the number the next write of an item gets: one past the highest ever
 // used, deleted revisions included (the store never reuses numbers).
 func (o *overlay) nextRevision(ctx context.Context, kind, tenant, name string) (int, error) {
-	revs, err := o.base.ListRevisions(ctx, kind, tenant, name)
+	revs, err := o.ListRevisions(ctx, kind, tenant, name)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
 		return 0, err
 	}
@@ -489,6 +507,10 @@ func (o *overlay) GetItem(ctx context.Context, kind, tenant, name string, revisi
 			return &c, nil
 		}
 	}
+	if a, ok := o.applied[key]; ok && (revision == 0 || revision == a.Revision) {
+		c := *a
+		return &c, nil
+	}
 	return o.base.GetItem(ctx, kind, tenant, name, revision)
 }
 
@@ -509,7 +531,12 @@ func (o *overlay) ListKind(ctx context.Context, kind string) ([]*model.CatalogIt
 }
 
 func (o *overlay) ListRevisions(ctx context.Context, kind, tenant, name string) ([]*model.CatalogItem, error) {
-	return o.base.ListRevisions(ctx, kind, tenant, name)
+	revs, err := o.base.ListRevisions(ctx, kind, tenant, name)
+	if a, ok := o.applied[kind+"|"+tenant+"|"+name]; ok && (err == nil || errors.Is(err, store.ErrNotFound)) {
+		c := *a
+		return append(revs, &c), nil
+	}
+	return revs, err
 }
 
 func (o *overlay) ListDeleted(ctx context.Context, kind, tenant string) ([]*model.CatalogItem, error) {
@@ -520,6 +547,12 @@ func (o *overlay) merge(ctx context.Context, list []*model.CatalogItem, match fu
 	byKey := map[string]*model.CatalogItem{}
 	for _, it := range list {
 		byKey[it.Kind+"|"+it.Tenant+"|"+it.Name] = it
+	}
+	for k, a := range o.applied {
+		if match(a) {
+			c := *a
+			byKey[k] = &c
+		}
 	}
 	for k, p := range o.pending {
 		if match(p) {

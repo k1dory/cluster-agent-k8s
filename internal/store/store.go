@@ -187,16 +187,25 @@ type GitSyncs interface {
 
 // GitJobs persists webhook actions (model.GitJob) so an accepted delivery survives the replica
 // that accepted it. Enqueue is idempotent per delivery (ErrConflict names the existing job);
-// Claim hands one job to one replica at a time: a pending one, or a running one whose lease
-// lapsed, atomically, under a new lease; Finish records the outcome.
+// Claim hands one job to one replica at a time: a pending one whose wait is over, or a running
+// one whose lease lapsed, atomically, under a new lease; Finish, Retry and Requeue move it on.
+// Finish and Retry are the holder's only (owner and attempt as claimed): a lapsed lease taken
+// over elsewhere, or claimed again by the same replica, refuses the former attempt's writes.
 type GitJobs interface {
 	EnqueueGitJob(ctx context.Context, j *model.GitJob) error
 	// ClaimGitJob returns the next job for owner with a lease until now+lease, incrementing
-	// Attempts; ErrNotFound when none is waiting.
+	// Attempts; ErrNotFound when none is waiting. A pending job whose LeaseUntil is in the
+	// future (a retry scheduled by RetryGitJob) is not waiting yet.
 	ClaimGitJob(ctx context.Context, owner string, now time.Time, lease time.Duration) (*model.GitJob, error)
-	// FinishGitJob records the outcome of a job the caller holds (ErrConflict when the lease
-	// moved to another owner meanwhile).
-	FinishGitJob(ctx context.Context, id, owner, status, outcome, errMsg string) error
+	// FinishGitJob records the outcome of the attempt the caller holds (ErrConflict when the
+	// job is not running under that owner and attempt).
+	FinishGitJob(ctx context.Context, id, owner string, attempt int, status, outcome, errMsg string) error
+	// RetryGitJob puts the attempt the caller holds back to pending, to be claimed no earlier
+	// than notBefore, keeping Attempts and recording why (ErrConflict as for Finish).
+	RetryGitJob(ctx context.Context, id, owner string, attempt int, notBefore time.Time, errMsg string) error
+	// RequeueGitJob makes a failed job pending again with Attempts reset (ErrConflict when the
+	// job is not failed): a redelivery of a delivery whose job gave up.
+	RequeueGitJob(ctx context.Context, id string) error
 	GetGitJob(ctx context.Context, id string) (*model.GitJob, error)
 	// GetGitJobByDelivery finds the job of a delivery (tenant, name, delivery key).
 	GetGitJobByDelivery(ctx context.Context, tenant, name, delivery string) (*model.GitJob, error)

@@ -1417,6 +1417,9 @@ func printGitSync(g model.GitSync) {
 	}
 	if g.Sync != nil {
 		fmt.Printf("sync     %s  %s  commit %s", g.Sync.At.Format(time.RFC3339), g.Sync.Status, g.Sync.Commit)
+		if g.Sync.Generation > 0 {
+			fmt.Printf("  generation %d", g.Sync.Generation)
+		}
 		if g.Sync.Error != "" {
 			fmt.Printf("  %s", g.Sync.Error)
 		}

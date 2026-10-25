@@ -210,25 +210,62 @@ func TestGitJobContract(t *testing.T) {
 			if err != nil || j1b.ID != "gitjob_a" || j1b.Owner != "three" || j1b.Attempts != 2 {
 				t.Fatalf("takeover: %v %+v", err, j1b)
 			}
-			if err := st.FinishGitJob(ctx, "gitjob_a", "one", model.GitJobDone, "done", ""); !errors.Is(err, ErrConflict) {
+			if err := st.FinishGitJob(ctx, "gitjob_a", "one", 1, model.GitJobDone, "done", ""); !errors.Is(err, ErrConflict) {
 				t.Fatalf("the former holder finishing: %v", err)
 			}
-			if err := st.FinishGitJob(ctx, "gitjob_a", "three", model.GitJobDone, "done", ""); err != nil {
+			// The same replica holding a later attempt: the former attempt's write is refused too.
+			if err := st.FinishGitJob(ctx, "gitjob_a", "three", 1, model.GitJobDone, "done", ""); !errors.Is(err, ErrConflict) {
+				t.Fatalf("a stale attempt finishing: %v", err)
+			}
+			if err := st.FinishGitJob(ctx, "gitjob_a", "three", 2, model.GitJobDone, "done", ""); err != nil {
 				t.Fatalf("the holder finishing: %v", err)
 			}
 			got, err := st.GetGitJob(ctx, "gitjob_a")
 			if err != nil || got.Status != model.GitJobDone || got.Outcome != "done" || got.LeaseUntil != nil || got.Attempts != 2 {
 				t.Fatalf("finished job: %v %+v", err, got)
 			}
-			// Done jobs are never claimed again; a failed one neither.
-			if err := st.FinishGitJob(ctx, "gitjob_b", "two", model.GitJobFailed, "error", "boom"); err != nil {
+			// A retry: the holder puts the job back to pending with a not-before; it is not
+			// claimable until then, keeps its attempts, and the former holder can no longer act.
+			if err := st.RetryGitJob(ctx, "gitjob_b", "two", 1, now.Add(10*time.Minute), "git unreachable"); err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+			if err := st.FinishGitJob(ctx, "gitjob_b", "two", 1, model.GitJobDone, "done", ""); !errors.Is(err, ErrConflict) {
+				t.Fatalf("finishing a job put back to pending: %v", err)
+			}
+			if j, _ := st.GetGitJob(ctx, "gitjob_b"); j.Status != model.GitJobPending || j.Attempts != 1 || j.Error != "git unreachable" || j.LeaseUntil == nil || !j.LeaseUntil.Equal(now.Add(10*time.Minute)) {
+				t.Fatalf("retried job: %+v", j)
+			}
+			if err := st.FinishGitJob(ctx, "gitjob_c", "two", 1, model.GitJobDone, "done", ""); err != nil {
 				t.Fatal(err)
 			}
-			if err := st.FinishGitJob(ctx, "gitjob_c", "two", model.GitJobDone, "done", ""); err != nil {
+			if _, err := st.ClaimGitJob(ctx, "four", now.Add(5*time.Minute), time.Minute); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("a retry claimed before its time: %v", err)
+			}
+			jb, err := st.ClaimGitJob(ctx, "four", now.Add(10*time.Minute), time.Minute)
+			if err != nil || jb.ID != "gitjob_b" || jb.Attempts != 2 || jb.Owner != "four" {
+				t.Fatalf("a retry claimed once due: %v %+v", err, jb)
+			}
+			// Done jobs are never claimed again; a failed one neither, until it is requeued.
+			if err := st.FinishGitJob(ctx, "gitjob_b", "four", 2, model.GitJobFailed, "error", "boom"); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := st.ClaimGitJob(ctx, "four", now.Add(time.Hour), time.Minute); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("finished jobs claimed: %v", err)
+			}
+			if err := st.RequeueGitJob(ctx, "gitjob_c"); !errors.Is(err, ErrConflict) {
+				t.Fatalf("requeueing a done job: %v", err)
+			}
+			if err := st.RequeueGitJob(ctx, "gitjob_b"); err != nil {
+				t.Fatalf("requeue: %v", err)
+			}
+			if j, _ := st.GetGitJob(ctx, "gitjob_b"); j.Status != model.GitJobPending || j.Attempts != 0 || j.Outcome != "" || j.Error != "" || j.LeaseUntil != nil {
+				t.Fatalf("requeued job: %+v", j)
+			}
+			if j, err := st.ClaimGitJob(ctx, "five", now.Add(time.Hour), time.Minute); err != nil || j.ID != "gitjob_b" || j.Attempts != 1 {
+				t.Fatalf("a requeued job claimed: %v %+v", err, j)
+			}
+			if err := st.RequeueGitJob(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("requeueing an unknown job: %v", err)
 			}
 			if _, err := st.GetGitJob(ctx, "nope"); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("unknown job: %v", err)

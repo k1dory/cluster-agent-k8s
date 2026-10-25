@@ -152,12 +152,19 @@ spec:
 - `sandboxctl gitrepo sync config [-commit <sha>]` (`POST /v1/gitrepos/config/sync`) reads
   the bundle files at the commit (the ref's head by default; a pinned commit must be reachable
   from the ref) and applies each through the apply controller, one apply per bundle file under
-  the key `git:config@<commit>:<path>`, with `source.commit` on every revision. The documents
-  are applied with the repository's authority: a tenant's repository can do what the tenant
-  can, the admin's shared repository what the admin can, whoever triggered the sync. Syncing
-  the same commit again finds the same applies and writes nothing; an apply that stopped is
-  continued by syncing that commit again. Exit codes as for `apply`: 0 done, 2 a bundle
-  invalid (nothing of it written), 3 an apply stopped, 1 the repository unreadable.
+  the key `git:config@<commit>:<path>` (`#<generation>` appended from the second transition
+  on), with `source.commit` on every revision. The files are applied in path order, each over
+  the state the files before it left, so a document may name what an earlier file introduces
+  (not a later one), and an item lives in one file: two files describing the same item make
+  the sync invalid before anything is written. The documents are applied with the repository's
+  authority: a tenant's repository can do what the tenant can, the admin's shared repository
+  what the admin can, whoever triggered the sync. Syncing the same commit again finds the same
+  applies and writes nothing; an apply that stopped is continued by syncing that commit again.
+  Going back to a commit synced earlier (a force push A → B → A, a revert) is a new transition
+  of the desired state, counted by the record's `generation`: it gets applies of its own and
+  writes A again, with a new revision; only a repeat of the *same* transition (the same commit
+  as the last sync) is a no-op. Exit codes as for `apply`: 0 done, 2 a bundle invalid (nothing
+  of it written), 3 an apply stopped, 1 the repository unreadable.
 - `sandboxctl gitrepo status config` (`GET /v1/gitrepos/config/status`) shows the last check
   and the last sync: the head, the commit, one line per bundle with its apply id and status.
   The two halves are recorded independently and atomically, so a check running next to a sync
@@ -197,20 +204,39 @@ A delivery is accepted only when its signature matches the secret (GitHub's
 accepts none. An accepted delivery becomes a persisted job (one per delivery: a redelivery
 names the same job), which one replica at a time claims under a lease and runs with the
 repository's authority (a tenant's repository does what the tenant may), under the tenant's
-cross-replica lock; a replica that dies mid-way leaves a job another replica picks up once the
-lease lapses, and the work (a sync, a comment updated in place) is idempotent, so a repeat is
-harmless. A push syncs the ref's *current* head, not the commit the delivery named: deliveries
-arrive in any order, and one handled after a newer push finds the newer head already applied
-and is recorded as `superseded`, never writing an older state over a newer one. The delivery,
-the decision, the job and the outcome land in the `hook` half of `gitrepo status`, and every
-delivery, plan and sync is an event (`git.hook`, `git.plan`, `git.sync`) on the tenant's event
-stream, so a SOC or SRE integration can follow them without polling.
+cross-replica lock, syncs and pull request plans alike; a replica that dies mid-way leaves a
+job another replica picks up once the lease lapses, and the work (a sync, a comment updated in
+place) is idempotent, so a repeat is harmless. Deliveries arrive in any order, so a job acts on
+what the repository holds *now*, never on what the delivery saw: a push syncs the ref's current
+head, and a pull request plan is published for the request's current head only; a delivery
+whose commit the ref or the request has moved past is recorded as `superseded` and publishes
+nothing, so an older state is never written over a newer one and an older plan never lands over
+a newer comment, whichever replica ran which job first.
 
-The pull request plan treats the bundle files as one bundle in path order, as a sync applies
-them in sequence, so a document in a later file may name what an earlier file introduces; the
-comment shows one section per file, and two files describing the same item are reported as the
-error they are. The comment and the commit status are posted independently: a comment the
-provider refuses still leaves the status set.
+A job that ends with an error (the repository or the provider's API unreachable, a credential
+not available) is not over: it runs again after 30 seconds, then 1, 2 and 4 minutes, five
+attempts in all, and then gives up (`failed`); the record says which attempt failed and when
+the next one runs. An invalid bundle is an outcome, not an error, and is not retried. A job
+that runs out of its lease (ten minutes) is taken over by the next replica to see it, up to the
+same five attempts; the fifth records its failure even though its own time is up. A redelivery
+(the provider's "redeliver", the same delivery id) of a delivery whose job ran reports how it
+went and changes nothing; of one whose job gave up, queues the job again with its attempts
+reset, which is the way to run a delivery the platform could not handle at the time; of one
+still waiting or running, names the job. The delivery, the decision, the job and the outcome
+land in the `hook` half of `gitrepo status`, which follows the delivery accepted last (an
+older job that ran late never writes over a newer delivery's summary; its outcome is in the
+job and the event), and every delivery, plan and sync is an event (`git.hook`, `git.plan`,
+`git.sync`) on the tenant's event stream, so a SOC or SRE integration can follow them without
+polling.
+
+The pull request plan follows the sync's contract exactly: the bundle files are planned in
+path order, each over the state the files before it would leave (not the live catalogue
+alone), so a document may name what an earlier file introduces and a reference to a later file
+is reported as invalid, as the sync would refuse it; two files describing the same item are
+refused before anything is planned, as the sync refuses them before anything is written; and
+the plan stops at the first file that is not valid, where a sync would stop. The comment shows
+one section per file. The comment and the commit status are posted independently: a comment
+the provider refuses still leaves the status set.
 
 The CI templates and the webhook are two ways to the same controller; a repository may use
 either. The templates need Docker and a secret in the repository and show the plan in the

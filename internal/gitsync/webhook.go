@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 
@@ -316,23 +315,61 @@ func (s *Service) Hook(ctx context.Context, tenant, name string, hdr http.Header
 		if gerr != nil {
 			return nil, err
 		}
-		job = existing
-		h.Reason = "a redelivery: the same job"
+		return s.redelivered(ctx, it, h, existing)
 	}
 	h.Job = job.ID
 	if err := s.Store.RecordGitHook(ctx, it.Tenant, it.Name, *h); err != nil {
 		return nil, err
 	}
 	s.emit(ctx, it, "git.hook", h)
-	if s.Inline {
-		for {
-			if ran, _ := s.RunOnce(ctx); !ran {
-				break
-			}
+	return s.inline(ctx, it, h)
+}
+
+// redelivered answers a delivery whose job exists. A job that ran reports how it went, and the
+// record keeps the summary it has (an acceptance is never written over an outcome, an older
+// job's over a newer one's); a job that gave up (failed) is queued again, with its attempts
+// reset, so a redelivery is the way to run a delivery the platform could not handle at the
+// time; a job still waiting or running is just named.
+func (s *Service) redelivered(ctx context.Context, it *model.CatalogItem, h *model.GitHook, job *model.GitJob) (*model.GitHook, error) {
+	h.Job = job.ID
+	switch job.Status {
+	case model.GitJobDone:
+		h.Outcome, h.Error, h.Reason = job.Outcome, job.Error, "a redelivery: the job already ran"
+		s.emit(ctx, it, "git.hook", h)
+		return h, nil
+	case model.GitJobFailed:
+		if err := s.jobs().RequeueGitJob(ctx, job.ID); err != nil && !errors.Is(err, store.ErrConflict) {
+			return nil, err
 		}
-		if g, err := s.Store.GetGitSync(ctx, it.Tenant, it.Name); err == nil && g.Hook != nil {
-			return g.Hook, nil
+		h.Reason = "a redelivery: the job had given up (" + job.Error + ") and runs again"
+		if err := s.Store.RecordGitHook(ctx, it.Tenant, it.Name, *h); err != nil {
+			return nil, err
 		}
+	default:
+		h.Reason = "a redelivery: the same job, " + job.Status
+	}
+	s.emit(ctx, it, "git.hook", h)
+	return s.inline(ctx, it, h)
+}
+
+// inline runs the waiting jobs in the request when Inline is set (tests) and returns the
+// hook as recorded afterwards.
+func (s *Service) inline(ctx context.Context, it *model.CatalogItem, h *model.GitHook) (*model.GitHook, error) {
+	if !s.Inline {
+		return h, nil
+	}
+	for {
+		if ran, _ := s.RunOnce(ctx); !ran {
+			break
+		}
+	}
+	if g, err := s.Store.GetGitSync(ctx, it.Tenant, it.Name); err == nil && g.Hook != nil && g.Hook.Job == h.Job {
+		s.fillHook(ctx, g)
+		return g.Hook, nil
+	}
+	// The record kept another job's summary: this job's outcome comes from the job itself.
+	if j, err := s.jobs().GetGitJob(ctx, h.Job); err == nil && (j.Status == model.GitJobDone || j.Status == model.GitJobFailed) {
+		h.Outcome, h.Error = j.Outcome, j.Error
 	}
 	return h, nil
 }
@@ -372,25 +409,38 @@ func (s *Service) RunOnce(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// MaxAttempts bounds how often a job is retried after a replica lost it mid-way.
+// MaxAttempts bounds how often a job runs: after a replica lost it mid-way (the lease ran
+// out) or after an error (the repository or the provider's API unreachable), it runs again,
+// up to this many attempts in all; then it fails, and a redelivery queues it anew.
 const MaxAttempts = 5
 
+// finishTimeout bounds the writes that end a job (its outcome, the hook record): they get a
+// context of their own, so a job whose lease ran out still ends.
+const finishTimeout = 30 * time.Second
+
 func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
-	ctx, cancel := context.WithTimeout(ctx, s.lease())
+	work, cancel := context.WithTimeout(ctx, s.lease())
 	defer cancel()
+	fin, cancelFin := context.WithTimeout(context.WithoutCancel(ctx), finishTimeout)
+	defer cancelFin()
+	fail := func(msg string) {
+		if err := s.jobs().FinishGitJob(fin, job.ID, s.owner(), job.Attempts, model.GitJobFailed, model.GitSyncError, msg); err != nil && s.Log != nil {
+			s.Log.Warn("git job: finish", "job", job.ID, "err", err)
+		}
+	}
 	var d Delivery
 	if err := json.Unmarshal(job.Payload, &d); err != nil {
-		_ = s.jobs().FinishGitJob(ctx, job.ID, s.owner(), model.GitJobFailed, model.GitSyncError, "payload: "+err.Error())
+		fail("payload: " + err.Error())
 		return
 	}
-	it, err := s.Repos.Store.GetItem(ctx, model.KindGitRepository, job.Tenant, job.Name, 0)
+	it, err := s.Repos.Store.GetItem(fin, model.KindGitRepository, job.Tenant, job.Name, 0)
 	if err != nil {
-		_ = s.jobs().FinishGitJob(ctx, job.ID, s.owner(), model.GitJobFailed, model.GitSyncError, "repository: "+err.Error())
+		fail("repository: " + err.Error())
 		return
 	}
 	sp, err := gitrepo.Decode(it)
 	if err != nil {
-		_ = s.jobs().FinishGitJob(ctx, job.ID, s.owner(), model.GitJobFailed, model.GitSyncError, "spec: "+err.Error())
+		fail("spec: " + err.Error())
 		return
 	}
 	// The documents are applied with the repository's authority: the tenant's for a tenant's
@@ -400,13 +450,20 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 	if d.PR != nil {
 		done.Number, done.Commit = d.PR.Number, d.PR.HeadSHA
 	}
+	if job.Attempts > MaxAttempts {
+		// Claimed once more after its last attempt died unfinished: nothing runs again.
+		done.Outcome = model.GitSyncError
+		done.Error = fmt.Sprintf("gave up after %d attempts; the last one did not finish", MaxAttempts)
+		s.conclude(fin, it, job, &done, model.GitJobFailed, time.Time{})
+		return
+	}
 	var outcome string
 	var runErr error
 	switch job.Action {
 	case model.HookActionSync:
-		outcome, done.Commit, done.Reason, runErr = s.syncHead(ctx, it, sp, scope, d.After)
+		outcome, done.Commit, done.Reason, runErr = s.syncHead(work, it, sp, scope, d.After)
 	case model.HookActionPlan:
-		outcome, runErr = s.preview(ctx, it, sp, scope, *d.PR)
+		outcome, done.Reason, runErr = s.preview(work, it, sp, scope, *d.PR)
 	default:
 		outcome, runErr = model.GitSyncError, fmt.Errorf("unknown action %q", job.Action)
 	}
@@ -414,27 +471,77 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 	if runErr != nil {
 		done.Error = runErr.Error()
 	}
-	status := model.GitJobDone
-	if ctx.Err() != nil && job.Attempts < MaxAttempts {
-		// Cut short (the lease ran out, the process is stopping): leave the job running under
+	switch {
+	case work.Err() != nil && runErr != nil && job.Attempts < MaxAttempts:
+		// Cut short (the lease ran out, the process is stopping): the job stays running under
 		// its lease, so another replica (or this one, later) takes it over.
 		return
+	case work.Err() != nil && runErr != nil:
+		done.Error = fmt.Sprintf("attempt %d of %d did not finish within its lease: %v", job.Attempts, MaxAttempts, runErr)
+		s.conclude(fin, it, job, &done, model.GitJobFailed, time.Time{})
+	case outcome == model.GitSyncError && runErr != nil && job.Attempts < MaxAttempts:
+		// An error (not an invalid bundle): the repository or the provider may be back later.
+		at := s.now().Add(s.backoff(job.Attempts))
+		done.Reason = fmt.Sprintf("attempt %d of %d failed; the job runs again at %s", job.Attempts, MaxAttempts, at.UTC().Format(time.RFC3339))
+		s.conclude(fin, it, job, &done, model.GitJobPending, at)
+	case outcome == model.GitSyncError && runErr != nil:
+		done.Error = fmt.Sprintf("gave up after %d attempts: %v", MaxAttempts, runErr)
+		s.conclude(fin, it, job, &done, model.GitJobFailed, time.Time{})
+	default:
+		s.conclude(fin, it, job, &done, model.GitJobDone, time.Time{})
 	}
-	if outcome == model.GitSyncError && runErr != nil {
-		status = model.GitJobFailed
+}
+
+// conclude records how an attempt went in the hook half of the record and moves the job on:
+// done or failed, or pending again at retryAt. The record is written first, so a replica dying
+// in between leaves a job that runs again (the work is idempotent), never a finished job whose
+// outcome nobody sees; and an older job never writes its summary over a newer job's.
+func (s *Service) conclude(ctx context.Context, it *model.CatalogItem, job *model.GitJob, done *model.GitHook, status string, retryAt time.Time) {
+	if g, err := s.Store.GetGitSync(ctx, it.Tenant, it.Name); err == nil && g.Hook != nil && g.Hook.Job != "" && g.Hook.Job != job.ID && s.keeps(ctx, g.Hook, job) {
+		s.emit(ctx, it, "git.hook", done)
+		s.move(ctx, job, status, done, retryAt)
+		return
 	}
-	if err := s.jobs().FinishGitJob(ctx, job.ID, s.owner(), status, outcome, done.Error); err != nil {
-		if s.Log != nil {
-			s.Log.Warn("git job: finish", "job", job.ID, "err", err)
-		}
-		if errors.Is(err, store.ErrConflict) {
-			return // another replica took the job over: its outcome counts
-		}
-	}
-	if err := s.Store.RecordGitHook(ctx, it.Tenant, it.Name, done); err != nil && s.Log != nil {
+	if err := s.Store.RecordGitHook(ctx, it.Tenant, it.Name, *done); err != nil && s.Log != nil {
 		s.Log.Error("git hook: record outcome", "tenant", it.Tenant, "repository", it.Name, "err", err)
 	}
-	s.emit(ctx, it, "git.hook", &done)
+	s.emit(ctx, it, "git.hook", done)
+	s.move(ctx, job, status, done, retryAt)
+}
+
+// keeps says whether the record's hook (another job's) stays over this job's outcome: the
+// record follows the delivery accepted last, so a job accepted earlier, however late it ran,
+// never writes its summary over a later delivery's (its outcome is in the job and the event).
+func (s *Service) keeps(ctx context.Context, cur *model.GitHook, job *model.GitJob) bool {
+	other, err := s.jobs().GetGitJob(ctx, cur.Job)
+	return err == nil && other.CreatedAt.After(job.CreatedAt)
+}
+
+func (s *Service) move(ctx context.Context, job *model.GitJob, status string, done *model.GitHook, retryAt time.Time) {
+	var err error
+	if status == model.GitJobPending {
+		err = s.jobs().RetryGitJob(ctx, job.ID, s.owner(), job.Attempts, retryAt, done.Error)
+	} else {
+		err = s.jobs().FinishGitJob(ctx, job.ID, s.owner(), job.Attempts, status, done.Outcome, done.Error)
+	}
+	if err != nil && s.Log != nil {
+		s.Log.Warn("git job: finish", "job", job.ID, "status", status, "err", err)
+	}
+}
+
+// backoff is the wait before the attempt after the given one.
+func (s *Service) backoff(attempt int) time.Duration {
+	base := s.Retry
+	if base <= 0 {
+		base = 30 * time.Second
+	}
+	if attempt < 1 {
+		attempt = 1
+	}
+	if attempt > 10 {
+		attempt = 10
+	}
+	return base << (attempt - 1)
 }
 
 // syncHead syncs the ref's current head for a push delivery, under the tenant's lock: the ref
@@ -530,123 +637,104 @@ func (s *Service) emit(ctx context.Context, it *model.CatalogItem, typ string, d
 
 // preview plans the bundles at a pull request's head with the repository's authority and
 // reports the result on the pull request: one comment (updated per push, found by the marker)
-// and one commit status, each posted whether or not the other could be. The files are planned
-// as one bundle in path order, as a sync applies them in sequence, so a document in a later
-// file may name what an earlier file introduces; the comment still shows one section per file.
-// Nothing is written to the catalogue.
-func (s *Service) preview(ctx context.Context, it *model.CatalogItem, sp gitrepo.Spec, scope plan.Scope, pr PullRequest) (string, error) {
+// and one commit status, each posted whether or not the other could be. It runs under the
+// tenant's lock, like a sync, so two jobs for one pull request never publish at once, and it
+// publishes only for the request's current head: a delivery whose head the request has moved
+// past is superseded, so an older plan never lands over a newer one, whatever order the
+// deliveries ran in. The files are planned as a sync applies them (parseBundles), one section
+// per file. Nothing is written to the catalogue. Returns the outcome and a note for the record.
+func (s *Service) preview(ctx context.Context, it *model.CatalogItem, sp gitrepo.Spec, scope plan.Scope, pr PullRequest) (outcome, note string, err error) {
 	if s.Reporter == nil {
-		return model.GitSyncError, errors.New("no pull request reporter is configured")
+		return model.GitSyncError, "", errors.New("no pull request reporter is configured")
 	}
-	r, err := s.remote(ctx, it, sp)
-	if err != nil {
-		return model.GitSyncError, err
-	}
-	target, err := TargetOf(r, pr)
-	if err != nil {
-		return model.GitSyncError, err
-	}
-	var body bytes.Buffer
-	outcome := model.GitSyncDone
-	changes := 0
-	r.Ref = pr.HeadRef
-	files, err := s.Fetch.Files(ctx, r, pr.HeadSHA, sp.Paths)
-	if err != nil {
-		err = fmt.Errorf("%w: %v", ErrRead, err)
-		render.Failure(&body, "Plan", "", err)
-		outcome = model.GitSyncError
-	} else {
-		outcome, changes = s.planFiles(ctx, &body, files, scope)
-	}
-	s.emit(ctx, it, "git.plan", map[string]any{"number": pr.Number, "commit": pr.HeadSHA, "outcome": outcome, "changes": changes})
-	state, description := StatusSuccess, fmt.Sprintf("plan: %d to apply on merge", changes)
-	switch outcome {
-	case model.GitSyncInvalid:
-		state, description = StatusFailure, "plan: a bundle is not valid; see the comment"
-	case model.GitSyncError:
-		state, description = StatusError, "plan: the repository could not be read; see the comment"
-	}
-	var report []error
-	if cerr := s.Reporter.UpsertComment(ctx, target, body.String()); cerr != nil {
-		report = append(report, fmt.Errorf("comment on %s #%d: %w", target.Repo, pr.Number, cerr))
-	}
-	if serr := s.Reporter.SetStatus(ctx, target, state, description); serr != nil {
-		report = append(report, fmt.Errorf("status on %s@%s: %w", target.Repo, pr.HeadSHA, serr))
-	}
-	if len(report) > 0 {
-		return model.GitSyncError, errors.Join(append(report, err)...)
-	}
-	return outcome, err
+	outcome = model.GitSyncError
+	err = s.locked(ctx, it.Tenant, func(ctx context.Context) error {
+		r, err := s.remote(ctx, it, sp)
+		if err != nil {
+			return err
+		}
+		target, err := TargetOf(r, pr)
+		if err != nil {
+			return err
+		}
+		r.Ref = pr.HeadRef
+		head, err := s.Fetch.Resolve(ctx, r)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrRead, err)
+		}
+		if head != pr.HeadSHA {
+			outcome = model.HookSuperseded
+			note = fmt.Sprintf("the pull request's head is now %s; the plan of %s is not published", head, pr.HeadSHA)
+			return nil
+		}
+		var body bytes.Buffer
+		changes := 0
+		files, err := s.Fetch.Files(ctx, r, pr.HeadSHA, sp.Paths)
+		if err != nil {
+			err = fmt.Errorf("%w: %v", ErrRead, err)
+			render.Failure(&body, "Plan", "", err)
+			outcome = model.GitSyncError
+		} else {
+			outcome, changes = s.planFiles(ctx, &body, files, scope)
+		}
+		s.emit(ctx, it, "git.plan", map[string]any{"number": pr.Number, "commit": pr.HeadSHA, "outcome": outcome, "changes": changes})
+		state, description := StatusSuccess, fmt.Sprintf("plan: %d to apply on merge", changes)
+		switch outcome {
+		case model.GitSyncInvalid:
+			state, description = StatusFailure, "plan: a bundle is not valid; see the comment"
+		case model.GitSyncError:
+			state, description = StatusError, "plan: the repository could not be read; see the comment"
+		}
+		var report []error
+		if cerr := s.Reporter.UpsertComment(ctx, target, body.String()); cerr != nil {
+			report = append(report, fmt.Errorf("comment on %s #%d: %w", target.Repo, pr.Number, cerr))
+		}
+		if serr := s.Reporter.SetStatus(ctx, target, state, description); serr != nil {
+			report = append(report, fmt.Errorf("status on %s@%s: %w", target.Repo, pr.HeadSHA, serr))
+		}
+		if len(report) > 0 {
+			outcome = model.GitSyncError
+			return errors.Join(append(report, err)...)
+		}
+		return err
+	})
+	return outcome, note, err
 }
 
-// planFiles plans the files as one bundle and renders one section per file (bundle-level
-// errors, such as two files describing one item, go with the first section).
+// planFiles plans the files as a sync applies them: in path order, each over the state the
+// files before it leave behind (plan.Deps.Virtual), stopping at the first that is not valid
+// (a sync stops there too), with one section per file. Returns the outcome and the creates and
+// updates a merge would apply.
 func (s *Service) planFiles(ctx context.Context, body *bytes.Buffer, files map[string][]byte, scope plan.Scope) (string, int) {
-	paths := make([]string, 0, len(files))
-	for p := range files {
-		paths = append(paths, p)
+	bundles, path, perr := parseBundles(files, scope.Tenant)
+	if perr != nil {
+		render.Failure(body, "Plan", path, perr)
+		return model.GitSyncInvalid, 0
 	}
-	sort.Strings(paths)
-	outcome := model.GitSyncDone
-	var all []*res.Document
-	owner := map[string]string{} // kind|tenant|name → file
-	var parsed []string
-	for _, p := range paths {
-		docs, perr := res.ParseYAMLAll(files[p])
-		if perr != nil {
-			render.Failure(body, "Plan", p, perr)
-			outcome = model.GitSyncInvalid
-			continue
+	changes := 0
+	var virtual []*model.CatalogItem
+	for i, bf := range bundles {
+		pl, items, err := s.Applier.Planner.Virtual(virtual).PlanItems(ctx, bf.Docs, scope)
+		if err != nil {
+			render.Failure(body, "Plan", bf.Path, err)
+			return model.GitSyncError, changes
 		}
-		for _, d := range docs {
-			tenant := scope.Tenant
-			if d.Tenant != nil {
-				tenant = *d.Tenant
-			}
-			k := d.Kind + "|" + tenant + "|" + d.Name
-			if _, dup := owner[k]; !dup {
-				owner[k] = p
-			}
-		}
-		all = append(all, docs...)
-		parsed = append(parsed, p)
-	}
-	if len(all) == 0 {
-		return outcome, 0
-	}
-	joint, err := s.Applier.Planner.Plan(ctx, all, scope)
-	if err != nil {
-		render.Failure(body, "Plan", "", err)
-		return model.GitSyncError, 0
-	}
-	if !joint.Valid {
-		outcome = model.GitSyncInvalid
-	}
-	for i, p := range parsed {
-		part := plan.Plan{Valid: true, Bundle: joint.Bundle, Fingerprint: joint.Fingerprint}
-		if i == 0 {
-			part.Errors = joint.Errors
-			part.Valid = len(joint.Errors) == 0
-		}
-		for _, c := range joint.Changes {
-			if owner[c.Kind+"|"+c.Tenant+"|"+c.Name] != p {
-				continue
-			}
-			part.Changes = append(part.Changes, c)
-			switch {
-			case len(c.Errors) > 0 || c.Action == plan.ActionInvalid:
-				part.Summary.Invalid++
-				part.Valid = false
-			case c.Action == plan.ActionCreate:
-				part.Summary.Create++
-			case c.Action == plan.ActionUpdate:
-				part.Summary.Update++
-			default:
-				part.Summary.Noop++
-			}
-		}
-		render.Plan(body, part, p)
+		render.Plan(body, *pl, bf.Path)
 		body.WriteString("\n")
+		if !pl.Valid {
+			if rest := len(bundles) - i - 1; rest > 0 {
+				fmt.Fprintf(body, "_%d more file(s) not planned: a sync stops at the first bundle that is not valid._\n\n", rest)
+			}
+			return model.GitSyncInvalid, changes
+		}
+		changes += pl.Summary.Create + pl.Summary.Update
+		for j, c := range pl.Changes {
+			if j < len(items) && items[j] != nil {
+				written := *items[j]
+				written.Revision = c.NextRevision
+				virtual = append(virtual, &written)
+			}
+		}
 	}
-	return outcome, joint.Summary.Create + joint.Summary.Update
+	return model.GitSyncDone, changes
 }

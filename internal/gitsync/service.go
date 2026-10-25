@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strconv"
 	"time"
 
 	"agent-sandbox/internal/apply"
@@ -42,13 +43,16 @@ type Service struct {
 	// store's tenant lock); Reporter posts plans on pull requests; Emit publishes git.hook,
 	// git.sync and git.plan events (nil: none); Replica names this process as a job owner;
 	// Lease bounds a job's run before another replica may take it over (default 10 minutes);
-	// Inline runs the accepted job in the request instead of leaving it to Run (tests).
+	// Retry is the first wait before a job that failed with an error (not an invalid bundle)
+	// runs again, doubling per attempt up to MaxAttempts (default 30 seconds); Inline runs the
+	// accepted job in the request instead of leaving it to Run (tests).
 	Jobs     store.GitJobs
 	Lock     func(ctx context.Context, tenant string, fn func(ctx context.Context) error) error
 	Reporter Reporter
 	Emit     func(ctx context.Context, e model.Event)
 	Replica  string
 	Lease    time.Duration
+	Retry    time.Duration
 	Inline   bool
 	Log      *slog.Logger
 }
@@ -120,7 +124,24 @@ func (s *Service) Status(ctx context.Context, scope plan.Scope, name string) (*m
 	if errors.Is(err, store.ErrNotFound) {
 		return nil, fmt.Errorf("%w: %s was never checked or synced", res.ErrNotFound, name)
 	}
-	return g, err
+	if err != nil {
+		return nil, err
+	}
+	s.fillHook(ctx, g)
+	return g, nil
+}
+
+// fillHook completes the hook half from its job: a job that ended before its outcome reached
+// the record (the replica died in between) still shows how it went.
+func (s *Service) fillHook(ctx context.Context, g *model.GitSync) {
+	if g == nil || g.Hook == nil || g.Hook.Job == "" || g.Hook.Outcome != "" || s.jobs() == nil {
+		return
+	}
+	j, err := s.jobs().GetGitJob(ctx, g.Hook.Job)
+	if err != nil || (j.Status != model.GitJobDone && j.Status != model.GitJobFailed) {
+		return
+	}
+	g.Hook.Outcome, g.Hook.Error = j.Outcome, j.Error
 }
 
 // Check resolves the ref and records the head (or why the repository cannot be read) in the
@@ -195,9 +216,24 @@ func (s *Service) locked(ctx context.Context, tenant string, fn func(ctx context
 func (s *Service) sync(ctx context.Context, it *model.CatalogItem, sp gitrepo.Spec, scope plan.Scope, commit string) (*model.GitSync, error) {
 	now := s.now()
 	result := model.GitSyncResult{Commit: commit, At: now}
+	// The generation: the last sync's, moved on when this one names another commit. The same
+	// rule gives the applies their keys and the record its number, so what is recorded is what
+	// was keyed, and a sync that fails before it knows its commit still moves on (never back).
+	prevCommit, generation, synced := "", 0, false
+	if prev, err := s.Store.GetGitSync(ctx, it.Tenant, it.Name); err == nil && prev.Sync != nil {
+		prevCommit, generation, synced = prev.Sync.Commit, prev.Sync.Generation, true
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, err
+	}
+	generationOf := func(commit string) int {
+		if synced && commit != prevCommit {
+			return generation + 1
+		}
+		return generation
+	}
 	var checked *model.GitCheck
 	finish := func(status string, err error) (*model.GitSync, error) {
-		result.Status = status
+		result.Status, result.Generation = status, generationOf(result.Commit)
 		if err != nil {
 			result.Error = err.Error()
 		}
@@ -240,28 +276,24 @@ func (s *Service) sync(ctx context.Context, it *model.CatalogItem, sp gitrepo.Sp
 	if err != nil {
 		return finish(model.GitSyncError, fmt.Errorf("%w: %v", ErrRead, err))
 	}
-	paths := make([]string, 0, len(files))
-	for p := range files {
-		paths = append(paths, p)
-	}
-	sort.Strings(paths)
 	// The documents are applied with the repository's authority, never the caller's: a tenant's
 	// repository can do what the tenant can; the admin's shared repository what the admin can.
 	applyScope := plan.Scope{Tenant: it.Tenant, Admin: it.Tenant == "" && scope.Admin, Subject: scope.Subject}
-	for _, p := range paths {
+	bundles, path, perr := parseBundles(files, applyScope.Tenant)
+	if perr != nil {
+		result.Bundles = append(result.Bundles, model.GitSyncBundle{Path: path, Status: model.GitSyncInvalid, Errors: []string{perr.Error()}})
+		return finish(model.GitSyncInvalid, fmt.Errorf("%w: %s: %v", ErrInvalid, path, perr))
+	}
+	gen := generationOf(commit)
+	for _, bf := range bundles {
+		p, docs := bf.Path, bf.Docs
 		b := model.GitSyncBundle{Path: p}
-		docs, err := res.ParseYAMLAll(files[p])
-		if err != nil {
-			b.Status, b.Errors = model.GitSyncInvalid, []string{err.Error()}
-			result.Bundles = append(result.Bundles, b)
-			return finish(model.GitSyncInvalid, fmt.Errorf("%w: %s: %v", ErrInvalid, p, err))
-		}
 		pl, err := s.Applier.Planner.Plan(ctx, docs, applyScope)
 		if err != nil {
 			result.Bundles = append(result.Bundles, b)
 			return finish(model.GitSyncError, fmt.Errorf("%s: plan: %w", p, err))
 		}
-		a, err := s.Applier.Submit(ctx, apply.Request{Docs: docs, Plan: pl.Fingerprint, Key: Key(it.Name, commit, p), Scope: applyScope,
+		a, err := s.Applier.Submit(ctx, apply.Request{Docs: docs, Plan: pl.Fingerprint, Key: Key(it.Name, commit, p, gen), Scope: applyScope,
 			Source: &model.Source{Repo: sp.URL, Ref: sp.Ref, Commit: commit, Path: p}})
 		var invalid *apply.InvalidPlan
 		switch {
@@ -294,10 +326,56 @@ func (s *Service) sync(ctx context.Context, it *model.CatalogItem, sp gitrepo.Sp
 	return finish(model.GitSyncDone, nil)
 }
 
-// Key is the idempotency key of a bundle's apply: stable for the repository, the commit and
-// the path, so a repeated sync of a commit finds its applies.
-func Key(repo, commit, path string) string {
-	return "git:" + repo + "@" + commit + ":" + path
+// Key is the idempotency key of a bundle's apply: stable for the repository, the commit, the
+// path and the sync generation, so a repeated sync of a commit finds its applies, while a
+// return to a commit synced in an earlier generation (a force push back) applies it anew.
+// Generation 0 keeps the key's earlier form.
+func Key(repo, commit, path string, generation int) string {
+	k := "git:" + repo + "@" + commit + ":" + path
+	if generation > 0 {
+		k += "#" + strconv.Itoa(generation)
+	}
+	return k
+}
+
+// bundleFile is one bundle file of a commit, parsed.
+type bundleFile struct {
+	Path string
+	Docs []*res.Document
+}
+
+// parseBundles parses the files in path order under the one contract a sync applies and a
+// pull request preview shows: file by file, in that order, so a document may name what an
+// earlier file introduces (not a later one), and an item lives in one file (two files
+// describing it are refused before anything is written). The path and the error name the
+// file at fault.
+func parseBundles(files map[string][]byte, tenant string) ([]bundleFile, string, error) {
+	paths := make([]string, 0, len(files))
+	for p := range files {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	owner := map[string]string{} // kind|tenant|name → file
+	var out []bundleFile
+	for _, p := range paths {
+		docs, err := res.ParseYAMLAll(files[p])
+		if err != nil {
+			return nil, p, err
+		}
+		for _, d := range docs {
+			t := tenant
+			if d.Tenant != nil {
+				t = *d.Tenant
+			}
+			k := d.Kind + "|" + t + "|" + d.Name
+			if first, dup := owner[k]; dup && first != p {
+				return nil, p, fmt.Errorf("files %s and %s both describe %s %s/%s", first, p, d.Kind, t, d.Name)
+			}
+			owner[k] = p
+		}
+		out = append(out, bundleFile{Path: p, Docs: docs})
+	}
+	return out, "", nil
 }
 
 func planErrors(p *plan.Plan) []string {
