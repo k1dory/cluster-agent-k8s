@@ -240,3 +240,8 @@ CREATE TABLE IF NOT EXISTS git_jobs (
     UNIQUE (tenant, name, delivery)
 );
 CREATE INDEX IF NOT EXISTS git_jobs_waiting ON git_jobs (status, lease_until, created_at);
+-- run counts a job's executions for good (attempts starts over when a redelivery requeues
+-- the job): the identity an execution's writes are fenced by. Rows from before carry their
+-- attempts as the executions so far.
+ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS run integer NOT NULL DEFAULT 0;
+UPDATE git_jobs SET run = attempts WHERE run = 0 AND attempts > 0;

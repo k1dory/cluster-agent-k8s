@@ -182,10 +182,11 @@ type GitSyncs interface {
 	RecordGitSync(ctx context.Context, tenant, name string, r model.GitSyncResult) error
 	RecordGitHook(ctx context.Context, tenant, name string, h model.GitHook) error
 	// RecordGitHookIf writes the hook half only while the record's hook is absent, or belongs
-	// to job (the delivery accepted last is still that one) and is from attempt or an earlier
-	// one, atomically; false when another delivery was accepted meanwhile, or a later attempt
-	// of the job already wrote, and the record keeps its summary.
-	RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string, attempt int) (bool, error)
+	// to job (the delivery accepted last is still that one) and is from execution run or an
+	// earlier one, atomically; false when another delivery was accepted meanwhile, or a later
+	// execution of the job already wrote, and the record keeps its summary. The same execution
+	// may write again (idempotent).
+	RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string, run int) (bool, error)
 	// GetGitSync returns the record; ErrNotFound when the repository was never checked or synced.
 	GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error)
 }
@@ -194,23 +195,25 @@ type GitSyncs interface {
 // that accepted it. Enqueue is idempotent per delivery (ErrConflict names the existing job);
 // Claim hands one job to one replica at a time: a pending one whose wait is over, or a running
 // one whose lease lapsed, atomically, under a new lease; Finish, Retry and Requeue move it on.
-// Finish and Retry are the holder's only (owner and attempt as claimed): a lapsed lease taken
-// over elsewhere, or claimed again by the same replica, refuses the former attempt's writes.
+// Finish and Retry are the holder's only (owner and run as claimed): a lapsed lease taken
+// over elsewhere, or claimed again by the same replica, refuses the former execution's writes.
+// Run counts every claim and is never reset (the identity of an execution); Attempts counts
+// them within the current budget and starts over when a redelivery requeues the job.
 type GitJobs interface {
 	EnqueueGitJob(ctx context.Context, j *model.GitJob) error
 	// ClaimGitJob returns the next job for owner with a lease until now+lease, incrementing
-	// Attempts; ErrNotFound when none is waiting. A pending job whose LeaseUntil is in the
+	// Attempts and Run; ErrNotFound when none is waiting. A pending job whose LeaseUntil is in the
 	// future (a retry scheduled by RetryGitJob) is not waiting yet.
 	ClaimGitJob(ctx context.Context, owner string, now time.Time, lease time.Duration) (*model.GitJob, error)
-	// FinishGitJob records the outcome of the attempt the caller holds (ErrConflict when the
-	// job is not running under that owner and attempt).
-	FinishGitJob(ctx context.Context, id, owner string, attempt int, status, outcome, errMsg string) error
-	// RetryGitJob puts the attempt the caller holds back to pending, to be claimed no earlier
+	// FinishGitJob records the outcome of the execution the caller holds (ErrConflict when the
+	// job is not running under that owner and run).
+	FinishGitJob(ctx context.Context, id, owner string, run int, status, outcome, errMsg string) error
+	// RetryGitJob puts the execution the caller holds back to pending, to be claimed no earlier
 	// than notBefore, keeping Attempts and recording why (ErrConflict as for Finish).
-	RetryGitJob(ctx context.Context, id, owner string, attempt int, notBefore time.Time, errMsg string) error
+	RetryGitJob(ctx context.Context, id, owner string, run int, notBefore time.Time, errMsg string) error
 	// RequeueGitJob makes a failed job, or a pending one waiting for its next attempt, due now
-	// with Attempts reset (ErrConflict when the job is running or done): a redelivery of a
-	// delivery whose job gave up or waits.
+	// with Attempts reset and Run kept (ErrConflict when the job is running or done): a
+	// redelivery of a delivery whose job gave up or waits.
 	RequeueGitJob(ctx context.Context, id string) error
 	GetGitJob(ctx context.Context, id string) (*model.GitJob, error)
 	// GetGitJobByDelivery finds the job of a delivery (tenant, name, delivery key).

@@ -149,7 +149,7 @@ func (s *Service) fillHook(ctx context.Context, g *model.GitSync) {
 	if g.Hook.Outcome != "" {
 		g.Hook.Reason = "" // an earlier attempt's note (its next run, its head) no longer holds
 	}
-	g.Hook.Outcome, g.Hook.Error, g.Hook.Attempt = j.Outcome, j.Error, j.Attempts
+	g.Hook.Outcome, g.Hook.Error, g.Hook.Run, g.Hook.Attempt = j.Outcome, j.Error, j.Run, j.Attempts
 }
 
 // Check resolves the ref and records the head (or why the repository cannot be read) in the

@@ -64,30 +64,39 @@ func TestGitSyncRecordContract(t *testing.T) {
 			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", At: now}, "gitjob_1", 0); err != nil || !ok {
 				t.Fatalf("hook if, no hook yet: %v %v", ok, err)
 			}
-			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Attempt: 2, Outcome: "done", At: now}, "gitjob_1", 2); err != nil || !ok {
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Run: 2, Attempt: 2, Outcome: "done", At: now}, "gitjob_1", 2); err != nil || !ok {
 				t.Fatalf("hook if, own job: %v %v", ok, err)
 			}
 			// An earlier attempt of the same job writing late: refused; the same attempt again: taken.
-			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Attempt: 1, Outcome: "error", At: now}, "gitjob_1", 1); err != nil || ok {
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Run: 1, Attempt: 1, Outcome: "error", At: now}, "gitjob_1", 1); err != nil || ok {
 				t.Fatalf("hook if, an earlier attempt: %v %v", ok, err)
 			}
-			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Attempt: 2, Outcome: "done", Reason: "again", At: now}, "gitjob_1", 2); err != nil || !ok {
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Run: 2, Attempt: 2, Outcome: "done", Reason: "again", At: now}, "gitjob_1", 2); err != nil || !ok {
 				t.Fatalf("hook if, the same attempt: %v %v", ok, err)
 			}
-			if got, _ = st.GetGitSync(ctx, "acme", "config"); got.Hook.Attempt != 2 || got.Hook.Outcome != "done" || got.Hook.Reason != "again" {
-				t.Fatalf("a late earlier attempt wrote over a later one: %+v", got.Hook)
+			if got, _ = st.GetGitSync(ctx, "acme", "config"); got.Hook.Run != 2 || got.Hook.Outcome != "done" || got.Hook.Reason != "again" {
+				t.Fatalf("a late earlier execution wrote over a later one: %+v", got.Hook)
+			}
+			// The condition is the execution (run), not the attempt within a budget: after a
+			// requeue, attempts start over at 1 while runs go on; a late write of run 2 is refused
+			// by run 3's acceptance-level fence, and run 3 (attempt 1) writes.
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Run: 3, Attempt: 1, Outcome: "done", At: now}, "gitjob_1", 3); err != nil || !ok {
+				t.Fatalf("hook if, the next execution after a requeue: %v %v", ok, err)
+			}
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Run: 2, Attempt: 2, Outcome: "error", At: now}, "gitjob_1", 2); err != nil || ok {
+				t.Fatalf("hook if, a late earlier execution with a repeated attempt number: %v %v", ok, err)
 			}
 			if err := st.RecordGitHook(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_2", At: now}); err != nil {
 				t.Fatal(err)
 			}
-			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Attempt: 3, Outcome: "superseded", At: now}, "gitjob_1", 3); err != nil || ok {
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Run: 4, Attempt: 2, Outcome: "superseded", At: now}, "gitjob_1", 4); err != nil || ok {
 				t.Fatalf("hook if, another job's acceptance: %v %v", ok, err)
 			}
 			got, _ = st.GetGitSync(ctx, "acme", "config")
 			if got.Hook == nil || got.Hook.Job != "gitjob_2" || got.Hook.Outcome != "" || got.Sync.Commit != "cccc" || got.Check.Error != "unreachable" {
 				t.Fatalf("the newer acceptance was written over, or the other halves touched: %+v", got)
 			}
-			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_2", Attempt: 1, Outcome: "done", At: now}, "gitjob_2", 1); err != nil || !ok {
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_2", Run: 1, Attempt: 1, Outcome: "done", At: now}, "gitjob_2", 1); err != nil || !ok {
 				t.Fatalf("hook if, the first attempt over the acceptance: %v %v", ok, err)
 			}
 			if ok, err := st.RecordGitHookIf(ctx, "acme", "other", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_3", At: now}, "gitjob_3", 0); err != nil || !ok {
@@ -241,13 +250,13 @@ func TestGitJobContract(t *testing.T) {
 			}
 			// A lapsed lease is claimable again (attempt 2); the former holder can no longer finish.
 			j1b, err := st.ClaimGitJob(ctx, "three", now.Add(2*time.Minute), time.Minute)
-			if err != nil || j1b.ID != "gitjob_a" || j1b.Owner != "three" || j1b.Attempts != 2 {
+			if err != nil || j1b.ID != "gitjob_a" || j1b.Owner != "three" || j1b.Attempts != 2 || j1b.Run != 2 {
 				t.Fatalf("takeover: %v %+v", err, j1b)
 			}
 			if err := st.FinishGitJob(ctx, "gitjob_a", "one", 1, model.GitJobDone, "done", ""); !errors.Is(err, ErrConflict) {
 				t.Fatalf("the former holder finishing: %v", err)
 			}
-			// The same replica holding a later attempt: the former attempt's write is refused too.
+			// The same replica holding a later execution: the former execution's write is refused too.
 			if err := st.FinishGitJob(ctx, "gitjob_a", "three", 1, model.GitJobDone, "done", ""); !errors.Is(err, ErrConflict) {
 				t.Fatalf("a stale attempt finishing: %v", err)
 			}
@@ -266,7 +275,7 @@ func TestGitJobContract(t *testing.T) {
 			if err := st.FinishGitJob(ctx, "gitjob_b", "two", 1, model.GitJobDone, "done", ""); !errors.Is(err, ErrConflict) {
 				t.Fatalf("finishing a job put back to pending: %v", err)
 			}
-			if j, _ := st.GetGitJob(ctx, "gitjob_b"); j.Status != model.GitJobPending || j.Attempts != 1 || j.Error != "git unreachable" || j.LeaseUntil == nil || !j.LeaseUntil.Equal(now.Add(10*time.Minute)) {
+			if j, _ := st.GetGitJob(ctx, "gitjob_b"); j.Status != model.GitJobPending || j.Attempts != 1 || j.Run != 1 || j.Error != "git unreachable" || j.LeaseUntil == nil || !j.LeaseUntil.Equal(now.Add(10*time.Minute)) {
 				t.Fatalf("retried job: %+v", j)
 			}
 			if err := st.FinishGitJob(ctx, "gitjob_c", "two", 1, model.GitJobDone, "done", ""); err != nil {
@@ -275,19 +284,26 @@ func TestGitJobContract(t *testing.T) {
 			if _, err := st.ClaimGitJob(ctx, "four", now.Add(5*time.Minute), time.Minute); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("a retry claimed before its time: %v", err)
 			}
-			// A waiting retry can be brought forward (a redelivery): due now, attempts reset.
+			// A waiting retry can be brought forward (a redelivery): due now, attempts reset,
+			// the run going on (the next execution is run 2, attempt 1).
 			if err := st.RequeueGitJob(ctx, "gitjob_b"); err != nil {
 				t.Fatalf("requeue a waiting retry: %v", err)
 			}
+			if j, _ := st.GetGitJob(ctx, "gitjob_b"); j.Attempts != 0 || j.Run != 1 {
+				t.Fatalf("a requeue must keep the run: %+v", j)
+			}
 			jb, err := st.ClaimGitJob(ctx, "four", now.Add(5*time.Minute), time.Minute)
-			if err != nil || jb.ID != "gitjob_b" || jb.Attempts != 1 || jb.Owner != "four" || jb.Error != "" {
+			if err != nil || jb.ID != "gitjob_b" || jb.Attempts != 1 || jb.Run != 2 || jb.Owner != "four" || jb.Error != "" {
 				t.Fatalf("a requeued retry claimed at once: %v %+v", err, jb)
 			}
 			if err := st.RequeueGitJob(ctx, "gitjob_b"); !errors.Is(err, ErrConflict) {
 				t.Fatalf("requeueing a running job: %v", err)
 			}
 			// Done jobs are never claimed again; a failed one neither, until it is requeued.
-			if err := st.FinishGitJob(ctx, "gitjob_b", "four", 1, model.GitJobFailed, "error", "boom"); err != nil {
+			if err := st.FinishGitJob(ctx, "gitjob_b", "four", 1, model.GitJobFailed, "error", "boom"); !errors.Is(err, ErrConflict) {
+				t.Fatalf("finishing with the attempt number instead of the run: %v", err)
+			}
+			if err := st.FinishGitJob(ctx, "gitjob_b", "four", 2, model.GitJobFailed, "error", "boom"); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := st.ClaimGitJob(ctx, "four", now.Add(time.Hour), time.Minute); !errors.Is(err, ErrNotFound) {
@@ -299,10 +315,10 @@ func TestGitJobContract(t *testing.T) {
 			if err := st.RequeueGitJob(ctx, "gitjob_b"); err != nil {
 				t.Fatalf("requeue: %v", err)
 			}
-			if j, _ := st.GetGitJob(ctx, "gitjob_b"); j.Status != model.GitJobPending || j.Attempts != 0 || j.Outcome != "" || j.Error != "" || j.LeaseUntil != nil {
+			if j, _ := st.GetGitJob(ctx, "gitjob_b"); j.Status != model.GitJobPending || j.Attempts != 0 || j.Run != 2 || j.Outcome != "" || j.Error != "" || j.LeaseUntil != nil {
 				t.Fatalf("requeued job: %+v", j)
 			}
-			if j, err := st.ClaimGitJob(ctx, "five", now.Add(time.Hour), time.Minute); err != nil || j.ID != "gitjob_b" || j.Attempts != 1 {
+			if j, err := st.ClaimGitJob(ctx, "five", now.Add(time.Hour), time.Minute); err != nil || j.ID != "gitjob_b" || j.Attempts != 1 || j.Run != 3 {
 				t.Fatalf("a requeued job claimed: %v %+v", err, j)
 			}
 			if err := st.RequeueGitJob(ctx, "nope"); !errors.Is(err, ErrNotFound) {

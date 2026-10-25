@@ -194,18 +194,18 @@ func TestReviewTwoReplicasKeepLatestPRComment(t *testing.T) {
 // ignores it. Model that boundary explicitly to check exhaustion of the lease.
 type reviewContextAwareJobs struct{ store.GitJobs }
 
-func (j reviewContextAwareJobs) FinishGitJob(ctx context.Context, id, owner string, attempt int, status, outcome, message string) error {
+func (j reviewContextAwareJobs) FinishGitJob(ctx context.Context, id, owner string, run int, status, outcome, message string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return j.GitJobs.FinishGitJob(ctx, id, owner, attempt, status, outcome, message)
+	return j.GitJobs.FinishGitJob(ctx, id, owner, run, status, outcome, message)
 }
 
-func (j reviewContextAwareJobs) RetryGitJob(ctx context.Context, id, owner string, attempt int, notBefore time.Time, message string) error {
+func (j reviewContextAwareJobs) RetryGitJob(ctx context.Context, id, owner string, run int, notBefore time.Time, message string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return j.GitJobs.RetryGitJob(ctx, id, owner, attempt, notBefore, message)
+	return j.GitJobs.RetryGitJob(ctx, id, owner, run, notBefore, message)
 }
 
 type reviewDeadlineFetch struct{ Fetcher }
