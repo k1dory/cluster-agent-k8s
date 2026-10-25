@@ -486,6 +486,10 @@ from the harness (Claude Code's stream-json `result` line is understood; others 
 
 ## Run locally (no Kubernetes)
 
+Build and test changes follow the [shared CI contract](docs/ci-contract.md): checks are
+implemented once, and GitHub, GitLab, Forgejo and local development invoke the same commands.
+The contract defines ownership, acceptance criteria and the remaining adoption work.
+
 ```sh
 make test           # unit tests
 make integration    # the gateway on a real caddy (CADDY_BIN=... or caddy on PATH)

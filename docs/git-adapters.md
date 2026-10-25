@@ -10,6 +10,10 @@ Nothing in the adapters is specific to the platform's own repository. A tenant k
 in its own repository with its own key; the admin keeps bindings, settings and shared items in
 another with the admin token. Both use the same workflow file.
 
+All adapters follow the [shared CI contract](ci-contract.md): common commands own the check
+logic, while provider files arrange jobs and deliver reports. Plan, apply and drift semantics
+remain in `sandboxctl` and the platform API.
+
 ## The pieces
 
 - `sandboxctl plan -markdown`, `apply -markdown`, `drift -markdown`: the same results as the
