@@ -59,6 +59,14 @@ func TestGitSyncRecordContract(t *testing.T) {
 			if got.Check.Error != "unreachable" || got.Sync.Commit != "cccc" || len(got.Sync.Bundles) != 0 || got.Sync.Error != "down" {
 				t.Fatalf("a sync did not replace its half whole, or touched the check: %+v", got)
 			}
+			// The third half, the webhook, is written on its own too.
+			if err := st.RecordGitHook(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Action: "sync", Commit: "cccc", Outcome: "done", At: now}); err != nil {
+				t.Fatal(err)
+			}
+			got, _ = st.GetGitSync(ctx, "acme", "config")
+			if got.Hook == nil || got.Hook.Action != "sync" || got.Check.Error != "unreachable" || got.Sync.Commit != "cccc" {
+				t.Fatalf("the hook half: %+v", got)
+			}
 			// The record is a copy: mutating what came back changes nothing stored.
 			got.Sync.Commit = "mutated"
 			if again, _ := st.GetGitSync(ctx, "acme", "config"); again.Sync.Commit != "cccc" {

@@ -180,6 +180,7 @@ type Credentials interface {
 type GitSyncs interface {
 	RecordGitCheck(ctx context.Context, tenant, name string, c model.GitCheck) error
 	RecordGitSync(ctx context.Context, tenant, name string, r model.GitSyncResult) error
+	RecordGitHook(ctx context.Context, tenant, name string, h model.GitHook) error
 	// GetGitSync returns the record; ErrNotFound when the repository was never checked or synced.
 	GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error)
 }

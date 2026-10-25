@@ -12,3 +12,6 @@ spec:
   ref: main
   paths: ["bundles/*.yaml"]
   credential: config-repo-token   # a tenant credential (BYOK) or an operator secret; empty for a public repository
+  # The provider's webhook secret, by reference: with it, a push to main syncs and a pull request
+  # gets its plan as a comment, with nothing installed in the repository (see docs/git-adapters.md).
+  webhook_secret: config-hook-secret
