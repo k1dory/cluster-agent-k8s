@@ -242,10 +242,11 @@ func TestCheckNeverErasesTheSyncResult(t *testing.T) {
 		t.Fatalf("sync: %v %+v", err, g)
 	}
 	applied := g.Sync.Bundles[0].Apply
-	// Reads fail: the check still records its half and reports it; the sync half is intact.
+	// Reads fail: the check still records its half (and says so), reports the read failure
+	// rather than an empty record, and the sync half is intact.
 	flaky.fail = true
 	g, err = s.Check(ctx, scope, "config")
-	if err != nil || g.Check == nil || g.Check.Head != sha1 {
+	if err == nil || !strings.Contains(err.Error(), "connection reset") || g == nil || g.Check == nil || g.Check.Head != sha1 {
 		t.Fatalf("check during a read outage: %v %+v", err, g)
 	}
 	flaky.fail = false

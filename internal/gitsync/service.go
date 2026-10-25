@@ -63,14 +63,18 @@ func (s *Service) repository(ctx context.Context, scope plan.Scope, name string)
 }
 
 // record returns the repository's record as stored (what Status shows), or the bare record
-// when nothing was stored yet or the read failed: the halves the caller just wrote are added
-// by the caller, so a failed read costs nothing but the other half in the answer.
-func (s *Service) record(ctx context.Context, it *model.CatalogItem) *model.GitSync {
+// when nothing was stored yet. It is read only after the caller's half was written, so a
+// failed read costs no data: the half just written is added by the caller and the read's
+// error is returned with it, never mistaken for "no record".
+func (s *Service) record(ctx context.Context, it *model.CatalogItem) (*model.GitSync, error) {
 	g, err := s.Store.GetGitSync(ctx, it.Tenant, it.Name)
 	if err != nil {
 		g = &model.GitSync{Tenant: it.Tenant, Name: it.Name}
+		if errors.Is(err, store.ErrNotFound) {
+			err = nil
+		}
 	}
-	return g
+	return g, err
 }
 
 // remote resolves the credential (if any) into a Remote.
@@ -125,8 +129,11 @@ func (s *Service) Check(ctx context.Context, scope plan.Scope, name string) (*mo
 	if perr := s.Store.RecordGitCheck(ctx, it.Tenant, it.Name, ck); perr != nil {
 		return nil, perr
 	}
-	g := s.record(ctx, it)
+	g, rerr := s.record(ctx, it)
 	g.Check = &ck
+	if rerr != nil {
+		return g, rerr
+	}
 	return g, err
 }
 
@@ -155,10 +162,13 @@ func (s *Service) Sync(ctx context.Context, scope plan.Scope, name, commit strin
 		if perr := s.Store.RecordGitSync(ctx, it.Tenant, it.Name, result); perr != nil {
 			return nil, perr
 		}
-		g := s.record(ctx, it)
+		g, rerr := s.record(ctx, it)
 		g.Sync = &result
 		if checked != nil {
 			g.Check = checked
+		}
+		if rerr != nil {
+			return g, rerr
 		}
 		return g, err
 	}

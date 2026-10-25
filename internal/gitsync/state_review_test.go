@@ -60,10 +60,10 @@ func TestReviewGitCheckPreservesConcurrentSyncStatus(t *testing.T) {
 	}
 	// Explicit SHA avoids another Resolve: this sync completes before the check.
 	g, err := s.Sync(ctx, scope, "config", sha1)
-	if err != nil || g.Status != model.GitSyncDone || len(g.Bundles) != 1 {
+	if err != nil || g.Sync.Status != model.GitSyncDone || len(g.Sync.Bundles) != 1 {
 		t.Fatalf("sync: record=%+v err=%v", g, err)
 	}
-	applyID := g.Bundles[0].Apply
+	applyID := g.Sync.Bundles[0].Apply
 	release()
 	if err := <-checked; err != nil {
 		t.Fatal(err)
@@ -72,7 +72,7 @@ func TestReviewGitCheckPreservesConcurrentSyncStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != model.GitSyncDone || got.Commit != sha1 || got.SyncedAt == nil || len(got.Bundles) != 1 || got.Bundles[0].Apply != applyID {
+	if got.Sync == nil || got.Sync.Status != model.GitSyncDone || got.Sync.Commit != sha1 || got.Sync.At.IsZero() || len(got.Sync.Bundles) != 1 || got.Sync.Bundles[0].Apply != applyID {
 		t.Fatalf("a concurrent check erased the completed sync: %+v", got)
 	}
 }
@@ -100,7 +100,7 @@ func TestReviewGitStatusReadErrorDoesNotReplaceExistingRecord(t *testing.T) {
 		t.Errorf("status read failure must be returned; got %v", err)
 	}
 	got, err := st.GetGitSync(t.Context(), "acme", "config")
-	if err != nil || got.Status != model.GitSyncDone || got.Commit != sha1 || len(got.Bundles) != 1 {
+	if err != nil || got.Sync == nil || got.Sync.Status != model.GitSyncDone || got.Sync.Commit != sha1 || len(got.Sync.Bundles) != 1 {
 		t.Errorf("read failure replaced an existing sync: record=%+v err=%v", got, err)
 	}
 }
