@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"sync"
 	"time"
 
 	"agent-sandbox/internal/apply"
@@ -38,17 +37,20 @@ type Service struct {
 	Fetch   Fetcher
 	Applier *apply.Controller
 	Now     func() time.Time
-	// Webhooks (see webhook.go): Reporter posts plans on pull requests; Emit publishes
-	// git.hook, git.sync and git.plan events (nil: none); HookTimeout bounds a background
-	// action (default 10 minutes); Inline runs the action in the request (tests).
-	Reporter    Reporter
-	Emit        func(ctx context.Context, e model.Event)
-	HookTimeout time.Duration
-	Inline      bool
-	Log         *slog.Logger
-
-	locksMu sync.Mutex
-	locks   map[string]*sync.Mutex // one per repository: a sync and a plan never interleave
+	// Webhooks (see webhook.go): a delivery becomes a persisted job (Jobs) that one replica at
+	// a time claims and runs (Run); Lock serialises the work of a tenant across replicas (the
+	// store's tenant lock); Reporter posts plans on pull requests; Emit publishes git.hook,
+	// git.sync and git.plan events (nil: none); Replica names this process as a job owner;
+	// Lease bounds a job's run before another replica may take it over (default 10 minutes);
+	// Inline runs the accepted job in the request instead of leaving it to Run (tests).
+	Jobs     store.GitJobs
+	Lock     func(ctx context.Context, tenant string, fn func(ctx context.Context) error) error
+	Reporter Reporter
+	Emit     func(ctx context.Context, e model.Event)
+	Replica  string
+	Lease    time.Duration
+	Inline   bool
+	Log      *slog.Logger
 }
 
 func (s *Service) now() time.Time {
@@ -164,6 +166,27 @@ func (s *Service) Sync(ctx context.Context, scope plan.Scope, name, commit strin
 	if commit != "" && !shaRe.MatchString(commit) {
 		return nil, fmt.Errorf("%w: %q is not a commit SHA (40 hex digits)", res.ErrInvalid, commit)
 	}
+	// Resolving the head and applying happen under the tenant's lock, shared by every replica:
+	// two syncs of one repository cannot interleave, and a head resolved here is the head when
+	// the apply runs.
+	var g *model.GitSync
+	err = s.locked(ctx, it.Tenant, func(ctx context.Context) error {
+		var err error
+		g, err = s.sync(ctx, it, sp, scope, commit)
+		return err
+	})
+	return g, err
+}
+
+// locked runs fn under the tenant's cross-replica lock when one is wired.
+func (s *Service) locked(ctx context.Context, tenant string, fn func(ctx context.Context) error) error {
+	if s.Lock == nil {
+		return fn(ctx)
+	}
+	return s.Lock(ctx, tenant, fn)
+}
+
+func (s *Service) sync(ctx context.Context, it *model.CatalogItem, sp gitrepo.Spec, scope plan.Scope, commit string) (*model.GitSync, error) {
 	now := s.now()
 	result := model.GitSyncResult{Commit: commit, At: now}
 	var checked *model.GitCheck

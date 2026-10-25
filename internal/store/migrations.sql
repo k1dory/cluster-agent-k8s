@@ -219,3 +219,24 @@ UPDATE git_syncs SET doc =
     || CASE WHEN doc ? 'sync' OR NOT (doc ? 'synced_at') THEN '{}'::jsonb
             ELSE jsonb_build_object('sync', jsonb_strip_nulls(jsonb_build_object('commit', doc->'commit', 'bundles', doc->'bundles', 'status', doc->'status', 'error', doc->'error', 'at', doc->'synced_at'))) END
 WHERE doc ?| array['checked_at', 'synced_at', 'head', 'commit', 'status', 'bundles', 'check_error', 'tenant', 'name', 'updated_at'];
+
+-- Webhook jobs (model.GitJob): an accepted delivery survives the replica that accepted it; one
+-- job per delivery; claimed under a lease by one replica at a time (store.GitJobs).
+CREATE TABLE IF NOT EXISTS git_jobs (
+    id          text PRIMARY KEY,
+    tenant      text NOT NULL DEFAULT '',
+    name        text NOT NULL,
+    action      text NOT NULL,
+    delivery    text NOT NULL,
+    payload     bytea NOT NULL,
+    status      text NOT NULL,
+    attempts    integer NOT NULL DEFAULT 0,
+    owner       text NOT NULL DEFAULT '',
+    lease_until timestamptz,
+    outcome     text NOT NULL DEFAULT '',
+    error       text NOT NULL DEFAULT '',
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (tenant, name, delivery)
+);
+CREATE INDEX IF NOT EXISTS git_jobs_waiting ON git_jobs (status, lease_until, created_at);

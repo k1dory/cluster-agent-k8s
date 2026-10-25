@@ -194,11 +194,23 @@ repository), content type JSON, events *push* and *pull request* (GitHub) or *pu
 
 A delivery is accepted only when its signature matches the secret (GitHub's
 `X-Hub-Signature-256`, GitLab's `X-Gitlab-Token`); a repository without `webhook_secret`
-accepts none. The action runs in the background with the repository's authority (a tenant's
-repository does what the tenant may); the delivery, the decision and the outcome land in the
-`hook` half of `gitrepo status`, and every delivery, plan and sync is an event (`git.hook`,
-`git.plan`, `git.sync`) on the tenant's event stream, so a SOC or SRE integration can follow
-them without polling.
+accepts none. An accepted delivery becomes a persisted job (one per delivery: a redelivery
+names the same job), which one replica at a time claims under a lease and runs with the
+repository's authority (a tenant's repository does what the tenant may), under the tenant's
+cross-replica lock; a replica that dies mid-way leaves a job another replica picks up once the
+lease lapses, and the work (a sync, a comment updated in place) is idempotent, so a repeat is
+harmless. A push syncs the ref's *current* head, not the commit the delivery named: deliveries
+arrive in any order, and one handled after a newer push finds the newer head already applied
+and is recorded as `superseded`, never writing an older state over a newer one. The delivery,
+the decision, the job and the outcome land in the `hook` half of `gitrepo status`, and every
+delivery, plan and sync is an event (`git.hook`, `git.plan`, `git.sync`) on the tenant's event
+stream, so a SOC or SRE integration can follow them without polling.
+
+The pull request plan treats the bundle files as one bundle in path order, as a sync applies
+them in sequence, so a document in a later file may name what an earlier file introduces; the
+comment shows one section per file, and two files describing the same item are reported as the
+error they are. The comment and the commit status are posted independently: a comment the
+provider refuses still leaves the status set.
 
 The CI templates and the webhook are two ways to the same controller; a repository may use
 either. The templates need Docker and a secret in the repository and show the plan in the

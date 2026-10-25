@@ -185,6 +185,23 @@ type GitSyncs interface {
 	GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error)
 }
 
+// GitJobs persists webhook actions (model.GitJob) so an accepted delivery survives the replica
+// that accepted it. Enqueue is idempotent per delivery (ErrConflict names the existing job);
+// Claim hands one job to one replica at a time: a pending one, or a running one whose lease
+// lapsed, atomically, under a new lease; Finish records the outcome.
+type GitJobs interface {
+	EnqueueGitJob(ctx context.Context, j *model.GitJob) error
+	// ClaimGitJob returns the next job for owner with a lease until now+lease, incrementing
+	// Attempts; ErrNotFound when none is waiting.
+	ClaimGitJob(ctx context.Context, owner string, now time.Time, lease time.Duration) (*model.GitJob, error)
+	// FinishGitJob records the outcome of a job the caller holds (ErrConflict when the lease
+	// moved to another owner meanwhile).
+	FinishGitJob(ctx context.Context, id, owner, status, outcome, errMsg string) error
+	GetGitJob(ctx context.Context, id string) (*model.GitJob, error)
+	// GetGitJobByDelivery finds the job of a delivery (tenant, name, delivery key).
+	GetGitJobByDelivery(ctx context.Context, tenant, name, delivery string) (*model.GitJob, error)
+}
+
 // Apply is model.Apply (aliased so the store's doc reads on its own).
 type Apply = model.Apply
 
@@ -305,6 +322,7 @@ type Store interface {
 	APIKeys
 	Credentials
 	GitSyncs
+	GitJobs
 
 	Close() error
 }

@@ -27,6 +27,7 @@ type Memory struct {
 	applies   map[string]*model.Apply
 	apiKeys   map[string]*model.APIKey
 	gitSyncs  map[string]*model.GitSync
+	gitJobs   map[string]*model.GitJob
 	creds     map[string]*memCredential // tenant|name
 	nextInst  int
 	nextEvent int64
@@ -46,6 +47,7 @@ func NewMemory() *Memory {
 		applies:   map[string]*model.Apply{},
 		apiKeys:   map[string]*model.APIKey{},
 		gitSyncs:  map[string]*model.GitSync{},
+		gitJobs:   map[string]*model.GitJob{},
 		creds:     map[string]*memCredential{},
 	}
 }
@@ -1118,4 +1120,84 @@ func (m *Memory) GetGitSync(_ context.Context, tenant, name string) (*model.GitS
 		return nil, ErrNotFound
 	}
 	return cloneGitSync(g), nil
+}
+
+// --- Git webhook jobs ---------------------------------------------------------------------------
+
+func cloneGitJob(j *model.GitJob) *model.GitJob {
+	c := *j
+	c.Payload = append([]byte(nil), j.Payload...)
+	if j.LeaseUntil != nil {
+		t := *j.LeaseUntil
+		c.LeaseUntil = &t
+	}
+	return &c
+}
+
+func (m *Memory) EnqueueGitJob(_ context.Context, j *model.GitJob) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.gitJobs {
+		if e.Tenant == j.Tenant && e.Name == j.Name && e.Delivery == j.Delivery {
+			return fmt.Errorf("%w: delivery %s is job %s", ErrConflict, j.Delivery, e.ID)
+		}
+	}
+	now := time.Now()
+	j.Status, j.CreatedAt, j.UpdatedAt = model.GitJobPending, now, now
+	m.gitJobs[j.ID] = cloneGitJob(j)
+	return nil
+}
+
+func (m *Memory) ClaimGitJob(_ context.Context, owner string, now time.Time, lease time.Duration) (*model.GitJob, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var pick *model.GitJob
+	for _, j := range m.gitJobs {
+		waiting := j.Status == model.GitJobPending || (j.Status == model.GitJobRunning && j.LeaseUntil != nil && !j.LeaseUntil.After(now))
+		if waiting && (pick == nil || j.CreatedAt.Before(pick.CreatedAt) || (j.CreatedAt.Equal(pick.CreatedAt) && j.ID < pick.ID)) {
+			pick = j
+		}
+	}
+	if pick == nil {
+		return nil, ErrNotFound
+	}
+	until := now.Add(lease)
+	pick.Status, pick.Owner, pick.LeaseUntil, pick.UpdatedAt = model.GitJobRunning, owner, &until, now
+	pick.Attempts++
+	return cloneGitJob(pick), nil
+}
+
+func (m *Memory) FinishGitJob(_ context.Context, id, owner, status, outcome, errMsg string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.gitJobs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if j.Owner != owner || j.Status != model.GitJobRunning {
+		return fmt.Errorf("%w: job %s is %s, owned by %q", ErrConflict, id, j.Status, j.Owner)
+	}
+	j.Status, j.Outcome, j.Error, j.LeaseUntil, j.UpdatedAt = status, outcome, errMsg, nil, time.Now()
+	return nil
+}
+
+func (m *Memory) GetGitJob(_ context.Context, id string) (*model.GitJob, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	j, ok := m.gitJobs[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return cloneGitJob(j), nil
+}
+
+func (m *Memory) GetGitJobByDelivery(_ context.Context, tenant, name, delivery string) (*model.GitJob, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, j := range m.gitJobs {
+		if j.Tenant == tenant && j.Name == name && j.Delivery == delivery {
+			return cloneGitJob(j), nil
+		}
+	}
+	return nil, ErrNotFound
 }

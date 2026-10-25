@@ -773,8 +773,12 @@ paths:
         a commit status `agent-sandbox/plan` (`action: plan`); anything else is recorded as
         ignored with the reason. The delivery is authenticated by its signature against the
         repository's `webhook_secret` (GitHub `X-Hub-Signature-256`, GitLab `X-Gitlab-Token`) and
-        must name the registered repository. The action runs in the background with the
-        repository's authority; its outcome lands in the `hook` half of the status.
+        must name the registered repository. The action is a persisted job: one per delivery (a
+        redelivery names the same job), claimed by one replica at a time under a lease and taken
+        over by another when that replica dies; it runs with the repository's authority, under the
+        tenant's cross-replica lock, and its outcome lands in the `hook` half of the status. A push
+        syncs the ref's current head, never the commit the delivery named if the ref moved on, so a
+        delivery handled late cannot roll a newer state back (`superseded`).
       security: []
       parameters:
         - { name: tenant, in: path, required: true, schema: { type: string }, description: "The repository's tenant; `-` for the shared scope" }
@@ -1781,7 +1785,8 @@ components:
         commit: { type: string }
         number: { type: integer, description: "The pull or merge request number" }
         delivery: { type: string, description: "The provider's delivery id" }
-        outcome: { type: string, enum: [done, invalid, stopped, error, ignored], description: "Absent while the action runs" }
+        job: { type: string, description: "The persisted job carrying the action out (a redelivery names the same job)" }
+        outcome: { type: string, enum: [done, invalid, stopped, error, ignored, superseded], description: "Absent while the action runs; superseded: a push delivery whose head the ref had already moved past" }
         error: { type: string }
         at: { type: string, format: date-time }
     GitSyncError:
