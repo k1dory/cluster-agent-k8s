@@ -734,7 +734,7 @@ paths:
                 commit: { type: string, pattern: "^[0-9a-f]{40}$", description: "A commit reachable from the ref; empty for the head" }
       responses:
         "200": { description: Every bundle applied, content: { application/json: { schema: { $ref: "#/components/schemas/GitSync" } } } }
-        "400": { description: "Malformed body: not one JSON object, an unknown field, trailing data (code `bad_request`); nothing was read from Git", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "400": { description: "Malformed body: not one JSON object (`null` included), `commit` not a string (`null` included), an unknown field, trailing data (code `bad_request`); nothing was read from Git", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { description: "The token is scoped to another tenant (`forbidden`), or a tenant acting on a shared repository", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "404": { $ref: "#/components/responses/Error" }

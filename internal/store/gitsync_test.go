@@ -91,3 +91,56 @@ func postgresDSNForGitSync(t *testing.T) string {
 	}
 	return reviewPostgresURL(t, false)
 }
+
+// Records written before the two halves (PR #25: check and sync fields at the root) are read
+// as the two halves, and the migration rewrites them: a half already written in the new form
+// (an older replica's flat sync next to a new replica's check) is kept, the other taken from
+// the root fields, and nothing is lost.
+func TestGitSyncLegacyFlatRecordsAreReadAndMigrated(t *testing.T) {
+	dsn := postgresDSNForGitSync(t)
+	if dsn == "" {
+		t.Skip("PostgreSQL only: the flat form never existed in memory")
+	}
+	st := reviewOpenPostgres(t, dsn)
+	ctx := context.Background()
+	flat := `{"tenant":"acme","name":"old","head":"aaaa","checked_at":"2026-10-25T08:00:00Z","commit":"bbbb","bundles":[{"path":"bundles/a.yaml","apply":"apply_1","status":"done","changes":2}],"status":"done","synced_at":"2026-10-25T08:01:00Z","updated_at":"2026-10-25T08:01:00Z"}`
+	mixed := `{"tenant":"acme","name":"mixed","commit":"bbbb","bundles":[{"path":"bundles/a.yaml","apply":"apply_1","status":"done"}],"status":"done","synced_at":"2026-10-25T08:01:00Z","check":{"head":"cccc","at":"2026-10-25T09:00:00Z"}}`
+	checkOnly := `{"tenant":"acme","name":"checked","head":"","checked_at":"2026-10-25T08:00:00Z","check_error":"unreachable","updated_at":"2026-10-25T08:00:00Z"}`
+	for name, doc := range map[string]string{"old": flat, "mixed": mixed, "checked": checkOnly} {
+		if _, err := st.pool.Exec(ctx, `INSERT INTO git_syncs (tenant, name, doc) VALUES ('acme', $1, $2::jsonb)`, name, doc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expect := func(when string) {
+		t.Helper()
+		got, err := st.GetGitSync(ctx, "acme", "old")
+		if err != nil || got.Check == nil || got.Check.Head != "aaaa" || got.Sync == nil || got.Sync.Commit != "bbbb" || got.Sync.Status != model.GitSyncDone || len(got.Sync.Bundles) != 1 || got.Sync.Bundles[0].Apply != "apply_1" || got.Sync.Bundles[0].Changes != 2 || got.Sync.At.IsZero() {
+			t.Fatalf("%s: flat record: %v %+v", when, err, got)
+		}
+		got, err = st.GetGitSync(ctx, "acme", "mixed")
+		if err != nil || got.Check == nil || got.Check.Head != "cccc" || got.Sync == nil || got.Sync.Commit != "bbbb" || got.Sync.Bundles[0].Apply != "apply_1" {
+			t.Fatalf("%s: mixed record (new check next to a flat sync): %v %+v", when, err, got)
+		}
+		got, err = st.GetGitSync(ctx, "acme", "checked")
+		if err != nil || got.Check == nil || got.Check.Error != "unreachable" || got.Sync != nil {
+			t.Fatalf("%s: flat check-only record: %v %+v", when, err, got)
+		}
+	}
+	// Read compatibly before any migration touched them (a replica of the new version next to
+	// an older one still writing the flat form).
+	expect("before the migration")
+	// Opening the store runs the migration: the rows are in the two-half form, no root field left.
+	st = reviewOpenPostgres(t, dsn)
+	var remaining int
+	if err := st.pool.QueryRow(ctx, `SELECT count(*) FROM git_syncs WHERE doc ?| array['checked_at','synced_at','head','commit','status','bundles','check_error','tenant','name','updated_at']`).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("root fields left after the migration: %d %v", remaining, err)
+	}
+	expect("after the migration")
+	// The halves keep working on a migrated record: a new check leaves the migrated sync.
+	if err := st.RecordGitCheck(ctx, "acme", "old", model.GitCheck{Head: "dddd", At: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := st.GetGitSync(ctx, "acme", "old"); got.Check.Head != "dddd" || got.Sync == nil || got.Sync.Bundles[0].Apply != "apply_1" {
+		t.Fatalf("a check after the migration: %+v", got)
+	}
+}

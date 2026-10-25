@@ -49,30 +49,49 @@ func (p *Platform) gitSyncRepo(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// The whole body is checked before Git is asked: an empty body means the head; anything
-	// else must be exactly one JSON object with known fields and nothing after it.
-	var body struct {
-		Commit string `json:"commit"`
-	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, syncBodyLimit))
 	if err != nil {
 		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("body: at most %d bytes", syncBodyLimit))
 		return
 	}
-	if len(bytes.TrimSpace(raw)) > 0 {
-		dec := json.NewDecoder(bytes.NewReader(raw))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&body); err != nil {
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("body: %w", err))
-			return
+	commit, err := parseSyncBody(raw)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	g, err := p.GitSync.Sync(r.Context(), scope, r.PathValue("name"), commit)
+	writeGitSync(w, g, err)
+}
+
+// parseSyncBody checks the whole sync body before Git is asked, to the declared contract: an
+// empty body means the head; anything else is exactly one JSON object, with `commit` a string
+// when present (null is not a string, and `null` is not an object), no other field, and
+// nothing after it.
+func parseSyncBody(raw []byte) (string, error) {
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return "", nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	var fields map[string]json.RawMessage
+	if err := dec.Decode(&fields); err != nil {
+		return "", fmt.Errorf("body: %w", err)
+	}
+	if fields == nil {
+		return "", errors.New("body: must be a JSON object (or empty for the ref's head), not null")
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return "", errors.New("body: trailing data after the JSON document")
+	}
+	var commit string
+	for k, v := range fields {
+		if k != "commit" {
+			return "", fmt.Errorf("body: unknown field %q", k)
 		}
-		if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-			writeErr(w, http.StatusBadRequest, errors.New("body: trailing data after the JSON document"))
-			return
+		if err := json.Unmarshal(v, &commit); err != nil || bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
+			return "", errors.New("body: commit must be a string (a 40-digit SHA, or empty for the ref's head)")
 		}
 	}
-	g, err := p.GitSync.Sync(r.Context(), scope, r.PathValue("name"), body.Commit)
-	writeGitSync(w, g, err)
+	return commit, nil
 }
 
 func (p *Platform) gitStatus(w http.ResponseWriter, r *http.Request) {
