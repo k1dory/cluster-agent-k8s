@@ -98,6 +98,25 @@ jobs:
           docker build -f images/sandboxd/Dockerfile --target sandboxctl -t agent-sandbox/sandboxctl:ci .
           docker run --rm agent-sandbox/sandboxctl:ci 2>&1 | head -3
           docker run --rm --entrypoint sh agent-sandbox/sandboxctl:ci -c 'command -v curl jq git >/dev/null && echo tools-present'
+      - name: the image reads a checkout owned by another user (the CI case) and records its SHA
+        run: |
+          # The runner's checkout is owned by the runner, the image runs as uid 1000: without the
+          # image's safe.directory Git refuses it, and apply would have no commit to record.
+          test "$(stat -c %u .)" != 1000
+          docker run --rm -v "$PWD:/w" -w /w --entrypoint git agent-sandbox/sandboxctl:ci rev-parse HEAD | grep -qx "$GITHUB_SHA"
+          # apply -require-commit reads the source before it asks the platform: with none
+          # reachable, a clean checkout fails at the request (exit 1, a marker block, no
+          # -require-commit complaint); a modified file fails on the missing SHA.
+          ctl() { docker run --rm -v "$PWD:/w" -w /w -e SANDBOXD_URL=http://127.0.0.1:9 -e SANDBOXD_TOKEN=x agent-sandbox/sandboxctl:ci "$@" 2>&1; }
+          set +e
+          out=$(ctl apply -f examples/catalog/bundle.yaml -require-commit -markdown); code=$?
+          echo "$out"
+          [ "$code" -eq 1 ] && echo "$out" | grep -q '<!-- agent-sandbox -->' && ! echo "$out" | grep -q 'require-commit' || exit 1
+          echo "# touched" >> examples/catalog/bundle.yaml
+          out=$(ctl apply -f examples/catalog/bundle.yaml -require-commit -markdown); code=$?
+          echo "$out"
+          [ "$code" -eq 1 ] && echo "$out" | grep -q 'require-commit: no commit SHA' || exit 1
+          git checkout -- examples/catalog/bundle.yaml
       - name: smoke test the shipped agent image (user, tools, netlock, agent-init, agent-runner)
         run: hack/smoke-image.sh agent-sandbox/agent:ci
       - name: network lock on an isolated Docker network (pod ↔ pod denied, gateway ↔ pod allowed both ways)

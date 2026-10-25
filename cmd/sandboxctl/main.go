@@ -28,6 +28,7 @@ import (
 	"agent-sandbox/internal/drift"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/plan"
+	"agent-sandbox/internal/resource"
 )
 
 const usage = `sandboxctl <command> [flags]
@@ -37,9 +38,11 @@ const usage = `sandboxctl <command> [flags]
   plan     -f file.yaml [-tenant t] [-json|-markdown]   validate a bundle (--- separated documents) and show what apply
            would change; writes nothing (-markdown: a pull request comment; see docs/git-adapters.md)
   apply    -f file.yaml [-tenant t] [-key k] [-json|-markdown]  plan the bundle, then apply it through the controller: one
-           transaction per step, continued by key after any failure (apply -resume <id> continues a stopped one)
+           transaction per step, continued by key after any failure (apply -resume <id> continues a stopped one;
+           CI passes a stable -key such as path@commit, so a re-run continues the same apply)
            apply records where the bundle came from: the Git commit the file matches is detected (-repo,
-           -ref, -commit, -path override it; -no-git records nothing); a dirty file is applied without a SHA
+           -ref, -commit, -path override it; -no-git records nothing); a dirty file is applied without a SHA,
+           -require-commit refuses to apply without one; a checkout Git cannot read is an error
   applies  [-tenant t] [-json]              applies of the scope, newest first; applies <id> shows one
   drift    [-tenant t] [-json|-markdown]    items changed or deleted outside apply since an apply wrote them;
            drift -f bundle.yaml shows what the bundle would change (Git versus the platform), writing nothing
@@ -326,21 +329,11 @@ func (c *cli) run(cmd string, args []string) error {
 		if *file == "" {
 			return errors.New("plan: -f is required")
 		}
-		raw, err := os.ReadFile(*file)
+		_, _, out, err := c.planFile(*file, *tenant)
 		if err != nil {
-			return err
-		}
-		docs, err := catalog.ParseYAMLAll(raw)
-		if err != nil {
-			return err
-		}
-		q := ""
-		if *tenant != "" {
-			q = "?tenant=" + url.QueryEscape(*tenant)
-		}
-		var out plan.Plan
-		if err := c.do("POST", "/v1/plan"+q, map[string]any{"documents": docs}, &out); err != nil {
-			return err
+			// With -markdown the failure is the comment: the pipeline must not keep showing the
+			// previous push's plan when this one produced none.
+			return reportFailure(*asMarkdown, "Plan", *file, err)
 		}
 		switch {
 		case *asJSON:
@@ -356,7 +349,7 @@ func (c *cli) run(cmd string, args []string) error {
 	case "apply":
 		file := fs.String("f", "", "YAML file: one document, or several separated by ---")
 		tenant := fs.String("tenant", "", "default scope for documents without a tenant (admin)")
-		key := fs.String("key", "", "idempotency key (default: the plan fingerprint)")
+		key := fs.String("key", "", "idempotency key (default: the plan fingerprint; CI: a stable one such as path@commit, so a re-run continues the same apply)")
 		resume := fs.String("resume", "", "continue the apply with this id instead of submitting a bundle")
 		asJSON := fs.Bool("json", false, "print the apply as JSON")
 		asMarkdown := fs.Bool("markdown", false, "print the apply as Markdown (a job summary)")
@@ -366,59 +359,32 @@ func (c *cli) run(cmd string, args []string) error {
 		fs.StringVar(&src.Commit, "commit", "", "source: the commit the bundle file matches (default: detected, only when the file is clean)")
 		fs.StringVar(&src.Path, "path", "", "source: bundle path in the repository (default: detected)")
 		noGit := fs.Bool("no-git", false, "record no source")
+		requireCommit := fs.Bool("require-commit", false, "refuse to apply without a commit SHA (CI: the checkout must be a clean, readable work tree)")
 		_ = fs.Parse(flags)
-		q := ""
-		if *tenant != "" {
-			q = "?tenant=" + url.QueryEscape(*tenant)
-		}
 		var a model.Apply
 		if *resume != "" {
 			if err := c.do("POST", "/v1/applies/"+url.PathEscape(*resume)+"/resume", nil, &a); err != nil {
-				return err
+				return reportFailure(*asMarkdown, "Apply", "", err)
 			}
 		} else {
 			if *file == "" {
 				return errors.New("apply: -f is required")
 			}
-			raw, err := os.ReadFile(*file)
-			if err != nil {
-				return err
-			}
-			docs, err := catalog.ParseYAMLAll(raw)
-			if err != nil {
-				return err
-			}
-			body := map[string]any{"documents": docs, "key": *key}
-			if !*noGit {
-				detected, ok, dirty, err := gitSource(*file, raw)
-				if err != nil {
-					return err
+			var invalid *invalidPlan
+			switch err := c.submitApply(*file, *tenant, *key, src, *noGit, *requireCommit, &a); {
+			case errors.As(err, &invalid):
+				// The plan says what is wrong, in the requested format; nothing was written.
+				switch {
+				case *asJSON:
+					printJSON(invalid.plan)
+				case *asMarkdown:
+					markdownPlan(os.Stdout, invalid.plan, *file)
+				default:
+					printPlan(invalid.plan)
 				}
-				if ok && dirty && src.Commit == "" {
-					fmt.Fprintf(os.Stderr, "warning: %s is not what HEAD holds for it: applied without a commit SHA\n", *file)
-				}
-				src = mergeSource(src, detected)
-				// Never send a credential, even one pasted into -repo.
-				ms := model.Source{Repo: src.Repo, Ref: src.Ref, Commit: src.Commit, Path: src.Path}
-				if err := apply.CleanSource(&ms); err != nil {
-					return err
-				}
-				src = bundleSource{Repo: ms.Repo, Ref: ms.Ref, Commit: ms.Commit, Path: ms.Path}
-				if src != (bundleSource{}) {
-					body["source"] = src
-				}
-			}
-			var p plan.Plan
-			if err := c.do("POST", "/v1/plan"+q, map[string]any{"documents": docs}, &p); err != nil {
-				return err
-			}
-			if !p.Valid {
-				printPlan(p)
 				os.Exit(2)
-			}
-			body["plan"] = p.Fingerprint
-			if err := c.do("POST", "/v1/apply"+q, body, &a); err != nil {
-				return err
+			case err != nil:
+				return reportFailure(*asMarkdown, "Apply", *file, err)
 			}
 		}
 		switch {
@@ -562,17 +528,9 @@ func (c *cli) run(cmd string, args []string) error {
 			q = "?tenant=" + url.QueryEscape(*tenant)
 		}
 		if *file != "" {
-			raw, err := os.ReadFile(*file)
+			_, _, p, err := c.planFile(*file, *tenant)
 			if err != nil {
-				return err
-			}
-			docs, err := catalog.ParseYAMLAll(raw)
-			if err != nil {
-				return err
-			}
-			var p plan.Plan
-			if err := c.do("POST", "/v1/plan"+q, map[string]any{"documents": docs}, &p); err != nil {
-				return err
+				return reportFailure(*asMarkdown, "Drift", *file, err)
 			}
 			switch {
 			case *asJSON:
@@ -589,7 +547,7 @@ func (c *cli) run(cmd string, args []string) error {
 		}
 		var rep drift.Report
 		if err := c.do("GET", "/v1/drift"+q, nil, &rep); err != nil {
-			return err
+			return reportFailure(*asMarkdown, "Drift", "", err)
 		}
 		switch {
 		case *asJSON:
@@ -1246,6 +1204,99 @@ func shortSHA(s string) string {
 		return s[:12]
 	}
 	return s
+}
+
+// tenantQuery is the ?tenant= query for an admin acting in a tenant's scope.
+func tenantQuery(tenant string) string {
+	if tenant == "" {
+		return ""
+	}
+	return "?tenant=" + url.QueryEscape(tenant)
+}
+
+// loadBundle reads and parses a bundle file.
+func loadBundle(file string) (raw []byte, docs []*resource.Document, err error) {
+	if raw, err = os.ReadFile(file); err != nil {
+		return nil, nil, err
+	}
+	docs, err = catalog.ParseYAMLAll(raw)
+	return raw, docs, err
+}
+
+// planFile reads and parses a bundle and plans it on the platform; it writes nothing.
+func (c *cli) planFile(file, tenant string) (raw []byte, docs []*resource.Document, p plan.Plan, err error) {
+	if raw, docs, err = loadBundle(file); err != nil {
+		return nil, nil, p, err
+	}
+	err = c.do("POST", "/v1/plan"+tenantQuery(tenant), map[string]any{"documents": docs}, &p)
+	return raw, docs, p, err
+}
+
+// invalidPlan is the error of an apply whose plan is not valid: the caller prints the plan.
+type invalidPlan struct{ plan plan.Plan }
+
+func (e *invalidPlan) Error() string {
+	return fmt.Sprintf("the bundle is not valid (%d invalid)", e.plan.Summary.Invalid)
+}
+
+// submitApply attaches the bundle's Git source, plans it and submits it under the key. The
+// source is read before the platform is asked, so a checkout Git cannot read fails on its own
+// terms, not behind a request error.
+func (c *cli) submitApply(file, tenant, key string, src bundleSource, noGit, requireCommit bool, a *model.Apply) error {
+	raw, docs, err := loadBundle(file)
+	if err != nil {
+		return err
+	}
+	body := map[string]any{"documents": docs, "key": key}
+	why := "-no-git records no source" // for -require-commit: why there is no SHA
+	if !noGit {
+		detected, ok, dirty, err := gitSource(file, raw)
+		if err != nil {
+			// Git could not read the checkout (a container running as another user sees
+			// "dubious ownership"): applying without a SHA would silently lose the provenance.
+			return fmt.Errorf("source of %s: %w (fix the checkout, pass -commit, or -no-git to record no source)", file, err)
+		}
+		switch {
+		case !ok:
+			why = "the file is not in a Git work tree with a commit"
+		case dirty:
+			why = "the file is not what HEAD holds for it (modified, staged or untracked)"
+			if src.Commit == "" {
+				fmt.Fprintf(os.Stderr, "warning: %s is not what HEAD holds for it: applied without a commit SHA\n", file)
+			}
+		}
+		src = mergeSource(src, detected)
+		// Never send a credential, even one pasted into -repo.
+		ms := model.Source{Repo: src.Repo, Ref: src.Ref, Commit: src.Commit, Path: src.Path}
+		if err := apply.CleanSource(&ms); err != nil {
+			return err
+		}
+		src = bundleSource{Repo: ms.Repo, Ref: ms.Ref, Commit: ms.Commit, Path: ms.Path}
+		if src != (bundleSource{}) {
+			body["source"] = src
+		}
+	}
+	if requireCommit && src.Commit == "" {
+		return fmt.Errorf("-require-commit: no commit SHA for %s: %s", file, why)
+	}
+	var p plan.Plan
+	if err := c.do("POST", "/v1/plan"+tenantQuery(tenant), map[string]any{"documents": docs}, &p); err != nil {
+		return err
+	}
+	if !p.Valid {
+		return &invalidPlan{plan: p}
+	}
+	body["plan"] = p.Fingerprint
+	return c.do("POST", "/v1/apply"+tenantQuery(tenant), body, a)
+}
+
+// reportFailure returns err; with markdown set it first prints the failure as a marker block,
+// so the pipeline's comment or summary shows it instead of a stale result.
+func reportFailure(markdown bool, what, file string, err error) error {
+	if markdown {
+		markdownFailure(os.Stdout, what, file, err)
+	}
+	return err
 }
 
 // mergeSource lets explicit flags win over what was detected.

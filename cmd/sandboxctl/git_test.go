@@ -140,3 +140,67 @@ func TestExitCodesDoNotDependOnTheOutputFormat(t *testing.T) {
 		}
 	}
 }
+
+// A checkout Git refuses to read (the CI container runs as another user than the one that
+// cloned: "detected dubious ownership") is an error, not "no repository": applying with it
+// silently would lose the SHA. Git's own test switch makes every repository look foreign.
+func TestGitSourceSurfacesACheckoutGitCannotRead(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is required")
+	}
+	repo := t.TempDir()
+	run(t, repo, "init", "-q", "-b", "main")
+	file := filepath.Join(repo, "bundle.yaml")
+	content := []byte("kind: EnvironmentProfile\nname: py\nspec: {image: stable}\n")
+	if err := os.WriteFile(file, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, repo, "add", ".")
+	run(t, repo, "commit", "-q", "-m", "bundle")
+	head := run(t, repo, "rev-parse", "HEAD")
+
+	// Git's own test switch makes every repository look foreign; the machine's configuration
+	// is left out (CI runners mark every directory safe, which is exactly what is under test).
+	isolateGitConfig(t)
+	t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+	if out, err := exec.Command("git", "-C", repo, "rev-parse", "--show-toplevel").CombinedOutput(); err == nil || !strings.Contains(string(out), "dubious ownership") {
+		t.Fatalf("precondition: this git does not refuse a foreign-owned checkout under GIT_TEST_ASSUME_DIFFERENT_OWNER: %v %s", err, out)
+	}
+	src, ok, dirty, err := gitSource(file, content)
+	if err == nil || !strings.Contains(err.Error(), "dubious ownership") || ok || dirty || src.Commit != "" {
+		t.Fatalf("a foreign-owned checkout must be an error, not a plain file: ok=%v dirty=%v err=%v %+v", ok, dirty, err, src)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("one line of git's message is enough: %q", err)
+	}
+	// What the sandboxctl image configures (safe.directory for every directory) makes the same
+	// checkout readable again, and the SHA is recorded.
+	if err := os.WriteFile(os.Getenv("GIT_CONFIG_GLOBAL"), []byte("[safe]\n\tdirectory = *\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if src, ok, dirty, err := gitSource(file, content); err != nil || !ok || dirty || src.Commit != head {
+		t.Fatalf("with safe.directory: ok=%v dirty=%v err=%v %+v", ok, dirty, err, src)
+	}
+	// Any other Git failure is surfaced too (a corrupt configuration here).
+	t.Setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "")
+	if err := os.WriteFile(filepath.Join(repo, ".git", "config"), []byte("[core\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _, err := gitSource(file, content); err == nil || ok {
+		t.Fatalf("a corrupt repository must be an error: ok=%v err=%v", ok, err)
+	}
+}
+
+// isolateGitConfig hides the machine's system and global Git configuration from the test
+// (a safe.directory set there would mask the ownership check), returning the empty global
+// file so a test can write its own.
+func isolateGitConfig(t *testing.T) string {
+	t.Helper()
+	global := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(global, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", global)
+	return global
+}

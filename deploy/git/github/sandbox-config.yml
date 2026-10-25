@@ -4,8 +4,10 @@
 #
 #   pull request  → plan every bundle, post or update one comment per bundle with the plan; a bundle
 #                   that is invalid fails the check, so it cannot be merged
-#   push to main  → apply every bundle; the merge commit's SHA lands in every new revision; the job
-#                   summary shows what was written; a stopped apply fails the job and names the id
+#   push to main  → apply every bundle under a key stable for the bundle at that commit; the merge
+#                   commit's SHA lands in every new revision (the job fails rather than apply
+#                   without one); the job summary shows what was written; a stopped apply fails
+#                   the job, and re-running the job continues it
 #   schedule      → drift: items changed or deleted by hand since an apply wrote them fail the job
 #
 # Secrets: SANDBOXD_URL (variable) and SANDBOXD_TOKEN (a tenant key sbk_… for a tenant's repository,
@@ -41,17 +43,27 @@ jobs:
       - uses: actions/checkout@v4
       - name: plan every bundle
         id: plan
+        shell: bash
         run: |
+          # Any failure fails the check: 2 invalid, 1 the platform could not be reached or refused
+          # the token, 125-127 the image could not run. Every bundle still gets its block in the
+          # comment: sandboxctl writes one for its own failures; when the container did not run
+          # at all, the loop writes it.
           set +e
           rc=0
           : > plans.md
           for f in bundles/*.yaml; do
             docker run --rm -e SANDBOXD_URL -e SANDBOXD_TOKEN -v "$PWD:/w" -w /w "$SANDBOXCTL_IMAGE" \
-              plan -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown >> plans.md
+              plan -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown > plan.md
             code=$?
+            if [ "$code" -ne 0 ] && ! grep -q '<!-- agent-sandbox -->' plan.md; then
+              printf '<!-- agent-sandbox -->\n### Plan ❌ error · `%s`\n\nsandboxctl exited %d without a plan (the image could not run; see the job log).\n' "$f" "$code" > plan.md
+            fi
+            cat plan.md >> plans.md
             echo >> plans.md
-            [ "$code" -eq 2 ] && rc=2          # invalid: the check fails, the comment says why
-            [ "$code" -eq 1 ] && rc=1          # the platform could not be reached or refused the token
+            if [ "$code" -ne 0 ]; then
+              rc=$code
+            fi
           done
           cat plans.md >> "$GITHUB_STEP_SUMMARY"
           exit $rc
@@ -80,16 +92,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: apply every bundle with this commit as the source
+        shell: bash
         run: |
           set +e
           rc=0
           for f in bundles/*.yaml; do
             # The checkout is a detached HEAD: name the branch; the commit and the path are detected
-            # from the work tree (the SHA is recorded only when the file equals its committed bytes).
+            # from the work tree. -require-commit fails the job instead of applying without a SHA
+            # (a file that differs from the commit, or a checkout Git cannot read). The key is the
+            # bundle at this commit: a re-run of the job continues the same apply where it stopped
+            # instead of starting another one.
             docker run --rm -e SANDBOXD_URL -e SANDBOXD_TOKEN -v "$PWD:/w" -w /w "$SANDBOXCTL_IMAGE" \
-              apply -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -ref "$GITHUB_REF_NAME" -repo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" -markdown >> "$GITHUB_STEP_SUMMARY"
+              apply -f "$f" ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -ref "$GITHUB_REF_NAME" -repo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+              -key "$f@$GITHUB_SHA" -require-commit -markdown > apply.md
             code=$?
-            [ "$code" -ne 0 ] && rc=$code      # 2 invalid, 3 stopped (conflict/failed: resume once fixed), 1 unreachable
+            if [ "$code" -ne 0 ] && ! grep -q '<!-- agent-sandbox -->' apply.md; then
+              printf '<!-- agent-sandbox -->\n### Apply ❌ error · `%s`\n\nsandboxctl exited %d without a result (the image could not run; see the job log).\n' "$f" "$code" > apply.md
+            fi
+            cat apply.md >> "$GITHUB_STEP_SUMMARY"
+            echo >> "$GITHUB_STEP_SUMMARY"
+            if [ "$code" -ne 0 ]; then
+              rc=$code                        # 2 invalid, 3 stopped (re-run the job once fixed: same key), 1 unreachable or no SHA
+            fi
           done
           exit $rc
 
@@ -98,7 +122,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: what moved outside apply
+        shell: bash
         run: |
+          # The report is written to a file, then shown: no pipe between sandboxctl and the summary,
+          # so its exit code is the step's. 3 when anything drifted (wire the job's failure to your
+          # paging), 1 when the platform could not be reached or refused the token.
+          set +e
           docker run --rm -e SANDBOXD_URL -e SANDBOXD_TOKEN "$SANDBOXCTL_IMAGE" \
-            drift ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown | tee -a "$GITHUB_STEP_SUMMARY"
-          # exit 3 when anything drifted: wire the job's failure to your paging
+            drift ${SANDBOX_TENANT:+-tenant "$SANDBOX_TENANT"} -markdown > drift.md
+          code=$?
+          cat drift.md
+          cat drift.md >> "$GITHUB_STEP_SUMMARY"
+          exit $code
