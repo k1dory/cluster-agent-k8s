@@ -15,6 +15,8 @@ func TestReviewGitSyncRequiresOneCompleteJSONBody(t *testing.T) {
 	}{
 		{"two_documents", "{} {}"},
 		{"body_larger_than_reader", strings.Repeat(" ", 4096) + `{"commit":"not-a-sha"}`},
+		{"null_document", "null"},
+		{"null_commit", `{"commit":null}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, git, _ := gitStack(t)
