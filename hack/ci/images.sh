@@ -23,8 +23,12 @@ docker run --rm --entrypoint git "$sandboxd" --version
 test "$(docker run --rm --entrypoint id "$sandboxd" -u)" = 65532 || ci_die "images: sandboxd must run as uid 65532"
 
 echo "== sandboxctl: runs, tools"
-docker run --rm "$ctl" 2>&1 | head -3
-docker run --rm --entrypoint sh "$ctl" -c 'command -v curl jq git >/dev/null && echo tools-present' | grep -qx tools-present || ci_die "images: sandboxctl lacks curl, jq or git"
+# Without a command the binary prints its usage and exits non-zero: that it ran is the check.
+usage=$(docker run --rm "$ctl" 2>&1 || true)
+printf '%s\n' "$usage" | head -3
+printf '%s\n' "$usage" | grep -q 'sandboxctl <command>' || ci_die "images: the sandboxctl image did not run the binary"
+tools=$(docker run --rm --entrypoint sh "$ctl" -c 'command -v curl jq git >/dev/null && echo tools-present' || true)
+[ "$tools" = tools-present ] || ci_die "images: sandboxctl lacks curl, jq or git"
 
 echo "== sandboxctl: a checkout owned by another user is read and its SHA recorded"
 # A copy of the checkout owned by root in a volume: foreign to the image's uid 1000 whoever
@@ -34,7 +38,8 @@ docker volume create "$vol" >/dev/null
 trap 'docker volume rm -f "$vol" >/dev/null 2>&1 || true' EXIT
 docker run --rm -v "$PWD:/src:ro" -v "$vol:/w" --user 0 --entrypoint sh "$ctl" -c 'cp -a /src/. /w/ && chown -R 0:0 /w'
 head=$(git rev-parse HEAD)
-docker run --rm -v "$vol:/w" -w /w --entrypoint git "$ctl" rev-parse HEAD | grep -qx "$head" || ci_die "images: git in the sandboxctl image does not read a checkout owned by another user"
+seen=$(docker run --rm -v "$vol:/w" -w /w --entrypoint git "$ctl" rev-parse HEAD 2>&1 || true)
+[ "$seen" = "$head" ] || ci_die "images: git in the sandboxctl image does not read a checkout owned by another user: $seen"
 ctl_apply() { docker run --rm -v "$vol:/w" -w /w -e SANDBOXD_URL=http://127.0.0.1:9 -e SANDBOXD_TOKEN=x "$ctl" apply -f examples/catalog/bundle.yaml -require-commit -markdown 2>&1; }
 # apply -require-commit reads the source before it asks the platform: a clean checkout fails at
 # the request (exit 1, a marker block, no -require-commit complaint); a modified file fails on
