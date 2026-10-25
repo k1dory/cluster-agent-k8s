@@ -27,7 +27,11 @@ func TestIssueAuthenticateRotateRevoke(t *testing.T) {
 	if err != nil || got.ID != k.ID || got.Tenant != "acme" || got.LastUsedAt == nil {
 		t.Fatalf("authenticate: %v %+v", err, got)
 	}
-	for _, bad := range []string{secret[:len(secret)-1] + "0", secret + "x", Prefix + "000000000000_" + strings.Repeat("0", 44), "sbk_short", "", "t0k"} {
+	replacement := "0"
+	if strings.HasSuffix(secret, replacement) {
+		replacement = "1"
+	}
+	for _, bad := range []string{secret[:len(secret)-1] + replacement, secret + "x", Prefix + "000000000000_" + strings.Repeat("0", 44), "sbk_short", "", "t0k"} {
 		if _, err := s.Authenticate(ctx, bad); !errors.Is(err, ErrBadKey) {
 			t.Fatalf("%q accepted: %v", bad, err)
 		}
