@@ -7,3 +7,4 @@
 /agent-init
 /sandboxd
 /sandboxctl
+/.ci/

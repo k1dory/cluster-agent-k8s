@@ -491,6 +491,9 @@ implemented once, and GitHub, GitLab, Forgejo and local development invoke the s
 The contract defines ownership, acceptance criteria and the remaining adoption work.
 
 ```sh
+make ci-fast        # before a push: build, vet, every test under -race, the policy gate
+make ci             # the full required set (needs SANDBOX_TEST_POSTGRES_URL, Docker, python3)
+make ci-caddy CADDY_BIN=/path/to/caddy   # one group with an input of yours; make ci-versions lists the pins
 make test           # unit tests
 make integration    # the gateway on a real caddy (CADDY_BIN=... or caddy on PATH)
 make dev            # fake runtime, in-memory store, API on 127.0.0.1:8080, token dev-token, DNS on 127.0.0.1:15353

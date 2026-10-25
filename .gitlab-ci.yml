@@ -1,0 +1,81 @@
+# The product CI on GitLab, under the shared contract (docs/ci-contract.md): the same
+# `make ci-<group>` targets as .github/workflows/ci.yaml and .forgejo/workflows/ci.yaml. This
+# file selects the pipeline, arranges the jobs, prepares tools and services and maps them to the
+# targets' inputs; the checks live in the Makefile and hack/ci. (deploy/git/gitlab/.gitlab-ci.yml
+# is something else: the template a configuration repository uses to drive the platform.)
+#
+# The Go image's major.minor is pinned here; GOTOOLCHAIN=auto fetches the exact go.mod version.
+# The `images` and `git-adapter-e2e` jobs need a Docker daemon: a docker-in-docker service
+# (privileged runner) as below, or DOCKER_HOST pointing at one the runner offers.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+stages: [check]
+
+default:
+  image: golang:1.26
+  cache:
+    key: go-modules
+    paths: [.go-mod-cache/]
+
+variables:
+  GOTOOLCHAIN: auto
+  GOMODCACHE: $CI_PROJECT_DIR/.go-mod-cache
+  GOFLAGS: -buildvcs=false
+
+unit:
+  stage: check
+  script:
+    - make ci-build
+    - make ci-vet
+    - make ci-unit
+    - make ci-policy
+
+postgres:
+  stage: check
+  services:
+    - name: postgres:16   # keep in step with hack/ci/versions.env (POSTGRES_IMAGE)
+      alias: postgres
+  variables:
+    POSTGRES_USER: sandbox
+    POSTGRES_PASSWORD: sandbox
+    POSTGRES_DB: sandbox_test
+    SANDBOX_TEST_POSTGRES_URL: postgres://sandbox:sandbox@postgres:5432/sandbox_test?sslmode=disable
+  script:
+    - make ci-postgres
+
+caddy:
+  stage: check
+  # Every supported Caddy in one job (the target downloads each; `make ci-versions` lists them).
+  script:
+    - make ci-caddy
+
+helm:
+  stage: check
+  script:
+    - make ci-helm
+
+.docker-job:
+  stage: check
+  services:
+    - name: docker:27-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    # The targets download the docker CLI when the runner has none; python3 is a runner tool.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 python3-yaml >/dev/null
+    - for i in $(seq 1 30); do (echo > /dev/tcp/docker/2375) 2>/dev/null && break; sleep 2; done
+
+images:
+  extends: .docker-job
+  script:
+    - make ci-images
+
+git-adapter-e2e:
+  extends: .docker-job
+  script:
+    - make ci-e2e-git
