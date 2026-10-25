@@ -59,6 +59,27 @@ func TestGitSyncRecordContract(t *testing.T) {
 			if got.Check.Error != "unreachable" || got.Sync.Commit != "cccc" || len(got.Sync.Bundles) != 0 || got.Sync.Error != "down" {
 				t.Fatalf("a sync did not replace its half whole, or touched the check: %+v", got)
 			}
+			// The hook half, conditionally: written while the record's hook is absent or the
+			// named job's; a hook of another job (a delivery accepted meanwhile) stays.
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", At: now}, "gitjob_1"); err != nil || !ok {
+				t.Fatalf("hook if, no hook yet: %v %v", ok, err)
+			}
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Outcome: "done", At: now}, "gitjob_1"); err != nil || !ok {
+				t.Fatalf("hook if, own job: %v %v", ok, err)
+			}
+			if err := st.RecordGitHook(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_2", At: now}); err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Outcome: "superseded", At: now}, "gitjob_1"); err != nil || ok {
+				t.Fatalf("hook if, another job's acceptance: %v %v", ok, err)
+			}
+			got, _ = st.GetGitSync(ctx, "acme", "config")
+			if got.Hook == nil || got.Hook.Job != "gitjob_2" || got.Hook.Outcome != "" || got.Sync.Commit != "cccc" || got.Check.Error != "unreachable" {
+				t.Fatalf("the newer acceptance was written over, or the other halves touched: %+v", got)
+			}
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "other", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_3", At: now}, "gitjob_3"); err != nil || !ok {
+				t.Fatalf("hook if on a repository with no record: %v %v", ok, err)
+			}
 			// The third half, the webhook, is written on its own too.
 			if err := st.RecordGitHook(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Action: "sync", Commit: "cccc", Outcome: "done", At: now}); err != nil {
 				t.Fatal(err)

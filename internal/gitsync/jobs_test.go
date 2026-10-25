@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -450,5 +451,233 @@ func TestAttemptsAreBoundedWhenTheLeaseRunsOut(t *testing.T) {
 	}
 	if ran, _ := s.RunOnce(ctx); ran {
 		t.Fatal("an ended job was claimed again")
+	}
+}
+
+// lossyStore loses the sync summary written after the bundles were applied (a store that went
+// away for that one write), never the transition recorded before them.
+type lossyStore struct {
+	store.Store
+	lose atomic.Bool
+}
+
+func (w *lossyStore) RecordGitSync(ctx context.Context, tenant, name string, r model.GitSyncResult) error {
+	if w.lose.Load() && r.Status != model.GitSyncRunning {
+		return errors.New("the database went away")
+	}
+	return w.Store.RecordGitSync(ctx, tenant, name, r)
+}
+
+// The transition (commit and generation) is fixed before the first write, so a sync whose
+// summary is lost after it wrote the catalogue is still the last transition: syncing the same
+// commit again continues it (nothing written twice), and a return to the commit before it is a
+// transition of its own, never the first time's done apply returned with the catalogue elsewhere.
+func TestTheTransitionSurvivesALostSyncSummary(t *testing.T) {
+	ctx := context.Background()
+	fetch := &refFetcher{auth: "tok", heads: map[string]string{"main": sha1}, files: map[string]map[string][]byte{
+		sha1: {"bundles/a.yaml": []byte(envYAML("first"))}, sha2: {"bundles/a.yaml": []byte(envYAML("second"))}}}
+	s, st, _ := hookService(t, fetch)
+	w := &lossyStore{Store: st}
+	s.Store = w
+	scope := plan.Scope{Tenant: "acme", Subject: "alice"}
+	if g, err := s.Sync(ctx, scope, "config", sha1); err != nil || g.Sync.Generation != 0 {
+		t.Fatalf("A: %v %+v", err, g)
+	}
+	fetch.heads["main"] = sha2
+	w.lose.Store(true)
+	if g, err := s.Sync(ctx, scope, "config", sha2); err == nil || g != nil {
+		t.Fatalf("B with its summary lost must say so: %v %+v", err, g)
+	}
+	w.lose.Store(false)
+	if it, _ := st.GetItem(ctx, model.KindEnvironment, "acme", "py", 0); it.Description != "second" || it.Revision != 2 {
+		t.Fatalf("B was applied before the summary was lost: %+v", it)
+	}
+	if g, _ := s.Status(ctx, scope, "config"); g.Sync == nil || g.Sync.Status != model.GitSyncRunning || g.Sync.Commit != sha2 || g.Sync.Generation != 1 {
+		t.Fatalf("the transition to B must be on record: %+v", g.Sync)
+	}
+	// The same commit again: the transition continues, nothing is written twice.
+	if g, err := s.Sync(ctx, scope, "config", sha2); err != nil || g.Sync.Status != model.GitSyncDone || g.Sync.Generation != 1 || g.Sync.Bundles[0].Changes != 1 {
+		t.Fatalf("B again: %v %+v", err, g.Sync)
+	}
+	if n := revs(t, st, model.KindEnvironment, "acme", "py"); n != 2 {
+		t.Fatalf("a repeat of the transition wrote: %d revisions", n)
+	}
+	// Back to A: a transition of its own, generation 2, A written again.
+	w.lose.Store(true)
+	_, _ = s.Sync(ctx, scope, "config", sha2) // the summary lost once more: still the transition to B
+	w.lose.Store(false)
+	fetch.heads["main"] = sha1
+	g, err := s.Sync(ctx, scope, "config", sha1)
+	if err != nil || g.Sync.Status != model.GitSyncDone || g.Sync.Generation != 2 {
+		t.Fatalf("A after B: %v %+v", err, g.Sync)
+	}
+	if it, _ := st.GetItem(ctx, model.KindEnvironment, "acme", "py", 0); it.Description != "first" || it.Revision != 3 || it.Source.Commit != sha1 {
+		t.Fatalf("the return to A: %+v", it)
+	}
+}
+
+// deadlineStore records how much of the finishing context is left when a job is finished.
+type deadlineStore struct {
+	store.Store
+	mu   sync.Mutex
+	left []time.Duration
+}
+
+func (w *deadlineStore) FinishGitJob(ctx context.Context, id, owner string, attempt int, status, outcome, errMsg string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if d, ok := ctx.Deadline(); ok {
+		w.mu.Lock()
+		w.left = append(w.left, time.Until(d))
+		w.mu.Unlock()
+	}
+	return w.Store.FinishGitJob(ctx, id, owner, attempt, status, outcome, errMsg)
+}
+
+// pausingFetcher takes its time: a Git read longer than the finishing window would allow.
+type pausingFetcher struct {
+	*refFetcher
+	pause time.Duration
+}
+
+func (f *pausingFetcher) Resolve(ctx context.Context, r Remote) (string, error) {
+	time.Sleep(f.pause)
+	return f.refFetcher.Resolve(ctx, r)
+}
+
+// The context that ends a job is made once the work is over, not when it started: a job whose
+// work took longer than the finishing window still records its outcome with the whole window
+// ahead of it.
+func TestTheFinishingContextStartsWhenTheWorkIsOver(t *testing.T) {
+	ctx := context.Background()
+	fetch := &pausingFetcher{refFetcher: &refFetcher{auth: "tok", heads: map[string]string{"main": sha1}, files: map[string]map[string][]byte{sha1: {"bundles/a.yaml": []byte(envYAML("x"))}}}, pause: 600 * time.Millisecond}
+	s, st, _ := hookService(t, fetch)
+	w := &deadlineStore{Store: st}
+	s.Store, s.Jobs, s.Lock, s.Inline = w, w, w.WithTenantLock, false
+	h := deliver(t, s, "push", pushBody(sha1))
+	if ran, err := s.RunOnce(ctx); err != nil || !ran {
+		t.Fatalf("run: %v %v", ran, err)
+	}
+	job, _ := st.GetGitJob(ctx, h.Job)
+	if job.Status != model.GitJobDone || job.Outcome != model.GitSyncDone {
+		t.Fatalf("a slow job must still end: %+v", job)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.left) != 1 || w.left[0] < finishTimeout-300*time.Millisecond {
+		t.Fatalf("the finishing window had already been running during the work: %v of %v left", w.left, finishTimeout)
+	}
+}
+
+// A stopped apply (the store went away mid-way) is unfinished work, not an outcome: the job
+// runs again and continues the same apply; a redelivery of a job that gave up on it requeues it.
+func TestAStoppedApplyIsRetriedAndContinued(t *testing.T) {
+	ctx := context.Background()
+	fetch := &refFetcher{auth: "tok", heads: map[string]string{"main": sha1}, files: map[string]map[string][]byte{sha1: {"bundles/a.yaml": []byte(envYAML("x"))}}}
+	s, st, _ := hookService(t, fetch)
+	now := time.Now()
+	s.Now = func() time.Time { return now }
+	st.arm("py")
+	h := deliver(t, s, "push", pushBody(sha1))
+	if h.Outcome != model.GitSyncStopped || !strings.Contains(h.Reason, "attempt 1 of 5 ended with stopped") {
+		t.Fatalf("a stopped apply: %+v", h)
+	}
+	job, _ := st.GetGitJob(ctx, h.Job)
+	if job.Status != model.GitJobPending || job.Attempts != 1 {
+		t.Fatalf("job after a stopped apply: %+v", job)
+	}
+	g, _ := s.Status(ctx, plan.Scope{Tenant: "acme"}, "config")
+	stopped := g.Sync.Bundles[0].Apply
+	st.arm("")
+	now = now.Add(31 * time.Second)
+	if ran, err := s.RunOnce(ctx); err != nil || !ran {
+		t.Fatalf("the retry: %v %v", ran, err)
+	}
+	job, _ = st.GetGitJob(ctx, h.Job)
+	g, _ = s.Status(ctx, plan.Scope{Tenant: "acme"}, "config")
+	if job.Status != model.GitJobDone || job.Outcome != model.GitSyncDone || g.Hook.Outcome != model.GitSyncDone || g.Sync.Bundles[0].Apply != stopped || g.Sync.Status != model.GitSyncDone {
+		t.Fatalf("the retry must continue the stopped apply: %+v %+v %+v", job, g.Hook, g.Sync)
+	}
+	if n := revs(t, st, model.KindEnvironment, "acme", "py"); n != 1 {
+		t.Fatalf("revisions: %d", n)
+	}
+	// A store that stays away: the job gives up after five attempts, with the outcome on record.
+	st.arm("py")
+	fetch.heads["main"] = sha2
+	fetch.files[sha2] = map[string][]byte{"bundles/a.yaml": []byte(envYAML("y"))}
+	h2 := deliver(t, s, "push", pushBody(sha2))
+	for i := 0; i < 20; i++ {
+		now = now.Add(5 * time.Minute)
+		if ran, _ := s.RunOnce(ctx); !ran {
+			break
+		}
+	}
+	job, _ = st.GetGitJob(ctx, h2.Job)
+	if job.Status != model.GitJobFailed || job.Outcome != model.GitSyncStopped || job.Attempts != MaxAttempts || !strings.Contains(job.Error, "gave up after 5 attempts") {
+		t.Fatalf("job after giving up: %+v", job)
+	}
+	if g, _ := s.Status(ctx, plan.Scope{Tenant: "acme"}, "config"); g.Hook.Outcome != model.GitSyncStopped || !strings.Contains(g.Hook.Error, "gave up") {
+		t.Fatalf("record after giving up: %+v", g.Hook)
+	}
+}
+
+// gatedStore holds a job's finish until released: the window between the work and the record.
+type gatedStore struct {
+	store.Store
+	job     string
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *gatedStore) FinishGitJob(ctx context.Context, id, owner string, attempt int, status, outcome, errMsg string) error {
+	if id == w.job {
+		w.once.Do(func() { close(w.entered) })
+		<-w.release
+	}
+	return w.Store.FinishGitJob(ctx, id, owner, attempt, status, outcome, errMsg)
+}
+
+// A delivery accepted while an older job is ending keeps the record: the job's outcome is
+// written only while the record still carries that job, in one store operation.
+func TestAFinishNeverWritesOverADeliveryAcceptedMeanwhile(t *testing.T) {
+	ctx := context.Background()
+	fetch := &refFetcher{auth: "tok", heads: map[string]string{"main": sha1}, files: map[string]map[string][]byte{
+		sha1: {"bundles/a.yaml": []byte(envYAML("x"))}, sha2: {"bundles/a.yaml": []byte(envYAML("y"))}}}
+	s, st, _ := hookService(t, fetch)
+	s.Inline = false
+	first := deliver(t, s, "push", pushBody(sha1))
+	w := &gatedStore{Store: st, job: first.Job, entered: make(chan struct{}), release: make(chan struct{})}
+	one := *s
+	one.Store, one.Jobs, one.Lock = w, w, w.WithTenantLock
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		_, _ = one.RunOnce(ctx)
+	}()
+	select {
+	case <-w.entered:
+	case <-time.After(5 * time.Second):
+		close(w.release)
+		t.Fatal("the first job did not reach its finish")
+	}
+	// The ref moves and a new delivery is accepted while the first job is ending.
+	fetch.heads["main"] = sha2
+	second := deliver(t, s, "push", pushBody(sha2))
+	close(w.release)
+	<-finished
+	g, _ := s.Status(ctx, plan.Scope{Tenant: "acme"}, "config")
+	if g.Hook == nil || g.Hook.Job != second.Job || g.Hook.Outcome != "" {
+		t.Fatalf("the record must keep the delivery accepted last: %+v", g.Hook)
+	}
+	if job, _ := st.GetGitJob(ctx, first.Job); job.Status != model.GitJobDone || job.Outcome != model.GitSyncDone {
+		t.Fatalf("the first job still ends: %+v", job)
+	}
+	if ran, err := s.RunOnce(ctx); err != nil || !ran {
+		t.Fatalf("the second job: %v %v", ran, err)
+	}
+	if g, _ := s.Status(ctx, plan.Scope{Tenant: "acme"}, "config"); g.Hook.Job != second.Job || g.Hook.Outcome != model.GitSyncDone || g.Hook.Commit != sha2 {
+		t.Fatalf("the second job's outcome: %+v", g.Hook)
 	}
 }
