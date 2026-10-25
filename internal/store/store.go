@@ -203,8 +203,9 @@ type GitJobs interface {
 	// RetryGitJob puts the attempt the caller holds back to pending, to be claimed no earlier
 	// than notBefore, keeping Attempts and recording why (ErrConflict as for Finish).
 	RetryGitJob(ctx context.Context, id, owner string, attempt int, notBefore time.Time, errMsg string) error
-	// RequeueGitJob makes a failed job pending again with Attempts reset (ErrConflict when the
-	// job is not failed): a redelivery of a delivery whose job gave up.
+	// RequeueGitJob makes a failed job, or a pending one waiting for its next attempt, due now
+	// with Attempts reset (ErrConflict when the job is running or done): a redelivery of a
+	// delivery whose job gave up or waits.
 	RequeueGitJob(ctx context.Context, id string) error
 	GetGitJob(ctx context.Context, id string) (*model.GitJob, error)
 	// GetGitJobByDelivery finds the job of a delivery (tenant, name, delivery key).

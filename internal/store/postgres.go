@@ -1329,7 +1329,7 @@ func (p *Postgres) RetryGitJob(ctx context.Context, id, owner string, attempt in
 
 func (p *Postgres) RequeueGitJob(ctx context.Context, id string) error {
 	tag, err := p.pool.Exec(ctx, `UPDATE git_jobs SET status='pending', attempts=0, outcome='', error='', lease_until=NULL, updated_at=now()
-		WHERE id=$1 AND status='failed'`, id)
+		WHERE id=$1 AND status IN ('failed', 'pending')`, id)
 	if err != nil {
 		return err
 	}
@@ -1338,7 +1338,7 @@ func (p *Postgres) RequeueGitJob(ctx context.Context, id string) error {
 		if err != nil {
 			return err
 		}
-		return fmt.Errorf("%w: job %s is %s, not failed", ErrConflict, id, j.Status)
+		return fmt.Errorf("%w: job %s is %s, neither failed nor waiting", ErrConflict, id, j.Status)
 	}
 	return nil
 }

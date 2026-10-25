@@ -241,12 +241,19 @@ func TestGitJobContract(t *testing.T) {
 			if _, err := st.ClaimGitJob(ctx, "four", now.Add(5*time.Minute), time.Minute); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("a retry claimed before its time: %v", err)
 			}
-			jb, err := st.ClaimGitJob(ctx, "four", now.Add(10*time.Minute), time.Minute)
-			if err != nil || jb.ID != "gitjob_b" || jb.Attempts != 2 || jb.Owner != "four" {
-				t.Fatalf("a retry claimed once due: %v %+v", err, jb)
+			// A waiting retry can be brought forward (a redelivery): due now, attempts reset.
+			if err := st.RequeueGitJob(ctx, "gitjob_b"); err != nil {
+				t.Fatalf("requeue a waiting retry: %v", err)
+			}
+			jb, err := st.ClaimGitJob(ctx, "four", now.Add(5*time.Minute), time.Minute)
+			if err != nil || jb.ID != "gitjob_b" || jb.Attempts != 1 || jb.Owner != "four" || jb.Error != "" {
+				t.Fatalf("a requeued retry claimed at once: %v %+v", err, jb)
+			}
+			if err := st.RequeueGitJob(ctx, "gitjob_b"); !errors.Is(err, ErrConflict) {
+				t.Fatalf("requeueing a running job: %v", err)
 			}
 			// Done jobs are never claimed again; a failed one neither, until it is requeued.
-			if err := st.FinishGitJob(ctx, "gitjob_b", "four", 2, model.GitJobFailed, "error", "boom"); err != nil {
+			if err := st.FinishGitJob(ctx, "gitjob_b", "four", 1, model.GitJobFailed, "error", "boom"); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := st.ClaimGitJob(ctx, "four", now.Add(time.Hour), time.Minute); !errors.Is(err, ErrNotFound) {

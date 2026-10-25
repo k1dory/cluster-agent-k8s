@@ -1210,8 +1210,8 @@ func (m *Memory) RequeueGitJob(_ context.Context, id string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	if j.Status != model.GitJobFailed {
-		return fmt.Errorf("%w: job %s is %s, not failed", ErrConflict, id, j.Status)
+	if j.Status != model.GitJobFailed && j.Status != model.GitJobPending {
+		return fmt.Errorf("%w: job %s is %s, neither failed nor waiting", ErrConflict, id, j.Status)
 	}
 	j.Status, j.Attempts, j.Outcome, j.Error, j.LeaseUntil, j.UpdatedAt = model.GitJobPending, 0, "", "", nil, time.Now()
 	return nil

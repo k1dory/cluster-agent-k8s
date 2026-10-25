@@ -220,9 +220,9 @@ the next one runs. An invalid bundle is an outcome, not an error, and is not ret
 that runs out of its lease (ten minutes) is taken over by the next replica to see it, up to the
 same five attempts; the fifth records its failure even though its own time is up. A redelivery
 (the provider's "redeliver", the same delivery id) of a delivery whose job ran reports how it
-went and changes nothing; of one whose job gave up, queues the job again with its attempts
-reset, which is the way to run a delivery the platform could not handle at the time; of one
-still waiting or running, names the job. The delivery, the decision, the job and the outcome
+went and changes nothing; of one whose job gave up, or waits for its next attempt, runs the job
+again now with its attempts reset, which is the way to run a delivery the platform could not
+handle at the time; of one due or running, names the job. The delivery, the decision, the job and the outcome
 land in the `hook` half of `gitrepo status`, which follows the delivery accepted last (an
 older job that ran late never writes over a newer delivery's summary; its outcome is in the
 job and the event), and every delivery, plan and sync is an event (`git.hook`, `git.plan`,

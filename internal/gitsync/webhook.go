@@ -327,21 +327,24 @@ func (s *Service) Hook(ctx context.Context, tenant, name string, hdr http.Header
 
 // redelivered answers a delivery whose job exists. A job that ran reports how it went, and the
 // record keeps the summary it has (an acceptance is never written over an outcome, an older
-// job's over a newer one's); a job that gave up (failed) is queued again, with its attempts
-// reset, so a redelivery is the way to run a delivery the platform could not handle at the
-// time; a job still waiting or running is just named.
+// job's over a newer one's); a job that gave up (failed), or waits for its next attempt after
+// an error, runs again now with its attempts reset, so a redelivery is the way to run a
+// delivery the platform could not handle at the time; a job due or running is just named.
 func (s *Service) redelivered(ctx context.Context, it *model.CatalogItem, h *model.GitHook, job *model.GitJob) (*model.GitHook, error) {
 	h.Job = job.ID
-	switch job.Status {
-	case model.GitJobDone:
+	switch {
+	case job.Status == model.GitJobDone:
 		h.Outcome, h.Error, h.Reason = job.Outcome, job.Error, "a redelivery: the job already ran"
 		s.emit(ctx, it, "git.hook", h)
 		return h, nil
-	case model.GitJobFailed:
+	case job.Status == model.GitJobFailed, job.Status == model.GitJobPending && job.LeaseUntil != nil && job.LeaseUntil.After(s.now()):
 		if err := s.jobs().RequeueGitJob(ctx, job.ID); err != nil && !errors.Is(err, store.ErrConflict) {
 			return nil, err
 		}
 		h.Reason = "a redelivery: the job had given up (" + job.Error + ") and runs again"
+		if job.Status == model.GitJobPending {
+			h.Reason = "a redelivery: the job waited for its next attempt (" + job.Error + ") and runs now"
+		}
 		if err := s.Store.RecordGitHook(ctx, it.Tenant, it.Name, *h); err != nil {
 			return nil, err
 		}
@@ -658,6 +661,12 @@ func (s *Service) preview(ctx context.Context, it *model.CatalogItem, sp gitrepo
 			return err
 		}
 		r.Ref = pr.HeadRef
+		var body bytes.Buffer
+		changes := 0
+		files, ferr := s.Fetch.Files(ctx, r, pr.HeadSHA, sp.Paths)
+		// The request as it is now, read after the files (the closest to publishing): a head
+		// the request has moved past (a push, a force push that took the commit off the ref)
+		// is superseded, and nothing of it is published.
 		head, err := s.Fetch.Resolve(ctx, r)
 		if err != nil {
 			return fmt.Errorf("%w: %v", ErrRead, err)
@@ -667,11 +676,8 @@ func (s *Service) preview(ctx context.Context, it *model.CatalogItem, sp gitrepo
 			note = fmt.Sprintf("the pull request's head is now %s; the plan of %s is not published", head, pr.HeadSHA)
 			return nil
 		}
-		var body bytes.Buffer
-		changes := 0
-		files, err := s.Fetch.Files(ctx, r, pr.HeadSHA, sp.Paths)
-		if err != nil {
-			err = fmt.Errorf("%w: %v", ErrRead, err)
+		if ferr != nil {
+			err = fmt.Errorf("%w: %v", ErrRead, ferr)
 			render.Failure(&body, "Plan", "", err)
 			outcome = model.GitSyncError
 		} else {
