@@ -62,7 +62,9 @@ func (s *Service) repository(ctx context.Context, scope plan.Scope, name string)
 	return it, sp, nil
 }
 
-// record loads the repository's record or starts one.
+// record returns the repository's record as stored (what Status shows), or the bare record
+// when nothing was stored yet or the read failed: the halves the caller just wrote are added
+// by the caller, so a failed read costs nothing but the other half in the answer.
 func (s *Service) record(ctx context.Context, it *model.CatalogItem) *model.GitSync {
 	g, err := s.Store.GetGitSync(ctx, it.Tenant, it.Name)
 	if err != nil {
@@ -102,36 +104,38 @@ func (s *Service) Status(ctx context.Context, scope plan.Scope, name string) (*m
 	return g, err
 }
 
-// Check resolves the ref and records the head (or why the repository cannot be read). The
-// record is returned with the error, so the caller can show both.
+// Check resolves the ref and records the head (or why the repository cannot be read) in the
+// check half of the record, the sync half untouched. The record is returned with the error,
+// so the caller can show both.
 func (s *Service) Check(ctx context.Context, scope plan.Scope, name string) (*model.GitSync, error) {
 	it, sp, err := s.repository(ctx, scope, name)
 	if err != nil {
 		return nil, err
 	}
-	g := s.record(ctx, it)
-	now := s.now()
-	g.CheckedAt, g.Head, g.CheckError = &now, "", ""
+	ck := model.GitCheck{At: s.now()}
 	r, err := s.remote(ctx, it, sp)
 	if err == nil {
-		if g.Head, err = s.Fetch.Resolve(ctx, r); err != nil {
+		if ck.Head, err = s.Fetch.Resolve(ctx, r); err != nil {
 			err = fmt.Errorf("%w: %v", ErrRead, err)
 		}
 	}
 	if err != nil {
-		g.CheckError = err.Error()
+		ck.Error = err.Error()
 	}
-	if perr := s.Store.PutGitSync(ctx, g); perr != nil {
-		return g, perr
+	if perr := s.Store.RecordGitCheck(ctx, it.Tenant, it.Name, ck); perr != nil {
+		return nil, perr
 	}
+	g := s.record(ctx, it)
+	g.Check = &ck
 	return g, err
 }
 
 // Sync applies the bundles of one commit (the ref's head when commit is empty): every bundle
 // file is planned and applied through the controller under the key
 // "git:<repository>@<commit>:<path>", in path order, stopping at the first bundle that is
-// refused or whose apply does not finish. The record is stored and returned with the outcome;
-// the error says which kind of outcome it was (ErrRead, ErrCredential, ErrInvalid, ErrStopped).
+// refused or whose apply does not finish. The outcome is recorded in the sync half of the
+// record (the check half too when the head was resolved here) and returned with the error,
+// which says which kind of outcome it was (ErrRead, ErrCredential, ErrInvalid, ErrStopped).
 func (s *Service) Sync(ctx context.Context, scope plan.Scope, name, commit string) (*model.GitSync, error) {
 	it, sp, err := s.repository(ctx, scope, name)
 	if err != nil {
@@ -140,16 +144,21 @@ func (s *Service) Sync(ctx context.Context, scope plan.Scope, name, commit strin
 	if commit != "" && !shaRe.MatchString(commit) {
 		return nil, fmt.Errorf("%w: %q is not a commit SHA (40 hex digits)", res.ErrInvalid, commit)
 	}
-	g := s.record(ctx, it)
 	now := s.now()
-	g.SyncedAt, g.Commit, g.Bundles, g.Status, g.Error = &now, commit, nil, "", ""
+	result := model.GitSyncResult{Commit: commit, At: now}
+	var checked *model.GitCheck
 	finish := func(status string, err error) (*model.GitSync, error) {
-		g.Status = status
+		result.Status = status
 		if err != nil {
-			g.Error = err.Error()
+			result.Error = err.Error()
 		}
-		if perr := s.Store.PutGitSync(ctx, g); perr != nil {
-			return g, perr
+		if perr := s.Store.RecordGitSync(ctx, it.Tenant, it.Name, result); perr != nil {
+			return nil, perr
+		}
+		g := s.record(ctx, it)
+		g.Sync = &result
+		if checked != nil {
+			g.Check = checked
 		}
 		return g, err
 	}
@@ -158,13 +167,21 @@ func (s *Service) Sync(ctx context.Context, scope plan.Scope, name, commit strin
 		return finish(model.GitSyncError, err)
 	}
 	if commit == "" {
+		ck := model.GitCheck{At: now}
 		head, err := s.Fetch.Resolve(ctx, r)
 		if err != nil {
-			g.CheckedAt, g.CheckError = &now, err.Error()
+			ck.Error = fmt.Errorf("%w: %v", ErrRead, err).Error()
+		} else {
+			ck.Head = head
+		}
+		if perr := s.Store.RecordGitCheck(ctx, it.Tenant, it.Name, ck); perr != nil {
+			return nil, perr
+		}
+		checked = &ck
+		if err != nil {
 			return finish(model.GitSyncError, fmt.Errorf("%w: %v", ErrRead, err))
 		}
-		g.CheckedAt, g.Head, g.CheckError = &now, head, ""
-		commit, g.Commit = head, head
+		commit, result.Commit = head, head
 	}
 	files, err := s.Fetch.Files(ctx, r, commit, sp.Paths)
 	if err != nil {
@@ -183,12 +200,12 @@ func (s *Service) Sync(ctx context.Context, scope plan.Scope, name, commit strin
 		docs, err := res.ParseYAMLAll(files[p])
 		if err != nil {
 			b.Status, b.Errors = model.GitSyncInvalid, []string{err.Error()}
-			g.Bundles = append(g.Bundles, b)
+			result.Bundles = append(result.Bundles, b)
 			return finish(model.GitSyncInvalid, fmt.Errorf("%w: %s: %v", ErrInvalid, p, err))
 		}
 		pl, err := s.Applier.Planner.Plan(ctx, docs, applyScope)
 		if err != nil {
-			g.Bundles = append(g.Bundles, b)
+			result.Bundles = append(result.Bundles, b)
 			return finish(model.GitSyncError, fmt.Errorf("%s: plan: %w", p, err))
 		}
 		a, err := s.Applier.Submit(ctx, apply.Request{Docs: docs, Plan: pl.Fingerprint, Key: Key(it.Name, commit, p), Scope: applyScope,
@@ -197,14 +214,14 @@ func (s *Service) Sync(ctx context.Context, scope plan.Scope, name, commit strin
 		switch {
 		case errors.As(err, &invalid):
 			b.Status, b.Errors = model.GitSyncInvalid, planErrors(invalid.Plan)
-			g.Bundles = append(g.Bundles, b)
+			result.Bundles = append(result.Bundles, b)
 			return finish(model.GitSyncInvalid, fmt.Errorf("%w: %s: %d invalid", ErrInvalid, p, invalid.Plan.Summary.Invalid))
 		case err != nil:
 			if a != nil {
 				b.Apply, b.Status = a.ID, a.Status
 			}
 			b.Errors = []string{err.Error()}
-			g.Bundles = append(g.Bundles, b)
+			result.Bundles = append(result.Bundles, b)
 			return finish(model.GitSyncError, fmt.Errorf("%s: %w", p, err))
 		}
 		b.Apply, b.Status = a.ID, a.Status
@@ -216,7 +233,7 @@ func (s *Service) Sync(ctx context.Context, scope plan.Scope, name, commit strin
 		if a.Error != "" {
 			b.Errors = []string{a.Error}
 		}
-		g.Bundles = append(g.Bundles, b)
+		result.Bundles = append(result.Bundles, b)
 		if a.Status != model.ApplyDone {
 			return finish(model.GitSyncStopped, fmt.Errorf("%w: %s: apply %s is %s; sync the same commit again once the cause is fixed", ErrStopped, p, a.ID, a.Status))
 		}

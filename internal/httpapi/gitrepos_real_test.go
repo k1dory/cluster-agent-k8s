@@ -44,12 +44,12 @@ func TestGitRepositorySyncFromARealGitServer(t *testing.T) {
 		t.Fatalf("register: %d", code)
 	}
 	resp, body := call(t, "POST", api+"/v1/gitrepos/config/check", "alice-tok", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 200 || g.Head != sha1 {
+	if g := syncOf(t, body); resp.StatusCode != 200 || g.Check.Head != sha1 {
 		t.Fatalf("check: %d %s", resp.StatusCode, body)
 	}
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil)
 	g := syncOf(t, body)
-	if resp.StatusCode != 200 || g.Status != model.GitSyncDone || g.Commit != sha1 || len(g.Bundles) != 1 || g.Bundles[0].Changes != 2 {
+	if resp.StatusCode != 200 || g.Sync.Status != model.GitSyncDone || g.Sync.Commit != sha1 || len(g.Sync.Bundles) != 1 || g.Sync.Bundles[0].Changes != 2 {
 		t.Fatalf("sync: %d %s", resp.StatusCode, body)
 	}
 	var agent model.CatalogItem
@@ -60,11 +60,11 @@ func TestGitRepositorySyncFromARealGitServer(t *testing.T) {
 	}
 	// A second commit; the old one stays syncable and still writes nothing; the new one applies.
 	sha2 := srv.Commit(t, map[string]string{"bundles/acme.yaml": "kind: EnvironmentProfile\nname: py\nspec: {image: stable, env: {LOG: debug}}\n---\nkind: AgentDefinition\nname: backend\nspec: {policy: backend-dev, environment: py}\n"}, "two")
-	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", map[string]string{"commit": sha1}, nil); resp.StatusCode != 200 || syncOf(t, body).Bundles[0].Apply != g.Bundles[0].Apply {
+	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", map[string]string{"commit": sha1}, nil); resp.StatusCode != 200 || syncOf(t, body).Sync.Bundles[0].Apply != g.Sync.Bundles[0].Apply {
 		t.Fatalf("re-sync of the first commit: %d %s", resp.StatusCode, body)
 	}
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 200 || g.Commit != sha2 || g.Bundles[0].Changes != 1 {
+	if g := syncOf(t, body); resp.StatusCode != 200 || g.Sync.Commit != sha2 || g.Sync.Bundles[0].Changes != 1 {
 		t.Fatalf("sync of the second commit: %d %s", resp.StatusCode, body)
 	}
 	var revs []model.CatalogItem
@@ -76,13 +76,13 @@ func TestGitRepositorySyncFromARealGitServer(t *testing.T) {
 	// The wrong credential at the real server: 502, the value nowhere in the answer.
 	call(t, "PUT", api+"/v1/credentials/config-token", "alice-tok", map[string]string{"value": "tok-wrong"}, nil)
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/check", "alice-tok", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 502 || !strings.Contains(g.CheckError, "401") || strings.Contains(string(body), "tok-") {
+	if g := syncOf(t, body); resp.StatusCode != 502 || !strings.Contains(g.Check.Error, "401") || strings.Contains(string(body), "tok-") {
 		t.Fatalf("check with a wrong credential: %d %s", resp.StatusCode, body)
 	}
 	// The server gone: 502 and the record says so.
 	srv.Close()
 	call(t, "PUT", api+"/v1/credentials/config-token", "alice-tok", map[string]string{"value": "tok-real-1"}, nil)
-	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil); resp.StatusCode != 502 || syncOf(t, body).Status != model.GitSyncError {
+	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil); resp.StatusCode != 502 || syncOf(t, body).Sync.Status != model.GitSyncError {
 		t.Fatalf("sync against a stopped server: %d %s", resp.StatusCode, body)
 	}
 }

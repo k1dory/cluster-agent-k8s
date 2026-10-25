@@ -168,7 +168,7 @@ func TestGitRepositoryRegisterCheckSyncAndRepeat(t *testing.T) {
 	}
 	// Check: the head, with the tenant's credential handed to Git.
 	resp, body := call(t, "POST", api+"/v1/gitrepos/config/check", "alice-tok", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 200 || g.Head != shaA || g.CheckedAt == nil || g.CheckError != "" {
+	if g := syncOf(t, body); resp.StatusCode != 200 || g.Check.Head != shaA || g.Check.At.IsZero() || g.Check.Error != "" {
 		t.Fatalf("check: %d %s", resp.StatusCode, body)
 	}
 	if git.seen[len(git.seen)-1] != "tok-alice" {
@@ -177,10 +177,10 @@ func TestGitRepositoryRegisterCheckSyncAndRepeat(t *testing.T) {
 	// Sync the head: one apply for the one bundle, the commit on every revision.
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil)
 	g := syncOf(t, body)
-	if resp.StatusCode != 200 || g.Status != model.GitSyncDone || g.Commit != shaA || len(g.Bundles) != 1 || g.Bundles[0].Path != "bundles/acme.yaml" || g.Bundles[0].Status != model.ApplyDone || g.Bundles[0].Changes != 2 {
+	if resp.StatusCode != 200 || g.Sync.Status != model.GitSyncDone || g.Sync.Commit != shaA || len(g.Sync.Bundles) != 1 || g.Sync.Bundles[0].Path != "bundles/acme.yaml" || g.Sync.Bundles[0].Status != model.ApplyDone || g.Sync.Bundles[0].Changes != 2 {
 		t.Fatalf("sync: %d %s", resp.StatusCode, body)
 	}
-	first := g.Bundles[0].Apply
+	first := g.Sync.Bundles[0].Apply
 	var env model.CatalogItem
 	if resp, body := call(t, "GET", api+"/v1/environments/py", "alice-tok", nil, nil); resp.StatusCode != 200 {
 		t.Fatalf("environment: %d %s", resp.StatusCode, body)
@@ -198,7 +198,7 @@ func TestGitRepositoryRegisterCheckSyncAndRepeat(t *testing.T) {
 	}
 	// The same commit again (explicitly): the same apply, no new revision.
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", map[string]string{"commit": shaA}, nil)
-	if g := syncOf(t, body); resp.StatusCode != 200 || g.Bundles[0].Apply != first {
+	if g := syncOf(t, body); resp.StatusCode != 200 || g.Sync.Bundles[0].Apply != first {
 		t.Fatalf("repeat: %d %s", resp.StatusCode, body)
 	}
 	var revs []model.CatalogItem
@@ -219,7 +219,7 @@ func TestGitRepositoryRegisterCheckSyncAndRepeat(t *testing.T) {
 	git.repos["https://git.example.com/alice/config.git"].history["main"] = []string{shaA, shaB}
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil)
 	g = syncOf(t, body)
-	if resp.StatusCode != 200 || g.Commit != shaB || g.Bundles[0].Apply == first || g.Bundles[0].Changes != 1 {
+	if resp.StatusCode != 200 || g.Sync.Commit != shaB || g.Sync.Bundles[0].Apply == first || g.Sync.Bundles[0].Changes != 1 {
 		t.Fatalf("sync of the new head: %d %s", resp.StatusCode, body)
 	}
 	_, body = call(t, "GET", api+"/v1/environments/py", "alice-tok", nil, nil)
@@ -227,7 +227,7 @@ func TestGitRepositoryRegisterCheckSyncAndRepeat(t *testing.T) {
 	if env.Revision != 2 || env.Source.Commit != shaB {
 		t.Fatalf("environment after the second sync: rev %d %+v", env.Revision, env.Source)
 	}
-	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", map[string]string{"commit": shaA}, nil); resp.StatusCode != 200 || syncOf(t, body).Bundles[0].Apply != first {
+	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", map[string]string{"commit": shaA}, nil); resp.StatusCode != 200 || syncOf(t, body).Sync.Bundles[0].Apply != first {
 		t.Fatalf("the old commit again: %d %s", resp.StatusCode, body)
 	}
 	_, body = call(t, "GET", api+"/v1/environments/py/revisions", "alice-tok", nil, nil)
@@ -245,14 +245,32 @@ func TestGitRepositoryRegisterCheckSyncAndRepeat(t *testing.T) {
 	if resp, _ := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", map[string]string{"sha": shaA}, nil); resp.StatusCode != 400 {
 		t.Fatalf("unknown body field: %d", resp.StatusCode)
 	}
+	// The whole body is checked before Git is asked: trailing data, a second document, a
+	// truncated document and an oversized body are refused, and nothing is fetched or applied.
+	seen := len(git.seen)
+	for body, want := range map[string]int{
+		`{"commit":"` + shaA + `"} trailing`:             400,
+		`{"commit":"` + shaA + `"}{"commit":"x"}`:        400,
+		`{"commit":"` + shaA + `"`:                       400,
+		`[]`:                                             400,
+		`{"commit":"` + strings.Repeat("a", 5000) + `"}`: 413,
+	} {
+		if resp, got := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", body, map[string]string{"Content-Type": "application/json"}); resp.StatusCode != want {
+			t.Errorf("body %.40q: %d %s, want %d", body, resp.StatusCode, got, want)
+		}
+	}
+	if len(git.seen) != seen {
+		t.Fatalf("a refused body reached Git: %d calls", len(git.seen)-seen)
+	}
 	// Status: the last check and the last sync attempt, the failed one included (its commit
 	// and error), so the operator sees what was tried last.
 	resp, body = call(t, "GET", api+"/v1/gitrepos/config/status", "alice-tok", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 200 || g.Head != shaB || g.Commit != shaX || g.Status != model.GitSyncError || !strings.Contains(g.Error, "not reachable") {
+	if g := syncOf(t, body); resp.StatusCode != 200 || g.Check.Head != shaB || g.Sync.Commit != shaX || g.Sync.Status != model.GitSyncError || !strings.Contains(g.Sync.Error, "not reachable") {
 		t.Fatalf("status: %d %s", resp.StatusCode, body)
 	}
-	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil); resp.StatusCode != 200 || syncOf(t, body).Commit != shaB {
-		t.Fatalf("sync of the head after a failed attempt: %d %s", resp.StatusCode, body)
+	// An empty body (whitespace too) means the head.
+	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", "  \n", map[string]string{"Content-Type": "application/json"}); resp.StatusCode != 200 || syncOf(t, body).Sync.Commit != shaB {
+		t.Fatalf("sync of the head after a failed attempt (whitespace body): %d %s", resp.StatusCode, body)
 	}
 	// The repository is a versioned item: drift and revisions apply to it like to any other.
 	_, body = call(t, "GET", api+"/v1/gitrepos/config/revisions", "alice-tok", nil, nil)
@@ -290,11 +308,11 @@ func TestGitRepositoryIsolationCredentialRevocationAndUnreachable(t *testing.T) 
 	}
 	resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync?tenant=alice", "t0k", nil, nil)
 	g := syncOf(t, body)
-	if resp.StatusCode != 200 || g.Status != model.GitSyncDone {
+	if resp.StatusCode != 200 || g.Sync.Status != model.GitSyncDone {
 		t.Fatalf("admin sync of alice's repository: %d %s", resp.StatusCode, body)
 	}
 	var a model.Apply
-	_, body = call(t, "GET", api+"/v1/applies/"+g.Bundles[0].Apply+"?tenant=alice", "t0k", nil, nil)
+	_, body = call(t, "GET", api+"/v1/applies/"+g.Sync.Bundles[0].Apply+"?tenant=alice", "t0k", nil, nil)
 	_ = json.Unmarshal(body, &a)
 	if a.Tenant != "alice" || a.Admin {
 		t.Fatalf("an admin-triggered sync must apply with the tenant's authority: %+v", a)
@@ -304,7 +322,7 @@ func TestGitRepositoryIsolationCredentialRevocationAndUnreachable(t *testing.T) 
 	git.repos["https://git.example.com/alice/config.git"].history["main"] = []string{shaA, shaB}
 	git.repos["https://git.example.com/alice/config.git"].files[shaB] = map[string][]byte{"bundles/acme.yaml": []byte("kind: PolicyBinding\nname: backend-dev\nspec: {}\n")}
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/sync?tenant=alice", "t0k", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 422 || g.Status != model.GitSyncInvalid || !strings.Contains(strings.Join(g.Bundles[0].Errors, " "), "admin only") {
+	if g := syncOf(t, body); resp.StatusCode != 422 || g.Sync.Status != model.GitSyncInvalid || !strings.Contains(strings.Join(g.Sync.Bundles[0].Errors, " "), "admin only") {
 		t.Fatalf("a grant in a tenant's repository: %d %s", resp.StatusCode, body)
 	}
 	if resp, _ := call(t, "GET", api+"/v1/bindings/backend-dev", "alice-tok", nil, nil); resp.StatusCode != 404 {
@@ -320,7 +338,7 @@ func TestGitRepositoryIsolationCredentialRevocationAndUnreachable(t *testing.T) 
 		t.Fatalf("alice syncing the shared repository: %d", resp.StatusCode)
 	}
 	resp, body = call(t, "POST", api+"/v1/gitrepos/platform/sync", "t0k", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 200 || g.Status != model.GitSyncDone {
+	if g := syncOf(t, body); resp.StatusCode != 200 || g.Sync.Status != model.GitSyncDone {
 		t.Fatalf("admin sync of the shared repository: %d %s", resp.StatusCode, body)
 	}
 	if resp, _ := call(t, "GET", api+"/v1/bindings/backend-dev", "alice-tok", nil, nil); resp.StatusCode != 200 {
@@ -334,12 +352,12 @@ func TestGitRepositoryIsolationCredentialRevocationAndUnreachable(t *testing.T) 
 		t.Fatalf("delete credential: %d", resp.StatusCode)
 	}
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/check", "alice-tok", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 422 || g.CheckError == "" || !strings.Contains(g.CheckError, `"config-token"`) || strings.Contains(string(body), "tok-alice") {
+	if g := syncOf(t, body); resp.StatusCode != 422 || g.Check.Error == "" || !strings.Contains(g.Check.Error, `"config-token"`) || strings.Contains(string(body), "tok-alice") {
 		t.Fatalf("check without the credential: %d %s", resp.StatusCode, body)
 	}
 	seen := len(git.seen)
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 422 || g.Status != model.GitSyncError || !strings.Contains(g.Error, "not available") || len(git.seen) != seen {
+	if g := syncOf(t, body); resp.StatusCode != 422 || g.Sync.Status != model.GitSyncError || !strings.Contains(g.Sync.Error, "not available") || len(git.seen) != seen {
 		t.Fatalf("sync without the credential: %d %s", resp.StatusCode, body)
 	}
 	var revs []model.CatalogItem
@@ -351,29 +369,29 @@ func TestGitRepositoryIsolationCredentialRevocationAndUnreachable(t *testing.T) 
 	// A wrong credential is the server's refusal: 502, the token never in the message.
 	call(t, "PUT", api+"/v1/credentials/config-token", "alice-tok", map[string]string{"value": "tok-wrong"}, nil)
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 502 || g.Status != model.GitSyncError || !strings.Contains(g.Error, "401") || strings.Contains(string(body), "tok-wrong") {
+	if g := syncOf(t, body); resp.StatusCode != 502 || g.Sync.Status != model.GitSyncError || !strings.Contains(g.Sync.Error, "401") || strings.Contains(string(body), "tok-wrong") {
 		t.Fatalf("sync with a refused credential: %d %s", resp.StatusCode, body)
 	}
 	call(t, "PUT", api+"/v1/credentials/config-token", "alice-tok", map[string]string{"value": "tok-alice"}, nil)
-	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil); resp.StatusCode != 200 || syncOf(t, body).Status != model.GitSyncDone {
+	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", nil, nil); resp.StatusCode != 200 || syncOf(t, body).Sync.Status != model.GitSyncDone {
 		t.Fatalf("sync after restoring the credential: %d %s", resp.StatusCode, body)
 	}
 	// Unreachable: 502 on check and sync, recorded, nothing written; back online, it works.
 	git.repos["https://git.example.com/alice/config.git"].down = true
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/check", "alice-tok", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 502 || !strings.Contains(g.CheckError, "Could not connect") || g.Head != "" {
+	if g := syncOf(t, body); resp.StatusCode != 502 || !strings.Contains(g.Check.Error, "Could not connect") || g.Check.Head != "" {
 		t.Fatalf("check while down: %d %s", resp.StatusCode, body)
 	}
 	resp, body = call(t, "POST", api+"/v1/gitrepos/config/sync", "alice-tok", map[string]string{"commit": shaB}, nil)
-	if g := syncOf(t, body); resp.StatusCode != 502 || g.Status != model.GitSyncError {
+	if g := syncOf(t, body); resp.StatusCode != 502 || g.Sync.Status != model.GitSyncError {
 		t.Fatalf("sync while down: %d %s", resp.StatusCode, body)
 	}
 	resp, body = call(t, "GET", api+"/v1/gitrepos/config/status", "alice-tok", nil, nil)
-	if g := syncOf(t, body); resp.StatusCode != 200 || g.Status != model.GitSyncError || g.CheckError == "" {
+	if g := syncOf(t, body); resp.StatusCode != 200 || g.Sync.Status != model.GitSyncError || g.Check.Error == "" {
 		t.Fatalf("status while down: %d %s", resp.StatusCode, body)
 	}
 	git.repos["https://git.example.com/alice/config.git"].down = false
-	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/check", "alice-tok", nil, nil); resp.StatusCode != 200 || syncOf(t, body).Head != shaB {
+	if resp, body := call(t, "POST", api+"/v1/gitrepos/config/check", "alice-tok", nil, nil); resp.StatusCode != 200 || syncOf(t, body).Check.Head != shaB {
 		t.Fatalf("check back online: %d %s", resp.StatusCode, body)
 	}
 	// Deleting the registration ends the routes for it; the revisions it wrote stay.

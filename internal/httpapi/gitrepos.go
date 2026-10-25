@@ -1,8 +1,10 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -16,6 +18,9 @@ import (
 // three routes here read them. check resolves the ref, sync applies a commit through the apply
 // controller, status shows the last of each. A tenant acts on its own repositories, the admin
 // on any (?tenant= for a tenant's, none for the shared ones).
+
+// syncBodyLimit bounds the sync request body (a commit SHA and nothing else).
+const syncBodyLimit = 4096
 
 func (p *Platform) gitScope(w http.ResponseWriter, r *http.Request) (plan.Scope, bool) {
 	if p.GitSync == nil {
@@ -44,14 +49,25 @@ func (p *Platform) gitSyncRepo(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// The whole body is checked before Git is asked: an empty body means the head; anything
+	// else must be exactly one JSON object with known fields and nothing after it.
 	var body struct {
 		Commit string `json:"commit"`
 	}
-	if r.ContentLength != 0 && r.Body != nil {
-		dec := json.NewDecoder(io.LimitReader(r.Body, 4096))
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, syncBodyLimit))
+	if err != nil {
+		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("body: at most %d bytes", syncBodyLimit))
+		return
+	}
+	if len(bytes.TrimSpace(raw)) > 0 {
+		dec := json.NewDecoder(bytes.NewReader(raw))
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-			writeErr(w, http.StatusBadRequest, err)
+		if err := dec.Decode(&body); err != nil {
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("body: %w", err))
+			return
+		}
+		if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+			writeErr(w, http.StatusBadRequest, errors.New("body: trailing data after the JSON document"))
 			return
 		}
 	}

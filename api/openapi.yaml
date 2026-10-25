@@ -692,10 +692,12 @@ paths:
         repositories; a shared repository is the admin's.
       responses:
         "200": { description: The ref resolved, content: { application/json: { schema: { $ref: "#/components/schemas/GitSync" } } } }
-        "403": { description: "A tenant acting on a shared repository", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: "The token is scoped to another tenant (`forbidden`), or a tenant acting on a shared repository", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "404": { $ref: "#/components/responses/Error" }
-        "422": { description: "The credential is not available", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
-        "502": { description: "The repository could not be read", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
+        "422": { description: "The credential named by the spec is not available (code `credential`, with the record)", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
+        "502": { description: "The repository could not be read (code `unreachable`, with the record)", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
+        "503": { description: "Git repositories are disabled", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/gitrepos/{name}/sync:
     parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
     post:
@@ -720,11 +722,22 @@ paths:
                 commit: { type: string, pattern: "^[0-9a-f]{40}$", description: "A commit reachable from the ref; empty for the head" }
       responses:
         "200": { description: Every bundle applied, content: { application/json: { schema: { $ref: "#/components/schemas/GitSync" } } } }
-        "403": { description: "A tenant acting on a shared repository", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "400": { description: "Malformed body: not one JSON object, an unknown field, trailing data (code `bad_request`); nothing was read from Git", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: "The token is scoped to another tenant (`forbidden`), or a tenant acting on a shared repository", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "404": { $ref: "#/components/responses/Error" }
-        "409": { description: "An apply did not finish (failed or conflict): sync the same commit again once the cause is fixed", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
-        "422": { description: "A bundle is not valid (nothing of it written), or the credential is not available, or the commit is not a SHA", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
-        "502": { description: "The repository could not be read (unreachable, credential refused, ref missing, commit not on the ref)", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
+        "409": { description: "An apply did not finish (failed or conflict; code `stopped`, with the record): sync the same commit again once the cause is fixed", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
+        "413": { description: "Body over the limit (4096 bytes; code `too_large`)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422":
+          description: "A bundle is not valid, nothing of it written (code `invalid_plan`, with the record); the credential is not available (code `credential`, with the record); or `commit` is not a 40-digit SHA (code `invalid`, no record)"
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/GitSyncError" }
+                  - { $ref: "#/components/schemas/Error" }
+        "502": { description: "The repository could not be read: unreachable, credential refused, ref missing, commit not on the ref (code `unreachable`, with the record)", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
+        "503": { description: "Git repositories are disabled", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/gitrepos/{name}/status:
     parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
     get:
@@ -732,7 +745,10 @@ paths:
       summary: The last check and the last sync of a GitRepository
       responses:
         "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/GitSync" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: "The token is scoped to another tenant (`forbidden`), or a tenant reading a shared repository's status", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "404": { description: "Unknown repository, or never checked nor synced", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: "Git repositories are disabled", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/bindings:
     get:
       tags: [tenancy]
@@ -1535,7 +1551,7 @@ components:
         error: { type: string, description: Human-readable message }
         code:
           type: string
-          enum: [bad_request, unauthorized, forbidden, not_found, conflict, too_large, quota_exceeded, upstream_failed, internal, unavailable]
+          enum: [bad_request, unauthorized, forbidden, not_found, conflict, too_large, quota_exceeded, upstream_failed, invalid, internal, unavailable]
         request_id: { type: string }
     CreateSandbox:
       type: object
@@ -1678,27 +1694,35 @@ components:
         expected_revision: { type: integer }
     GitSync:
       type: object
-      description: The last check and the last sync of a GitRepository, as the platform saw them
+      description: The last check and the last sync of a GitRepository, as the platform saw them. The two halves are written independently (a check never touches the sync half and the other way round).
       properties:
         tenant: { type: string }
         name: { type: string }
-        head: { type: string, description: "The ref's head at the last check" }
-        checked_at: { type: string, format: date-time }
-        check_error: { type: string, description: "Why the last check could not read the repository" }
-        commit: { type: string, description: "The commit of the last sync" }
-        bundles:
-          type: array
-          items:
-            type: object
-            properties:
-              path: { type: string }
-              apply: { type: string, description: "The apply that wrote (or is writing) the bundle" }
-              status: { type: string, description: "The apply's status (done, failed, conflict, running), or invalid" }
-              changes: { type: integer, description: "Creates + updates of its plan" }
-              errors: { type: array, items: { type: string } }
-        status: { type: string, enum: [done, invalid, stopped, error] }
-        error: { type: string }
-        synced_at: { type: string, format: date-time }
+        check:
+          type: object
+          description: The last check (absent until one ran)
+          properties:
+            head: { type: string, description: "The ref's head; empty when the check failed" }
+            at: { type: string, format: date-time }
+            error: { type: string, description: "Why the repository could not be read" }
+        sync:
+          type: object
+          description: The last sync attempt (absent until one ran), the failed ones included
+          properties:
+            commit: { type: string, description: "The commit synced (or attempted)" }
+            bundles:
+              type: array
+              items:
+                type: object
+                properties:
+                  path: { type: string }
+                  apply: { type: string, description: "The apply that wrote (or is writing) the bundle" }
+                  status: { type: string, description: "The apply's status (done, failed, conflict, running), or invalid" }
+                  changes: { type: integer, description: "Creates + updates of its plan" }
+                  errors: { type: array, items: { type: string } }
+            status: { type: string, enum: [done, invalid, stopped, error] }
+            error: { type: string }
+            at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
     GitSyncError:
       type: object

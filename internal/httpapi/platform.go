@@ -948,6 +948,7 @@ const (
 	CodeUpstream     = "upstream_failed"
 	CodeInternal     = "internal"
 	CodeUnavailable  = "unavailable"
+	CodeInvalid      = "invalid" // 422: the request was understood and refused by validation
 )
 
 func codeFor(status int) string {
@@ -968,6 +969,8 @@ func codeFor(status int) string {
 		return CodeQuota
 	case http.StatusBadGateway:
 		return CodeUpstream
+	case http.StatusUnprocessableEntity:
+		return CodeInvalid
 	case http.StatusServiceUnavailable:
 		return CodeUnavailable
 	}

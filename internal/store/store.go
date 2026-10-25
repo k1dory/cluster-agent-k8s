@@ -173,9 +173,13 @@ type Credentials interface {
 }
 
 // GitSyncs persists the last known state of each GitRepository (model.GitSync): one record
-// per (tenant, name), replaced whole.
+// per (tenant, name) with two halves written independently. Each Record call replaces its
+// half whole and leaves the other untouched, atomically, with no read before the write: a
+// check and a sync of the same repository may run at once, and a failed read never costs a
+// record.
 type GitSyncs interface {
-	PutGitSync(ctx context.Context, s *model.GitSync) error
+	RecordGitCheck(ctx context.Context, tenant, name string, c model.GitCheck) error
+	RecordGitSync(ctx context.Context, tenant, name string, r model.GitSyncResult) error
 	// GetGitSync returns the record; ErrNotFound when the repository was never checked or synced.
 	GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error)
 }

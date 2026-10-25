@@ -160,6 +160,9 @@ spec:
   invalid (nothing of it written), 3 an apply stopped, 1 the repository unreadable.
 - `sandboxctl gitrepo status config` (`GET /v1/gitrepos/config/status`) shows the last check
   and the last sync: the head, the commit, one line per bundle with its apply id and status.
+  The two halves are recorded independently and atomically, so a check running next to a sync
+  never erases the sync's commit and apply ids, and a failed sync attempt is recorded as such
+  without touching the last check.
 
 The platform reads Git with the git binary over HTTPS (the control plane image carries it),
 so any server git talks to works: GitHub, GitLab, Gitea, a plain `git http-backend`. The
