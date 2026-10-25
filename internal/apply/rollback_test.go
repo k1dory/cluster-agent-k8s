@@ -370,3 +370,69 @@ func TestPlanFingerprintCoversWhatReferencesResolveTo(t *testing.T) {
 		t.Fatal("the conflicting step was written")
 	}
 }
+
+// A CI trust is a grant like a binding: narrowed or deleted by hand after an apply widened
+// it, rollback leaves it as it is while the configuration next to it is restored; nor is a
+// trust rolled back on its own.
+func TestRollbackNeverRestoresACITrust(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMemory()
+	c := controller(st, "r1", pols())
+	admin := plan.Scope{Admin: true, Subject: "root"}
+	bundle := func(ref, image string) string {
+		return "kind: CITrust\ntenant: acme\nname: gh\nspec: {issuer: https://token.actions.githubusercontent.com, audience: https://sandbox.example.com, claims: {repository: acme/config, ref: " + ref + "}}\n---\nkind: EnvironmentProfile\ntenant: acme\nname: py\nspec: {image: " + image + "}\n"
+	}
+	v1, err := c.Submit(ctx, planned(t, c, bundle("refs/heads/main", "stable"), admin))
+	if err != nil || v1.Status != model.ApplyDone {
+		t.Fatalf("v1: %v %+v", err, v1)
+	}
+	// v2 widens the trust to every ref and moves the environment.
+	v2, err := c.Submit(ctx, planned(t, c, bundle("'refs/*'", "canary"), admin))
+	if err != nil || v2.Status != model.ApplyDone || len(v2.Steps) != 2 {
+		t.Fatalf("v2: %v %+v", err, v2)
+	}
+	// The trust is then revoked by hand.
+	if err := st.DeleteItem(ctx, model.KindCITrust, "acme", "gh"); err != nil {
+		t.Fatal(err)
+	}
+	rb, err := c.Rollback(ctx, RollbackRequest{Apply: v2.ID, Scope: admin})
+	if err != nil || rb.Apply.Status != model.ApplyDone || len(rb.Documents) != 1 || rb.Documents[0].Kind != model.KindEnvironment {
+		t.Fatalf("rollback: %v %+v", err, rb)
+	}
+	if len(rb.Skipped) != 1 || rb.Skipped[0].Kind != model.KindCITrust || !strings.Contains(rb.Skipped[0].Reason, "not restored") {
+		t.Fatalf("the trust must be reported as skipped: %+v", rb.Skipped)
+	}
+	if _, err := st.GetItem(ctx, model.KindCITrust, "acme", "gh", 0); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("rollback restored a revoked CI trust")
+	}
+	if py := latest(t, st, model.KindEnvironment, "acme", "py"); py.Revision != 3 || !strings.Contains(string(py.Spec), "stable") {
+		t.Fatalf("configuration not restored: %+v", py)
+	}
+	// A trust narrowed by hand (not deleted) stays narrow too: rollback of the widening apply
+	// does not bring the wide revision back.
+	v3, err := c.Submit(ctx, planned(t, c, bundle("refs/heads/main", "stable"), admin))
+	if err != nil || v3.Status != model.ApplyDone {
+		t.Fatalf("v3: %v %+v", err, v3)
+	}
+	v4, err := c.Submit(ctx, planned(t, c, bundle("'refs/*'", "canary"), admin))
+	if err != nil || v4.Status != model.ApplyDone {
+		t.Fatalf("v4: %v %+v", err, v4)
+	}
+	if _, err := c.Submit(ctx, planned(t, c, bundle("refs/heads/release", "canary"), admin)); err != nil {
+		t.Fatal(err)
+	}
+	if rb, err := c.Rollback(ctx, RollbackRequest{Apply: v4.ID, Scope: admin}); err != nil || len(rb.Documents) != 1 {
+		t.Fatalf("rollback of v4: %v %+v", err, rb)
+	}
+	if gh := latest(t, st, model.KindCITrust, "acme", "gh"); !strings.Contains(string(gh.Spec), "refs/heads/release") {
+		t.Fatalf("rollback touched the trust: %s", gh.Spec)
+	}
+	if py := latest(t, st, model.KindEnvironment, "acme", "py"); !strings.Contains(string(py.Spec), "stable") {
+		t.Fatalf("configuration next to the trust not restored: %s", py.Spec)
+	}
+	for _, rev := range []int{0, 1} {
+		if _, err := c.Rollback(ctx, RollbackRequest{Kind: model.KindCITrust, Tenant: "acme", Name: "gh", Revision: rev, Scope: admin}); !errors.Is(err, res.ErrInvalid) {
+			t.Fatalf("trust rollback to %d: %v", rev, err)
+		}
+	}
+}

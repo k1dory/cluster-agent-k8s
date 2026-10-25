@@ -1,10 +1,7 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"net/http"
 
 	"agent-sandbox/internal/ciauth"
@@ -24,8 +21,12 @@ func (p *Platform) ciAuthRoutes(mux *http.ServeMux) {
 		var body struct {
 			Token string `json:"token"`
 		}
-		if err := decodeOne(io.LimitReader(r.Body, 2*ciauth.MaxTokenBytes), &body); err != nil {
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("body: %w", err))
+		if err := decodeStrict(w, r, &body, 2*ciauth.MaxTokenBytes); err != nil {
+			writeErr(w, http.StatusBadRequest, err)
+			return
+		}
+		if body.Token == "" {
+			writeErr(w, http.StatusBadRequest, errors.New("body: token is required"))
 			return
 		}
 		g, err := p.CIAuth.Exchange(r.Context(), body.Token)
@@ -50,17 +51,4 @@ type ciGrant struct {
 	model.APIKey
 	Secret  string `json:"secret"`
 	Subject string `json:"subject"`
-}
-
-// decodeOne reads exactly one JSON object (strict fields) from r.
-func decodeOne(r io.Reader, v any) error {
-	dec := json.NewDecoder(r)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
-		return err
-	}
-	if dec.More() {
-		return errors.New("trailing data after the JSON object")
-	}
-	return nil
 }

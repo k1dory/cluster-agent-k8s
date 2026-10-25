@@ -31,6 +31,10 @@ variables:
 
 unit:
   stage: check
+  before_script:
+    # ci-unit drives hack/e2e-git-adapter.sh with a stub docker (hack/ci/contract_test.go); the
+    # script reads the workflow with python3 and PyYAML before it touches Docker.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends python3 python3-yaml >/dev/null
   script:
     - make ci-build
     - make ci-vet

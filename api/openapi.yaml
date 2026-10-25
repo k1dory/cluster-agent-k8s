@@ -694,13 +694,13 @@ paths:
   /v1/citrusts:
     get:
       tags: [ci]
-      summary: List GitRepositories visible in the scope (own + shared)
+      summary: List the tenant's CITrusts (the admin with ?tenant=)
       description: |
-        A CITrust is a repository of bundles the platform reads itself: registering one
-        replaces installing a workflow in that repository. The platform checks the ref and syncs a
-        commit on request, through the same plan and apply the workflow would run (one apply per
-        bundle file, under a key of repository, commit and path). The credential that opens the
-        repository is a reference (`spec.credential`), never stored here.
+        A CITrust lets CI jobs of one repository act as the tenant without a stored key: the
+        issuer (the provider's token service), the audience the job requests its token for (the
+        platform's URL), the claims the token must carry (the repository, the ref) and the ttl of
+        the key an exchange issues. `POST /v1/auth/ci` exchanges a job's OIDC ID token for a key
+        under the trust that accepts it. A trust is a grant: rollback never restores one.
       parameters: [{ $ref: "#/components/parameters/scope" }]
       responses:
         "200": { description: Latest revisions, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
@@ -733,10 +733,10 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { description: "Wrote into another scope", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "409": { description: "expected_revision is not the latest", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "422": { description: "Invalid document: a URL with user information or a scheme other than https, a ref that is a SHA, a path that leaves the repository, a credential the tenant cannot resolve (the value is never echoed)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Invalid document: an issuer that is not an https URL, no audience, no claim, a reserved claim (iss, aud, exp, nbf, iat, jti), a ttl under a minute or over the platform's cap, or the shared scope", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
     delete:
       tags: [ci]
-      summary: Delete a CITrust (history kept; its applies and their revisions stay)
+      summary: Delete a CITrust (history kept; keys it issued expire on their own)
       responses:
         "204": { description: Deleted }
         "401": { $ref: "#/components/responses/Unauthorized" }

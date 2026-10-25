@@ -17,7 +17,6 @@ import (
 	"sync"
 	"time"
 
-	gooidc "github.com/coreos/go-oidc/v3/oidc"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 
@@ -32,7 +31,8 @@ var (
 	// ErrRefused: the token is not one a trust accepts (401). The reason is logged, not told:
 	// the caller learns nothing about which trusts exist.
 	ErrRefused = errors.New("the token is not accepted by any CI trust")
-	// ErrIssuer: the issuer could not be reached for its keys (503).
+	// ErrIssuer: the issuer's discovery document or keys could not be fetched, or are not the
+	// issuer's (503: the platform cannot tell whether the token is good).
 	ErrIssuer = errors.New("the issuer's keys are not available")
 	// ErrDisabled: no key service to issue from (503).
 	ErrDisabled = errors.New("CI authentication is disabled")
@@ -55,13 +55,13 @@ type Service struct {
 	Uses   store.TokenUses
 	// MaxTTL caps a trust's ttl (0: one hour); the trust service validates against the same.
 	MaxTTL time.Duration
-	// Client fetches discovery and keys (nil: http.DefaultClient).
+	// Client fetches discovery documents and keys (nil: a client with a 10s timeout).
 	Client *http.Client
 	Now    func() time.Time
 	Log    *slog.Logger
 
-	mu        sync.Mutex
-	providers map[string]*gooidc.Provider
+	mu      sync.Mutex // guards the map only; each issuer has its own lock
+	issuers map[string]*issuerKeys
 }
 
 func (s *Service) now() time.Time {
@@ -74,7 +74,14 @@ func (s *Service) now() time.Time {
 // MaxTokenBytes bounds the ID token a job may present.
 const MaxTokenBytes = 16 * 1024
 
-// Exchange verifies raw and issues a key under the matching trust.
+// signatureAlgorithms a token may carry: asymmetric only (a shared secret would make the
+// platform able to mint the provider's tokens).
+var signatureAlgorithms = []jose.SignatureAlgorithm{jose.RS256, jose.RS384, jose.RS512, jose.ES256, jose.ES384, jose.ES512, jose.PS256, jose.PS384, jose.PS512, jose.EdDSA}
+
+// Exchange verifies raw and issues a key under the matching trust. The token is counted as
+// used only once its key is stored: a key the store could not write leaves the token for the
+// job's retry, and a key stored for a token that turns out used already is removed before
+// anything learns its secret.
 func (s *Service) Exchange(ctx context.Context, raw string) (*Grant, error) {
 	if s.Keys == nil || s.Uses == nil || s.Trusts == nil {
 		return nil, ErrDisabled
@@ -83,41 +90,62 @@ func (s *Service) Exchange(ctx context.Context, raw string) (*Grant, error) {
 		return nil, fmt.Errorf("%w: a token is 1 to %d bytes", ErrRefused, MaxTokenBytes)
 	}
 	// The issuer, read before anything is trusted, selects the trusts and the keys.
-	parsed, err := jwt.ParseSigned(raw, []jose.SignatureAlgorithm{jose.RS256, jose.RS384, jose.RS512, jose.ES256, jose.ES384, jose.ES512, jose.PS256, jose.PS384, jose.PS512, jose.EdDSA})
-	if err != nil {
-		return nil, s.refuse("not a signed JWT", err)
+	parsed, err := jwt.ParseSigned(raw, signatureAlgorithms)
+	if err != nil || len(parsed.Headers) != 1 {
+		return nil, s.refuse("not a JWT with one signature", err)
 	}
 	var unverified jwt.Claims
 	if err := parsed.UnsafeClaimsWithoutVerification(&unverified); err != nil || unverified.Issuer == "" {
 		return nil, s.refuse("no issuer claim", err)
 	}
-	trusts, err := s.trustsOf(ctx, unverified.Issuer)
+	issuer := unverified.Issuer
+	trusts, err := s.trustsOf(ctx, issuer)
 	if err != nil {
 		return nil, err
 	}
 	if len(trusts) == 0 {
-		return nil, s.refuse("no CITrust names issuer "+unverified.Issuer, nil)
+		return nil, s.refuse("no CITrust names issuer "+issuer, nil)
 	}
-	provider, err := s.provider(ctx, unverified.Issuer)
+	// The issuer's keys: unavailable keys are the issuer's problem, not the token's.
+	kid := parsed.Headers[0].KeyID
+	keys, err := s.keysFor(ctx, issuer, kid)
 	if err != nil {
+		if s.Log != nil {
+			s.Log.Warn("ci auth: issuer unavailable", "issuer", issuer, "err", err)
+		}
 		return nil, fmt.Errorf("%w: %v", ErrIssuer, err)
 	}
-	// Signature, issuer and expiry are the verifier's; the audience is each trust's own.
-	tok, err := provider.Verifier(&gooidc.Config{SkipClientIDCheck: true}).Verify(ctx, raw)
-	if err != nil {
-		return nil, s.refuse("verification failed", err)
+	if len(keys) == 0 {
+		return nil, s.refuse(fmt.Sprintf("issuer %s has no signing key %q", issuer, kid), nil)
 	}
-	var claims map[string]any
-	if err := tok.Claims(&claims); err != nil {
-		return nil, s.refuse("claims unreadable", err)
+	var (
+		std    jwt.Claims
+		claims map[string]any
+	)
+	verified := false
+	for i := range keys {
+		if err = parsed.Claims(&keys[i], &std, &claims); err == nil {
+			verified = true
+			break
+		}
 	}
-	jti, _ := claims["jti"].(string)
+	if !verified {
+		return nil, s.refuse("signature not verified by the issuer's keys", err)
+	}
+	// Issuer, expiry and not-before are the token's own; the audience is each trust's.
+	if std.Expiry == nil {
+		return nil, s.refuse("no exp claim", nil)
+	}
+	if err := std.Validate(jwt.Expected{Issuer: issuer, Time: s.now()}); err != nil {
+		return nil, s.refuse("claims not valid", err)
+	}
+	jti := std.ID
 	if jti == "" {
 		return nil, s.refuse("no jti claim: the token could not be used once", nil)
 	}
 	var matched []trust
 	for _, t := range trusts {
-		if !contains(tok.Audience, t.spec.Audience) {
+		if !contains(std.Audience, t.spec.Audience) {
 			continue
 		}
 		if ok, _ := citrust.Matches(t.spec, claims); ok {
@@ -125,7 +153,7 @@ func (s *Service) Exchange(ctx context.Context, raw string) (*Grant, error) {
 		}
 	}
 	if len(matched) == 0 {
-		return nil, s.refuse(fmt.Sprintf("no trust of issuer %s matches the token's audience and claims", unverified.Issuer), nil)
+		return nil, s.refuse(fmt.Sprintf("no trust of issuer %s matches the token's audience and claims", issuer), nil)
 	}
 	for _, t := range matched[1:] {
 		if t.item.Tenant != matched[0].item.Tenant {
@@ -137,21 +165,21 @@ func (s *Service) Exchange(ctx context.Context, raw string) (*Grant, error) {
 	if err != nil {
 		return nil, s.refuse("the trust's ttl is not valid", err)
 	}
-	// Once: a token presented twice (replayed, or leaked from the job's log) opens nothing.
-	exp := tok.Expiry
-	if exp.IsZero() {
-		exp = s.now().Add(time.Hour)
+	// The key first, then the token's one use: a key the store refused leaves the token
+	// unused for the job's retry. Once: a token presented twice (replayed, or leaked from the
+	// job's log) opens nothing, and the key stored for the second presentation is removed
+	// before its secret leaves this call.
+	key, secret, err := s.Keys.CreateTrusted(ctx, chosen.item.Tenant, keyName(chosen.item.Name), ttl, "ci:"+std.Subject, chosen.item.Name)
+	if err != nil {
+		return nil, err
 	}
-	if err := s.Uses.UseToken(ctx, unverified.Issuer+"#"+jti, exp); err != nil {
+	if err := s.Uses.UseToken(ctx, issuer+"#"+jti, std.Expiry.Time()); err != nil {
+		if derr := s.Keys.Store.DeleteAPIKey(ctx, key.ID); derr != nil && s.Log != nil {
+			s.Log.Warn("ci auth: key of a refused exchange not removed", "key", key.ID, "err", derr)
+		}
 		if errors.Is(err, store.ErrConflict) {
 			return nil, s.refuse("the token was exchanged already", nil)
 		}
-		return nil, err
-	}
-	name := "ci." + chosen.item.Name // a key name: the trust it came from
-	by := "ci:" + tok.Subject
-	key, secret, err := s.Keys.CreateTrusted(ctx, chosen.item.Tenant, name, ttl, by, chosen.item.Name)
-	if err != nil {
 		return nil, err
 	}
 	if n, perr := s.Keys.Store.PruneTrustedAPIKeys(ctx, s.now().Add(-24*time.Hour)); perr != nil && s.Log != nil {
@@ -160,9 +188,19 @@ func (s *Service) Exchange(ctx context.Context, raw string) (*Grant, error) {
 		s.Log.Info("ci auth: pruned expired keys", "n", n)
 	}
 	if s.Log != nil {
-		s.Log.Info("ci auth: key issued", "tenant", chosen.item.Tenant, "trust", chosen.item.Name, "subject", tok.Subject, "key", key.ID, "expires", key.ExpiresAt)
+		s.Log.Info("ci auth: key issued", "tenant", chosen.item.Tenant, "trust", chosen.item.Name, "subject", std.Subject, "key", key.ID, "expires", key.ExpiresAt)
 	}
-	return &Grant{Key: key, Secret: secret, Trust: chosen.item.Name, Tenant: chosen.item.Tenant, Subject: tok.Subject}, nil
+	return &Grant{Key: key, Secret: secret, Trust: chosen.item.Name, Tenant: chosen.item.Tenant, Subject: std.Subject}, nil
+}
+
+// keyName labels a key with the trust it came from, within a key name's length; the key's
+// trust field carries the whole name.
+func keyName(trust string) string {
+	n := "ci." + trust
+	if len(n) > apikeys.MaxNameLen {
+		n = n[:apikeys.MaxNameLen]
+	}
+	return n
 }
 
 type trust struct {
@@ -194,28 +232,6 @@ func (s *Service) trustsOf(ctx context.Context, issuer string) ([]trust, error) 
 		return out[i].item.Name < out[j].item.Name
 	})
 	return out, nil
-}
-
-// provider is the issuer's discovery and keys, fetched once and kept (go-oidc refreshes the
-// keys on an unknown key id).
-func (s *Service) provider(ctx context.Context, issuer string) (*gooidc.Provider, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if p, ok := s.providers[issuer]; ok {
-		return p, nil
-	}
-	if s.Client != nil {
-		ctx = gooidc.ClientContext(ctx, s.Client)
-	}
-	p, err := gooidc.NewProvider(ctx, issuer)
-	if err != nil {
-		return nil, err
-	}
-	if s.providers == nil {
-		s.providers = map[string]*gooidc.Provider{}
-	}
-	s.providers[issuer] = p
-	return p, nil
 }
 
 func (s *Service) refuse(reason string, cause error) error {
