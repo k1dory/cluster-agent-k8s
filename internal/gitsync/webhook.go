@@ -418,15 +418,22 @@ func (s *Service) RunOnce(ctx context.Context) (bool, error) {
 const MaxAttempts = 5
 
 // finishTimeout bounds the writes that end a job (its outcome, the hook record): they get a
-// context of their own, so a job whose lease ran out still ends.
+// context of their own, made when the work is over, so a job whose lease ran out, or whose
+// work took longer than this, still ends.
 const finishTimeout = 30 * time.Second
+
+// finishContext is the context for the writes that end a job: bounded, and independent of
+// the work's, which may have ended.
+func (s *Service) finishContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), finishTimeout)
+}
 
 func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 	work, cancel := context.WithTimeout(ctx, s.lease())
 	defer cancel()
-	fin, cancelFin := context.WithTimeout(context.WithoutCancel(ctx), finishTimeout)
-	defer cancelFin()
 	fail := func(msg string) {
+		fin, cancel := s.finishContext(ctx)
+		defer cancel()
 		if err := s.jobs().FinishGitJob(fin, job.ID, s.owner(), job.Attempts, model.GitJobFailed, model.GitSyncError, msg); err != nil && s.Log != nil {
 			s.Log.Warn("git job: finish", "job", job.ID, "err", err)
 		}
@@ -436,7 +443,7 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 		fail("payload: " + err.Error())
 		return
 	}
-	it, err := s.Repos.Store.GetItem(fin, model.KindGitRepository, job.Tenant, job.Name, 0)
+	it, err := s.Repos.Store.GetItem(work, model.KindGitRepository, job.Tenant, job.Name, 0)
 	if err != nil {
 		fail("repository: " + err.Error())
 		return
@@ -457,7 +464,7 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 		// Claimed once more after its last attempt died unfinished: nothing runs again.
 		done.Outcome = model.GitSyncError
 		done.Error = fmt.Sprintf("gave up after %d attempts; the last one did not finish", MaxAttempts)
-		s.conclude(fin, it, job, &done, model.GitJobFailed, time.Time{})
+		s.conclude(ctx, it, job, &done, model.GitJobFailed, time.Time{})
 		return
 	}
 	var outcome string
@@ -474,6 +481,11 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 	if runErr != nil {
 		done.Error = runErr.Error()
 	}
+	// Unfinished work is retried: an error (the repository or the provider unreachable, a
+	// credential not available) and a stopped apply (the store went away mid-way, a conflict)
+	// alike, the latter continuing the same applies under the same keys. An invalid bundle is
+	// an outcome, not unfinished work.
+	unfinished := runErr != nil && (outcome == model.GitSyncError || outcome == model.GitSyncStopped)
 	switch {
 	case work.Err() != nil && runErr != nil && job.Attempts < MaxAttempts:
 		// Cut short (the lease ran out, the process is stopping): the job stays running under
@@ -481,55 +493,48 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 		return
 	case work.Err() != nil && runErr != nil:
 		done.Error = fmt.Sprintf("attempt %d of %d did not finish within its lease: %v", job.Attempts, MaxAttempts, runErr)
-		s.conclude(fin, it, job, &done, model.GitJobFailed, time.Time{})
-	case outcome == model.GitSyncError && runErr != nil && job.Attempts < MaxAttempts:
-		// An error (not an invalid bundle): the repository or the provider may be back later.
+		s.conclude(ctx, it, job, &done, model.GitJobFailed, time.Time{})
+	case unfinished && job.Attempts < MaxAttempts:
 		at := s.now().Add(s.backoff(job.Attempts))
-		done.Reason = fmt.Sprintf("attempt %d of %d failed; the job runs again at %s", job.Attempts, MaxAttempts, at.UTC().Format(time.RFC3339))
-		s.conclude(fin, it, job, &done, model.GitJobPending, at)
-	case outcome == model.GitSyncError && runErr != nil:
+		done.Reason = fmt.Sprintf("attempt %d of %d ended with %s; the job runs again at %s", job.Attempts, MaxAttempts, outcome, at.UTC().Format(time.RFC3339))
+		s.conclude(ctx, it, job, &done, model.GitJobPending, at)
+	case unfinished:
 		done.Error = fmt.Sprintf("gave up after %d attempts: %v", MaxAttempts, runErr)
-		s.conclude(fin, it, job, &done, model.GitJobFailed, time.Time{})
+		s.conclude(ctx, it, job, &done, model.GitJobFailed, time.Time{})
 	default:
-		s.conclude(fin, it, job, &done, model.GitJobDone, time.Time{})
+		s.conclude(ctx, it, job, &done, model.GitJobDone, time.Time{})
 	}
 }
 
-// conclude records how an attempt went in the hook half of the record and moves the job on:
-// done or failed, or pending again at retryAt. The record is written first, so a replica dying
-// in between leaves a job that runs again (the work is idempotent), never a finished job whose
-// outcome nobody sees; and an older job never writes its summary over a newer job's.
+// conclude moves the job on (done or failed, or pending again at retryAt) and records how the
+// attempt went in the hook half of the record, under a context of its own. The job first: it
+// checks owner and attempt, so a late attempt another replica took over writes nothing, not
+// even the record. The record then, only while it still carries this job: a delivery accepted
+// meanwhile keeps its summary (the condition is the store's, in one statement), and a job
+// that ended without reaching the record still shows its outcome (Status completes the hook
+// from the job).
 func (s *Service) conclude(ctx context.Context, it *model.CatalogItem, job *model.GitJob, done *model.GitHook, status string, retryAt time.Time) {
-	if g, err := s.Store.GetGitSync(ctx, it.Tenant, it.Name); err == nil && g.Hook != nil && g.Hook.Job != "" && g.Hook.Job != job.ID && s.keeps(ctx, g.Hook, job) {
-		s.emit(ctx, it, "git.hook", done)
-		s.move(ctx, job, status, done, retryAt)
-		return
+	fin, cancel := s.finishContext(ctx)
+	defer cancel()
+	if err := s.move(fin, job, status, done, retryAt); err != nil {
+		if s.Log != nil {
+			s.Log.Warn("git job: finish", "job", job.ID, "status", status, "err", err)
+		}
+		if errors.Is(err, store.ErrConflict) {
+			return // the holder's outcome counts
+		}
 	}
-	if err := s.Store.RecordGitHook(ctx, it.Tenant, it.Name, *done); err != nil && s.Log != nil {
+	if _, err := s.Store.RecordGitHookIf(fin, it.Tenant, it.Name, *done, job.ID); err != nil && s.Log != nil {
 		s.Log.Error("git hook: record outcome", "tenant", it.Tenant, "repository", it.Name, "err", err)
 	}
-	s.emit(ctx, it, "git.hook", done)
-	s.move(ctx, job, status, done, retryAt)
+	s.emit(fin, it, "git.hook", done)
 }
 
-// keeps says whether the record's hook (another job's) stays over this job's outcome: the
-// record follows the delivery accepted last, so a job accepted earlier, however late it ran,
-// never writes its summary over a later delivery's (its outcome is in the job and the event).
-func (s *Service) keeps(ctx context.Context, cur *model.GitHook, job *model.GitJob) bool {
-	other, err := s.jobs().GetGitJob(ctx, cur.Job)
-	return err == nil && other.CreatedAt.After(job.CreatedAt)
-}
-
-func (s *Service) move(ctx context.Context, job *model.GitJob, status string, done *model.GitHook, retryAt time.Time) {
-	var err error
+func (s *Service) move(ctx context.Context, job *model.GitJob, status string, done *model.GitHook, retryAt time.Time) error {
 	if status == model.GitJobPending {
-		err = s.jobs().RetryGitJob(ctx, job.ID, s.owner(), job.Attempts, retryAt, done.Error)
-	} else {
-		err = s.jobs().FinishGitJob(ctx, job.ID, s.owner(), job.Attempts, status, done.Outcome, done.Error)
+		return s.jobs().RetryGitJob(ctx, job.ID, s.owner(), job.Attempts, retryAt, done.Error)
 	}
-	if err != nil && s.Log != nil {
-		s.Log.Warn("git job: finish", "job", job.ID, "status", status, "err", err)
-	}
+	return s.jobs().FinishGitJob(ctx, job.ID, s.owner(), job.Attempts, status, done.Outcome, done.Error)
 }
 
 // backoff is the wait before the attempt after the given one.

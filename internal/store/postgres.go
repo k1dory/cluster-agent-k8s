@@ -1204,6 +1204,22 @@ func (p *Postgres) RecordGitHook(ctx context.Context, tenant, name string, h mod
 	return p.recordGitHalf(ctx, tenant, name, "hook", h)
 }
 
+// RecordGitHookIf: the condition is in the statement, so an acceptance written between a
+// read and this write is never overwritten.
+func (p *Postgres) RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string) (bool, error) {
+	doc, err := json.Marshal(h)
+	if err != nil {
+		return false, err
+	}
+	tag, err := p.pool.Exec(ctx, `INSERT INTO git_syncs (tenant, name, doc, updated_at) VALUES ($1,$2,jsonb_build_object('hook', $3::jsonb),now())
+		ON CONFLICT (tenant, name) DO UPDATE SET doc = git_syncs.doc || jsonb_build_object('hook', $3::jsonb), updated_at = now()
+		WHERE git_syncs.doc->'hook' IS NULL OR git_syncs.doc->'hook'->>'job' = $4`, tenant, name, doc, job)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 func (p *Postgres) GetGitSync(ctx context.Context, tenant, name string) (*model.GitSync, error) {
 	var doc []byte
 	g := &model.GitSync{Tenant: tenant, Name: name}

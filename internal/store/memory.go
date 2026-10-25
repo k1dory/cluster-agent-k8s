@@ -1112,6 +1112,17 @@ func (m *Memory) RecordGitHook(_ context.Context, tenant, name string, h model.G
 	return nil
 }
 
+func (m *Memory) RecordGitHookIf(_ context.Context, tenant, name string, h model.GitHook, job string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	g := m.gitSync(tenant, name)
+	if g.Hook != nil && g.Hook.Job != job {
+		return false, nil
+	}
+	g.Hook = &h
+	return true, nil
+}
+
 func (m *Memory) GetGitSync(_ context.Context, tenant, name string) (*model.GitSync, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

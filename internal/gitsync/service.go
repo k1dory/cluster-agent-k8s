@@ -285,6 +285,13 @@ func (s *Service) sync(ctx context.Context, it *model.CatalogItem, sp gitrepo.Sp
 		return finish(model.GitSyncInvalid, fmt.Errorf("%w: %s: %v", ErrInvalid, path, perr))
 	}
 	gen := generationOf(commit)
+	// The transition is fixed before the first write: the commit and its generation are the
+	// identity of the applies (their keys), so a sync that dies, or whose summary below is
+	// lost, is continued under the same generation by the next sync of the commit, and a later
+	// return to the commit gets a generation of its own; the summary is never the only carrier.
+	if err := s.Store.RecordGitSync(ctx, it.Tenant, it.Name, model.GitSyncResult{Commit: commit, Generation: gen, Status: model.GitSyncRunning, At: now}); err != nil {
+		return nil, err
+	}
 	for _, bf := range bundles {
 		p, docs := bf.Path, bf.Docs
 		b := model.GitSyncBundle{Path: p}

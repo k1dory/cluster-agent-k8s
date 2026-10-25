@@ -780,9 +780,9 @@ paths:
         half of the status. A job acts on what the repository holds now: a push syncs the ref's
         current head and a pull request plan is published for the request's current head only, so a
         delivery handled late cannot roll a newer state back or land an older plan over a newer one
-        (`superseded`). A job that ends with an error (not an invalid bundle) runs again after 30s,
-        1m, 2m and 4m, five attempts in all, then fails; one that runs out of its lease is taken
-        over, up to the same five attempts. A redelivery of a delivery whose job ran reports its
+        (`superseded`). A job whose work is unfinished (an error, or a stopped apply, which is then
+        continued; not an invalid bundle) runs again after 30s, 1m, 2m and 4m, five attempts in all,
+        then fails; one that runs out of its lease is taken over, up to the same five attempts. A redelivery of a delivery whose job ran reports its
         outcome and changes nothing; of one whose job failed or waits for its next attempt, runs it
         again now; of one due or running, names it.
       security: []
@@ -1775,7 +1775,7 @@ components:
                   status: { type: string, description: "The apply's status (done, failed, conflict, running), or invalid" }
                   changes: { type: integer, description: "Creates + updates of its plan" }
                   errors: { type: array, items: { type: string } }
-            status: { type: string, enum: [done, invalid, stopped, error] }
+            status: { type: string, enum: [running, done, invalid, stopped, error], description: "running: the transition (commit, generation) is fixed and the bundles are being applied, or that sync died before its summary" }
             error: { type: string }
             at: { type: string, format: date-time }
         hook: { $ref: "#/components/schemas/GitHook" }

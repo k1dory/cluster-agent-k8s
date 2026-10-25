@@ -227,6 +227,7 @@ type GitSyncResult struct {
 
 // GitSync statuses.
 const (
+	GitSyncRunning = "running" // the transition is fixed (commit and generation) and the bundles are being applied
 	GitSyncDone    = "done"    // every bundle applied
 	GitSyncInvalid = "invalid" // a bundle's plan was refused; nothing of it was written
 	GitSyncStopped = "stopped" // an apply did not finish (failed or conflict): continue by syncing the same commit again

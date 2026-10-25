@@ -163,7 +163,9 @@ spec:
   Going back to a commit synced earlier (a force push A → B → A, a revert) is a new transition
   of the desired state, counted by the record's `generation`: it gets applies of its own and
   writes A again, with a new revision; only a repeat of the *same* transition (the same commit
-  as the last sync) is a no-op. Exit codes as for `apply`: 0 done, 2 a bundle invalid (nothing
+  as the last sync) is a no-op. The transition (commit and generation) is recorded as `running`
+  before the first write, so a sync that dies or whose summary is lost is continued, never
+  mistaken for an earlier transition to the same commit. Exit codes as for `apply`: 0 done, 2 a bundle invalid (nothing
   of it written), 3 an apply stopped, 1 the repository unreadable.
 - `sandboxctl gitrepo status config` (`GET /v1/gitrepos/config/status`) shows the last check
   and the last sync: the head, the commit, one line per bundle with its apply id and status.
@@ -213,10 +215,12 @@ whose commit the ref or the request has moved past is recorded as `superseded` a
 nothing, so an older state is never written over a newer one and an older plan never lands over
 a newer comment, whichever replica ran which job first.
 
-A job that ends with an error (the repository or the provider's API unreachable, a credential
-not available) is not over: it runs again after 30 seconds, then 1, 2 and 4 minutes, five
-attempts in all, and then gives up (`failed`); the record says which attempt failed and when
-the next one runs. An invalid bundle is an outcome, not an error, and is not retried. A job
+A job whose work is unfinished is not over: an error (the repository or the provider's API
+unreachable, a credential not available) and a stopped apply (the store went away mid-way, a
+conflict) alike, it runs again after 30 seconds, then 1, 2 and 4 minutes, five attempts in all,
+and then gives up (`failed`); a stopped apply is continued, under the same keys, not started
+over. The record says which attempt ended how and when the next one runs. An invalid bundle is
+an outcome, not unfinished work, and is not retried. A job
 that runs out of its lease (ten minutes) is taken over by the next replica to see it, up to the
 same five attempts; the fifth records its failure even though its own time is up. A redelivery
 (the provider's "redeliver", the same delivery id) of a delivery whose job ran reports how it
