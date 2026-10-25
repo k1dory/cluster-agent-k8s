@@ -178,12 +178,18 @@ func (s *Service) Sync(ctx context.Context, scope plan.Scope, name, commit strin
 	return g, err
 }
 
-// locked runs fn under the tenant's cross-replica lock when one is wired.
+// locked runs fn under the tenant's cross-replica lock: Lock when wired, else the status
+// store's own tenant lock when it has one (every store does), else fn alone.
 func (s *Service) locked(ctx context.Context, tenant string, fn func(ctx context.Context) error) error {
-	if s.Lock == nil {
-		return fn(ctx)
+	if s.Lock != nil {
+		return s.Lock(ctx, tenant, fn)
 	}
-	return s.Lock(ctx, tenant, fn)
+	if l, ok := s.Store.(interface {
+		WithTenantLock(ctx context.Context, tenant string, fn func(ctx context.Context) error) error
+	}); ok {
+		return l.WithTenantLock(ctx, tenant, fn)
+	}
+	return fn(ctx)
 }
 
 func (s *Service) sync(ctx context.Context, it *model.CatalogItem, sp gitrepo.Spec, scope plan.Scope, commit string) (*model.GitSync, error) {

@@ -304,11 +304,15 @@ func (s *Service) Hook(ctx context.Context, tenant, name string, hdr http.Header
 		key = fmt.Sprintf("%s:%s:%s:%d:%s", d.Provider, d.Event, h.Commit, h.Number, h.At.UTC().Format(time.RFC3339Nano))
 	}
 	job := &model.GitJob{ID: newJobID(), Tenant: it.Tenant, Name: it.Name, Action: h.Action, Delivery: key, Payload: payload}
-	if err := s.Jobs.EnqueueGitJob(ctx, job); err != nil {
+	jobs := s.jobs()
+	if jobs == nil {
+		return nil, errors.New("webhooks need a job store")
+	}
+	if err := jobs.EnqueueGitJob(ctx, job); err != nil {
 		if !errors.Is(err, store.ErrConflict) {
 			return nil, err
 		}
-		existing, gerr := s.Jobs.GetGitJobByDelivery(ctx, it.Tenant, it.Name, key)
+		existing, gerr := jobs.GetGitJobByDelivery(ctx, it.Tenant, it.Name, key)
 		if gerr != nil {
 			return nil, err
 		}
@@ -336,7 +340,7 @@ func (s *Service) Hook(ctx context.Context, tenant, name string, hdr http.Header
 // Run claims and runs webhook jobs until ctx ends: the worker every replica runs. A job whose
 // replica died is picked up once its lease lapsed.
 func (s *Service) Run(ctx context.Context) {
-	if s.Jobs == nil {
+	if s.jobs() == nil {
 		return
 	}
 	for {
@@ -357,7 +361,7 @@ func (s *Service) Run(ctx context.Context) {
 
 // RunOnce claims one waiting job and runs it to its outcome; false when none was waiting.
 func (s *Service) RunOnce(ctx context.Context) (bool, error) {
-	job, err := s.Jobs.ClaimGitJob(ctx, s.owner(), s.now(), s.lease())
+	job, err := s.jobs().ClaimGitJob(ctx, s.owner(), s.now(), s.lease())
 	if errors.Is(err, store.ErrNotFound) {
 		return false, nil
 	}
@@ -376,17 +380,17 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 	defer cancel()
 	var d Delivery
 	if err := json.Unmarshal(job.Payload, &d); err != nil {
-		_ = s.Jobs.FinishGitJob(ctx, job.ID, s.owner(), model.GitJobFailed, model.GitSyncError, "payload: "+err.Error())
+		_ = s.jobs().FinishGitJob(ctx, job.ID, s.owner(), model.GitJobFailed, model.GitSyncError, "payload: "+err.Error())
 		return
 	}
 	it, err := s.Repos.Store.GetItem(ctx, model.KindGitRepository, job.Tenant, job.Name, 0)
 	if err != nil {
-		_ = s.Jobs.FinishGitJob(ctx, job.ID, s.owner(), model.GitJobFailed, model.GitSyncError, "repository: "+err.Error())
+		_ = s.jobs().FinishGitJob(ctx, job.ID, s.owner(), model.GitJobFailed, model.GitSyncError, "repository: "+err.Error())
 		return
 	}
 	sp, err := gitrepo.Decode(it)
 	if err != nil {
-		_ = s.Jobs.FinishGitJob(ctx, job.ID, s.owner(), model.GitJobFailed, model.GitSyncError, "spec: "+err.Error())
+		_ = s.jobs().FinishGitJob(ctx, job.ID, s.owner(), model.GitJobFailed, model.GitSyncError, "spec: "+err.Error())
 		return
 	}
 	// The documents are applied with the repository's authority: the tenant's for a tenant's
@@ -419,7 +423,7 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 	if outcome == model.GitSyncError && runErr != nil {
 		status = model.GitJobFailed
 	}
-	if err := s.Jobs.FinishGitJob(ctx, job.ID, s.owner(), status, outcome, done.Error); err != nil {
+	if err := s.jobs().FinishGitJob(ctx, job.ID, s.owner(), status, outcome, done.Error); err != nil {
 		if s.Log != nil {
 			s.Log.Warn("git job: finish", "job", job.ID, "err", err)
 		}
@@ -469,6 +473,16 @@ func (s *Service) syncHead(ctx context.Context, it *model.CatalogItem, sp gitrep
 		return serr
 	})
 	return outcome, commit, note, err
+}
+
+// jobs is the job store: Jobs when wired, else the status store when it keeps jobs too (every
+// store does; a Service built from a store alone works).
+func (s *Service) jobs() store.GitJobs {
+	if s.Jobs != nil {
+		return s.Jobs
+	}
+	j, _ := s.Store.(store.GitJobs)
+	return j
 }
 
 func (s *Service) owner() string {
