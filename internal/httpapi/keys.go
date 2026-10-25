@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -155,17 +156,26 @@ type issued struct {
 	Replaces string `json:"replaces,omitempty"`
 }
 
-// decodeStrict reads exactly one JSON document of at most limit bytes into v: unknown fields,
-// a second document or trailing garbage after the first are errors, so nothing is written on
-// a body that was not what the client meant to send.
+// decodeStrict reads exactly one JSON object of at most limit bytes into v: a body that is
+// not an object (null, a string, an array), unknown fields, a second document or trailing
+// garbage after the object are errors, so nothing is written on a body that was not what the
+// client meant to send. The stream is read to its end before the object is decoded.
 func decodeStrict(w http.ResponseWriter, r *http.Request, v any, limit int64) error {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil {
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
 		return fmt.Errorf("body: %w", err)
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return errors.New("body: trailing data after the JSON document")
+		return errors.New("body: trailing data after the JSON object")
+	}
+	if b := bytes.TrimSpace(raw); len(b) == 0 || b[0] != '{' {
+		return errors.New("body: one JSON object is expected")
+	}
+	obj := json.NewDecoder(bytes.NewReader(raw))
+	obj.DisallowUnknownFields()
+	if err := obj.Decode(v); err != nil {
+		return fmt.Errorf("body: %w", err)
 	}
 	return nil
 }

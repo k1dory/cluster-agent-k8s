@@ -73,7 +73,7 @@ the subset a developer runs before pushing and says so in its last line.
 |---|---|---|
 | `ci-build` | `go build ./...`; the version copies a provider file must carry match `hack/ci/versions.env` and `go.mod` | Go (`go.mod`'s version) |
 | `ci-vet` | `go vet`; `gofmt` over the module's Go files as `go list` names them (a module cache inside the tree is not formatted), with gofmt's own failure a failure | Go |
-| `ci-unit` | every test under the race detector, in-memory store | Go |
+| `ci-unit` | every test under the race detector, in-memory store | Go, python3 with PyYAML (the tests of the e2e script run its preflight, which reads the workflow) |
 | `ci-policy` | policies validate, expectations pass, the rendered gateway configuration passes `caddy validate` | Go; `CADDY_BIN`, else the newest supported Caddy is downloaded |
 | `ci-postgres` | store, Git job and record contracts, the database-taking tests of `internal/gitsync` | `SANDBOX_TEST_POSTGRES_URL` (required; the provider maps its service to it) |
 | `ci-caddy` | the gateway end to end on a real Caddy and `caddy validate`, per supported version | `CADDY_VERSION=x.y.z` for one version (a provider's matrix), `CADDY_BIN` for a binary of yours, else every version in `versions.env` is downloaded |

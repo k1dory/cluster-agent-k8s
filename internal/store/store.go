@@ -154,6 +154,9 @@ type APIKeys interface {
 	// expiring at `at`+grace (sooner if it already expires sooner). A revocation already
 	// recorded stands. ErrNotFound for an unknown key.
 	RetireAPIKey(ctx context.Context, id, rotatedTo string, at time.Time, grace time.Duration) error
+	// DeleteAPIKey removes a key outright: one issued for a CI token that turned out used
+	// already, withdrawn before its secret left the process. ErrNotFound for an unknown key.
+	DeleteAPIKey(ctx context.Context, id string) error
 	// PruneTrustedAPIKeys deletes the keys a CITrust issued (Trust set) that expired before
 	// the given time: a CI job's key is of no interest once long gone. Returns how many.
 	PruneTrustedAPIKeys(ctx context.Context, expiredBefore time.Time) (int, error)

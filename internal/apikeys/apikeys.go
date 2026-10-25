@@ -32,6 +32,9 @@ var (
 	ErrForbidden = errors.New("forbidden")
 )
 
+// MaxNameLen bounds a key's name.
+const MaxNameLen = 64
+
 var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$`)
 
 // MaxTTL caps a key's lifetime when the caller names one longer; 0 = no cap.

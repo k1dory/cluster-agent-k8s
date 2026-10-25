@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,9 +25,13 @@ import (
 
 // issuer is a CI provider's token service: discovery, a JWKS, and tokens it signs.
 type issuer struct {
-	srv *httptest.Server
-	key *rsa.PrivateKey
-	n   int
+	srv      *httptest.Server
+	key      *rsa.PrivateKey
+	n        int
+	kid      string        // the key id tokens name (k1: the published key)
+	keysDown atomic.Bool   // the key set answers 503
+	hold     chan struct{} // when set, discovery blocks until it is closed, reporting on blocked
+	blocked  chan struct{}
 }
 
 func newIssuer(t *testing.T) *issuer {
@@ -35,12 +40,20 @@ func newIssuer(t *testing.T) *issuer {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := &issuer{key: key}
+	p := &issuer{key: key, kid: "k1", blocked: make(chan struct{}, 1)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, r *http.Request) {
+		if h := p.hold; h != nil {
+			p.blocked <- struct{}{}
+			<-h
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"issuer": p.srv.URL, "jwks_uri": p.srv.URL + "/keys", "id_token_signing_alg_values_supported": []string{"RS256"}})
 	})
 	mux.HandleFunc("/keys", func(w http.ResponseWriter, r *http.Request) {
+		if p.keysDown.Load() {
+			http.Error(w, "keys are being rotated", http.StatusServiceUnavailable)
+			return
+		}
 		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}})
 	})
 	p.srv = httptest.NewServer(mux)
@@ -52,7 +65,7 @@ func newIssuer(t *testing.T) *issuer {
 // given audience, a fresh jti each time.
 func (p *issuer) token(t *testing.T, aud string, claims map[string]any, ttl time.Duration) string {
 	t.Helper()
-	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: p.key}, (&jose.SignerOptions{}).WithHeader("kid", "k1"))
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: p.key}, (&jose.SignerOptions{}).WithHeader("kid", p.kid))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,5 +242,134 @@ func TestExchangeReportsAnUnreachableIssuer(t *testing.T) {
 	idp.srv.Close()
 	if _, err := s.Exchange(ctx, raw); !errors.Is(err, ErrIssuer) {
 		t.Fatalf("unreachable issuer: %v", err)
+	}
+}
+
+// The issuer's keys unavailable is the issuer's failure, not the token's: 503, never 401.
+// Keys fetched before are kept, so a rotation outage leaves tokens under known keys working;
+// a token under a key the set does not hold asks the issuer again and reports its outage.
+func TestExchangeReportsKeysItCannotFetch(t *testing.T) {
+	ctx := context.Background()
+	idp := newIssuer(t)
+	s, _, trusts := newService(t)
+	putTrust(t, trusts, "acme", "t", citrust.Spec{Issuer: idp.srv.URL, Audience: aud, Claims: map[string]string{"repository": "acme/config"}})
+	idp.keysDown.Store(true)
+	if _, err := s.Exchange(ctx, idp.token(t, aud, nil, 5*time.Minute)); !errors.Is(err, ErrIssuer) {
+		t.Fatalf("keys unavailable at the first exchange: %v", err)
+	}
+	idp.keysDown.Store(false)
+	if _, err := s.Exchange(ctx, idp.token(t, aud, nil, 5*time.Minute)); err != nil {
+		t.Fatalf("keys back: %v", err)
+	}
+	idp.keysDown.Store(true)
+	if _, err := s.Exchange(ctx, idp.token(t, aud, nil, 5*time.Minute)); err != nil {
+		t.Fatalf("a known key is served from the cache during an outage: %v", err)
+	}
+	// A key id the set does not hold, a minute later: the issuer is asked and is down.
+	idp.kid = "k2"
+	s.Now = func() time.Time { return time.Now().Add(2 * time.Minute) }
+	if _, err := s.Exchange(ctx, idp.token(t, aud, nil, 5*time.Minute)); !errors.Is(err, ErrIssuer) {
+		t.Fatalf("an unknown key during an outage: %v", err)
+	}
+	// Issuer back, the set still has no k2: the token is refused, the issuer is not asked
+	// again within the minute.
+	idp.keysDown.Store(false)
+	if _, err := s.Exchange(ctx, idp.token(t, aud, nil, 5*time.Minute)); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a key the issuer does not publish: %v", err)
+	}
+	s.Now = func() time.Time { return time.Now().Add(4 * time.Minute) }
+	if _, err := s.Exchange(ctx, idp.token(t, aud, nil, 5*time.Minute)); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a key the issuer does not publish, after a refetch: %v", err)
+	}
+}
+
+type failingKeys struct {
+	store.APIKeys
+	fail atomic.Bool
+}
+
+func (f *failingKeys) CreateAPIKey(ctx context.Context, k *model.APIKey) error {
+	if f.fail.Load() {
+		return errors.New("api_keys: disk full")
+	}
+	return f.APIKeys.CreateAPIKey(ctx, k)
+}
+
+// A key the store could not write leaves the token unused: the job's retry with the same
+// token gets its key. A replayed token leaves no key behind.
+func TestExchangeLeavesTheTokenUnusedWhenTheKeyIsNotStored(t *testing.T) {
+	ctx := context.Background()
+	idp := newIssuer(t)
+	s, st, trusts := newService(t)
+	keys := &failingKeys{APIKeys: st}
+	s.Keys = &apikeys.Service{Store: keys}
+	putTrust(t, trusts, "acme", "t", citrust.Spec{Issuer: idp.srv.URL, Audience: aud, Claims: map[string]string{"repository": "acme/config"}})
+	raw := idp.token(t, aud, nil, 5*time.Minute)
+	keys.fail.Store(true)
+	if _, err := s.Exchange(ctx, raw); err == nil || errors.Is(err, ErrRefused) || errors.Is(err, ErrIssuer) {
+		t.Fatalf("a store failure is reported as such: %v", err)
+	}
+	keys.fail.Store(false)
+	g, err := s.Exchange(ctx, raw)
+	if err != nil {
+		t.Fatalf("the same token after the store recovered: %v", err)
+	}
+	if _, err := s.Exchange(ctx, raw); !errors.Is(err, ErrRefused) {
+		t.Fatalf("the token a third time: %v", err)
+	}
+	list, _ := st.ListAPIKeys(ctx, "acme")
+	if len(list) != 1 || list[0].ID != g.Key.ID {
+		t.Fatalf("a replay must leave no key behind: %+v", list)
+	}
+}
+
+// A slow issuer holds up the tokens it issued and no other: another issuer, cached or not,
+// is served meanwhile.
+func TestASlowIssuerDoesNotDelayOthers(t *testing.T) {
+	ctx := context.Background()
+	fast, slow := newIssuer(t), newIssuer(t)
+	s, _, trusts := newService(t)
+	putTrust(t, trusts, "acme", "fast", citrust.Spec{Issuer: fast.srv.URL, Audience: aud, Claims: map[string]string{"repository": "acme/config"}})
+	putTrust(t, trusts, "acme", "slow", citrust.Spec{Issuer: slow.srv.URL, Audience: aud, Claims: map[string]string{"repository": "acme/config"}})
+	if _, err := s.Exchange(ctx, fast.token(t, aud, nil, 5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	slow.hold = make(chan struct{})
+	slowDone := make(chan error, 1)
+	go func() {
+		_, err := s.Exchange(ctx, slow.token(t, aud, nil, 5*time.Minute))
+		slowDone <- err
+	}()
+	<-slow.blocked // the slow issuer's discovery is in flight and will not answer
+	fastDone := make(chan error, 1)
+	go func() {
+		_, err := s.Exchange(ctx, fast.token(t, aud, nil, 5*time.Minute))
+		fastDone <- err
+	}()
+	select {
+	case err := <-fastDone:
+		if err != nil {
+			t.Fatalf("the cached issuer: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the cached issuer waited for the slow issuer's fetch")
+	}
+	close(slow.hold)
+	if err := <-slowDone; err != nil {
+		t.Fatalf("the slow issuer, once it answered: %v", err)
+	}
+}
+
+// A trust may carry the longest catalog name; the key it issues is labelled within a key
+// name's length and carries the whole trust name in its trust field.
+func TestExchangeIssuesForTheLongestTrustName(t *testing.T) {
+	ctx := context.Background()
+	idp := newIssuer(t)
+	s, _, trusts := newService(t)
+	name := strings.Repeat("t", 63)
+	putTrust(t, trusts, "acme", name, citrust.Spec{Issuer: idp.srv.URL, Audience: aud, Claims: map[string]string{"repository": "acme/config"}})
+	g, err := s.Exchange(ctx, idp.token(t, aud, nil, 5*time.Minute))
+	if err != nil || g.Trust != name || g.Key.Trust != name || len(g.Key.Name) != apikeys.MaxNameLen || !strings.HasPrefix(g.Key.Name, "ci."+name[:10]) {
+		t.Fatalf("exchange under a long trust name: %v %+v", err, g)
 	}
 }

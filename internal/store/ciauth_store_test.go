@@ -18,7 +18,8 @@ func TestPostgresTrustedKeysAndTokenUses(t *testing.T) {
 
 // A key a CITrust issued keeps the trust's name through every read; the prune removes only
 // the trusted keys that expired before the cut, never a person's key and never one still
-// valid. A token id is used once until it expires; an expired record no longer blocks the id.
+// valid; a key is deleted outright on request. A token id is used once until it expires; an
+// expired record no longer blocks the id.
 func trustedKeysAndTokenUses(t *testing.T, st interface {
 	APIKeys
 	TokenUses
@@ -67,6 +68,19 @@ func trustedKeysAndTokenUses(t *testing.T, st interface {
 	}
 	if n, err := st.PruneTrustedAPIKeys(ctx, now); err != nil || n != 0 {
 		t.Fatalf("second prune: %d %v", n, err)
+	}
+	// A key withdrawn outright (its token turned out used): gone, and gone only once.
+	if err := st.DeleteAPIKey(ctx, "key_ci_live"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.GetAPIKey(ctx, "key_ci_live"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a deleted key must be gone: %v", err)
+	}
+	if err := st.DeleteAPIKey(ctx, "key_ci_live"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleting it again: %v", err)
+	}
+	if listed, _ := st.ListAPIKeys(ctx, "acme"); len(listed) != 2 {
+		t.Fatalf("list after the delete: %d keys", len(listed))
 	}
 
 	if err := st.UseToken(ctx, "https://idp#jti-1", future); err != nil {

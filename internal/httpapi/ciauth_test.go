@@ -152,3 +152,26 @@ func TestCITrustExchangeOnTheRealStack(t *testing.T) {
 		t.Fatalf("a shared trust: %d %+v", code, body)
 	}
 }
+
+// The exchange takes one JSON object with a token and nothing else: anything that is not an
+// object, a missing or empty token, an unknown field, a second document or bytes after the
+// object are 400, read to the end of the body before anything is decoded.
+func TestCITrustExchangeBodyIsOneObject(t *testing.T) {
+	s := newStack(t)
+	st := s.orch.Store
+	s.p.Keys = &apikeys.Service{Store: st}
+	s.p.CIAuth = &ciauth.Service{Trusts: st, Keys: s.p.Keys, Uses: st}
+	api := s.platform.URL
+	for _, body := range []string{``, `null`, `"x"`, `[]`, `[{"token":"x"}]`, `{}`, `{"token":""}`, `{"token":null}`, `{"token":"x","extra":1}`,
+		`{"token":"x"}}`, `{"token":"x"}]`, `{"token":"x"} {"token":"y"}`, `{"token":"x"} x`, `{"token":"x"`, `{"token":1}`} {
+		if resp, out := call(t, "POST", api+"/v1/auth/ci", "", body, map[string]string{"Content-Type": "application/json"}); resp.StatusCode != 400 {
+			t.Errorf("body %q: %d %s", body, resp.StatusCode, out)
+		}
+	}
+	// A well-formed body with a token no trust accepts is the exchange's refusal, not a body error.
+	for _, body := range []string{`{"token":"x"}`, ` {"token":"x"} ` + "\n"} {
+		if resp, out := call(t, "POST", api+"/v1/auth/ci", "", body, map[string]string{"Content-Type": "application/json"}); resp.StatusCode != 401 {
+			t.Errorf("body %q: %d %s", body, resp.StatusCode, out)
+		}
+	}
+}

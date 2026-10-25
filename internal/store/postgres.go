@@ -1091,6 +1091,10 @@ func (p *Postgres) keyExec(ctx context.Context, q string, args ...any) error {
 	return nil
 }
 
+func (p *Postgres) DeleteAPIKey(ctx context.Context, id string) error {
+	return p.keyExec(ctx, `DELETE FROM api_keys WHERE id=$1`, id)
+}
+
 func (p *Postgres) PruneTrustedAPIKeys(ctx context.Context, before time.Time) (int, error) {
 	tag, err := p.pool.Exec(ctx, `DELETE FROM api_keys WHERE trust <> '' AND expires_at IS NOT NULL AND expires_at < $1`, before)
 	if err != nil {

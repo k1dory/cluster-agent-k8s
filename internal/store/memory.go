@@ -981,6 +981,16 @@ func (m *Memory) RetireAPIKey(_ context.Context, id, rotatedTo string, at time.T
 	return nil
 }
 
+func (m *Memory) DeleteAPIKey(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.apiKeys[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.apiKeys, id)
+	return nil
+}
+
 func (m *Memory) PruneTrustedAPIKeys(_ context.Context, before time.Time) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

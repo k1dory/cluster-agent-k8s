@@ -28,16 +28,19 @@ what may act is written down on the platform, as a resource of the tenant.
    the admin's own jobs keep the admin token (the shared scope has no trusts).
 2. The job obtains its ID token from the provider, for the audience the trust names, and
    presents it: `POST /v1/auth/ci {"token": …}`, or `sandboxctl auth ci -token … | -github`.
-3. The platform fetches the issuer's keys (OpenID discovery, once per issuer), verifies the
-   token's signature, issuer and expiry, finds the one tenant whose trust names that issuer,
-   carries the audience and matches the claims, marks the token used (its `jti`: a replay,
-   or a token copied from a job log, opens nothing), and issues a key of that tenant with the
-   trust's `ttl`. The answer is the key and its secret, shown once.
+3. The platform fetches the issuer's keys (OpenID discovery, kept per issuer and fetched
+   again when a token names a key the set does not hold), verifies the token's signature,
+   issuer and expiry, finds the one tenant whose trust names that issuer, carries the
+   audience and matches the claims, stores a key of that tenant with the trust's `ttl`, and
+   then marks the token used (its `jti`: a replay, or a token copied from a job log, opens
+   nothing). The answer is the key and its secret, shown once.
 4. The job uses the secret as `SANDBOXD_TOKEN` for the rest of the run. The key is an
    ordinary tenant key: `sandboxctl keys list` shows it with `trust` set and when it was last
    used; it can be revoked like any other; it is pruned once long expired.
 
-Deleting the trust ends it: the next job of that repository gets nothing.
+Deleting the trust ends it: the next job of that repository gets nothing. A trust is a grant
+like a PolicyBinding: `rollback` never restores one that was deleted or narrowed by hand;
+register it again deliberately.
 
 ## Claims
 
@@ -70,12 +73,17 @@ the `SANDBOXD_URL` variable, are then all the repository needs.
 - The token is bound to an audience the trust names; a token meant for another service is
   refused. Request the platform's URL as the audience, and name it in the trust.
 - A token is exchanged once, on every replica (the `jti` is recorded until the token expires).
+  It counts as used only once its key is stored: a key the store could not write leaves the
+  token for the job's retry; a key stored for a token that turns out used already is removed
+  before its secret leaves the server.
 - The key lives `spec.ttl` (default 15m, at most `ci_auth.max_ttl` on the server, one hour by
   default); it is a tenant key with the tenant's rights, never the admin's.
 - A job that two tenants' trusts accept gets nothing: an identity is one tenant's or none.
 - A refusal says nothing about which trusts exist; the reason is in the server log.
-- The issuer's keys are fetched over HTTPS from the issuer itself (its discovery document);
-  an unreachable issuer is a 503, never a pass.
+- The issuer's keys are fetched over HTTPS from the issuer itself (its discovery document,
+  which must name that issuer); an issuer whose discovery or keys cannot be fetched is a 503,
+  never a pass and never a refusal of the token. Keys already fetched serve during an outage.
+  Each issuer is fetched under its own lock: a slow issuer delays its own tokens and no other.
 
 ## Server configuration
 

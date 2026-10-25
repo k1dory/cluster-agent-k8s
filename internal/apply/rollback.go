@@ -20,7 +20,7 @@ var ErrNothingToRollBack = errors.New("nothing to roll back")
 // replaced), or one item to a revision (0: the last revision an apply wrote). The restored
 // documents are planned and applied like any bundle, under the caller's current rights: a
 // policy, environment or connection the caller may no longer use fails the plan, and nothing is
-// written. Grants (PolicyBinding, TenantSettings) are never restored: a revoked right stays
+// written. Grants (PolicyBinding, TenantSettings, CITrust) are never restored: a revoked right stays
 // revoked whatever an earlier bundle said.
 type RollbackRequest struct {
 	Apply    string
@@ -55,6 +55,7 @@ type Rollback struct {
 var grants = map[string]string{
 	model.KindBinding:        "a grant is not restored by rollback: issue it again deliberately",
 	model.KindTenantSettings: "quotas and allowed environments are not restored by rollback: set them again deliberately",
+	model.KindCITrust:        "a CI trust is a grant: a revoked or narrowed trust is not restored by rollback; register it again deliberately",
 }
 
 // Rollback builds the documents of the target, plans them and, unless DryRun, applies them.
