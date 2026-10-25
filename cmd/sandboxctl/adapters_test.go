@@ -167,11 +167,14 @@ func TestAdapterMarkdownOnFailurePaths(t *testing.T) {
 		want string
 	}{
 		{"modified", nil, []string{"apply", "-f", "bundles/acme.yaml", "-require-commit", "-markdown"}, "not what HEAD holds"},
-		{"foreign_owner", []string{"GIT_TEST_ASSUME_DIFFERENT_OWNER=1"}, []string{"apply", "-f", "bundles/acme.yaml", "-markdown"}, "dubious ownership"},
+		{"foreign_owner", []string{"GIT_TEST_ASSUME_DIFFERENT_OWNER=1", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=" + isolateGitConfig(t)}, []string{"apply", "-f", "bundles/acme.yaml", "-markdown"}, "dubious ownership"},
 		{"no_git", nil, []string{"apply", "-f", "bundles/acme.yaml", "-require-commit", "-no-git", "-markdown"}, "-no-git records no source"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			mu.Lock()
+			lastApplyBody = ""
+			mu.Unlock()
 			out, errOut, code := ctlChild(t, repo, srv.URL, "t", tc.env, tc.args...)
 			if code != 1 || !strings.Contains(errOut, tc.want) || !strings.HasPrefix(out, Marker+"\n### Apply ❌ error") {
 				t.Errorf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
