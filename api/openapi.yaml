@@ -691,6 +691,67 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/ScopeForbidden" }
         "404": { $ref: "#/components/responses/Error" }
+  /v1/citrusts:
+    get:
+      tags: [ci]
+      summary: List GitRepositories visible in the scope (own + shared)
+      description: |
+        A CITrust is a repository of bundles the platform reads itself: registering one
+        replaces installing a workflow in that repository. The platform checks the ref and syncs a
+        commit on request, through the same plan and apply the workflow would run (one apply per
+        bundle file, under a key of repository, commit and path). The credential that opens the
+        repository is a reference (`spec.credential`), never stored here.
+      parameters: [{ $ref: "#/components/parameters/scope" }]
+      responses:
+        "200": { description: Latest revisions, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "503": { description: "CI trusts are disabled", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/citrusts/{name}:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [ci]
+      summary: One CITrust (latest, or ?revision=N)
+      parameters: [{ name: revision, in: query, schema: { type: integer, minimum: 1 } }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "404": { $ref: "#/components/responses/Error" }
+    put:
+      tags: [ci]
+      summary: Register or update a CITrust (appends a revision)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CITrustDocument" }
+      responses:
+        "201": { description: Created (revision 1), content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "200": { description: New revision, content: { application/json: { schema: { $ref: "#/components/schemas/CatalogItem" } } } }
+        "400": { description: "Malformed document", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { description: "Wrote into another scope", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "expected_revision is not the latest", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "Invalid document: a URL with user information or a scheme other than https, a ref that is a SHA, a path that leaves the repository, a credential the tenant cannot resolve (the value is never echoed)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    delete:
+      tags: [ci]
+      summary: Delete a CITrust (history kept; its applies and their revisions stay)
+      responses:
+        "204": { description: Deleted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "404": { $ref: "#/components/responses/Error" }
+  /v1/citrusts/{name}/revisions:
+    parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
+    get:
+      tags: [ci]
+      summary: History of a CITrust, oldest first, deleted revisions included
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/CatalogItem" } } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "404": { $ref: "#/components/responses/Error" }
   /v1/gitrepos/{name}/check:
     parameters: [{ $ref: "#/components/parameters/catalogName" }, { $ref: "#/components/parameters/scope" }]
     post:
@@ -802,6 +863,37 @@ paths:
         "404": { description: "No such repository, or one without a `webhook_secret`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "413": { description: "Payload over 2 MiB", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { description: "Git repositories are disabled, or the webhook secret cannot be resolved", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/auth/ci:
+    post:
+      tags: [ci]
+      summary: Exchange a CI provider's OIDC ID token for a short-lived tenant key (no bearer token)
+      description: |
+        The job presents the ID token its provider issued to it for this run (GitHub Actions'
+        `ACTIONS_ID_TOKEN_REQUEST_URL`, GitLab's `id_tokens:`, a Forgejo that issues them). The
+        platform verifies the token's signature, issuer and expiry against the issuer's published
+        keys, finds the one tenant whose CITrust names that issuer, carries the token's audience and
+        matches its claims, uses the token once (its `jti`), and issues a key of that tenant that
+        expires in the trust's `ttl`. The key is an ordinary tenant key (`sbk_…`): `keys list` shows
+        it with `trust` set; it is pruned once long expired. A refusal says nothing about which
+        trusts exist. `sandboxctl auth ci -token … | -github` wraps the call.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              additionalProperties: false
+              properties:
+                token: { type: string, description: "The provider's ID token (a signed JWT, at most 16 KiB)" }
+      responses:
+        "201":
+          description: The key, its secret (shown once), the trust that matched and the token's subject
+          content: { application/json: { schema: { $ref: "#/components/schemas/CIGrant" } } }
+        "400": { description: "The body is not one JSON object with `token`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { description: "No CITrust accepts the token (unknown issuer, another audience, claims that match no trust, expired, already exchanged, two tenants' trusts matching)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: "CI authentication is disabled, or the issuer's keys could not be fetched", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/bindings:
     get:
       tags: [tenancy]
@@ -1746,6 +1838,30 @@ components:
         description: { type: string }
         spec: { $ref: "#/components/schemas/GitRepositorySpec" }
         expected_revision: { type: integer }
+    CITrustSpec:
+      type: object
+      additionalProperties: false
+      required: [issuer, audience, claims]
+      properties:
+        issuer: { type: string, description: "The token issuer exactly as its `iss` claim: https://token.actions.githubusercontent.com (GitHub Actions), the instance URL for GitLab or Forgejo; https, no trailing slash" }
+        audience: { type: string, description: "The value the job requests its token for (`aud`); by convention the platform's URL. A token for another audience is refused" }
+        claims: { type: object, additionalProperties: { type: string }, minProperties: 1, maxProperties: 16, description: "What the token must say, each claim exactly or as a pattern (*, ?, [...] within a segment): GitHub's repository and ref, GitLab's project_path and ref. A list claim matches on any entry. iss, aud, exp, nbf, iat and jti are not a trust's to name" }
+        ttl: { type: string, description: "Lifetime of the key a matching job gets (default 15m, at least 1m, at most the server's ci_auth.max_ttl, one hour by default)" }
+    CITrustDocument:
+      type: object
+      properties:
+        kind: { type: string, enum: [CITrust] }
+        name: { type: string }
+        description: { type: string }
+        spec: { $ref: "#/components/schemas/CITrustSpec" }
+        expected_revision: { type: integer }
+    CIGrant:
+      allOf:
+        - $ref: "#/components/schemas/APIKey"
+        - type: object
+          properties:
+            secret: { type: string, description: "The key's secret (sbk_…), shown once; the key's `trust` names the CITrust that accepted the token" }
+            subject: { type: string, description: "The token's sub claim (GitHub: repo:owner/name:ref:…; GitLab: project_path:…:ref_type:…:ref:…)" }
     GitSync:
       type: object
       description: The last check and the last sync of a GitRepository, as the platform saw them. The two halves are written independently (a check never touches the sync half and the other way round).
@@ -1829,6 +1945,7 @@ components:
         revoked_at: { type: string, format: date-time }
         rotated_to: { type: string, description: "The key that replaced this one" }
         last_used_at: { type: string, format: date-time, description: "Recorded at most once a minute" }
+        trust: { type: string, description: "The CITrust that issued the key to a CI job (POST /v1/auth/ci); absent for a key a person or the admin created" }
     IssuedKey:
       allOf:
         - { $ref: "#/components/schemas/APIKey" }

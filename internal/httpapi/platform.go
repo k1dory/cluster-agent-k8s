@@ -25,6 +25,8 @@ import (
 	"agent-sandbox/internal/apply"
 	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
+	"agent-sandbox/internal/ciauth"
+	"agent-sandbox/internal/citrust"
 	"agent-sandbox/internal/connections"
 	"agent-sandbox/internal/credentials"
 	"agent-sandbox/internal/events"
@@ -56,6 +58,8 @@ type Platform struct {
 	Planner        *plan.Deps        // POST /v1/plan; nil disables
 	Applier        *apply.Controller // POST /v1/apply, /v1/applies; nil disables
 	GitRepos       *gitrepo.Service  // /v1/gitrepos; nil disables
+	CITrusts       *citrust.Service  // /v1/citrusts; nil disables
+	CIAuth         *ciauth.Service   // POST /v1/auth/ci; nil disables
 	GitSync        *gitsync.Service  // /v1/gitrepos/{name}/check|sync|status; nil disables
 	Token          string            // admin token: every tenant, every sandbox
 	Tenants        map[string]string // tenant-scoped tokens: token → tenant
@@ -80,6 +84,12 @@ func (p *Platform) SetServices(cat *catalog.Service, conns *connections.Service,
 // SetGit installs the Git repository services (see internal/app).
 func (p *Platform) SetGit(repos *gitrepo.Service, sync *gitsync.Service) {
 	p.GitRepos, p.GitSync = repos, sync
+}
+
+// SetCITrusts installs the CI trust catalogue (see internal/app); the exchange itself
+// (CIAuth) is wired where the key service is.
+func (p *Platform) SetCITrusts(trusts *citrust.Service) {
+	p.CITrusts = trusts
 }
 
 // Principal is who is calling: the admin (every tenant) or one tenant. Expires is set for
@@ -151,6 +161,7 @@ func (p *Platform) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/version", p.auth(p.version))
 	p.keyRoutes(mux)
 	p.credentialRoutes(mux)
+	p.ciAuthRoutes(mux)
 	mux.HandleFunc("GET /v1/whoami", p.auth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, principalOf(r))
 	}))

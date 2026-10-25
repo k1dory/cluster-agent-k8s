@@ -26,6 +26,7 @@ type Memory struct {
 	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
 	applies   map[string]*model.Apply
 	apiKeys   map[string]*model.APIKey
+	tokenUses map[string]time.Time
 	gitSyncs  map[string]*model.GitSync
 	gitJobs   map[string]*model.GitJob
 	creds     map[string]*memCredential // tenant|name
@@ -46,6 +47,7 @@ func NewMemory() *Memory {
 		catalog:   map[string][]*model.CatalogItem{},
 		applies:   map[string]*model.Apply{},
 		apiKeys:   map[string]*model.APIKey{},
+		tokenUses: map[string]time.Time{},
 		gitSyncs:  map[string]*model.GitSync{},
 		gitJobs:   map[string]*model.GitJob{},
 		creds:     map[string]*memCredential{},
@@ -976,6 +978,35 @@ func (m *Memory) RetireAPIKey(_ context.Context, id, rotatedTo string, at time.T
 	if k.ExpiresAt == nil || end.Before(*k.ExpiresAt) {
 		k.ExpiresAt = &end
 	}
+	return nil
+}
+
+func (m *Memory) PruneTrustedAPIKeys(_ context.Context, before time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for id, k := range m.apiKeys {
+		if k.Trust != "" && k.ExpiresAt != nil && k.ExpiresAt.Before(before) {
+			delete(m.apiKeys, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (m *Memory) UseToken(_ context.Context, id string, expiresAt time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	for k, exp := range m.tokenUses {
+		if exp.Before(now) {
+			delete(m.tokenUses, k)
+		}
+	}
+	if _, used := m.tokenUses[id]; used {
+		return fmt.Errorf("%w: token %s was used already", ErrConflict, id)
+	}
+	m.tokenUses[id] = expiresAt
 	return nil
 }
 

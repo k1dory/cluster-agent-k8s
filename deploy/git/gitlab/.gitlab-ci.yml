@@ -9,7 +9,9 @@
 #                        that commit: retrying the job continues a stopped apply
 #   scheduled pipeline → drift
 #
-# CI/CD variables: SANDBOXD_URL, SANDBOXD_TOKEN (masked; a tenant key sbk_… or the admin token),
+# CI/CD variables: SANDBOXD_URL, SANDBOXD_TOKEN (optional, masked; a tenant key sbk_… or the admin
+# token: without it the job exchanges the ID token GitLab issues to it for a short-lived key under
+# a CITrust the tenant registered for this project, docs/ci-auth.md),
 # SANDBOXCTL_IMAGE (the sandboxctl image built from the platform repository: `make images`, target
 # sandboxctl; it carries sh, curl, jq and git next to the binary), SANDBOX_TENANT (admin
 # repositories only), GITLAB_TOKEN (optional, for the note).
@@ -21,8 +23,14 @@ default:
   image:
     name: $SANDBOXCTL_IMAGE
     entrypoint: [""]
+  # The ID token GitLab issues to the job, for the platform as its audience (what the trust names).
+  id_tokens:
+    SANDBOX_ID_TOKEN:
+      aud: $SANDBOXD_URL
   before_script:
-    - test -n "$SANDBOXD_URL" -a -n "$SANDBOXD_TOKEN" || { echo "SANDBOXD_URL and SANDBOXD_TOKEN are required"; exit 1; }
+    - test -n "$SANDBOXD_URL" || { echo "SANDBOXD_URL is required"; exit 1; }
+    # The exchange's own exit status fails the job (`export X=$(…)` would hide it).
+    - if [ -z "$SANDBOXD_TOKEN" ]; then SANDBOXD_TOKEN=$(/sandboxctl auth ci -token "$SANDBOX_ID_TOKEN") || exit 1; export SANDBOXD_TOKEN; fi
 
 plan:
   stage: test

@@ -1030,11 +1030,11 @@ func (p *Postgres) DeleteItem(ctx context.Context, kind, tenant, name string) er
 
 // --- api keys ---------------------------------------------------------------------------
 
-const keyCols = `id, tenant, name, hash, created_by, created_at, expires_at, revoked_at, rotated_to, last_used_at`
+const keyCols = `id, tenant, name, hash, created_by, created_at, expires_at, revoked_at, rotated_to, last_used_at, trust`
 
 func scanKey(row pgx.Row) (*model.APIKey, error) {
 	var k model.APIKey
-	err := row.Scan(&k.ID, &k.Tenant, &k.Name, &k.Hash, &k.CreatedBy, &k.CreatedAt, &k.ExpiresAt, &k.RevokedAt, &k.RotatedTo, &k.LastUsedAt)
+	err := row.Scan(&k.ID, &k.Tenant, &k.Name, &k.Hash, &k.CreatedBy, &k.CreatedAt, &k.ExpiresAt, &k.RevokedAt, &k.RotatedTo, &k.LastUsedAt, &k.Trust)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -1048,8 +1048,8 @@ func (p *Postgres) CreateAPIKey(ctx context.Context, k *model.APIKey) error {
 	if k.CreatedAt.IsZero() {
 		k.CreatedAt = time.Now()
 	}
-	tag, err := p.pool.Exec(ctx, `INSERT INTO api_keys (`+keyCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO NOTHING`,
-		k.ID, k.Tenant, k.Name, k.Hash, k.CreatedBy, k.CreatedAt, k.ExpiresAt, k.RevokedAt, k.RotatedTo, k.LastUsedAt)
+	tag, err := p.pool.Exec(ctx, `INSERT INTO api_keys (`+keyCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+		k.ID, k.Tenant, k.Name, k.Hash, k.CreatedBy, k.CreatedAt, k.ExpiresAt, k.RevokedAt, k.RotatedTo, k.LastUsedAt, k.Trust)
 	if err != nil {
 		return err
 	}
@@ -1087,6 +1087,29 @@ func (p *Postgres) keyExec(ctx context.Context, q string, args ...any) error {
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) PruneTrustedAPIKeys(ctx context.Context, before time.Time) (int, error) {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM api_keys WHERE trust <> '' AND expires_at IS NOT NULL AND expires_at < $1`, before)
+	if err != nil {
+		return 0, err
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// UseToken: one row per token id; the insert that finds the row is the second use.
+func (p *Postgres) UseToken(ctx context.Context, id string, expiresAt time.Time) error {
+	if _, err := p.pool.Exec(ctx, `DELETE FROM token_uses WHERE expires_at < now()`); err != nil {
+		return err
+	}
+	tag, err := p.pool.Exec(ctx, `INSERT INTO token_uses (id, expires_at) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`, id, expiresAt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: token %s was used already", ErrConflict, id)
 	}
 	return nil
 }

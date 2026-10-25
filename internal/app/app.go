@@ -13,6 +13,7 @@ import (
 	"agent-sandbox/internal/apply"
 	"agent-sandbox/internal/bindings"
 	"agent-sandbox/internal/catalog"
+	"agent-sandbox/internal/citrust"
 	"agent-sandbox/internal/connections"
 	"agent-sandbox/internal/gitrepo"
 	"agent-sandbox/internal/gitsync"
@@ -36,6 +37,8 @@ type Deps struct {
 	Replica  string // this replica's name (lease owner for applies)
 	// Fetch reads registered Git repositories (nil: the git binary over HTTPS).
 	Fetch gitsync.Fetcher
+	// CITrustMaxTTL caps the key lifetime a CITrust may grant (0: one hour).
+	CITrustMaxTTL time.Duration
 }
 
 // Services is the assembled set. Guard is what every ownership decision goes through.
@@ -49,6 +52,7 @@ type Services struct {
 	Applier     *apply.Controller // applies planned bundles, one step per transaction, continued by key
 	GitRepos    *gitrepo.Service  // registered repositories (kind GitRepository)
 	GitSync     *gitsync.Service  // checks and syncs them through Applier
+	CITrusts    *citrust.Service  // what CI jobs may act as a tenant (kind CITrust)
 }
 
 // Wire builds the services, loads their snapshots and installs the guard and the quotas on the
@@ -58,7 +62,7 @@ func Wire(ctx context.Context, d Deps) (*Services, error) {
 		q := d.Orch.Cfg.QuotaFor(t)
 		return tenants.Quota{MaxSandboxes: q.MaxSandboxes, MaxAwake: q.MaxAwake}
 	}
-	svc := services.Assemble(d.Store, services.Options{Policies: d.Policies, Images: d.Orch.Cfg, Secrets: d.Secrets, Defaults: defaults, Sandboxes: d.Store})
+	svc := services.Assemble(d.Store, services.Options{Policies: d.Policies, Images: d.Orch.Cfg, Secrets: d.Secrets, Defaults: defaults, Sandboxes: d.Store, CITrustMaxTTL: d.CITrustMaxTTL})
 	bind, tset, conns, guard := svc.Bindings, svc.Tenants, svc.Connections, svc.Guard
 	for name, r := range map[string]interface{ Refresh(context.Context) error }{"bindings": bind, "tenant settings": tset, "connections": conns} {
 		if err := r.Refresh(ctx); err != nil {
@@ -67,7 +71,7 @@ func Wire(ctx context.Context, d Deps) (*Services, error) {
 	}
 	d.Orch.Policies = guard
 	d.Orch.Quotas = limits{tenants: tset, bindings: bind}
-	planner := plan.Deps{Store: d.Store, Policies: d.Policies, Images: d.Orch.Cfg, Secrets: d.Secrets, Defaults: defaults}
+	planner := plan.Deps{Store: d.Store, Policies: d.Policies, Images: d.Orch.Cfg, Secrets: d.Secrets, Defaults: defaults, CITrustMaxTTL: d.CITrustMaxTTL}
 	replica := d.Replica
 	if replica == "" {
 		replica = fmt.Sprintf("replica-%d", time.Now().UnixNano())
@@ -84,6 +88,7 @@ func Wire(ctx context.Context, d Deps) (*Services, error) {
 		Planner:  planner,
 		Applier:  applier,
 		GitRepos: svc.GitRepos,
+		CITrusts: svc.CITrusts,
 		GitSync: &gitsync.Service{Store: d.Store, Jobs: d.Store, Lock: d.Store.WithTenantLock, Repos: svc.GitRepos, Secrets: d.Secrets, Fetch: fetch, Applier: applier,
 			Reporter: gitsync.RESTReporter{}, Emit: emitter(d), Replica: replica, Log: d.Log},
 	}, nil
@@ -101,6 +106,7 @@ func (s *Services) Watch(ctx context.Context, log *slog.Logger) {
 type API interface {
 	SetServices(cat *catalog.Service, conns *connections.Service, bind *bindings.Service, tset *tenants.Service, planner *plan.Deps, applier *apply.Controller)
 	SetGit(repos *gitrepo.Service, sync *gitsync.Service)
+	SetCITrusts(trusts *citrust.Service)
 }
 
 // Install mounts the services on the API.
@@ -108,6 +114,7 @@ func (s *Services) Install(p API) {
 	planner := s.Planner
 	p.SetServices(s.Catalog, s.Connections, s.Bindings, s.Tenants, &planner, s.Applier)
 	p.SetGit(s.GitRepos, s.GitSync)
+	p.SetCITrusts(s.CITrusts)
 }
 
 // limits composes the orchestrator's quotas from tenant settings and policy bindings.

@@ -10,9 +10,12 @@
 #                   the job, and re-running the job continues it
 #   schedule      → drift: items changed or deleted by hand since an apply wrote them fail the job
 #
-# Secrets: SANDBOXD_URL (variable) and SANDBOXD_TOKEN (a tenant key sbk_… for a tenant's repository,
-# the admin token for the platform's). sandboxctl runs from the sandboxctl image (built from the
-# platform repository with `make images`, target sandboxctl), so the job needs no Go toolchain.
+# Secrets: SANDBOXD_URL (variable) and, optionally, SANDBOXD_TOKEN (a tenant key sbk_… for a tenant's
+# repository, the admin token for the platform's). Without SANDBOXD_TOKEN the job authenticates
+# with the OIDC token GitHub issues to it, under a CITrust the tenant registered for this
+# repository (docs/ci-auth.md): nothing long-lived is stored here. sandboxctl runs from the
+# sandboxctl image (built from the platform repository with `make images`, target sandboxctl), so
+# the job needs no Go toolchain.
 name: sandbox-config
 on:
   pull_request:
@@ -34,6 +37,7 @@ env:
 permissions:
   contents: read
   pull-requests: write
+  id-token: write      # the OIDC token the job exchanges for a short-lived key (docs/ci-auth.md)
 
 jobs:
   plan:
@@ -45,6 +49,14 @@ jobs:
         id: plan
         shell: bash
         run: |
+          # Without a stored SANDBOXD_TOKEN the job proves who it is with the OIDC token GitHub
+          # issues to it, exchanged for a tenant key that expires in minutes under a CITrust that
+          # names this repository (docs/ci-auth.md). With a stored key, that key is used as before.
+          if [ -z "$SANDBOXD_TOKEN" ]; then
+            SANDBOXD_TOKEN=$(docker run --rm -e SANDBOXD_URL -e ACTIONS_ID_TOKEN_REQUEST_URL -e ACTIONS_ID_TOKEN_REQUEST_TOKEN "$SANDBOXCTL_IMAGE" auth ci -github) || exit 1
+            echo "::add-mask::$SANDBOXD_TOKEN"
+            export SANDBOXD_TOKEN
+          fi
           # Any failure fails the check: 2 invalid, 1 the platform could not be reached or refused
           # the token, 125-127 the image could not run. Every bundle still gets its block in the
           # comment: sandboxctl writes one for its own failures; when the container did not run
@@ -94,6 +106,14 @@ jobs:
       - name: apply every bundle with this commit as the source
         shell: bash
         run: |
+          # Without a stored SANDBOXD_TOKEN the job proves who it is with the OIDC token GitHub
+          # issues to it, exchanged for a tenant key that expires in minutes under a CITrust that
+          # names this repository (docs/ci-auth.md). With a stored key, that key is used as before.
+          if [ -z "$SANDBOXD_TOKEN" ]; then
+            SANDBOXD_TOKEN=$(docker run --rm -e SANDBOXD_URL -e ACTIONS_ID_TOKEN_REQUEST_URL -e ACTIONS_ID_TOKEN_REQUEST_TOKEN "$SANDBOXCTL_IMAGE" auth ci -github) || exit 1
+            echo "::add-mask::$SANDBOXD_TOKEN"
+            export SANDBOXD_TOKEN
+          fi
           set +e
           rc=0
           for f in bundles/*.yaml; do
@@ -124,6 +144,14 @@ jobs:
       - name: what moved outside apply
         shell: bash
         run: |
+          # Without a stored SANDBOXD_TOKEN the job proves who it is with the OIDC token GitHub
+          # issues to it, exchanged for a tenant key that expires in minutes under a CITrust that
+          # names this repository (docs/ci-auth.md). With a stored key, that key is used as before.
+          if [ -z "$SANDBOXD_TOKEN" ]; then
+            SANDBOXD_TOKEN=$(docker run --rm -e SANDBOXD_URL -e ACTIONS_ID_TOKEN_REQUEST_URL -e ACTIONS_ID_TOKEN_REQUEST_TOKEN "$SANDBOXCTL_IMAGE" auth ci -github) || exit 1
+            echo "::add-mask::$SANDBOXD_TOKEN"
+            export SANDBOXD_TOKEN
+          fi
           # The report is written to a file, then shown: no pipe between sandboxctl and the summary,
           # so its exit code is the step's. 3 when anything drifted (wire the job's failure to your
           # paging), 1 when the platform could not be reached or refused the token.

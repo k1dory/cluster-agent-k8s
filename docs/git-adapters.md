@@ -251,7 +251,9 @@ one section per file. The comment and the commit status are posted independently
 the provider refuses still leaves the status set.
 
 The CI templates and the webhook are two ways to the same controller; a repository may use
-either. The templates need Docker and a secret in the repository and show the plan in the
+either. The templates need no stored key when the tenant registers a CITrust for the
+repository: the job exchanges its provider's ID token for a key that expires in minutes
+([ci-auth.md](ci-auth.md)). The templates need Docker and a secret in the repository and show the plan in the
 job log too; the webhook needs the platform reachable from the provider and nothing in the
 repository.
 

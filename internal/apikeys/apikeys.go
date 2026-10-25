@@ -53,6 +53,19 @@ func (s *Service) now() time.Time {
 
 // Create issues a key for tenant. The returned secret is the only time it is visible.
 func (s *Service) Create(ctx context.Context, tenant, name string, ttl time.Duration, by string) (*model.APIKey, string, error) {
+	return s.create(ctx, tenant, name, ttl, by, "")
+}
+
+// CreateTrusted issues a key on behalf of a CITrust (internal/ciauth): the same key, marked
+// with the trust that issued it, so it is listed as such and pruned once long expired.
+func (s *Service) CreateTrusted(ctx context.Context, tenant, name string, ttl time.Duration, by, trust string) (*model.APIKey, string, error) {
+	if trust == "" {
+		return nil, "", fmt.Errorf("%w: a trusted key names its trust", ErrInvalid)
+	}
+	return s.create(ctx, tenant, name, ttl, by, trust)
+}
+
+func (s *Service) create(ctx context.Context, tenant, name string, ttl time.Duration, by, trust string) (*model.APIKey, string, error) {
 	if tenant == "" {
 		return nil, "", fmt.Errorf("%w: a key belongs to a tenant", ErrInvalid)
 	}
@@ -69,7 +82,7 @@ func (s *Service) Create(ctx context.Context, tenant, name string, ttl time.Dura
 	if err != nil {
 		return nil, "", err
 	}
-	k := &model.APIKey{ID: id, Tenant: tenant, Name: name, Hash: hash, CreatedBy: by, CreatedAt: s.now()}
+	k := &model.APIKey{ID: id, Tenant: tenant, Name: name, Hash: hash, CreatedBy: by, CreatedAt: s.now(), Trust: trust}
 	if ttl > 0 {
 		exp := k.CreatedAt.Add(ttl)
 		k.ExpiresAt = &exp

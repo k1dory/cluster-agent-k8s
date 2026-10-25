@@ -34,6 +34,12 @@ type Config struct {
 	APIKeys struct {
 		MaxTTL time.Duration `yaml:"max_ttl"`
 	} `yaml:"api_keys"`
+	// CIAuth: CI jobs exchange their provider's OIDC ID token for a short-lived tenant key
+	// (POST /v1/auth/ci) under a CITrust the tenant registered; max_ttl caps the key lifetime
+	// a trust may grant (0 = one hour).
+	CIAuth struct {
+		MaxTTL time.Duration `yaml:"max_ttl"`
+	} `yaml:"ci_auth"`
 	// Credentials: secrets tenants bring through the API (PUT /v1/credentials/{name}), encrypted
 	// at rest under key (64 hex characters or the base64 of 32 bytes; `openssl rand -hex 32`).
 	// Empty disables the API; `secret:NAME` then resolves from the secrets provider alone.
