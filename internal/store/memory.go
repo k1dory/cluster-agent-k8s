@@ -1112,11 +1112,11 @@ func (m *Memory) RecordGitHook(_ context.Context, tenant, name string, h model.G
 	return nil
 }
 
-func (m *Memory) RecordGitHookIf(_ context.Context, tenant, name string, h model.GitHook, job string) (bool, error) {
+func (m *Memory) RecordGitHookIf(_ context.Context, tenant, name string, h model.GitHook, job string, attempt int) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	g := m.gitSync(tenant, name)
-	if g.Hook != nil && g.Hook.Job != job {
+	if g.Hook != nil && (g.Hook.Job != job || g.Hook.Attempt > attempt) {
 		return false, nil
 	}
 	g.Hook = &h

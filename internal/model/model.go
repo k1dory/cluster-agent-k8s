@@ -161,6 +161,7 @@ type GitHook struct {
 	Number   int       `json:"number,omitempty"`   // the pull/merge request number
 	Delivery string    `json:"delivery,omitempty"` // the provider's delivery id
 	Job      string    `json:"job,omitempty"`      // the persisted job that carries the action out
+	Attempt  int       `json:"attempt,omitempty"`  // the job's attempt this outcome is from (0: the acceptance)
 	Outcome  string    `json:"outcome,omitempty"`  // done | invalid | stopped | error | ignored | superseded
 	Error    string    `json:"error,omitempty"`
 	At       time.Time `json:"at"`

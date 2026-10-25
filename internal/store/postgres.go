@@ -1206,14 +1206,15 @@ func (p *Postgres) RecordGitHook(ctx context.Context, tenant, name string, h mod
 
 // RecordGitHookIf: the condition is in the statement, so an acceptance written between a
 // read and this write is never overwritten.
-func (p *Postgres) RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string) (bool, error) {
+func (p *Postgres) RecordGitHookIf(ctx context.Context, tenant, name string, h model.GitHook, job string, attempt int) (bool, error) {
 	doc, err := json.Marshal(h)
 	if err != nil {
 		return false, err
 	}
 	tag, err := p.pool.Exec(ctx, `INSERT INTO git_syncs (tenant, name, doc, updated_at) VALUES ($1,$2,jsonb_build_object('hook', $3::jsonb),now())
 		ON CONFLICT (tenant, name) DO UPDATE SET doc = git_syncs.doc || jsonb_build_object('hook', $3::jsonb), updated_at = now()
-		WHERE git_syncs.doc->'hook' IS NULL OR git_syncs.doc->'hook'->>'job' = $4`, tenant, name, doc, job)
+		WHERE git_syncs.doc->'hook' IS NULL
+		   OR (git_syncs.doc->'hook'->>'job' = $4 AND COALESCE((git_syncs.doc->'hook'->>'attempt')::int, 0) <= $5)`, tenant, name, doc, job, attempt)
 	if err != nil {
 		return false, err
 	}

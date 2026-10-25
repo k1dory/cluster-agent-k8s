@@ -165,7 +165,9 @@ spec:
   writes A again, with a new revision; only a repeat of the *same* transition (the same commit
   as the last sync) is a no-op. The transition (commit and generation) is recorded as `running`
   before the first write, so a sync that dies or whose summary is lost is continued, never
-  mistaken for an earlier transition to the same commit. Exit codes as for `apply`: 0 done, 2 a bundle invalid (nothing
+  mistaken for an earlier transition to the same commit; a sync that could not read the head
+  names no state and leaves the transition on record as it is (an unfinished one included),
+  recording its error against it. Exit codes as for `apply`: 0 done, 2 a bundle invalid (nothing
   of it written), 3 an apply stopped, 1 the repository unreadable.
 - `sandboxctl gitrepo status config` (`GET /v1/gitrepos/config/status`) shows the last check
   and the last sync: the head, the commit, one line per bundle with its apply id and status.
@@ -227,9 +229,10 @@ same five attempts; the fifth records its failure even though its own time is up
 went and changes nothing; of one whose job gave up, or waits for its next attempt, runs the job
 again now with its attempts reset, which is the way to run a delivery the platform could not
 handle at the time; of one due or running, names the job. The delivery, the decision, the job and the outcome
-land in the `hook` half of `gitrepo status`, which follows the delivery accepted last (an
-older job that ran late never writes over a newer delivery's summary; its outcome is in the
-job and the event), and every delivery, plan and sync is an event (`git.hook`, `git.plan`,
+land in the `hook` half of `gitrepo status`, which follows the delivery accepted last and its
+latest attempt (an older job that ran late never writes over a newer delivery's summary, an
+earlier attempt never over a later one's; a job's final outcome shows even when its last write
+was lost), and every delivery, plan and sync is an event (`git.hook`, `git.plan`,
 `git.sync`) on the tenant's event stream, so a SOC or SRE integration can follow them without
 polling.
 

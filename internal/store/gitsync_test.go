@@ -61,23 +61,36 @@ func TestGitSyncRecordContract(t *testing.T) {
 			}
 			// The hook half, conditionally: written while the record's hook is absent or the
 			// named job's; a hook of another job (a delivery accepted meanwhile) stays.
-			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", At: now}, "gitjob_1"); err != nil || !ok {
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", At: now}, "gitjob_1", 0); err != nil || !ok {
 				t.Fatalf("hook if, no hook yet: %v %v", ok, err)
 			}
-			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Outcome: "done", At: now}, "gitjob_1"); err != nil || !ok {
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Attempt: 2, Outcome: "done", At: now}, "gitjob_1", 2); err != nil || !ok {
 				t.Fatalf("hook if, own job: %v %v", ok, err)
+			}
+			// An earlier attempt of the same job writing late: refused; the same attempt again: taken.
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Attempt: 1, Outcome: "error", At: now}, "gitjob_1", 1); err != nil || ok {
+				t.Fatalf("hook if, an earlier attempt: %v %v", ok, err)
+			}
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Attempt: 2, Outcome: "done", Reason: "again", At: now}, "gitjob_1", 2); err != nil || !ok {
+				t.Fatalf("hook if, the same attempt: %v %v", ok, err)
+			}
+			if got, _ = st.GetGitSync(ctx, "acme", "config"); got.Hook.Attempt != 2 || got.Hook.Outcome != "done" || got.Hook.Reason != "again" {
+				t.Fatalf("a late earlier attempt wrote over a later one: %+v", got.Hook)
 			}
 			if err := st.RecordGitHook(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_2", At: now}); err != nil {
 				t.Fatal(err)
 			}
-			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Outcome: "superseded", At: now}, "gitjob_1"); err != nil || ok {
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_1", Attempt: 3, Outcome: "superseded", At: now}, "gitjob_1", 3); err != nil || ok {
 				t.Fatalf("hook if, another job's acceptance: %v %v", ok, err)
 			}
 			got, _ = st.GetGitSync(ctx, "acme", "config")
 			if got.Hook == nil || got.Hook.Job != "gitjob_2" || got.Hook.Outcome != "" || got.Sync.Commit != "cccc" || got.Check.Error != "unreachable" {
 				t.Fatalf("the newer acceptance was written over, or the other halves touched: %+v", got)
 			}
-			if ok, err := st.RecordGitHookIf(ctx, "acme", "other", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_3", At: now}, "gitjob_3"); err != nil || !ok {
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "config", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_2", Attempt: 1, Outcome: "done", At: now}, "gitjob_2", 1); err != nil || !ok {
+				t.Fatalf("hook if, the first attempt over the acceptance: %v %v", ok, err)
+			}
+			if ok, err := st.RecordGitHookIf(ctx, "acme", "other", model.GitHook{Provider: "github", Event: "push", Job: "gitjob_3", At: now}, "gitjob_3", 0); err != nil || !ok {
 				t.Fatalf("hook if on a repository with no record: %v %v", ok, err)
 			}
 			// The third half, the webhook, is written on its own too.

@@ -456,7 +456,7 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 	// The documents are applied with the repository's authority: the tenant's for a tenant's
 	// repository, the admin's for a shared one. The subject names the provider.
 	scope := plan.Scope{Tenant: it.Tenant, Admin: it.Tenant == "", Subject: "webhook:" + d.Provider}
-	done := model.GitHook{Provider: d.Provider, Event: d.Event, Ref: d.Ref, Commit: d.After, Delivery: d.ID, Job: job.ID, Action: job.Action, At: s.now()}
+	done := model.GitHook{Provider: d.Provider, Event: d.Event, Ref: d.Ref, Commit: d.After, Delivery: d.ID, Job: job.ID, Attempt: job.Attempts, Action: job.Action, At: s.now()}
 	if d.PR != nil {
 		done.Number, done.Commit = d.PR.Number, d.PR.HeadSHA
 	}
@@ -509,10 +509,10 @@ func (s *Service) runJob(ctx context.Context, job *model.GitJob) {
 // conclude moves the job on (done or failed, or pending again at retryAt) and records how the
 // attempt went in the hook half of the record, under a context of its own. The job first: it
 // checks owner and attempt, so a late attempt another replica took over writes nothing, not
-// even the record. The record then, only while it still carries this job: a delivery accepted
-// meanwhile keeps its summary (the condition is the store's, in one statement), and a job
-// that ended without reaching the record still shows its outcome (Status completes the hook
-// from the job).
+// even the record. The record then, only while it still carries this job and no later attempt
+// of it has written: a delivery accepted meanwhile, or a later attempt's outcome, keeps its
+// summary (the condition is the store's, in one statement), and a job that ended without
+// reaching the record still shows its outcome (Status completes the hook from the job).
 func (s *Service) conclude(ctx context.Context, it *model.CatalogItem, job *model.GitJob, done *model.GitHook, status string, retryAt time.Time) {
 	fin, cancel := s.finishContext(ctx)
 	defer cancel()
@@ -524,7 +524,7 @@ func (s *Service) conclude(ctx context.Context, it *model.CatalogItem, job *mode
 			return // the holder's outcome counts
 		}
 	}
-	if _, err := s.Store.RecordGitHookIf(fin, it.Tenant, it.Name, *done, job.ID); err != nil && s.Log != nil {
+	if _, err := s.Store.RecordGitHookIf(fin, it.Tenant, it.Name, *done, job.ID, job.Attempts); err != nil && s.Log != nil {
 		s.Log.Error("git hook: record outcome", "tenant", it.Tenant, "repository", it.Name, "err", err)
 	}
 	s.emit(fin, it, "git.hook", done)

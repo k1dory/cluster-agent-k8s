@@ -1775,7 +1775,7 @@ components:
                   status: { type: string, description: "The apply's status (done, failed, conflict, running), or invalid" }
                   changes: { type: integer, description: "Creates + updates of its plan" }
                   errors: { type: array, items: { type: string } }
-            status: { type: string, enum: [running, done, invalid, stopped, error], description: "running: the transition (commit, generation) is fixed and the bundles are being applied, or that sync died before its summary" }
+            status: { type: string, enum: [running, done, invalid, stopped, error], description: "running: the transition (commit, generation) is fixed and the bundles are being applied, or that sync died before its summary. A sync that could not read the head keeps the transition on record (commit and generation) and records its error against it" }
             error: { type: string }
             at: { type: string, format: date-time }
         hook: { $ref: "#/components/schemas/GitHook" }
@@ -1793,6 +1793,7 @@ components:
         number: { type: integer, description: "The pull or merge request number" }
         delivery: { type: string, description: "The provider's delivery id" }
         job: { type: string, description: "The persisted job carrying the action out (a redelivery names the same job)" }
+        attempt: { type: integer, description: "The job's attempt this outcome is from; absent on the acceptance" }
         outcome: { type: string, enum: [done, invalid, stopped, error, ignored, superseded], description: "Absent while the action runs or waits for its next attempt; superseded: a delivery whose commit the ref or the pull request had already moved past, so nothing was written or published; error with a reason naming the next attempt: the job runs again" }
         error: { type: string }
         at: { type: string, format: date-time }

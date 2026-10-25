@@ -133,15 +133,23 @@ func (s *Service) Status(ctx context.Context, scope plan.Scope, name string) (*m
 
 // fillHook completes the hook half from its job: a job that ended before its outcome reached
 // the record (the replica died in between) still shows how it went.
+// A job that ended is the truth about how it went: a record left at an earlier attempt's
+// outcome (the last attempt's write was lost) shows the job's.
 func (s *Service) fillHook(ctx context.Context, g *model.GitSync) {
-	if g == nil || g.Hook == nil || g.Hook.Job == "" || g.Hook.Outcome != "" || s.jobs() == nil {
+	if g == nil || g.Hook == nil || g.Hook.Job == "" || s.jobs() == nil {
 		return
 	}
 	j, err := s.jobs().GetGitJob(ctx, g.Hook.Job)
 	if err != nil || (j.Status != model.GitJobDone && j.Status != model.GitJobFailed) {
 		return
 	}
-	g.Hook.Outcome, g.Hook.Error = j.Outcome, j.Error
+	if g.Hook.Outcome == j.Outcome && g.Hook.Error == j.Error {
+		return
+	}
+	if g.Hook.Outcome != "" {
+		g.Hook.Reason = "" // an earlier attempt's note (its next run, its head) no longer holds
+	}
+	g.Hook.Outcome, g.Hook.Error, g.Hook.Attempt = j.Outcome, j.Error, j.Attempts
 }
 
 // Check resolves the ref and records the head (or why the repository cannot be read) in the
@@ -234,6 +242,12 @@ func (s *Service) sync(ctx context.Context, it *model.CatalogItem, sp gitrepo.Sp
 	var checked *model.GitCheck
 	finish := func(status string, err error) (*model.GitSync, error) {
 		result.Status, result.Generation = status, generationOf(result.Commit)
+		if result.Commit == "" {
+			// The head could not be read: no desired state was named, so the transition on
+			// record (its commit and generation, an unfinished one included) stays what it is
+			// and the attempt is recorded against it; the next sync of that commit continues it.
+			result.Commit, result.Generation = prevCommit, generation
+		}
 		if err != nil {
 			result.Error = err.Error()
 		}
