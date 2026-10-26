@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,8 +29,10 @@ type issuer struct {
 	srv      *httptest.Server
 	key      *rsa.PrivateKey
 	n        int
-	kid      string        // the key id tokens name (k1: the published key)
+	kid      string        // the key id tokens name (k1: the published key; "": none)
 	keysDown atomic.Bool   // the key set answers 503
+	fetches  atomic.Int32  // key set fetches served
+	mu       sync.Mutex    // key, replaced by rotate
 	hold     chan struct{} // when set, discovery blocks until it is closed, reporting on blocked
 	blocked  chan struct{}
 }
@@ -54,18 +57,40 @@ func newIssuer(t *testing.T) *issuer {
 			http.Error(w, "keys are being rotated", http.StatusServiceUnavailable)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}})
+		p.fetches.Add(1)
+		p.mu.Lock()
+		pub := p.key.PublicKey
+		p.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &pub, KeyID: "k1", Algorithm: "RS256", Use: "sig"}}})
 	})
 	p.srv = httptest.NewServer(mux)
 	t.Cleanup(p.srv.Close)
 	return p
 }
 
+// rotate replaces the signing key; the published key id stays k1 (as providers do).
+func (p *issuer) rotate(t *testing.T) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	p.key = key
+	p.mu.Unlock()
+}
+
 // token signs a job token: GitHub's shape (repository, ref, sha, job_workflow_ref) with the
 // given audience, a fresh jti each time.
 func (p *issuer) token(t *testing.T, aud string, claims map[string]any, ttl time.Duration) string {
 	t.Helper()
-	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: p.key}, (&jose.SignerOptions{}).WithHeader("kid", p.kid))
+	opts := &jose.SignerOptions{}
+	if p.kid != "" {
+		opts.WithHeader("kid", p.kid)
+	}
+	p.mu.Lock()
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.RS256, Key: p.key}, opts)
+	p.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -283,33 +308,50 @@ func TestExchangeReportsKeysItCannotFetch(t *testing.T) {
 	}
 }
 
-type failingKeys struct {
-	store.APIKeys
-	fail atomic.Bool
+// failingUses stands for a store whose write fails: before anything is written (the
+// connection dropped on the way in), or after the write committed (the acknowledgement was
+// lost), or whose reads fail.
+type failingUses struct {
+	store.TokenUses
+	before, after, reads atomic.Bool
 }
 
-func (f *failingKeys) CreateAPIKey(ctx context.Context, k *model.APIKey) error {
-	if f.fail.Load() {
-		return errors.New("api_keys: disk full")
+func (f *failingUses) IssueForToken(ctx context.Context, id string, exp time.Time, k *model.APIKey) error {
+	if f.before.Load() {
+		return errors.New("api_keys: connection reset before the write")
 	}
-	return f.APIKeys.CreateAPIKey(ctx, k)
+	err := f.TokenUses.IssueForToken(ctx, id, exp, k)
+	if err == nil && f.after.Load() {
+		return errors.New("api_keys: connection reset after the commit")
+	}
+	return err
 }
 
-// A key the store could not write leaves the token unused: the job's retry with the same
-// token gets its key. A replayed token leaves no key behind.
-func TestExchangeLeavesTheTokenUnusedWhenTheKeyIsNotStored(t *testing.T) {
+func (f *failingUses) TokenUse(ctx context.Context, id string) (string, error) {
+	if f.reads.Load() {
+		return "", errors.New("token_uses: connection refused")
+	}
+	return f.TokenUses.TokenUse(ctx, id)
+}
+
+// A write that failed before anything was stored leaves the token unused: the job's retry
+// with the same token gets its key. A write whose acknowledgement was lost after the commit
+// still answers with the key: the store is asked which key the token was recorded for. A
+// replay leaves no key behind in either case.
+func TestExchangeSurvivesAFailedOrUnacknowledgedWrite(t *testing.T) {
 	ctx := context.Background()
 	idp := newIssuer(t)
 	s, st, trusts := newService(t)
-	keys := &failingKeys{APIKeys: st}
-	s.Keys = &apikeys.Service{Store: keys}
+	uses := &failingUses{TokenUses: st}
+	s.Uses = uses
 	putTrust(t, trusts, "acme", "t", citrust.Spec{Issuer: idp.srv.URL, Audience: aud, Claims: map[string]string{"repository": "acme/config"}})
+
 	raw := idp.token(t, aud, nil, 5*time.Minute)
-	keys.fail.Store(true)
+	uses.before.Store(true)
 	if _, err := s.Exchange(ctx, raw); err == nil || errors.Is(err, ErrRefused) || errors.Is(err, ErrIssuer) {
 		t.Fatalf("a store failure is reported as such: %v", err)
 	}
-	keys.fail.Store(false)
+	uses.before.Store(false)
 	g, err := s.Exchange(ctx, raw)
 	if err != nil {
 		t.Fatalf("the same token after the store recovered: %v", err)
@@ -320,6 +362,98 @@ func TestExchangeLeavesTheTokenUnusedWhenTheKeyIsNotStored(t *testing.T) {
 	list, _ := st.ListAPIKeys(ctx, "acme")
 	if len(list) != 1 || list[0].ID != g.Key.ID {
 		t.Fatalf("a replay must leave no key behind: %+v", list)
+	}
+
+	// The commit went through, the answer did not: the key is issued all the same.
+	raw = idp.token(t, aud, nil, 5*time.Minute)
+	uses.after.Store(true)
+	g, err = s.Exchange(ctx, raw)
+	if err != nil || g.Key == nil {
+		t.Fatalf("an unacknowledged commit must still issue the key: %v", err)
+	}
+	if k, err := s.Keys.Authenticate(ctx, g.Secret); err != nil || k.ID != g.Key.ID {
+		t.Fatalf("the issued key must authenticate: %v %+v", err, k)
+	}
+	uses.after.Store(false)
+	if _, err := s.Exchange(ctx, raw); !errors.Is(err, ErrRefused) {
+		t.Fatalf("the token again after an unacknowledged commit: %v", err)
+	}
+	if list, _ := st.ListAPIKeys(ctx, "acme"); len(list) != 2 {
+		t.Fatalf("keys after two exchanges: %+v", list)
+	}
+	// The outcome cannot be checked either: an error, not a refusal.
+	raw = idp.token(t, aud, nil, 5*time.Minute)
+	uses.after.Store(true)
+	uses.reads.Store(true)
+	if _, err := s.Exchange(ctx, raw); err == nil || errors.Is(err, ErrRefused) {
+		t.Fatalf("an unacknowledged commit whose outcome is unknown: %v", err)
+	}
+	uses.after.Store(false)
+	uses.reads.Store(false)
+}
+
+// A token is accepted up to a minute past its exp (clock skew), and its use is recorded
+// for at least as long: a replay inside that minute opens nothing. Past the minute the
+// token itself is refused.
+func TestReplayInsideTheExpiryLeewayIsRefused(t *testing.T) {
+	ctx := context.Background()
+	idp := newIssuer(t)
+	s, st, trusts := newService(t)
+	putTrust(t, trusts, "acme", "t", citrust.Spec{Issuer: idp.srv.URL, Audience: aud, Claims: map[string]string{"repository": "acme/config"}})
+	raw := idp.token(t, aud, nil, -30*time.Second) // expired half a minute ago
+	if _, err := s.Exchange(ctx, raw); err != nil {
+		t.Fatalf("a token inside the leeway: %v", err)
+	}
+	if _, err := s.Exchange(ctx, raw); !errors.Is(err, ErrRefused) {
+		t.Fatalf("its replay inside the leeway: %v", err)
+	}
+	if list, _ := st.ListAPIKeys(ctx, "acme"); len(list) != 1 {
+		t.Fatalf("one key, not two: %+v", list)
+	}
+	if _, err := s.Exchange(ctx, idp.token(t, aud, nil, -2*time.Minute)); !errors.Is(err, ErrRefused) {
+		t.Fatalf("a token past the leeway: %v", err)
+	}
+	// The record is dropped by the store's clock, the token accepted by the service's: a
+	// service running ahead by the leeway still finds the record of a token at its exp.
+	raw = idp.token(t, aud, nil, 0)
+	if _, err := s.Exchange(ctx, raw); err != nil {
+		t.Fatalf("a token at its exp: %v", err)
+	}
+	s.Now = func() time.Time { return time.Now().Add(leeway) }
+	if _, err := s.Exchange(ctx, raw); !errors.Is(err, ErrRefused) {
+		t.Fatalf("its replay a minute later: %v", err)
+	}
+}
+
+// A key rotated under the same id (or tokens naming none): the held set no longer verifies
+// the signature, so the set is fetched again (at most once a minute) and the token checked
+// against what the issuer publishes now. No restart, no second instance.
+func TestRotatedKeysAreFetchedAgainOnASignatureMismatch(t *testing.T) {
+	for _, kid := range []string{"k1", ""} {
+		t.Run("kid="+kid, func(t *testing.T) {
+			ctx := context.Background()
+			idp := newIssuer(t)
+			idp.kid = kid
+			s, _, trusts := newService(t)
+			putTrust(t, trusts, "acme", "t", citrust.Spec{Issuer: idp.srv.URL, Audience: aud, Claims: map[string]string{"repository": "acme/config"}})
+			if _, err := s.Exchange(ctx, idp.token(t, aud, nil, 5*time.Minute)); err != nil {
+				t.Fatal(err)
+			}
+			idp.rotate(t)
+			// Within the minute of the last fetch: refused, without another fetch.
+			if _, err := s.Exchange(ctx, idp.token(t, aud, nil, 5*time.Minute)); !errors.Is(err, ErrRefused) || idp.fetches.Load() != 1 {
+				t.Fatalf("right after a fetch: %v, %d fetches", err, idp.fetches.Load())
+			}
+			s.Now = func() time.Time { return time.Now().Add(2 * time.Minute) }
+			if _, err := s.Exchange(ctx, idp.token(t, aud, nil, 5*time.Minute)); err != nil || idp.fetches.Load() != 2 {
+				t.Fatalf("after the rotation: %v, %d fetches", err, idp.fetches.Load())
+			}
+			// A forged signature does not fetch again within the minute.
+			parts := strings.SplitN(idp.token(t, aud, nil, 5*time.Minute), ".", 3)
+			if _, err := s.Exchange(ctx, parts[0]+"."+parts[1]+".AAAA"); !errors.Is(err, ErrRefused) || idp.fetches.Load() != 2 {
+				t.Fatalf("a forged token: %v, %d fetches", err, idp.fetches.Load())
+			}
+		})
 	}
 }
 

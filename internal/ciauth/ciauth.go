@@ -74,6 +74,11 @@ func (s *Service) now() time.Time {
 // MaxTokenBytes bounds the ID token a job may present.
 const MaxTokenBytes = 16 * 1024
 
+// leeway is the clock skew allowed on a token's exp and nbf. A token is accepted until
+// exp+leeway, so its use is recorded until then and a minute beyond (the store prunes by
+// its own clock): a replay inside the leeway finds the record.
+const leeway = time.Minute
+
 // signatureAlgorithms a token may carry: asymmetric only (a shared secret would make the
 // platform able to mint the provider's tokens).
 var signatureAlgorithms = []jose.SignatureAlgorithm{jose.RS256, jose.RS384, jose.RS512, jose.ES256, jose.ES384, jose.ES512, jose.PS256, jose.PS384, jose.PS512, jose.EdDSA}
@@ -108,12 +113,9 @@ func (s *Service) Exchange(ctx context.Context, raw string) (*Grant, error) {
 	}
 	// The issuer's keys: unavailable keys are the issuer's problem, not the token's.
 	kid := parsed.Headers[0].KeyID
-	keys, err := s.keysFor(ctx, issuer, kid)
+	keys, fetched, err := s.keysFor(ctx, issuer, kid, false)
 	if err != nil {
-		if s.Log != nil {
-			s.Log.Warn("ci auth: issuer unavailable", "issuer", issuer, "err", err)
-		}
-		return nil, fmt.Errorf("%w: %v", ErrIssuer, err)
+		return nil, s.unavailable(issuer, err)
 	}
 	if len(keys) == 0 {
 		return nil, s.refuse(fmt.Sprintf("issuer %s has no signing key %q", issuer, kid), nil)
@@ -122,21 +124,32 @@ func (s *Service) Exchange(ctx context.Context, raw string) (*Grant, error) {
 		std    jwt.Claims
 		claims map[string]any
 	)
-	verified := false
-	for i := range keys {
-		if err = parsed.Claims(&keys[i], &std, &claims); err == nil {
-			verified = true
-			break
+	verify := func(keys []jose.JSONWebKey) error {
+		var err error
+		for i := range keys {
+			if err = parsed.Claims(&keys[i], &std, &claims); err == nil {
+				return nil
+			}
 		}
+		return err
 	}
-	if !verified {
-		return nil, s.refuse("signature not verified by the issuer's keys", err)
+	if verr := verify(keys); verr != nil {
+		// A key rotated under the same id, or a token naming none: the set is fetched again
+		// (at most once a minute) and the signature checked against what the issuer publishes
+		// now, so a rotation never needs a restart.
+		again, fetchedAgain, err := s.keysFor(ctx, issuer, kid, true)
+		if err != nil {
+			return nil, s.unavailable(issuer, err)
+		}
+		if !fetchedAgain.After(fetched) || verify(again) != nil {
+			return nil, s.refuse("signature not verified by the issuer's keys", verr)
+		}
 	}
 	// Issuer, expiry and not-before are the token's own; the audience is each trust's.
 	if std.Expiry == nil {
 		return nil, s.refuse("no exp claim", nil)
 	}
-	if err := std.Validate(jwt.Expected{Issuer: issuer, Time: s.now()}); err != nil {
+	if err := std.ValidateWithLeeway(jwt.Expected{Issuer: issuer, Time: s.now()}, leeway); err != nil {
 		return nil, s.refuse("claims not valid", err)
 	}
 	jti := std.ID
@@ -165,22 +178,35 @@ func (s *Service) Exchange(ctx context.Context, raw string) (*Grant, error) {
 	if err != nil {
 		return nil, s.refuse("the trust's ttl is not valid", err)
 	}
-	// The key first, then the token's one use: a key the store refused leaves the token
-	// unused for the job's retry. Once: a token presented twice (replayed, or leaked from the
-	// job's log) opens nothing, and the key stored for the second presentation is removed
-	// before its secret leaves this call.
-	key, secret, err := s.Keys.CreateTrusted(ctx, chosen.item.Tenant, keyName(chosen.item.Name), ttl, "ci:"+std.Subject, chosen.item.Name)
+	// The key and the token's one use are one write: both or neither. Once: a token
+	// presented twice (replayed, or leaked from the job's log) opens nothing. The record
+	// outlives the token's acceptance (exp plus the leeway, plus a minute for the store's
+	// clock), so a replay inside the leeway finds it.
+	key, secret, err := s.Keys.NewTrusted(chosen.item.Tenant, keyName(chosen.item.Name), ttl, "ci:"+std.Subject, chosen.item.Name)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.Uses.UseToken(ctx, issuer+"#"+jti, std.Expiry.Time()); err != nil {
-		if derr := s.Keys.Store.DeleteAPIKey(ctx, key.ID); derr != nil && s.Log != nil {
-			s.Log.Warn("ci auth: key of a refused exchange not removed", "key", key.ID, "err", derr)
-		}
+	use := issuer + "#" + jti
+	if err := s.Uses.IssueForToken(ctx, use, std.Expiry.Time().Add(2*leeway), key); err != nil {
 		if errors.Is(err, store.ErrConflict) {
 			return nil, s.refuse("the token was exchanged already", nil)
 		}
-		return nil, err
+		// The write's outcome is unknown (the acknowledgement was lost): the store says which
+		// key the token is recorded for. Ours: the exchange went through, and the job gets
+		// its key rather than a retry that would find the token used. None: nothing was
+		// written, the token stays unused for the retry. Another: a replay that won.
+		owner, lerr := s.tokenOwner(ctx, use)
+		switch {
+		case lerr != nil:
+			return nil, fmt.Errorf("issue key: %w; the outcome could not be checked: %v", err, lerr)
+		case owner == "":
+			return nil, fmt.Errorf("issue key: %w", err)
+		case owner != key.ID:
+			return nil, s.refuse("the token was exchanged already", nil)
+		}
+		if s.Log != nil {
+			s.Log.Warn("ci auth: key issued although the write reported an error", "key", key.ID, "err", err)
+		}
 	}
 	if n, perr := s.Keys.Store.PruneTrustedAPIKeys(ctx, s.now().Add(-24*time.Hour)); perr != nil && s.Log != nil {
 		s.Log.Warn("ci auth: prune keys", "err", perr)
@@ -232,6 +258,34 @@ func (s *Service) trustsOf(ctx context.Context, issuer string) ([]trust, error) 
 		return out[i].item.Name < out[j].item.Name
 	})
 	return out, nil
+}
+
+// tokenOwner asks the store which key a token was exchanged for, a few times when the store
+// does not answer: the write just failed to acknowledge, the store may be back.
+func (s *Service) tokenOwner(ctx context.Context, use string) (string, error) {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(300 * time.Millisecond):
+			}
+		}
+		var owner string
+		if owner, err = s.Uses.TokenUse(ctx, use); err == nil {
+			return owner, nil
+		}
+	}
+	return "", err
+}
+
+// unavailable reports an issuer whose keys could not be fetched (503).
+func (s *Service) unavailable(issuer string, err error) error {
+	if s.Log != nil {
+		s.Log.Warn("ci auth: issuer unavailable", "issuer", issuer, "err", err)
+	}
+	return fmt.Errorf("%w: %v", ErrIssuer, err)
 }
 
 func (s *Service) refuse(reason string, cause error) error {

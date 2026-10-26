@@ -31,9 +31,9 @@ what may act is written down on the platform, as a resource of the tenant.
 3. The platform fetches the issuer's keys (OpenID discovery, kept per issuer and fetched
    again when a token names a key the set does not hold), verifies the token's signature,
    issuer and expiry, finds the one tenant whose trust names that issuer, carries the
-   audience and matches the claims, stores a key of that tenant with the trust's `ttl`, and
-   then marks the token used (its `jti`: a replay, or a token copied from a job log, opens
-   nothing). The answer is the key and its secret, shown once.
+   audience and matches the claims, and stores, in one write, a key of that tenant with the
+   trust's `ttl` and the token's use (its `jti`: a replay, or a token copied from a job log,
+   opens nothing). The answer is the key and its secret, shown once.
 4. The job uses the secret as `SANDBOXD_TOKEN` for the rest of the run. The key is an
    ordinary tenant key: `sandboxctl keys list` shows it with `trust` set and when it was last
    used; it can be revoked like any other; it is pruned once long expired.
@@ -72,17 +72,22 @@ the `SANDBOXD_URL` variable, are then all the repository needs.
 
 - The token is bound to an audience the trust names; a token meant for another service is
   refused. Request the platform's URL as the audience, and name it in the trust.
-- A token is exchanged once, on every replica (the `jti` is recorded until the token expires).
-  It counts as used only once its key is stored: a key the store could not write leaves the
-  token for the job's retry; a key stored for a token that turns out used already is removed
-  before its secret leaves the server.
+- A token is exchanged once, on every replica. The key and the token's use (its `jti`) are
+  one write: both or neither. A write that failed leaves the token for the job's retry; a
+  write whose acknowledgement was lost is resolved by asking the store which key the token
+  was recorded for, so the job still gets its key instead of a retry that would find the
+  token used.
+- A token is accepted up to a minute past its `exp` (clock skew); its use is recorded for a
+  minute beyond that, so a replay inside the skew allowance finds the record.
 - The key lives `spec.ttl` (default 15m, at most `ci_auth.max_ttl` on the server, one hour by
   default); it is a tenant key with the tenant's rights, never the admin's.
 - A job that two tenants' trusts accept gets nothing: an identity is one tenant's or none.
 - A refusal says nothing about which trusts exist; the reason is in the server log.
 - The issuer's keys are fetched over HTTPS from the issuer itself (its discovery document,
   which must name that issuer); an issuer whose discovery or keys cannot be fetched is a 503,
-  never a pass and never a refusal of the token. Keys already fetched serve during an outage.
+  never a pass and never a refusal of the token. Keys already fetched serve during an outage;
+  a signature the held keys do not verify (a key rotated under the same id, or a token naming
+  none) fetches the set again, at most once a minute, so a rotation never needs a restart.
   Each issuer is fetched under its own lock: a slow issuer delays its own tokens and no other.
 
 ## Server configuration

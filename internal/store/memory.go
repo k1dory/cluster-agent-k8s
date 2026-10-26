@@ -26,7 +26,7 @@ type Memory struct {
 	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
 	applies   map[string]*model.Apply
 	apiKeys   map[string]*model.APIKey
-	tokenUses map[string]time.Time
+	tokenUses map[string]tokenUse
 	gitSyncs  map[string]*model.GitSync
 	gitJobs   map[string]*model.GitJob
 	creds     map[string]*memCredential // tenant|name
@@ -47,7 +47,7 @@ func NewMemory() *Memory {
 		catalog:   map[string][]*model.CatalogItem{},
 		applies:   map[string]*model.Apply{},
 		apiKeys:   map[string]*model.APIKey{},
-		tokenUses: map[string]time.Time{},
+		tokenUses: map[string]tokenUse{},
 		gitSyncs:  map[string]*model.GitSync{},
 		gitJobs:   map[string]*model.GitJob{},
 		creds:     map[string]*memCredential{},
@@ -1004,20 +1004,39 @@ func (m *Memory) PruneTrustedAPIKeys(_ context.Context, before time.Time) (int, 
 	return n, nil
 }
 
-func (m *Memory) UseToken(_ context.Context, id string, expiresAt time.Time) error {
+// tokenUse is one token's record: until when it is kept, and the key it was exchanged for.
+type tokenUse struct {
+	expiresAt time.Time
+	key       string
+}
+
+func (m *Memory) IssueForToken(_ context.Context, id string, expiresAt time.Time, k *model.APIKey) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := time.Now()
-	for k, exp := range m.tokenUses {
-		if exp.Before(now) {
-			delete(m.tokenUses, k)
+	for t, u := range m.tokenUses {
+		if u.expiresAt.Before(now) {
+			delete(m.tokenUses, t)
 		}
 	}
 	if _, used := m.tokenUses[id]; used {
 		return fmt.Errorf("%w: token %s was used already", ErrConflict, id)
 	}
-	m.tokenUses[id] = expiresAt
+	if _, dup := m.apiKeys[k.ID]; dup {
+		return fmt.Errorf("api key %s exists", k.ID)
+	}
+	if k.CreatedAt.IsZero() {
+		k.CreatedAt = now
+	}
+	m.apiKeys[k.ID] = cloneKey(k)
+	m.tokenUses[id] = tokenUse{expiresAt: expiresAt, key: k.ID}
 	return nil
+}
+
+func (m *Memory) TokenUse(_ context.Context, id string) (string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.tokenUses[id].key, nil
 }
 
 func (m *Memory) ListAPIKeys(_ context.Context, tenant string) ([]*model.APIKey, error) {
