@@ -67,6 +67,10 @@ Two layouts, pick one.
 
 In both cases, adding an external service the agents may use is one rule in a policy file.
 
+Before a release, run the production acceptance against the cluster it goes to
+([docs/acceptance.md](docs/acceptance.md)): install with replicas, the Git path to a running
+agent, a replica lost, the database lost, an upgrade, a backup restored, one report.
+
 ## Policy workflow
 
 ```sh

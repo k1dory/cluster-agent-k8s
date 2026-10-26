@@ -362,7 +362,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken, Tenants: tokenTenants,
 		Keys: &apikeys.Service{Store: st, MaxTTL: cfg.APIKeys.MaxTTL}, Credentials: creds,
-		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Log: log.With("log", "api")}
+		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Replica: replicaName(), Log: log.With("log", "api")}
 	services.Install(platform)
 	// CI jobs trade their provider's ID token for a key of the trusting tenant.
 	platform.CIAuth = &ciauth.Service{Trusts: st, Keys: platform.Keys, Uses: st, MaxTTL: cfg.CIAuth.MaxTTL, Log: log.With("log", "ci-auth")}
@@ -503,4 +503,13 @@ func policyCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "unknown policy subcommand", sub)
 		return 2
 	}
+}
+
+// replicaName identifies this replica in GET /v1/version: the pod's name (its hostname).
+func replicaName() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return "unknown"
+	}
+	return h
 }

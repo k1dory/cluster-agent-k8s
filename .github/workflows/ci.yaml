@@ -88,3 +88,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make ci-e2e-git
+  acceptance:
+    # The production acceptance (docs/acceptance.md) on a kind cluster shaped like production:
+    # two gateway nodes on a VLAN, Multus, PostgreSQL in the cluster, the images built here;
+    # install, the Git path to a running agent, a replica lost, an agent pod and the database
+    # lost, an upgrade, a backup restored. The report is an artifact (the dump and the
+    # kubeconfig of the throwaway cluster are not).
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: make ci-acceptance
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: acceptance-report
+          path: |
+            .ci/acceptance/
+            !.ci/acceptance/backup.sql
+            !.ci/acceptance/kubeconfig
+          if-no-files-found: ignore

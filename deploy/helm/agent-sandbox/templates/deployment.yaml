@@ -70,7 +70,8 @@ spec:
             - secretRef:
                 name: {{ .Values.existingSecret }}
           readinessProbe:
-            httpGet: { path: /healthz, port: {{ .Values.gateway.apiPort }} }
+            # the store answers: a replica that lost the database stops taking traffic
+            httpGet: { path: /readyz, port: {{ .Values.gateway.apiPort }} }
           livenessProbe:
             httpGet: { path: /healthz, port: {{ .Values.gateway.apiPort }} }
           securityContext:

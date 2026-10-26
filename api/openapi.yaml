@@ -1313,6 +1313,8 @@ paths:
                 type: object
                 properties:
                   sandboxd: { type: string, description: "Build version of the control plane" }
+                  replica: { type: string, description: "The replica that answered (its pod name)" }
+                  leader: { type: boolean, description: "Whether that replica runs the reconciler (holds the leadership lease)" }
                   agent:
                     type: object
                     properties:
@@ -1474,6 +1476,13 @@ paths:
       summary: Liveness
       responses:
         "200": { description: OK }
+  /readyz:
+    get:
+      security: []
+      summary: Readiness (the store answers)
+      responses:
+        "200": { description: Ready }
+        "503": { description: "The store does not answer: this replica takes no traffic" }
 
   /agent/runs/next:
     get:

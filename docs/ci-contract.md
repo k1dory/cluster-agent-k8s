@@ -75,12 +75,13 @@ the subset a developer runs before pushing and says so in its last line.
 | `ci-vet` | `go vet`; `gofmt` over the module's Go files as `go list` names them (a module cache inside the tree is not formatted), with gofmt's own failure a failure | Go |
 | `ci-unit` | every test under the race detector, in-memory store | Go, python3 with PyYAML (the tests of the e2e script run its preflight, which reads the workflow) |
 | `ci-policy` | policies validate, expectations pass, the rendered gateway configuration passes `caddy validate` | Go; `CADDY_BIN`, else the newest supported Caddy is downloaded |
-| `ci-postgres` | store, Git job and record contracts, the database-taking tests of `internal/gitsync` | `SANDBOX_TEST_POSTGRES_URL` (required; the provider maps its service to it) |
+| `ci-postgres` | store, Git job and record contracts, the database-taking tests of `internal/gitsync` and `internal/ciauth` | `SANDBOX_TEST_POSTGRES_URL` (required; the provider maps its service to it) |
 | `ci-caddy` | the gateway end to end on a real Caddy and `caddy validate`, per supported version | `CADDY_VERSION=x.y.z` for one version (a provider's matrix), `CADDY_BIN` for a binary of yours, else every version in `versions.env` is downloaded |
 | `ci-helm` | chart lint in both layouts; `deploy/k8s` is what the chart renders | `HELM`, else the pinned Helm is downloaded |
 | `ci-images` | the three images build; git and nonroot in the control plane; sandboxctl's tools, a checkout owned by another user, `-require-commit`; the agent image's smoke test and network lock | any Docker daemon, local or remote (files move through the API, never a bind mount; the CLI is downloaded when missing), python3; `IMAGE_PREFIX`, `IMAGE_TAG` |
 | `ci-e2e-git` | the Git adapters end to end from the images (`hack/e2e-git-adapter.sh`) | a Docker daemon on the job's host that sees the job's files (the templates' steps bind-mount the checkout; the check probes this and refuses a daemon elsewhere), python3 with PyYAML; `IMAGE_PREFIX`, `IMAGE_TAG` |
 | `ci-versions` | prints the shared versions | |
+| `ci-acceptance` | the production acceptance ([docs/acceptance.md](acceptance.md)) on a kind cluster shaped like production: install with two replicas, the Git path to a running agent on the VLAN, a replica lost, an agent pod and the database lost, an upgrade, a backup restored; not in the required set (twenty minutes, Docker able to run kind) | a Docker daemon on the job's host that can run privileged containers (kind), Go; `ACCEPT_KEEP=1` leaves the cluster |
 
 Versions and matrices (Caddy, Helm, PostgreSQL, the docker CLI) are defined once in
 `hack/ci/versions.env`; `hack/ci/versions.sh github` turns them into job outputs, so a

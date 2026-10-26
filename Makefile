@@ -13,7 +13,7 @@ HELM ?= helm
 CI_GROUPS := build vet unit policy postgres caddy helm images e2e-git
 
 .PHONY: build test vet dev images smoke-image helm-lint policy-test policy-render manifests clean integration \
-	ci ci-fast ci-versions $(addprefix ci-,$(CI_GROUPS))
+	ci ci-fast ci-versions ci-acceptance acceptance $(addprefix ci-,$(CI_GROUPS))
 
 # The full required set, in order; what a change must pass before it merges.
 ci: $(addprefix ci-,$(CI_GROUPS))
@@ -56,6 +56,17 @@ ci-e2e-git:
 
 ci-versions:
 	@hack/ci/versions.sh
+
+# The production acceptance (docs/acceptance.md) on a kind cluster shaped like production,
+# built on this host's Docker: not in the required set (twenty minutes, privileged Docker), run
+# by the GitHub workflow and by hand before a release.
+ci-acceptance:
+	hack/ci/acceptance.sh
+
+# The same acceptance against a cluster of yours: KUBECONFIG selects it, ACCEPT_* name the
+# values file, the database and the images (docs/acceptance.md).
+acceptance:
+	hack/acceptance/run.sh $(PHASES)
 
 build:
 	mkdir -p $(BIN)

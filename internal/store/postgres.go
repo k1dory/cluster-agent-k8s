@@ -56,6 +56,8 @@ func (p *Postgres) dedicated(ctx context.Context) (*pgx.Conn, error) {
 
 func (p *Postgres) Close() error { p.pool.Close(); return nil }
 
+func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
+
 const sandboxCols = `id, name, slug, owner, tenant, repo, idle_timeout, wake_on_preview, status, ip, instance,
 	pod_name, last_activity, created_at, expires_at, preview_port, preview_access, preview_host, error,
 	agent_version, desired_version, env_version, revision, admin_grant,

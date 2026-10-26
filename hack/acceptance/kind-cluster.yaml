@@ -1,0 +1,10 @@
+# The acceptance cluster: one control plane, two gateway nodes (one Caddy + sandboxd each,
+# labelled and tainted by kind.sh) and one node for the agents. Every node gets a second
+# interface on the Docker network that stands for the sandbox VLAN (kind.sh connects it).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+  - role: worker
