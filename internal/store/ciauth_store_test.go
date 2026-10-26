@@ -18,8 +18,8 @@ func TestPostgresTrustedKeysAndTokenUses(t *testing.T) {
 
 // A key a CITrust issued keeps the trust's name through every read; the prune removes only
 // the trusted keys that expired before the cut, never a person's key and never one still
-// valid; a key is deleted outright on request. A token id is used once until it expires; an
-// expired record no longer blocks the id.
+// valid; a key is deleted outright on request. A token id is used once, with its key, until
+// the record expires; an expired record no longer blocks the id.
 func trustedKeysAndTokenUses(t *testing.T, st interface {
 	APIKeys
 	TokenUses
@@ -83,24 +83,42 @@ func trustedKeysAndTokenUses(t *testing.T, st interface {
 		t.Fatalf("list after the delete: %d keys", len(listed))
 	}
 
-	if err := st.UseToken(ctx, "https://idp#jti-1", future); err != nil {
+	// A token's use and its key are one write: the second write for the same token stores
+	// nothing (no key), another token id is free, and the record names the key it issued.
+	k1 := &model.APIKey{ID: "key_tok_1", Tenant: "acme", Name: "ci.github", Hash: "h5", Trust: "github", ExpiresAt: &future}
+	if err := st.IssueForToken(ctx, "https://idp#jti-1", future, k1); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UseToken(ctx, "https://idp#jti-1", future); !errors.Is(err, ErrConflict) {
+	k2 := &model.APIKey{ID: "key_tok_2", Tenant: "acme", Name: "ci.github", Hash: "h6", Trust: "github", ExpiresAt: &future}
+	if err := st.IssueForToken(ctx, "https://idp#jti-1", future, k2); !errors.Is(err, ErrConflict) {
 		t.Fatalf("a second use must conflict: %v", err)
 	}
-	if err := st.UseToken(ctx, "https://idp#jti-2", future); err != nil {
+	if _, err := st.GetAPIKey(ctx, "key_tok_2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the key of a refused use must not be stored: %v", err)
+	}
+	if owner, err := st.TokenUse(ctx, "https://idp#jti-1"); err != nil || owner != "key_tok_1" {
+		t.Fatalf("the record names the key it issued: %q %v", owner, err)
+	}
+	if owner, err := st.TokenUse(ctx, "https://idp#jti-none"); err != nil || owner != "" {
+		t.Fatalf("an unknown token has no key: %q %v", owner, err)
+	}
+	if err := st.IssueForToken(ctx, "https://idp#jti-2", future, k2); err != nil {
 		t.Fatalf("another id is free: %v", err)
 	}
-	// A record that expired is dropped on the next use: the id is free again (the token
-	// itself is past its exp by then, so the issuer's check refuses it anyway).
-	if err := st.UseToken(ctx, "https://idp#jti-3", past); err != nil {
+	if got, err := st.GetAPIKey(ctx, "key_tok_2"); err != nil || got.Trust != "github" {
+		t.Fatalf("the key stored with the use: %+v %v", got, err)
+	}
+	// A record that expired is dropped on the next write: the id is free again (the token
+	// itself is past its exp and the leeway by then, so the exchange refuses it anyway).
+	k3 := &model.APIKey{ID: "key_tok_3", Tenant: "acme", Name: "ci.github", Hash: "h7", Trust: "github", ExpiresAt: &future}
+	if err := st.IssueForToken(ctx, "https://idp#jti-3", past, k3); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.UseToken(ctx, "https://idp#jti-3", future); err != nil {
+	k4 := &model.APIKey{ID: "key_tok_4", Tenant: "acme", Name: "ci.github", Hash: "h8", Trust: "github", ExpiresAt: &future}
+	if err := st.IssueForToken(ctx, "https://idp#jti-3", future, k4); err != nil {
 		t.Fatalf("an expired record must not block the id: %v", err)
 	}
-	if err := st.UseToken(ctx, "https://idp#jti-1", future); !errors.Is(err, ErrConflict) {
+	if err := st.IssueForToken(ctx, "https://idp#jti-1", future, &model.APIKey{ID: "key_tok_5", Tenant: "acme", Name: "x", Hash: "h9"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("a live record still blocks: %v", err)
 	}
 }

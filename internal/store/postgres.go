@@ -1103,19 +1103,45 @@ func (p *Postgres) PruneTrustedAPIKeys(ctx context.Context, before time.Time) (i
 	return int(tag.RowsAffected()), nil
 }
 
-// UseToken: one row per token id; the insert that finds the row is the second use.
-func (p *Postgres) UseToken(ctx context.Context, id string, expiresAt time.Time) error {
-	if _, err := p.pool.Exec(ctx, `DELETE FROM token_uses WHERE expires_at < now()`); err != nil {
+// IssueForToken: one row per token id and the key, in one transaction; the insert that finds
+// the token's row is the second use, and the transaction is rolled back.
+func (p *Postgres) IssueForToken(ctx context.Context, id string, expiresAt time.Time, k *model.APIKey) error {
+	if k.CreatedAt.IsZero() {
+		k.CreatedAt = time.Now()
+	}
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
 		return err
 	}
-	tag, err := p.pool.Exec(ctx, `INSERT INTO token_uses (id, expires_at) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`, id, expiresAt)
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if _, err := tx.Exec(ctx, `DELETE FROM token_uses WHERE expires_at < now()`); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO token_uses (id, expires_at, key_id) VALUES ($1, $2, $3) ON CONFLICT (id) DO NOTHING`, id, expiresAt, k.ID)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("%w: token %s was used already", ErrConflict, id)
 	}
-	return nil
+	tag, err = tx.Exec(ctx, `INSERT INTO api_keys (`+keyCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+		k.ID, k.Tenant, k.Name, k.Hash, k.CreatedBy, k.CreatedAt, k.ExpiresAt, k.RevokedAt, k.RotatedTo, k.LastUsedAt, k.Trust)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("api key %s exists", k.ID)
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) TokenUse(ctx context.Context, id string) (string, error) {
+	var key string
+	err := p.pool.QueryRow(ctx, `SELECT key_id FROM token_uses WHERE id=$1`, id).Scan(&key)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return key, err
 }
 
 func (p *Postgres) ListAPIKeys(ctx context.Context, tenant string) ([]*model.APIKey, error) {

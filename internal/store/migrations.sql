@@ -192,6 +192,8 @@ CREATE TABLE IF NOT EXISTS token_uses (
     id         text PRIMARY KEY,
     expires_at timestamptz NOT NULL
 );
+-- key_id: the key the token was exchanged for, written in the same transaction as the key.
+ALTER TABLE token_uses ADD COLUMN IF NOT EXISTS key_id text NOT NULL DEFAULT '';
 
 -- Tenant-brought credentials (BYOK): ciphertext only; the server key never touches the database.
 CREATE TABLE IF NOT EXISTS credentials (

@@ -198,10 +198,15 @@ type GitSyncs interface {
 }
 
 // TokenUses records tokens that may be used once (a CI provider's ID token exchanged for a
-// key): UseToken records id until expiresAt and returns ErrConflict when it was recorded
-// already, on every replica alike. Expired records are dropped as a side effect.
+// key). IssueForToken stores key and records token id as used by it, in one write: both or
+// neither; ErrConflict when id was recorded already, on every replica alike, and then
+// nothing is stored. The record is kept until expiresAt (the caller's horizon: as long as
+// the token could still be accepted); expired records are dropped as a side effect.
+// TokenUse returns the id of the key recorded for a token ("" when none): the caller's way
+// to learn the outcome of a write whose acknowledgement was lost.
 type TokenUses interface {
-	UseToken(ctx context.Context, id string, expiresAt time.Time) error
+	IssueForToken(ctx context.Context, id string, expiresAt time.Time, key *model.APIKey) error
+	TokenUse(ctx context.Context, id string) (string, error)
 }
 
 // GitJobs persists webhook actions (model.GitJob) so an accepted delivery survives the replica

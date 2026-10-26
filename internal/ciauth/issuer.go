@@ -44,9 +44,12 @@ func (s *Service) client() *http.Client {
 }
 
 // keysFor returns the issuer's keys a signature with key id kid may be checked against (every
-// signing key when the token names none). An error is the issuer's: discovery or keys could
-// not be fetched, or the discovery document is not the issuer's.
-func (s *Service) keysFor(ctx context.Context, issuer, kid string) ([]jose.JSONWebKey, error) {
+// signing key when the token names none) and when the set was fetched. The set is fetched
+// when it is unknown, lacks kid, or refresh is asked (a signature the held keys do not
+// verify: a key rotated under the same id), at most once in refreshInterval. An error is the
+// issuer's: discovery or keys could not be fetched, or the discovery document is not the
+// issuer's.
+func (s *Service) keysFor(ctx context.Context, issuer, kid string, refresh bool) ([]jose.JSONWebKey, time.Time, error) {
 	s.mu.Lock()
 	e := s.issuers[issuer]
 	if e == nil {
@@ -63,21 +66,21 @@ func (s *Service) keysFor(ctx context.Context, issuer, kid string) ([]jose.JSONW
 	if e.jwksURL == "" {
 		u, err := s.discover(ctx, issuer)
 		if err != nil {
-			return nil, err
+			return nil, time.Time{}, err
 		}
 		e.jwksURL = u
 	}
-	if found := pick(e.keys, kid); len(found) > 0 {
-		return found, nil
+	if found := pick(e.keys, kid); len(found) > 0 && !refresh {
+		return found, e.fetched, nil
 	}
 	if e.fetched.IsZero() || s.now().Sub(e.fetched) >= refreshInterval {
 		keys, err := s.fetchKeys(ctx, e.jwksURL)
 		if err != nil {
-			return nil, err
+			return nil, time.Time{}, err
 		}
 		e.keys, e.fetched = keys, s.now()
 	}
-	return pick(e.keys, kid), nil
+	return pick(e.keys, kid), e.fetched, nil
 }
 
 // pick selects the signing keys with key id kid, or every signing key when kid is empty.
