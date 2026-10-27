@@ -56,6 +56,49 @@ sandbox_pod() { kctl get pods -l "agent-sandbox.io/sandbox=$1" -o jsonpath='{.it
 sandbox_pod_uid() { kctl get pods -l "agent-sandbox.io/sandbox=$1" -o jsonpath='{.items[0].metadata.uid}' 2>/dev/null; }
 pod_phase() { kctl get pod "$1" -o jsonpath='{.status.phase}' 2>/dev/null; }
 rollout_ready() { "$kubectl" -n "$ACCEPT_NAMESPACE" rollout status "deploy/$ACCEPT_RELEASE-sandboxd" --timeout=5s >/dev/null 2>&1 && [ "$(kctl get pods -l "app.kubernetes.io/instance=$ACCEPT_RELEASE" -o json | jq '[.items[] | select(.status.phase=="Running") | select(all(.status.containerStatuses[]; .ready))] | length')" -eq "$ACCEPT_REPLICAS" ]; }
+# wait_sandbox SANDBOX STATUS waits for the sandbox to reach STATUS; an error state ends the
+# wait at once with the platform's reason (the agent did not come up, and why).
+wait_sandbox() {
+  local sb=$1 want=$2 start status
+  start=$(date +%s)
+  while :; do
+    status=$(get_json "$API/v1/sandboxes/$sb" | jq -r .status)
+    [ "$status" = "$want" ] && return 0
+    if [ "$status" = error ] && [ "$want" != error ]; then
+      acc_fail "sandbox $sb is in error: $(get_json "$API/v1/sandboxes/$sb" | jq -r .error)"
+      return 1
+    fi
+    if [ $(( $(date +%s) - start )) -ge "$ACCEPT_WAIT" ]; then
+      acc_fail "timed out after ${ACCEPT_WAIT}s waiting for sandbox $sb $want (it is $status)"
+      return 1
+    fi
+    sleep 3
+  done
+}
+# diagnose PHASE writes what the cluster shows after a failed phase (pods, events, the agent
+# pod's containers, the replicas' logs, the sandbox) next to the report, and into the log.
+diagnose() {
+  local f=$ACCEPT_OUT/diag-$1.txt pod c
+  {
+    echo "== pods"; kctl get pods -o wide 2>&1
+    echo "== events"; kctl get events --sort-by=.lastTimestamp 2>&1 | tail -80
+    for pod in $(kctl get pods -l agent-sandbox.io/sandbox -o name 2>/dev/null); do
+      echo "== describe $pod"; kctl describe "$pod" 2>&1 | tail -80
+      for c in $(kctl get "$pod" -o jsonpath='{range .spec.initContainers[*]}{.name}{"\n"}{end}{range .spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null); do
+        echo "== logs $pod $c"; kctl logs "$pod" -c "$c" --tail=80 2>&1 || true
+      done
+    done
+    for pod in $(kctl get pods -l "app.kubernetes.io/instance=$ACCEPT_RELEASE" -o name 2>/dev/null); do
+      echo "== logs $pod sandboxd"; kctl logs "$pod" -c sandboxd --tail=150 2>&1 || true
+      echo "== logs $pod caddy"; kctl logs "$pod" -c caddy --tail=40 2>&1 || true
+    done
+    if [ -n "${SB:-}" ] && [ -n "${API:-}" ]; then echo "== sandbox $SB"; get_json "$API/v1/sandboxes/$SB" 2>&1; echo; fi
+    echo "== multus"; "$kubectl" -n kube-system logs ds/kube-multus-ds --tail=40 2>&1 || true
+    echo "== whereabouts"; "$kubectl" -n kube-system logs ds/whereabouts --tail=40 2>&1 || true
+  } > "$f"
+  acc_log "diagnostics for $1 ($f):"
+  head -400 "$f"
+}
 # bundle VARIANT writes the tenant's bundle: an environment and an agent (the policy
 # backend-dev of the chart admits every tenant).
 bundle() {
@@ -166,7 +209,7 @@ phase_agent() {
   sb=$(ctl_as "$TENANT_TOKEN" create -name shop -agent backend -owner alice -tenant "$ACCEPT_TENANT" | jq -r .id)
   [ -n "$sb" ] && [ "$sb" != null ] || acc_fail "no sandbox created"
   save SB="$sb"
-  wait_for "$ACCEPT_WAIT" "sandbox $sb running" sh -c "[ \"\$(curl -sS -m 10 -H 'Authorization: Bearer $ADMIN' $API/v1/sandboxes/$sb | jq -r .status)\" = running ]"
+  wait_sandbox "$sb" running
   pod=$(sandbox_pod "$sb")
   [ "$(pod_phase "$pod")" = Running ] || acc_fail "pod $pod is $(pod_phase "$pod")"
   local vlan
@@ -216,9 +259,9 @@ phase_recovery() {
   # The agent pod lost: the reconciler fails the run and marks the sandbox; wake brings a fresh pod.
   pod=$(sandbox_pod "$SB")
   kctl delete pod "$pod" --wait=true >/dev/null
-  wait_for "$ACCEPT_WAIT" "sandbox $SB in error" sh -c "[ \"\$(curl -sS -m 10 -H 'Authorization: Bearer $ADMIN' $API/v1/sandboxes/$SB | jq -r .status)\" = error ]"
+  wait_sandbox "$SB" error
   ctl_as "$TENANT_TOKEN" wake "$SB" >/dev/null
-  wait_for "$ACCEPT_WAIT" "sandbox $SB running again" sh -c "[ \"\$(curl -sS -m 10 -H 'Authorization: Bearer $ADMIN' $API/v1/sandboxes/$SB | jq -r .status)\" = running ]"
+  wait_sandbox "$SB" running
   newpod=$(sandbox_pod "$SB")
   [ "$newpod" != "$pod" ] && [ "$(pod_phase "$newpod")" = Running ] || acc_fail "no fresh pod after wake ($newpod)"
   new_run_done "$SB" >/dev/null
@@ -344,8 +387,9 @@ for ph in $selected; do
   else
     failed=1
     failed_phases="$failed_phases $ph"
-    result "$ph" fail "see the log ($ACCEPT_OUT/log.txt)"
+    result "$ph" fail "see the log and diag-$ph.txt ($ACCEPT_OUT)"
     acc_log "== $ph FAILED"
+    ( load 2>/dev/null; diagnose "$ph" ) || true
   fi
 done
 report_write
