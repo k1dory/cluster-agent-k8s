@@ -10,6 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -146,5 +147,20 @@ func TestLaunchShapesThePod(t *testing.T) {
 	pod, _ = client.CoreV1().Pods("review").Get(ctx, name, metav1.GetOptions{})
 	if res := pod.Spec.Containers[0].Resources; res.Requests.Cpu().String() != "4" || res.Limits.Cpu().String() != "4" {
 		t.Fatalf("request above limit: %+v", res)
+	}
+}
+
+// The names of the pod and the workspace volume are what the API server accepts: a sandbox
+// id carries an underscore (sb_…), which a DNS subdomain may not; the fake client never
+// validated them, the first real cluster refused the volume.
+func TestPodAndVolumeNamesAreValidObjectNames(t *testing.T) {
+	sb := &model.Sandbox{ID: "sb_85ac4a23c9ae"}
+	for _, name := range []string{podName(sb), pvcName(sb)} {
+		if errs := validation.IsDNS1123Subdomain(name); len(errs) != 0 {
+			t.Errorf("%q: %v", name, errs)
+		}
+	}
+	if podName(sb) != "agent-sb-85ac4a23c9ae" || pvcName(sb) != "ws-sb-85ac4a23c9ae" {
+		t.Errorf("names: %s %s", podName(sb), pvcName(sb))
 	}
 }

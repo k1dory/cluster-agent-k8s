@@ -199,8 +199,13 @@ func NewClient(kubeconfig string) (kubernetes.Interface, error) {
 	return kubernetes.NewForConfig(cfg)
 }
 
-func pvcName(sb *model.Sandbox) string { return "ws-" + sb.ID }
-func podName(sb *model.Sandbox) string { return "agent-" + sb.ID }
+// objectName derives a Kubernetes object name from the sandbox id: a DNS subdomain, so the
+// id's underscore (sb_…) becomes a dash. The id itself travels in the labels and SANDBOX_ID.
+func objectName(prefix string, sb *model.Sandbox) string {
+	return prefix + strings.ReplaceAll(strings.ToLower(sb.ID), "_", "-")
+}
+func pvcName(sb *model.Sandbox) string { return objectName("ws-", sb) }
+func podName(sb *model.Sandbox) string { return objectName("agent-", sb) }
 
 func (r *Runtime) labels(sb *model.Sandbox) map[string]string {
 	return map[string]string{
