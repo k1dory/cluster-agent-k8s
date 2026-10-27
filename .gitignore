@@ -8,4 +8,23 @@
 /sandboxd
 /sandboxctl
 /.ci/
+
+# Local notes, credentials and development environments.
 MAYBE.md
+.env
+.env.*
+!.env.example
+!.env.*.example
+.venv/
+venv/
+node_modules/
+
+# Generated caches and editor/OS files.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+*.swp
+*.swo
+*~
