@@ -17,6 +17,7 @@
 # run goes on, so one report covers everything. hack/acceptance/kind.sh builds a cluster
 # shaped like production and runs this script against it (make ci-acceptance).
 . "$(dirname "$0")/lib.sh"
+shopt -s inherit_errexit # a failure inside $(...) is a failure
 
 phases="preflight install config agent replicas recovery upgrade backup teardown"
 if [ "${1:-}" = "--list" ]; then printf '%s\n' $phases; exit 0; fi
@@ -126,7 +127,7 @@ new_run_done() { # SANDBOX: a task runs to the end and, with a marker, prints it
   wait_for "$ACCEPT_WAIT" "run $run to finish" sh -c "[ \"\$(SANDBOXD_URL=$API SANDBOXD_TOKEN=$TENANT_TOKEN '$ctl' runs '$1' '$run' | jq -r .status)\" != running ] && [ \"\$(SANDBOXD_URL=$API SANDBOXD_TOKEN=$TENANT_TOKEN '$ctl' runs '$1' '$run' | jq -r .status)\" != queued ]"
   [ "$(run_status "$1" "$run")" = done ] || acc_fail "run $run ended $(run_status "$1" "$run")"
   if [ -n "$ACCEPT_HARNESS_MARKER" ]; then
-    ctl_as "$TENANT_TOKEN" events "$1" -run "$run" -json | jq -r 'if type=="array" then . else .events end | .[] | select(.type=="run.output") | .data' | grep -qF "$ACCEPT_HARNESS_MARKER" || acc_fail "the run's output lacks the harness marker $ACCEPT_HARNESS_MARKER"
+    ctl_as "$TENANT_TOKEN" events "$1" -run "$run" -json | jq -r 'if type=="array" then .[] else . end | select(.type=="run.output") | .data' | grep -qF "$ACCEPT_HARNESS_MARKER" || acc_fail "the run's output lacks the harness marker $ACCEPT_HARNESS_MARKER"
   fi
   echo "$run"
 }
@@ -291,7 +292,9 @@ phase_recovery() {
 
 phase_upgrade() {
   load
-  local before_ids before_rev after_ids after_rev
+  local before_ids before_rev after_ids after_rev before_uid
+  [ "$(sandbox_status "$SB")" = running ] || acc_fail "the sandbox is $(sandbox_status "$SB") before the upgrade"
+  before_uid=$(sandbox_pod_uid "$SB")
   before_ids=$(get_json "$API/v1/sandboxes" | jq -r 'if type=="array" then . else .items end | .[].id' | sort | tr '\n' ' ')
   before_rev=$(ctl_as "$ADMIN" get environment py -tenant "$ACCEPT_TENANT" | jq -r .revision)
   # The control plane moves to the next images and a changed value; the agent image stays
@@ -310,7 +313,7 @@ phase_upgrade() {
   after_rev=$(ctl_as "$ADMIN" get environment py -tenant "$ACCEPT_TENANT" | jq -r .revision)
   [ "$before_ids" = "$after_ids" ] || acc_fail "sandboxes changed across the upgrade: $before_ids vs $after_ids"
   [ "$before_rev" = "$after_rev" ] || acc_fail "the catalog changed across the upgrade"
-  [ "$(sandbox_pod_uid "$SB")" = "$POD_UID" ] || acc_fail "the agent pod was replaced by the control-plane upgrade"
+  [ "$(sandbox_pod_uid "$SB")" = "$before_uid" ] || acc_fail "the agent pod was replaced by the control-plane upgrade"
   [ "$(ctl_as "$TENANT_TOKEN" whoami | jq -r .tenant)" = "$ACCEPT_TENANT" ] || acc_fail "the tenant key stopped working"
   new_run_done "$SB" >/dev/null
   evidence "upgrade to ${ACCEPT_UPGRADE_TAG:-the same images with a changed value}: replicas back, one leader; sandboxes and catalog revisions unchanged; the agent pod untouched (same uid); the tenant key works; a run finished"
@@ -362,7 +365,8 @@ needs() {
     install) echo preflight ;;
     config) echo "preflight install" ;;
     agent) echo "preflight install config" ;;
-    replicas | recovery | upgrade | backup) echo "preflight install config agent" ;;
+    replicas | recovery) echo "preflight install config agent" ;;
+    upgrade | backup) echo "preflight install config agent recovery" ;;
     *) echo "" ;;
   esac
 }

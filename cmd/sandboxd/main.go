@@ -137,6 +137,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 
 	// Gateway: push Caddy config, learn Caddy's root, serve DNS.
 	gwCfg := gatewayConfig(cfg)
+	var sharedRoot []byte // the gateway root every replica's Caddy signs under, when shared
 	if cfg.CA.Source == "db" && cfg.Gateway.RootDir != "" {
 		// One gateway root for every replica: Caddy signs its site certificates under it, so an
 		// agent bootstrapped through one replica trusts the others.
@@ -147,6 +148,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 		if gwCfg.RootCert, gwCfg.RootKey, err = root.WriteTo(cfg.Gateway.RootDir, "gateway-root"); err != nil {
 			return fmt.Errorf("gateway root: %w", err)
 		}
+		sharedRoot = root.PEM()
 		log.Info("gateway root shared through the database", "dir", cfg.Gateway.RootDir)
 	}
 	// The gateway syncer starts once the connections service exists (its header names are part
@@ -160,6 +162,12 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	gatewayRoot := make(chan []byte, 1) // delivered once the root is known; published to pods below
 	switch {
+	case sharedRoot != nil:
+		// The root is ours, not Caddy's to tell: asked before the configuration with it is
+		// loaded, Caddy would answer with the local authority it generated for itself, and
+		// the pods would trust a root nothing signs under.
+		reg.SetGatewayCA(sharedRoot)
+		gatewayRoot <- sharedRoot
 	case cfg.CA.GatewayCAFile != "":
 		if reg.GatewayCA, err = os.ReadFile(cfg.CA.GatewayCAFile); err != nil {
 			return fmt.Errorf("gateway ca: %w", err)
