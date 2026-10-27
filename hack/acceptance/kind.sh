@@ -41,8 +41,8 @@ up() {
   local i=0 node workers gateways cni
   cni=$(manifest "cni-plugins-$CNI_PLUGINS_VERSION.tgz" "https://github.com/containernetworking/plugins/releases/download/$CNI_PLUGINS_VERSION/cni-plugins-linux-$(ci_arch)-$CNI_PLUGINS_VERSION.tgz")
   for node in $("$kind" get nodes --name "$name"); do
-    docker cp "$cni" "$node:/tmp/cni-plugins.tgz"
-    docker exec "$node" tar -C /opt/cni/bin -xzf /tmp/cni-plugins.tgz ./macvlan
+    # Streamed in: a node's /tmp is a tmpfs mounted over what docker cp would write to.
+    docker exec -i "$node" tar -C /opt/cni/bin -xzf - ./macvlan < "$cni"
   done
   workers=$("$kind" get nodes --name "$name" | grep -v control-plane | sort)
   for node in $workers; do
