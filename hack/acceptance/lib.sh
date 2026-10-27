@@ -34,8 +34,10 @@ acc_log() { printf '%s acceptance: %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 acc_fail() { echo "acceptance: FAIL: $*" >&2; return 1; }
 
 # --- tools -----------------------------------------------------------------------------------------
+# acc_kubectl prints the pinned kubectl (KUBECTL when set): the runner's own may be versions
+# ahead of the cluster.
 acc_kubectl() {
-  if command -v kubectl >/dev/null; then command -v kubectl; return; fi
+  if [ -n "${KUBECTL:-}" ]; then echo "$KUBECTL"; return; fi
   local dir="$CI_BIN/kubectl-$KUBECTL_VERSION"
   if [ ! -x "$dir/kubectl" ]; then
     mkdir -p "$dir"

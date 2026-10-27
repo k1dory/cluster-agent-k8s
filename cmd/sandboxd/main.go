@@ -297,7 +297,11 @@ func serve(cfgPath string, log *slog.Logger) error {
 		DefaultAgentVersion: cfg.Agent.Default, Versions: cfg.Agent.Versions, EnvVersion: envVersion,
 	}, log)
 	orch.ListenerPublishes = hasListener
-	go orch.Run(ctx) // reconciler on the replica holding the lease
+	orchDone := make(chan struct{})
+	go func() { // reconciler on the replica holding the lease
+		orch.Run(ctx)
+		close(orchDone)
+	}()
 
 	var secretProvider secrets.Provider = secrets.Static{}
 	switch cfg.Secrets.Provider {
@@ -405,6 +409,14 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	for _, s := range servers {
 		httpapi.ShutdownServer(context.Background(), s)
+	}
+	// The lead is handed over before the process ends: the reconciler releases its lease
+	// (unlock, connection closed), so a standby takes over within its polling interval rather
+	// than once the database notices a connection that went away with the process.
+	select {
+	case <-orchDone:
+	case <-time.After(10 * time.Second):
+		log.Warn("the reconciler did not stop in time; exiting with the lease unreleased")
 	}
 	return nil
 }

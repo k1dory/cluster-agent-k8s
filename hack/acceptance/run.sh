@@ -78,7 +78,7 @@ new_run_done() { # SANDBOX: a task runs to the end and, with a marker, prints it
   wait_for "$ACCEPT_WAIT" "run $run to finish" sh -c "[ \"\$(SANDBOXD_URL=$API SANDBOXD_TOKEN=$TENANT_TOKEN '$ctl' runs '$1' '$run' | jq -r .status)\" != running ] && [ \"\$(SANDBOXD_URL=$API SANDBOXD_TOKEN=$TENANT_TOKEN '$ctl' runs '$1' '$run' | jq -r .status)\" != queued ]"
   [ "$(run_status "$1" "$run")" = done ] || acc_fail "run $run ended $(run_status "$1" "$run")"
   if [ -n "$ACCEPT_HARNESS_MARKER" ]; then
-    ctl_as "$TENANT_TOKEN" events "$1" -run "$run" -json | jq -r '(.events // .)[] | select(.type=="run.output") | .data' | grep -qF "$ACCEPT_HARNESS_MARKER" || acc_fail "the run's output lacks the harness marker $ACCEPT_HARNESS_MARKER"
+    ctl_as "$TENANT_TOKEN" events "$1" -run "$run" -json | jq -r 'if type=="array" then . else .events end | .[] | select(.type=="run.output") | .data' | grep -qF "$ACCEPT_HARNESS_MARKER" || acc_fail "the run's output lacks the harness marker $ACCEPT_HARNESS_MARKER"
   fi
   echo "$run"
 }
@@ -98,7 +98,7 @@ phase_preflight() {
   db psql -U "$ACCEPT_DB_USER" -d "$ACCEPT_DB_NAME" -tAc 'select version()' | head -1 | sed 's/^/db: /'
   evidence "database answers: $(db psql -U "$ACCEPT_DB_USER" -d "$ACCEPT_DB_NAME" -tAc 'select version()' | cut -d, -f1)"
   ctl=$(acc_sandboxctl)
-  save CTL="$ctl"
+  save ctl="$ctl"
   ADMIN=${ACCEPT_ADMIN_TOKEN:-$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')}
   save ADMIN="$ADMIN"
   evidence "tools: $("$kubectl" version --client -o json | jq -r .clientVersion.gitVersion), $("$helm" version --short), sandboxctl built from $(git rev-parse --short HEAD)"
@@ -196,7 +196,7 @@ phase_replicas() {
     [ "$(http_code "$survivor/v1/sandboxes" "$ADMIN")" = 200 ] || failures=$((failures + 1))
     sleep 1
   done
-  wait_for 120 "the survivor leading" sh -c "[ \"\$(curl -sS -m 5 -H 'Authorization: Bearer $ADMIN' $survivor/v1/version | jq -r .leader)\" = true ]"
+  wait_for "$ACCEPT_WAIT" "the survivor leading" sh -c "[ \"\$(curl -sS -m 5 -H 'Authorization: Bearer $ADMIN' $survivor/v1/version | jq -r .leader)\" = true ]"
   moved=$(( $(date +%s) - start ))
   [ "$failures" -eq 0 ] || acc_fail "$failures of $probes requests to the surviving replica failed during the failover"
   wait_for "$ACCEPT_WAIT" "the replaced replica back" rollout_ready
@@ -244,7 +244,7 @@ phase_recovery() {
 phase_upgrade() {
   load
   local before_ids before_rev after_ids after_rev
-  before_ids=$(get_json "$API/v1/sandboxes" | jq -r '(.items // .)[].id' | sort | tr '\n' ' ')
+  before_ids=$(get_json "$API/v1/sandboxes" | jq -r 'if type=="array" then . else .items end | .[].id' | sort | tr '\n' ' ')
   before_rev=$(ctl_as "$ADMIN" get environment py -tenant "$ACCEPT_TENANT" | jq -r .revision)
   # The control plane moves to the next images and a changed value; the agent image stays
   # (an agent rollout is a deliberate command, not a side effect of a control-plane upgrade).
@@ -258,7 +258,7 @@ phase_upgrade() {
   if [ -n "$ACCEPT_UPGRADE_TAG" ]; then
     [ "$(kctl get pods -l "app.kubernetes.io/instance=$ACCEPT_RELEASE" -o jsonpath='{range .items[*]}{range .spec.containers[?(@.name=="sandboxd")]}{.image}{"\n"}{end}{end}' | grep -c ":$ACCEPT_UPGRADE_TAG\$")" -eq "$ACCEPT_REPLICAS" ] || acc_fail "the replicas do not run $ACCEPT_UPGRADE_TAG"
   fi
-  after_ids=$(get_json "$API/v1/sandboxes" | jq -r '(.items // .)[].id' | sort | tr '\n' ' ')
+  after_ids=$(get_json "$API/v1/sandboxes" | jq -r 'if type=="array" then . else .items end | .[].id' | sort | tr '\n' ' ')
   after_rev=$(ctl_as "$ADMIN" get environment py -tenant "$ACCEPT_TENANT" | jq -r .revision)
   [ "$before_ids" = "$after_ids" ] || acc_fail "sandboxes changed across the upgrade: $before_ids vs $after_ids"
   [ "$before_rev" = "$after_rev" ] || acc_fail "the catalog changed across the upgrade"
@@ -288,7 +288,7 @@ phase_backup() {
   # The state of the backup: what came after it is gone, what was before it is there.
   if ctl_as "$ADMIN" get environment post-dump -tenant "$ACCEPT_TENANT" >/dev/null 2>&1; then acc_fail "the post-dump document survived the restore"; fi
   ctl_as "$ADMIN" get environment py -tenant "$ACCEPT_TENANT" >/dev/null || acc_fail "the environment is gone after the restore"
-  get_json "$API/v1/sandboxes" | jq -e --arg id "$SB" '(.items // .)[] | select(.id==$id)' >/dev/null || acc_fail "the sandbox is gone after the restore"
+  get_json "$API/v1/sandboxes" | jq -e --arg id "$SB" 'if type=="array" then . else .items end | .[] | select(.id==$id)' >/dev/null || acc_fail "the sandbox is gone after the restore"
   [ "$(ctl_as "$TENANT_TOKEN" whoami | jq -r .tenant)" = "$ACCEPT_TENANT" ] || acc_fail "the tenant key from before the backup does not work"
   if SANDBOXD_URL=$API SANDBOXD_TOKEN=$post_key "$ctl" whoami >/dev/null 2>&1; then acc_fail "the key issued after the backup still works"; fi
   # The identities: the agent pod from before the restore still has a valid certificate (the
@@ -300,30 +300,52 @@ phase_backup() {
 phase_teardown() {
   load 2>/dev/null || true
   if [ -n "$ACCEPT_KEEP" ]; then evidence "kept (ACCEPT_KEEP): namespace $ACCEPT_NAMESPACE, release $ACCEPT_RELEASE"; return 0; fi
-  "$helm" uninstall "$ACCEPT_RELEASE" -n "$ACCEPT_NAMESPACE" --wait --timeout 5m >/dev/null 2>&1 || true
-  kctl delete pods -l agent-sandbox.io/sandbox --ignore-not-found --wait=true >/dev/null 2>&1 || true
-  kctl delete pvc --all --ignore-not-found >/dev/null 2>&1 || true
-  evidence "release uninstalled, agent pods and volumes removed"
+  "$helm" uninstall "$ACCEPT_RELEASE" -n "$ACCEPT_NAMESPACE" --wait --timeout 3m >/dev/null 2>&1 || true
+  kctl delete pods -l agent-sandbox.io/sandbox --ignore-not-found --timeout=120s >/dev/null 2>&1 || true
+  # The workspace volumes only (the database of the kind cluster lives in this namespace too).
+  kctl delete pvc -l agent-sandbox.io/sandbox --ignore-not-found --timeout=120s >/dev/null 2>&1 || true
+  evidence "release uninstalled, agent pods and workspace volumes removed"
 }
 
 # --- the run ----------------------------------------------------------------------------------------
+# needs PHASE prints the phases that must have passed for PHASE to be judged.
+needs() {
+  case "$1" in
+    install) echo preflight ;;
+    config) echo "preflight install" ;;
+    agent) echo "preflight install config" ;;
+    replicas | recovery | upgrade | backup) echo "preflight install config agent" ;;
+    *) echo "" ;;
+  esac
+}
 failed=0
+failed_phases=""
 for ph in $selected; do
   case " $phases " in *" $ph "*) ;; *) echo "unknown phase $ph (hack/acceptance/run.sh --list)" >&2; exit 2 ;; esac
+  blocked=""
+  for dep in $(needs "$ph"); do
+    case " $failed_phases " in *" $dep "*) blocked=$dep ;; esac
+  done
+  if [ -n "$blocked" ]; then
+    result "$ph" skip "the $blocked phase failed"
+    acc_log "== $ph skipped: the $blocked phase failed"
+    continue
+  fi
   acc_log "== $ph"
   lines_before=$(wc -l < "$evidence_file")
-  if ( set -e; "phase_$ph" ); then
+  # Not inside an if-condition: there bash ignores set -e, and a phase would run on past its
+  # first failure, reporting evidence it never gathered.
+  set +e
+  ( set -e; "phase_$ph" )
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
     result "$ph" pass "$(tail -n +$((lines_before + 1)) "$evidence_file" | head -1 | cut -c3-120)"
   else
     failed=1
+    failed_phases="$failed_phases $ph"
     result "$ph" fail "see the log ($ACCEPT_OUT/log.txt)"
     acc_log "== $ph FAILED"
-    if [ "$ph" = install ] || [ "$ph" = preflight ]; then
-      for rest in $selected; do
-        case "$rest" in preflight|install) ;; teardown) ( set -e; phase_teardown ) || true; result teardown pass "after a failed $ph" ;; *) result "$rest" skip "the $ph phase failed" ;; esac
-      done
-      break
-    fi
   fi
 done
 report_write
