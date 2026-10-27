@@ -50,6 +50,10 @@ replica_urls() {
 version() { get_json "$1/v1/version" | jq -r '"\(.replica) \(.leader)"'; }
 leader_url() { for u in $(replica_urls); do if [ "$(version "$u" | awk '{print $2}')" = true ]; then echo "$u"; return; fi; done; return 1; }
 one_leader() { [ "$(for u in $(replica_urls); do version "$u"; done | awk '$2=="true"' | wc -l)" -eq 1 ]; }
+# lead_moved: the pod named in LEAD_LEFT is gone and a replica leads. With hostNetwork every
+# replica answers at its node's address, so a pod and its successor cannot be told apart by URL
+# or name (the host name): the lead has moved once the leaving pod no longer exists.
+lead_moved() { ! kctl get pod "$LEAD_LEFT" >/dev/null 2>&1 && leader_url >/dev/null; }
 all_ready() { for u in $(replica_urls); do [ "$(http_code "$u/readyz")" = 200 ] || return 1; done; }
 sandbox_status() { get_json "$API/v1/sandboxes/$1" | jq -r .status; }
 run_status() { ctl_as "$TENANT_TOKEN" runs "$1" "$2" | jq -r .status; }
@@ -232,21 +236,26 @@ phase_agent() {
 
 phase_replicas() {
   load
-  local leader survivor leaderpod start moved failures=0 probes=0
+  local leader survivor leaderpod start moved newleader failures=0 probes=0
   leader=$(leader_url) || acc_fail "no leader"
   survivor=$(replica_urls | grep -v -F "$leader" | head -1)
   leaderpod=$(kctl get pods -l "app.kubernetes.io/instance=$ACCEPT_RELEASE" -o json | jq -r --arg ip "${leader#http://}" '.items[] | select((.status.podIP + ":8080") == $ip or .status.podIP == ($ip | split(":")[0])) | .metadata.name' | head -1)
   [ -n "$leaderpod" ] || acc_fail "cannot name the leader's pod for $leader"
   start=$(date +%s)
   kctl delete pod "$leaderpod" --wait=false >/dev/null
-  # The survivor answers throughout, and takes the lead.
+  # The survivor answers throughout. The lead moves: to the survivor, or to the replaced
+  # replica's successor when it comes up first (the leaving replica releases its lease, every
+  # standing replica tries for it every few seconds, and the successor tries on start).
   while [ $(( $(date +%s) - start )) -lt 30 ]; do
     probes=$((probes + 1))
     [ "$(http_code "$survivor/v1/sandboxes" "$ADMIN")" = 200 ] || failures=$((failures + 1))
     sleep 1
   done
-  wait_for "$ACCEPT_WAIT" "the survivor leading" sh -c "[ \"\$(curl -sS -m 5 -H 'Authorization: Bearer $ADMIN' $survivor/v1/version | jq -r .leader)\" = true ]"
+  LEAD_LEFT=$leaderpod
+  wait_for "$ACCEPT_WAIT" "the lead to move from $leaderpod" lead_moved
   moved=$(( $(date +%s) - start ))
+  newleader=$(leader_url)
+  if [ "$newleader" = "$survivor" ]; then newleader="the survivor $(version "$survivor" | awk '{print $1}')"; else newleader="the successor $(version "$newleader" | awk '{print $1}')"; fi
   [ "$failures" -eq 0 ] || acc_fail "$failures of $probes requests to the surviving replica failed during the failover"
   wait_for "$ACCEPT_WAIT" "the replaced replica back" rollout_ready
   wait_for 60 "every replica ready" all_ready
@@ -256,7 +265,7 @@ phase_replicas() {
   local repo=$ACCEPT_OUT/config-repo
   bundle v2 > "$repo/bundles/$ACCEPT_TENANT.yaml"
   git -C "$repo" commit -qam "widen" && (cd "$repo" && SANDBOXD_URL=$survivor SANDBOXD_TOKEN=$ADMIN "$ctl" apply -f "bundles/$ACCEPT_TENANT.yaml" -ref main -repo https://git.example.com/acceptance/config -key "bundles/$ACCEPT_TENANT.yaml@$(git rev-parse HEAD)" -require-commit -markdown) | grep -q "Apply ✅ done" || acc_fail "apply through the survivor"
-  evidence "leader pod $leaderpod deleted: the survivor answered $probes/$probes requests and led after ${moved}s; replicas back, one leader; the sandbox stayed running; an apply through the survivor went through"
+  evidence "leader pod $leaderpod deleted: the survivor answered $probes/$probes requests, $newleader led after ${moved}s; replicas back, one leader; the sandbox stayed running; an apply through the survivor went through"
 }
 
 phase_recovery() {
