@@ -64,8 +64,19 @@ func TestDNS(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = d.ListenAndServe(ctx, addr) }()
-	time.Sleep(100 * time.Millisecond)
 	cl := &dns.Client{Timeout: time.Second}
+	// Until the server answers (a loaded machine under the race detector takes a moment).
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		probe := new(dns.Msg)
+		probe.SetQuestion("api.sandbox.internal.", dns.TypeA)
+		if _, _, err := cl.Exchange(probe, addr); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the DNS server did not come up")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	ask := func(name string, qt uint16) *dns.Msg {
 		m := new(dns.Msg)
 		m.SetQuestion(dns.Fqdn(name), qt)
