@@ -261,18 +261,24 @@ phase_replicas() {
 
 phase_recovery() {
   load
-  local pod newpod restarts
+  local pod uid newpod newuid instance restarts
   # The agent pod lost: the reconciler fails the run and marks the sandbox; wake brings a fresh pod.
+  # The pod's name is the sandbox's, so the fresh pod carries the old name: its uid and the
+  # identity instance the registrar issued tell it apart.
   pod=$(sandbox_pod "$SB")
+  uid=$(sandbox_pod_uid "$SB")
+  instance=$(get_json "$API/v1/sandboxes/$SB" | jq -r .instance)
   kctl delete pod "$pod" --wait=true >/dev/null
   wait_sandbox "$SB" error
   ctl_as "$TENANT_TOKEN" wake "$SB" >/dev/null
   wait_sandbox "$SB" running
   newpod=$(sandbox_pod "$SB")
-  [ "$newpod" != "$pod" ] && [ "$(pod_phase "$newpod")" = Running ] || acc_fail "no fresh pod after wake ($newpod)"
+  newuid=$(sandbox_pod_uid "$SB")
+  [ -n "$newuid" ] && [ "$newuid" != "$uid" ] && [ "$(pod_phase "$newpod")" = Running ] || acc_fail "no fresh pod after wake (pod $newpod uid ${newuid:-none}, before $uid)"
+  [ "$(get_json "$API/v1/sandboxes/$SB" | jq -r .instance)" -gt "$instance" ] || acc_fail "the fresh pod did not bootstrap a new identity (instance still $instance)"
   new_run_done "$SB" >/dev/null
-  save POD_UID="$(sandbox_pod_uid "$SB")"
-  evidence "agent pod $pod deleted: sandbox went to error, wake started $newpod, a run finished on it"
+  save POD_UID="$newuid"
+  evidence "agent pod $pod deleted: sandbox went to error, wake started a fresh pod (uid $newuid, identity instance $instance → $(get_json "$API/v1/sandboxes/$SB" | jq -r .instance)), a run finished on it"
   # The database lost: replicas unready (no traffic), not restarted; back when it is.
   if [ -z "$ACCEPT_DB_OUTAGE" ] || [ -z "$ACCEPT_DB_RESTORE" ]; then
     evidence "database outage: skipped (ACCEPT_DB_OUTAGE/ACCEPT_DB_RESTORE not set for this database)"
