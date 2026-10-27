@@ -41,6 +41,15 @@ func TestRender(t *testing.T) {
 	if err != nil || !strings.Contains(shared, "cert /var/lib/sandboxd/gateway-root.crt") || !strings.Contains(shared, "key /var/lib/sandboxd/gateway-root.key") {
 		t.Fatalf("shared gateway root must land in the pki block: %v", err)
 	}
+	// Caddy keeps signing with the intermediate its storage holds (issued under the root its
+	// bootstrap configuration generated), so with a shared root the sites are signed by that
+	// root itself; without one, Caddy's own chain is what the pods are told to trust.
+	if n := strings.Count(shared, "sign_with_root"); n != 2 {
+		t.Fatalf("a shared root must sign the mTLS sites and the registrar itself, got %d sign_with_root:\n%s", n, shared)
+	}
+	if strings.Contains(out, "sign_with_root") {
+		t.Fatalf("without a shared root Caddy's own chain is the one published:\n%s", out)
+	}
 	cfg.RootCert, cfg.RootKey = "", ""
 	if path, err := exec.LookPath("caddy"); err == nil {
 		cmd := exec.Command(path, "validate", "--adapter", "caddyfile", "--config", "/dev/stdin")
@@ -64,8 +73,19 @@ func TestDNS(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = d.ListenAndServe(ctx, addr) }()
-	time.Sleep(100 * time.Millisecond)
 	cl := &dns.Client{Timeout: time.Second}
+	// Until the server answers (a loaded machine under the race detector takes a moment).
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		probe := new(dns.Msg)
+		probe.SetQuestion("api.sandbox.internal.", dns.TypeA)
+		if _, _, err := cl.Exchange(probe, addr); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the DNS server did not come up")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	ask := func(name string, qt uint16) *dns.Msg {
 		m := new(dns.Msg)
 		m.SetQuestion(dns.Fqdn(name), qt)

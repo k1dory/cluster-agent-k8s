@@ -67,6 +67,10 @@ Two layouts, pick one.
 
 In both cases, adding an external service the agents may use is one rule in a policy file.
 
+Before a release, run the production acceptance against the cluster it goes to
+([docs/acceptance.md](docs/acceptance.md)): install with replicas, the Git path to a running
+agent, a replica lost, the database lost, an upgrade, a backup restored, one report.
+
 ## Policy workflow
 
 ```sh
@@ -379,8 +383,8 @@ decision is a `rollout` event in the trace; every run records the `agent_version
 ### High availability
 
 `sandboxd` is stateless apart from Postgres. With `database_url` set and `ca.source: db` (the agent
-CA and the gateway root shared through the database, so every replica's Caddy issues certificates
-the pods trust) any number of replicas can run at once: every write is checked
+CA and the gateway root shared through the database, so every replica's Caddy signs its sites
+with the one root the pods trust) any number of replicas can run at once: every write is checked
 against the record's `revision`, quota decisions happen under a tenant lock shared by all replicas,
 the reconciler (idle sleep, expiry, deferred rollouts, refused deletes, pods a dead replica left
 behind) runs on the replica holding the leadership lease, and events appended by one replica reach

@@ -579,6 +579,8 @@ func (m *Memory) GetIdempotent(_ context.Context, key string) (*Idempotent, erro
 
 func (m *Memory) Close() error { return nil }
 
+func (m *Memory) Ping(context.Context) error { return nil }
+
 func (m *Memory) QuerySandboxes(_ context.Context, f SandboxFilter) ([]*model.Sandbox, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -295,10 +295,15 @@ func LoadOrCreateSharedNamed(ctx context.Context, st Blobs, name, cn string) (*C
 	return ParseBundle(data)
 }
 
-// WriteTo stores the CA as <dir>/<base>.crt and <dir>/<base>.key (0600) for a program that
-// reads PEM files (Caddy's pki root) and returns both paths.
+// WriteTo stores the CA as <dir>/<base>.crt and <dir>/<base>.key for a program that reads
+// PEM files (Caddy's pki root) and returns both paths. The key is 0640: Caddy runs next to
+// sandboxd in the same pod under another user with every capability dropped (no
+// CAP_DAC_OVERRIDE, so root obeys the mode bits), and reads it through the pod's group
+// (the chart's fsGroup); nobody outside the pod sees the directory. The directories WriteTo
+// creates on the way, nested ones included, let the group through (0750) for the same
+// reader; directories that already exist (a volume's mount point) are left as they are.
 func (c *CA) WriteTo(dir, base string) (certPath, keyPath string, err error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := mkdirAllGroup(dir); err != nil {
 		return "", "", err
 	}
 	keyDER, err := x509.MarshalECPrivateKey(c.key.(*ecdsa.PrivateKey))
@@ -309,8 +314,43 @@ func (c *CA) WriteTo(dir, base string) (certPath, keyPath string, err error) {
 	if err := os.WriteFile(certPath, c.pem, 0o644); err != nil {
 		return "", "", err
 	}
-	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o640); err != nil {
+		return "", "", err
+	}
+	// The modes as stated, whatever the process's umask (0077 would leave the group out).
+	if err := os.Chmod(certPath, 0o644); err != nil {
+		return "", "", err
+	}
+	if err := os.Chmod(keyPath, 0o640); err != nil {
 		return "", "", err
 	}
 	return certPath, keyPath, nil
+}
+
+// mkdirAllGroup creates dir and the missing directories above it, each 0750 whatever the
+// process's umask: the mode is set explicitly on every directory created here, never on one
+// found in place.
+func mkdirAllGroup(dir string) error {
+	dir = filepath.Clean(dir)
+	var missing []string
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, err := os.Stat(d); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		missing = append(missing, d)
+		if parent := filepath.Dir(d); parent == d {
+			break
+		}
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := os.Mkdir(missing[i], 0o750); err != nil && !os.IsExist(err) {
+			return err
+		}
+		if err := os.Chmod(missing[i], 0o750); err != nil {
+			return err
+		}
+	}
+	return nil
 }

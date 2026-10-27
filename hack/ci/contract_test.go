@@ -153,3 +153,47 @@ func TestImagesMoveTheCheckoutThroughTheAPI(t *testing.T) {
 		t.Error("images.sh must copy the checkout with docker cp")
 	}
 }
+
+// The acceptance scripts parse, name the same phases the runbook documents, and take their
+// tool versions from versions.env like every other check.
+func TestAcceptanceScriptsParseAndNameEveryPhase(t *testing.T) {
+	root := repoRoot(t)
+	for _, s := range []string{"hack/acceptance/lib.sh", "hack/acceptance/run.sh", "hack/acceptance/kind.sh", "hack/ci/acceptance.sh"} {
+		if out, err := exec.Command("bash", "-n", filepath.Join(root, s)).CombinedOutput(); err != nil {
+			t.Errorf("%s does not parse: %v\n%s", s, err, out)
+		}
+	}
+	out, err := exec.Command(filepath.Join(root, "hack/acceptance/run.sh"), "--list").CombinedOutput()
+	if err != nil {
+		t.Fatalf("run.sh --list: %v\n%s", err, out)
+	}
+	phases := strings.Fields(string(out))
+	want := []string{"preflight", "install", "config", "agent", "replicas", "recovery", "upgrade", "backup", "teardown"}
+	if strings.Join(phases, " ") != strings.Join(want, " ") {
+		t.Errorf("phases: %v, want %v", phases, want)
+	}
+	doc, err := os.ReadFile(filepath.Join(root, "docs/acceptance.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range want {
+		if !strings.Contains(string(doc), "`"+p+"`") {
+			t.Errorf("docs/acceptance.md does not document the %s phase", p)
+		}
+	}
+	env, err := os.ReadFile(filepath.Join(root, "hack/ci/versions.env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pin := range []string{"KIND_VERSION=", "KIND_NODE_IMAGE=", "KUBECTL_VERSION=", "MULTUS_VERSION=", "WHEREABOUTS_VERSION=", "CNI_PLUGINS_VERSION="} {
+		if !strings.Contains(string(env), pin) {
+			t.Errorf("versions.env lacks %s", pin)
+		}
+	}
+	kind, _ := os.ReadFile(filepath.Join(root, "hack/acceptance/kind.sh"))
+	for _, bad := range []string{"kindest/node:v", "multus-cni/v", "whereabouts/v", "plugins/releases/download/v"} {
+		if strings.Contains(string(kind), bad) {
+			t.Errorf("kind.sh carries a version of its own (%q): versions live in versions.env", bad)
+		}
+	}
+}

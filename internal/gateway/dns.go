@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -16,6 +17,8 @@ type DNS struct {
 	Policies HostLister // the policy set, or the guard that adds the connections' hosts
 	Extra    []string   // internal hosts (api, registrar)
 	Log      *slog.Logger
+	// RetryEvery is how often a bind that failed is tried again (0: 5s).
+	RetryEvery time.Duration
 }
 
 // Allowed reports whether the gateway serves name (an internal host, a repository host or a
@@ -64,21 +67,62 @@ func (d *DNS) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	_ = w.WriteMsg(m)
 }
 
-// ListenAndServe runs UDP and TCP servers on addr until ctx ends.
+// ListenAndServe runs UDP and TCP servers on addr until ctx ends. The address is bound
+// with IP_FREEBIND where the platform has it (Linux): a replica standing by for a gateway
+// address it does not hold yet (a VIP on another node) binds all the same and serves the
+// moment the address moves to its node. A bind that fails anyway is tried again every
+// RetryEvery until ctx ends, logged each time: a standby never gives up on the address.
 func (d *DNS) ListenAndServe(ctx context.Context, addr string) error {
-	udp := &dns.Server{Addr: addr, Net: "udp", Handler: d}
-	tcp := &dns.Server{Addr: addr, Net: "tcp", Handler: d}
+	retry := d.RetryEvery
+	if retry <= 0 {
+		retry = 5 * time.Second
+	}
+	for {
+		udp, tcp, err := d.bind(ctx, addr)
+		if err == nil {
+			return d.serve(ctx, udp, tcp)
+		}
+		if d.Log != nil {
+			d.Log.Error("dns: bind failed, trying again", "addr", addr, "retry", retry, "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(retry):
+		}
+	}
+}
+
+// bind opens the UDP and TCP sockets, both or neither.
+func (d *DNS) bind(ctx context.Context, addr string) (net.PacketConn, net.Listener, error) {
+	lc := net.ListenConfig{Control: freebind}
+	udp, err := lc.ListenPacket(ctx, "udp", addr)
+	if err != nil {
+		return nil, nil, err
+	}
+	tcp, err := lc.Listen(ctx, "tcp", addr)
+	if err != nil {
+		_ = udp.Close()
+		return nil, nil, err
+	}
+	return udp, tcp, nil
+}
+
+// serve answers on the open sockets until ctx ends or a server fails.
+func (d *DNS) serve(ctx context.Context, udp net.PacketConn, tcp net.Listener) error {
+	us := &dns.Server{PacketConn: udp, Handler: d}
+	ts := &dns.Server{Listener: tcp, Handler: d}
 	errCh := make(chan error, 2)
-	go func() { errCh <- udp.ListenAndServe() }()
-	go func() { errCh <- tcp.ListenAndServe() }()
+	go func() { errCh <- us.ActivateAndServe() }()
+	go func() { errCh <- ts.ActivateAndServe() }()
 	select {
 	case <-ctx.Done():
-		_ = udp.Shutdown()
-		_ = tcp.Shutdown()
+		_ = us.Shutdown()
+		_ = ts.Shutdown()
 		return nil
 	case err := <-errCh:
-		_ = udp.Shutdown()
-		_ = tcp.Shutdown()
+		_ = us.Shutdown()
+		_ = ts.Shutdown()
 		return err
 	}
 }

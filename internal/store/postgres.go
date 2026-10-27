@@ -42,11 +42,31 @@ func OpenPostgres(ctx context.Context, url string) (*Postgres, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := pool.Exec(ctx, migrations); err != nil {
+	if err := migrate(ctx, pool); err != nil {
 		pool.Close()
 		return nil, err
 	}
 	return &Postgres{pool: pool, lockers: make(chan struct{}, max(1, int(cfg.MaxConns)/2))}, nil
+}
+
+// migrate applies the schema under an advisory lock: replicas start together (a rollout
+// recreates them at once), and CREATE ... IF NOT EXISTS is not safe against itself on a fresh
+// database (two creators of one type collide on pg_type's unique index). One replica
+// migrates, the others wait and find everything in place.
+func migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Release()
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('agent-sandbox:migrations'))`); err != nil {
+		return err
+	}
+	_, merr := conn.Exec(ctx, migrations)
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext('agent-sandbox:migrations'))`); err != nil && merr == nil {
+		return err
+	}
+	return merr
 }
 
 // dedicated opens a connection outside the pool for long-held session state (locks, LISTEN).
@@ -55,6 +75,8 @@ func (p *Postgres) dedicated(ctx context.Context) (*pgx.Conn, error) {
 }
 
 func (p *Postgres) Close() error { p.pool.Close(); return nil }
+
+func (p *Postgres) Ping(ctx context.Context) error { return p.pool.Ping(ctx) }
 
 const sandboxCols = `id, name, slug, owner, tenant, repo, idle_timeout, wake_on_preview, status, ip, instance,
 	pod_name, last_activity, created_at, expires_at, preview_port, preview_access, preview_host, error,

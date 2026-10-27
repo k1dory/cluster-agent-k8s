@@ -284,6 +284,9 @@ type EventListener interface {
 // Store is the persistence interface. Postgres is the production implementation,
 // Memory is used for tests and local development.
 type Store interface {
+	// Ping reports whether the store answers: the readiness of a replica (a database it
+	// cannot reach makes it unready, so traffic goes to a replica that can).
+	Ping(ctx context.Context) error
 	// CreateSandbox inserts the record and sets its Revision to 1.
 	CreateSandbox(ctx context.Context, s *model.Sandbox) error
 	GetSandbox(ctx context.Context, id string) (*model.Sandbox, error)

@@ -137,6 +137,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 
 	// Gateway: push Caddy config, learn Caddy's root, serve DNS.
 	gwCfg := gatewayConfig(cfg)
+	var sharedRoot []byte // the gateway root every replica's Caddy signs under, when shared
 	if cfg.CA.Source == "db" && cfg.Gateway.RootDir != "" {
 		// One gateway root for every replica: Caddy signs its site certificates under it, so an
 		// agent bootstrapped through one replica trusts the others.
@@ -147,6 +148,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 		if gwCfg.RootCert, gwCfg.RootKey, err = root.WriteTo(cfg.Gateway.RootDir, "gateway-root"); err != nil {
 			return fmt.Errorf("gateway root: %w", err)
 		}
+		sharedRoot = root.PEM()
 		log.Info("gateway root shared through the database", "dir", cfg.Gateway.RootDir)
 	}
 	// The gateway syncer starts once the connections service exists (its header names are part
@@ -160,6 +162,12 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	gatewayRoot := make(chan []byte, 1) // delivered once the root is known; published to pods below
 	switch {
+	case sharedRoot != nil:
+		// The root is ours, not Caddy's to tell: asked before the configuration with it is
+		// loaded, Caddy would answer with the local authority it generated for itself, and
+		// the pods would trust a root nothing signs under.
+		reg.SetGatewayCA(sharedRoot)
+		gatewayRoot <- sharedRoot
 	case cfg.CA.GatewayCAFile != "":
 		if reg.GatewayCA, err = os.ReadFile(cfg.CA.GatewayCAFile); err != nil {
 			return fmt.Errorf("gateway ca: %w", err)
@@ -297,7 +305,11 @@ func serve(cfgPath string, log *slog.Logger) error {
 		DefaultAgentVersion: cfg.Agent.Default, Versions: cfg.Agent.Versions, EnvVersion: envVersion,
 	}, log)
 	orch.ListenerPublishes = hasListener
-	go orch.Run(ctx) // reconciler on the replica holding the lease
+	orchDone := make(chan struct{})
+	go func() { // reconciler on the replica holding the lease
+		orch.Run(ctx)
+		close(orchDone)
+	}()
 
 	var secretProvider secrets.Provider = secrets.Static{}
 	switch cfg.Secrets.Provider {
@@ -362,7 +374,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken, Tenants: tokenTenants,
 		Keys: &apikeys.Service{Store: st, MaxTTL: cfg.APIKeys.MaxTTL}, Credentials: creds,
-		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Log: log.With("log", "api")}
+		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Replica: replicaName(), Log: log.With("log", "api")}
 	services.Install(platform)
 	// CI jobs trade their provider's ID token for a key of the trusting tenant.
 	platform.CIAuth = &ciauth.Service{Trusts: st, Keys: platform.Keys, Uses: st, MaxTTL: cfg.CIAuth.MaxTTL, Log: log.With("log", "ci-auth")}
@@ -405,6 +417,14 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	for _, s := range servers {
 		httpapi.ShutdownServer(context.Background(), s)
+	}
+	// The lead is handed over before the process ends: the reconciler releases its lease
+	// (unlock, connection closed), so a standby takes over within its polling interval rather
+	// than once the database notices a connection that went away with the process.
+	select {
+	case <-orchDone:
+	case <-time.After(10 * time.Second):
+		log.Warn("the reconciler did not stop in time; exiting with the lease unreleased")
 	}
 	return nil
 }
@@ -503,4 +523,13 @@ func policyCmd(args []string) int {
 		fmt.Fprintln(os.Stderr, "unknown policy subcommand", sub)
 		return 2
 	}
+}
+
+// replicaName identifies this replica in GET /v1/version: the pod's name (its hostname).
+func replicaName() string {
+	h, err := os.Hostname()
+	if err != nil {
+		return "unknown"
+	}
+	return h
 }

@@ -73,6 +73,7 @@ type Platform struct {
 	// their agent certificates) at the token's expiry.
 	TTLFromToken bool
 	Build        string // control-plane version reported by GET /v1/version
+	Replica      string // this replica's name (the pod), reported by GET /v1/version
 	Log          *slog.Logger
 }
 
@@ -127,6 +128,18 @@ func principalOf(r *http.Request) Principal {
 func (p *Platform) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
+	// Readiness: the store answers. A replica that lost its database stops taking traffic
+	// (the others, on the same database, keep it); liveness stays /healthz, so it is not
+	// restarted for an outage that is not its own.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+		defer cancel()
+		if err := p.Orch.Store.Ping(ctx); err != nil {
+			http.Error(w, "store: "+err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		w.Write([]byte("ready\n"))
+	})
 	mux.HandleFunc("GET /openapi.yaml", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/yaml")
 		w.Write(api.OpenAPI)
@@ -200,6 +213,8 @@ func (p *Platform) version(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"sandboxd": p.Build,
+		"replica":  p.Replica,
+		"leader":   p.Orch.Leading(), // the replica running the reconciler
 		"agent":    map[string]any{"default": cfg.DefaultAgentVersion, "versions": versions},
 		"env":      envs,
 	})

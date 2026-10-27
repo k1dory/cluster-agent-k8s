@@ -335,6 +335,11 @@ spec:
         agent-sandbox.io/gateway: "true"
       securityContext:
         seccompProfile: { type: RuntimeDefault }
+        # One group for both containers: the gateway root sandboxd (uid 65532) writes under
+        # /var/lib/sandboxd (ca.source db) is read by Caddy through this group, since Caddy
+        # runs with every capability dropped and root obeys the mode bits without
+        # CAP_DAC_OVERRIDE.
+        fsGroup: 65532
       containers:
         - name: caddy
           image: caddy:2
@@ -356,7 +361,8 @@ spec:
             - secretRef:
                 name: agent-sandbox-secrets
           readinessProbe:
-            httpGet: { path: /healthz, port: 8080 }
+            # the store answers: a replica that lost the database stops taking traffic
+            httpGet: { path: /readyz, port: 8080 }
           livenessProbe:
             httpGet: { path: /healthz, port: 8080 }
           securityContext:
