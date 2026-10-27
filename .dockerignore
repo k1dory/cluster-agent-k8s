@@ -1,0 +1,27 @@
+# Local state must not enter the build context, including intermediate COPY layers.
+.git
+.ci
+var
+bin
+agent-init
+agent-runner
+sandboxd
+sandboxctl
+MAYBE.md
+**/MAYBE.md
+**/.env
+**/.env.*
+!deploy/**/.env.example
+**/*.key
+**/*.pem
+**/.venv
+**/venv
+**/node_modules
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+**/.mypy_cache
+**/.DS_Store
+**/*.swp
+**/*.swo
+**/*~
