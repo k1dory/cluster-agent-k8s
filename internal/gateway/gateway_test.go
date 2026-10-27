@@ -41,6 +41,15 @@ func TestRender(t *testing.T) {
 	if err != nil || !strings.Contains(shared, "cert /var/lib/sandboxd/gateway-root.crt") || !strings.Contains(shared, "key /var/lib/sandboxd/gateway-root.key") {
 		t.Fatalf("shared gateway root must land in the pki block: %v", err)
 	}
+	// Caddy keeps signing with the intermediate its storage holds (issued under the root its
+	// bootstrap configuration generated), so with a shared root the sites are signed by that
+	// root itself; without one, Caddy's own chain is what the pods are told to trust.
+	if n := strings.Count(shared, "sign_with_root"); n != 2 {
+		t.Fatalf("a shared root must sign the mTLS sites and the registrar itself, got %d sign_with_root:\n%s", n, shared)
+	}
+	if strings.Contains(out, "sign_with_root") {
+		t.Fatalf("without a shared root Caddy's own chain is the one published:\n%s", out)
+	}
 	cfg.RootCert, cfg.RootKey = "", ""
 	if path, err := exec.LookPath("caddy"); err == nil {
 		cmd := exec.Command(path, "validate", "--adapter", "caddyfile", "--config", "/dev/stdin")
