@@ -76,7 +76,9 @@ one phase again):
   worker joins as `eth1`: the first two workers are the gateway nodes (labelled, tainted;
   `10.77.77.1` and `10.77.77.2`), the third runs the agents;
 - Multus (thick plugin) and whereabouts, the versions pinned in `hack/ci/versions.env` with
-  kind, its node image and kubectl;
+  kind, its node image, kubectl and the reference CNI plugins (kind's nodes ship without
+  `macvlan`; your nodes need it under `/opt/cni/bin` too, which a distribution's CNI plugins
+  package provides);
 - PostgreSQL in the cluster on a persistent volume (`hack/acceptance/postgres.yaml`), stopped
   and started by the recovery phase;
 - the three images built from the checkout and loaded into the nodes, plus a second tag of the

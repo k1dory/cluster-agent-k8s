@@ -36,8 +36,14 @@ up() {
     "$kind" create cluster --name "$name" --image "$KIND_NODE_IMAGE" --config "$acc_dir/kind-cluster.yaml" --wait 180s
   fi
   "$kind" get kubeconfig --name "$name" > "$KUBECONFIG"
-  # The VLAN: every worker a second interface; the first two are the gateway nodes.
-  local i=0 node workers gateways
+  # The VLAN: every worker a second interface; the first two are the gateway nodes. Every node
+  # gets the macvlan plugin (kind's nodes carry only kindnet's plugins).
+  local i=0 node workers gateways cni
+  cni=$(manifest "cni-plugins-$CNI_PLUGINS_VERSION.tgz" "https://github.com/containernetworking/plugins/releases/download/$CNI_PLUGINS_VERSION/cni-plugins-linux-$(ci_arch)-$CNI_PLUGINS_VERSION.tgz")
+  for node in $("$kind" get nodes --name "$name"); do
+    docker cp "$cni" "$node:/tmp/cni-plugins.tgz"
+    docker exec "$node" tar -C /opt/cni/bin -xzf /tmp/cni-plugins.tgz ./macvlan
+  done
   workers=$("$kind" get nodes --name "$name" | grep -v control-plane | sort)
   for node in $workers; do
     i=$((i + 1))

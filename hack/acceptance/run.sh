@@ -91,6 +91,11 @@ diagnose() {
     for pod in $(kctl get pods -l "app.kubernetes.io/instance=$ACCEPT_RELEASE" -o name 2>/dev/null); do
       echo "== logs $pod sandboxd"; kctl logs "$pod" -c sandboxd --tail=150 2>&1 || true
       echo "== logs $pod caddy"; kctl logs "$pod" -c caddy --tail=40 2>&1 || true
+      for c in sandboxd caddy; do
+        if [ "$(kctl get "$pod" -o jsonpath="{.status.containerStatuses[?(@.name==\"$c\")].restartCount}" 2>/dev/null)" != 0 ]; then
+          echo "== logs $pod $c (previous container)"; kctl logs "$pod" -c "$c" --previous --tail=80 2>&1 || true
+        fi
+      done
     done
     if [ -n "${SB:-}" ] && [ -n "${API:-}" ]; then echo "== sandbox $SB"; get_json "$API/v1/sandboxes/$SB" 2>&1; echo; fi
     echo "== multus"; "$kubectl" -n kube-system logs ds/kube-multus-ds --tail=40 2>&1 || true

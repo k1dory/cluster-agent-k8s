@@ -295,8 +295,11 @@ func LoadOrCreateSharedNamed(ctx context.Context, st Blobs, name, cn string) (*C
 	return ParseBundle(data)
 }
 
-// WriteTo stores the CA as <dir>/<base>.crt and <dir>/<base>.key (0600) for a program that
-// reads PEM files (Caddy's pki root) and returns both paths.
+// WriteTo stores the CA as <dir>/<base>.crt and <dir>/<base>.key for a program that reads
+// PEM files (Caddy's pki root) and returns both paths. The key is 0640: Caddy runs next to
+// sandboxd in the same pod under another user with every capability dropped (no
+// CAP_DAC_OVERRIDE, so root obeys the mode bits), and reads it through the pod's group
+// (the chart's fsGroup); nobody outside the pod sees the directory.
 func (c *CA) WriteTo(dir, base string) (certPath, keyPath string, err error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", err
@@ -309,7 +312,14 @@ func (c *CA) WriteTo(dir, base string) (certPath, keyPath string, err error) {
 	if err := os.WriteFile(certPath, c.pem, 0o644); err != nil {
 		return "", "", err
 	}
-	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o640); err != nil {
+		return "", "", err
+	}
+	// The modes as stated, whatever the process's umask (0077 would leave the group out).
+	if err := os.Chmod(certPath, 0o644); err != nil {
+		return "", "", err
+	}
+	if err := os.Chmod(keyPath, 0o640); err != nil {
 		return "", "", err
 	}
 	return certPath, keyPath, nil

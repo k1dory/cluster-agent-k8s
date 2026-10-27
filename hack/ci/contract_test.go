@@ -185,13 +185,13 @@ func TestAcceptanceScriptsParseAndNameEveryPhase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, pin := range []string{"KIND_VERSION=", "KIND_NODE_IMAGE=", "KUBECTL_VERSION=", "MULTUS_VERSION=", "WHEREABOUTS_VERSION="} {
+	for _, pin := range []string{"KIND_VERSION=", "KIND_NODE_IMAGE=", "KUBECTL_VERSION=", "MULTUS_VERSION=", "WHEREABOUTS_VERSION=", "CNI_PLUGINS_VERSION="} {
 		if !strings.Contains(string(env), pin) {
 			t.Errorf("versions.env lacks %s", pin)
 		}
 	}
 	kind, _ := os.ReadFile(filepath.Join(root, "hack/acceptance/kind.sh"))
-	for _, bad := range []string{"kindest/node:v", "multus-cni/v", "whereabouts/v"} {
+	for _, bad := range []string{"kindest/node:v", "multus-cni/v", "whereabouts/v", "plugins/releases/download/v"} {
 		if strings.Contains(string(kind), bad) {
 			t.Errorf("kind.sh carries a version of its own (%q): versions live in versions.env", bad)
 		}
