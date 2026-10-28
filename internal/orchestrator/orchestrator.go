@@ -846,20 +846,8 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 			}
 			continue
 		}
-		r, err := o.Store.ClaimQueuedRun(ctx, sandboxID, time.Now())
+		r, err := o.claim(ctx, sandboxID)
 		if err == nil {
-			if r.Mode == model.RunMessage && r.Session == "" && r.ResumeOf != "" {
-				session, err := o.sessionOf(ctx, r.ResumeOf)
-				if err != nil {
-					// Started without its session the message would open a new conversation:
-					// the run goes back to the queue and the runner's next poll claims it again.
-					if rerr := o.Store.ReleaseRun(context.WithoutCancel(ctx), r.ID); rerr != nil {
-						o.Log.Warn("release run after a failed session read", "run", r.ID, "err", rerr)
-					}
-					return nil, fmt.Errorf("session of run %s: %w", r.ResumeOf, err)
-				}
-				r.Session = session
-			}
 			// The run records what it executes under; later catalogue changes never touch it.
 			if sb, err := o.Store.GetSandbox(ctx, sandboxID); err == nil {
 				r.AgentVersion, r.AgentRef, r.AgentRevision = sb.AgentVersion, sb.AgentRef, sb.AgentRevision
@@ -880,6 +868,29 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 			return nil, ctx.Err()
 		case <-time.After(500 * time.Millisecond):
 		}
+	}
+}
+
+// claim takes the oldest queued run of the sandbox. A message run queued while the run it
+// follows had no session yet gets that session now: it is read first and written by the claim
+// itself (one conditional update), so a failed read leaves the run queued with nothing to undo.
+func (o *Orchestrator) claim(ctx context.Context, sandboxID string) (*model.Run, error) {
+	for {
+		q, err := o.Store.QueuedRun(ctx, sandboxID)
+		if err != nil {
+			return nil, err
+		}
+		session := q.Session
+		if q.Mode == model.RunMessage && session == "" && q.ResumeOf != "" {
+			if session, err = o.sessionOf(ctx, q.ResumeOf); err != nil {
+				return nil, fmt.Errorf("session of run %s: %w", q.ResumeOf, err)
+			}
+		}
+		r, err := o.Store.ClaimRun(ctx, q.ID, time.Now(), session)
+		if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
+			continue // claimed by another poller or cancelled meanwhile: the next one in line
+		}
+		return r, err
 	}
 }
 

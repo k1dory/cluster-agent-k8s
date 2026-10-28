@@ -467,6 +467,35 @@ func (m *Memory) ReleaseRun(_ context.Context, runID string) error {
 	return nil
 }
 
+func (m *Memory) QueuedRun(_ context.Context, sandboxID string) (*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range m.runsOf(sandboxID) {
+		if r.Status == model.RunQueued {
+			return r, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (m *Memory) ClaimRun(_ context.Context, runID string, startedAt time.Time, session string) (*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[runID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if r.Status != model.RunQueued {
+		return nil, ErrConflict
+	}
+	r.Status, r.StartedAt = model.RunRunning, &startedAt
+	if r.Session == "" {
+		r.Session = session
+	}
+	out := *r
+	return &out, nil
+}
+
 func (m *Memory) RunningRun(_ context.Context, sandboxID string) (*model.Run, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -568,6 +568,24 @@ func (p *Postgres) ClaimQueuedRun(ctx context.Context, sandboxID string, started
 		RETURNING `+runCols, sandboxID, model.RunQueued, model.RunRunning, startedAt))
 }
 
+func (p *Postgres) QueuedRun(ctx context.Context, sandboxID string) (*model.Run, error) {
+	return scanRun(p.pool.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE sandbox_id=$1 AND status=$2
+		ORDER BY created_at, id LIMIT 1`, sandboxID, model.RunQueued))
+}
+
+func (p *Postgres) ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string) (*model.Run, error) {
+	r, err := scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4,
+		session = CASE WHEN session = '' THEN $5 ELSE session END
+		WHERE id=$1 AND status=$2 RETURNING `+runCols, runID, model.RunQueued, model.RunRunning, startedAt, session))
+	if errors.Is(err, ErrNotFound) {
+		if _, gerr := p.GetRun(ctx, runID); gerr != nil {
+			return nil, gerr
+		}
+		return nil, ErrConflict
+	}
+	return r, err
+}
+
 func (p *Postgres) RunningRun(ctx context.Context, sandboxID string) (*model.Run, error) {
 	return scanRun(p.pool.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE sandbox_id=$1 AND status=$2
 		ORDER BY created_at LIMIT 1`, sandboxID, model.RunRunning))

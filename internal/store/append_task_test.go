@@ -59,6 +59,57 @@ func testAppendQueuedTask(t *testing.T, s Store) {
 	}
 }
 
+// The claim NextRun makes: the oldest queued run is read, then claimed by id with the session
+// it continues, in one conditional write. A second claim of the same run is refused; a session
+// the run already has is kept.
+func testClaimRun(t *testing.T, s Store) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	sb := &model.Sandbox{ID: "claim-sb", Name: "c", Slug: "dev", Owner: "alice", Tenant: "acme", Status: model.StatusRunning, CreatedAt: now, LastActivity: now}
+	if err := s.CreateSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.QueuedRun(ctx, sb.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("nothing queued: %v", err)
+	}
+	for i, id := range []string{"claim-1", "claim-2"} {
+		r := &model.Run{ID: id, SandboxID: sb.ID, Tenant: sb.Tenant, Slug: sb.Slug, Task: id, Status: model.RunQueued,
+			Mode: model.RunMessage, ResumeOf: "earlier", CreatedAt: now.Add(time.Duration(i) * time.Second)}
+		if i == 1 {
+			r.Session = "own"
+		}
+		if err := s.CreateRun(ctx, r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q, err := s.QueuedRun(ctx, sb.ID)
+	if err != nil || q.ID != "claim-1" || q.Status != model.RunQueued {
+		t.Fatalf("oldest queued: %v %+v", err, q)
+	}
+	r, err := s.ClaimRun(ctx, q.ID, now, "sess")
+	if err != nil || r.Status != model.RunRunning || r.Session != "sess" || r.StartedAt == nil {
+		t.Fatalf("claim: %v %+v", err, r)
+	}
+	if got, _ := s.GetRun(ctx, q.ID); got.Status != model.RunRunning || got.Session != "sess" {
+		t.Fatalf("claim not stored: %+v", got)
+	}
+	if _, err := s.ClaimRun(ctx, q.ID, now, "sess"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("second claim: %v", err)
+	}
+	if _, err := s.ClaimRun(ctx, "run_nope", now, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown run: %v", err)
+	}
+	if r, err := s.ClaimRun(ctx, "claim-2", now, "other"); err != nil || r.Session != "own" {
+		t.Fatalf("a run's own session is kept: %v %+v", err, r)
+	}
+}
+
+func TestMemoryClaimRun(t *testing.T) { testClaimRun(t, NewMemory()) }
+
+func TestPostgresClaimRun(t *testing.T) {
+	testClaimRun(t, reviewOpenPostgres(t, reviewPostgresURL(t, false)))
+}
+
 func TestMemoryAppendQueuedTask(t *testing.T) { testAppendQueuedTask(t, NewMemory()) }
 
 func TestPostgresAppendQueuedTask(t *testing.T) {
