@@ -174,21 +174,33 @@ func ensureRepo(ctx context.Context) error {
 // variable gets ` --mcp-config "$SANDBOX_MCP_CONFIG"` appended; anything else is returned as
 // is, the variable being in its environment.
 func withMCPConfig(cmdline string) string {
-	if strings.Contains(cmdline, "--mcp-config") || strings.Contains(cmdline, "SANDBOX_MCP_CONFIG") {
+	if strings.Contains(cmdline, "--mcp-config") || strings.Contains(cmdline, "SANDBOX_MCP_CONFIG") || !runsClaude(cmdline) {
 		return cmdline
 	}
-	program := ""
+	return strings.TrimRight(cmdline, " \t") + ` --mcp-config "$SANDBOX_MCP_CONFIG"`
+}
+
+// withInstructions gives the agent's instructions (SANDBOX_INSTRUCTIONS, from its definition) to
+// a harness command that runs claude: ` --append-system-prompt "$SANDBOX_INSTRUCTIONS"` is
+// appended unless the command already mentions the variable or sets a system prompt of its
+// own. Anything else is returned as is, the variable being in its environment.
+func withInstructions(cmdline string) string {
+	if strings.Contains(cmdline, "SANDBOX_INSTRUCTIONS") || strings.Contains(cmdline, "system-prompt") || !runsClaude(cmdline) {
+		return cmdline
+	}
+	return strings.TrimRight(cmdline, " \t") + ` --append-system-prompt "$SANDBOX_INSTRUCTIONS"`
+}
+
+// runsClaude reports whether a harness command's program (its first word after any VAR=value
+// assignments) is claude.
+func runsClaude(cmdline string) bool {
 	for _, w := range strings.Fields(cmdline) {
 		if strings.Contains(w, "=") && !strings.HasPrefix(w, "-") {
 			continue // VAR=value prefix
 		}
-		program = w
-		break
+		return filepath.Base(w) == "claude"
 	}
-	if filepath.Base(program) != "claude" {
-		return cmdline
-	}
-	return strings.TrimRight(cmdline, " \t") + ` --mcp-config "$SANDBOX_MCP_CONFIG"`
+	return false
 }
 
 // writeMCPConfig renders SANDBOX_MCP_SERVERS ([{name, url}]) as a Claude Code MCP
@@ -285,6 +297,11 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	}
 	if mcpConfig != "" {
 		cmdline = withMCPConfig(cmdline)
+	}
+	// The agent definition's instructions are what makes a task like "triage the new incidents"
+	// mean something: without them the harness sees the task text alone.
+	if os.Getenv("SANDBOX_INSTRUCTIONS") != "" {
+		cmdline = withInstructions(cmdline)
 	}
 	fmt.Printf("agent-runner: run %s: %q\n", run.ID, truncate(run.Task, 80))
 	runCtx, cancel := context.WithCancel(ctx)

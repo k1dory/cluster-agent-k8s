@@ -244,6 +244,11 @@ default harness command loads it with `--mcp-config`. A custom `harness.command`
 `"$SANDBOX_MCP_CONFIG"` itself where it wants it. The gateway decides what each call may do; the
 configuration only tells the harness where the servers are.
 
+The definition's `instructions` reach the pod as `SANDBOX_INSTRUCTIONS`; for a claude harness the
+runner appends `--append-system-prompt "$SANDBOX_INSTRUCTIONS"` to the run and resume commands, so
+the agent reads them before the task. A custom command that names the variable, or sets a system
+prompt of its own, is left alone; a harness that is not claude reads the variable itself.
+
 ## What stays with the operator
 
 - The policy repository: the slugs and the network rules reviewed as code, their `tenants:`
