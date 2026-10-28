@@ -62,11 +62,28 @@ fi
 builder=agent-sandbox-publish
 docker buildx inspect "$builder" >/dev/null 2>&1 || docker buildx create --name "$builder" --driver docker-container >/dev/null
 
-# pushed_digest REF prints the digest REF names in the registry, and fails when it names none.
+# pushed_digest REF prints the digest REF names in the registry. It returns 1 only when the
+# registry says the tag (or the repository) does not exist, and 2 when the state is unknown (an
+# outage, a 5xx, a refused login, an answer without a digest): the publication then stops, since
+# taking that for "absent" would build and push over an immutable tag that may exist. A distinct
+# code, not ci_die: inside $(...) ci_die ends only the subshell and would read as "absent".
 pushed_digest() {
-  local json
-  json=$(docker buildx imagetools inspect "$1" --format '{{ json .Manifest }}' 2>/dev/null) || return 1
-  printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])' 2>/dev/null
+  local json err digest
+  err=$(mktemp)
+  if json=$(docker buildx imagetools inspect "$1" --format '{{ json .Manifest }}' 2>"$err"); then
+    rm -f "$err"
+    digest=$(printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])' 2>/dev/null) || true
+    case "$digest" in sha256:*) printf '%s\n' "$digest"; return 0 ;; esac
+    echo "publish: $1: the registry answered without a digest; its state is unknown" >&2
+    return 2
+  fi
+  if grep -qiE '(: not found|manifest unknown|name unknown|MANIFEST_UNKNOWN|NAME_UNKNOWN)' "$err"; then
+    rm -f "$err"
+    return 1
+  fi
+  json=$(cat "$err"); rm -f "$err"
+  echo "publish: $1: cannot tell whether the tag exists: ${json:-no message}" >&2
+  return 2
 }
 
 # publish NAME DOCKERFILE [TARGET]: build and push NAME, or find it already pushed; append its
@@ -75,8 +92,12 @@ publish() {
   local name=$1 file=$2 target=${3:-} ref digest meta args=()
   ref=$IMAGE_REPO/$name:$tag
   echo "== $name: $ref"
-  if digest=$(pushed_digest "$ref"); then
+  local state=0
+  digest=$(pushed_digest "$ref") || state=$?
+  if [ "$state" -eq 0 ]; then
     echo "$ref exists ($digest): an immutable tag is not rebuilt"
+  elif [ "$state" -ne 1 ]; then
+    ci_die "publish: $name: the registry lookup failed; nothing is pushed"
   else
     meta=$work/$name.json
     [ -n "$target" ] && args+=(--target "$target")

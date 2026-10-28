@@ -45,7 +45,7 @@ func publishStubs(t *testing.T, existing string) (bin, dockerLog, cosignLog stri
 	dockerLog, cosignLog = filepath.Join(logs, "docker.log"), filepath.Join(logs, "cosign.log")
 	stub(t, bin, "docker", `printf '%s\n' "$*" >> "`+dockerLog+`"
 case "$1 ${2:-} ${3:-}" in
-  "buildx imagetools inspect") [ -n "`+existing+`" ] && { echo '{"digest":"`+existing+`"}'; exit 0; }; exit 1 ;;
+  "buildx imagetools inspect") [ -n "`+existing+`" ] && { echo '{"digest":"`+existing+`"}'; exit 0; }; echo "ERROR: $4: not found" >&2; exit 1 ;;
   "buildx build "*)
     meta= tag=
     while [ $# -gt 0 ]; do case "$1" in --metadata-file) meta=$2; shift ;; -t) tag=$2; shift ;; esac; shift; done
