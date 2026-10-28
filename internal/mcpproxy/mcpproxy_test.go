@@ -14,6 +14,7 @@ func TestCheck(t *testing.T) {
 		deny bool
 	}{
 		{ro, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, false},
+		{ro, `{"jsonrpc":"2.0","id":1,"method":"server/discover"}`, false},
 		{ro, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_user","arguments":{}}}`, false},
 		{ro, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"search"}}`, false},
 		{ro, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_user"}}`, true},

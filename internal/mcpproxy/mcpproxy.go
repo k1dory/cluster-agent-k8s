@@ -59,6 +59,10 @@ var readMethods = map[string]bool{
 	"tools/list": true, "resources/list": true, "resources/read": true, "resources/templates/list": true,
 	"prompts/list": true, "prompts/get": true, "logging/setLevel": true, "completion/complete": true,
 	"notifications/cancelled": true, "notifications/progress": true, "notifications/roots/list_changed": true,
+	// What the server offers, asked before initialize by newer clients (Claude Code 2.1.3xx sends
+	// it on every start): refusing it changed nothing on the server and gave every run of an
+	// agent with a read-only connection a denied egress, which a SIEM rightly counts.
+	"server/discover": true,
 }
 
 // protocolKeys are the JSON-RPC / MCP keys the verdict depends on. Any key that equals one of
