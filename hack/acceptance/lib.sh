@@ -76,6 +76,18 @@ acc_kept_credentials_key() {
   cat "$1"
 }
 
+# acc_contains TEXT: stdin contains TEXT. It reads stdin to its end first: `cmd | grep -q`
+# exits at the first match, the writer still writing gets SIGPIPE, and under pipefail the
+# pipeline fails although the text was there (an apply that went through, reported failed).
+acc_contains() {
+  local all
+  all=$(cat)
+  grep -qF -- "$1" <<<"$all"
+}
+# acc_run_ended STATUS: the run is over (done, failed, cancelled). Anything else, an empty answer
+# from a request that failed included, means not yet: the wait goes on instead of ending early.
+acc_run_ended() { case "$1" in done | failed | cancelled) return 0 ;; *) return 1 ;; esac; }
+
 acc_log() { printf '%s acceptance: %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 acc_fail() { echo "acceptance: FAIL: $*" >&2; return 1; }
 

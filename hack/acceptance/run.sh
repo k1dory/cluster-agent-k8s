@@ -55,6 +55,7 @@ one_leader() { [ "$(for u in $(replica_urls); do version "$u"; done | awk '$2=="
 # or name (the host name): the lead has moved once the leaving pod no longer exists.
 lead_moved() { ! kctl get pod "$LEAD_LEFT" >/dev/null 2>&1 && leader_url >/dev/null; }
 all_ready() { for u in $(replica_urls); do [ "$(http_code "$u/readyz")" = 200 ] || return 1; done; }
+run_ended() { acc_run_ended "$(run_status "$1" "$2" 2>/dev/null || true)"; }
 sandbox_status() { get_json "$API/v1/sandboxes/$1" | jq -r .status; }
 run_status() { ctl_as "$TENANT_TOKEN" runs "$1" "$2" | jq -r .status; }
 sandbox_pod() { kctl get pods -l "agent-sandbox.io/sandbox=$1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null; }
@@ -128,10 +129,10 @@ B
 new_run_done() { # SANDBOX: a task runs to the end and, with a marker, prints it
   local run
   run=$(ctl_as "$TENANT_TOKEN" run "$1" "acceptance task $(date +%s)" | jq -r .id)
-  wait_for "$ACCEPT_WAIT" "run $run to finish" sh -c "[ \"\$(SANDBOXD_URL=$API SANDBOXD_TOKEN=$TENANT_TOKEN '$ctl' runs '$1' '$run' | jq -r .status)\" != running ] && [ \"\$(SANDBOXD_URL=$API SANDBOXD_TOKEN=$TENANT_TOKEN '$ctl' runs '$1' '$run' | jq -r .status)\" != queued ]"
+  wait_for "$ACCEPT_WAIT" "run $run to finish" run_ended "$1" "$run"
   [ "$(run_status "$1" "$run")" = done ] || acc_fail "run $run ended $(run_status "$1" "$run")"
   if [ -n "$ACCEPT_HARNESS_MARKER" ]; then
-    ctl_as "$TENANT_TOKEN" events "$1" -run "$run" -json | jq -r 'if type=="array" then .[] else . end | select(.type=="run.output") | .data' | grep -qF "$ACCEPT_HARNESS_MARKER" || acc_fail "the run's output lacks the harness marker $ACCEPT_HARNESS_MARKER"
+    ctl_as "$TENANT_TOKEN" events "$1" -run "$run" -json | jq -r 'if type=="array" then .[] else . end | select(.type=="run.output") | .data' | acc_contains "$ACCEPT_HARNESS_MARKER" || acc_fail "the run's output lacks the harness marker $ACCEPT_HARNESS_MARKER"
   fi
   echo "$run"
 }
@@ -242,7 +243,7 @@ phase_agent() {
   vlan=$(kctl get pod "$pod" -o jsonpath='{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/network-status}' | jq -r '.[] | .ips[]?' | grep -F "$ACCEPT_VLAN_PREFIX" | head -1 || true)
   [ -n "$vlan" ] || acc_fail "the agent pod has no address on the VLAN ($ACCEPT_VLAN_PREFIX)"
   # The pod resolves the gateway's names and nothing else: its only resolver is the gateway.
-  kctl exec "$pod" -c agent -- getent hosts api.sandbox.internal | grep -q "$ACCEPT_VLAN_PREFIX" || acc_fail "the pod does not resolve api.sandbox.internal to the gateway"
+  kctl exec "$pod" -c agent -- getent hosts api.sandbox.internal | acc_contains "$ACCEPT_VLAN_PREFIX" || acc_fail "the pod does not resolve api.sandbox.internal to the gateway"
   if kctl exec "$pod" -c agent -- getent hosts example.com >/dev/null 2>&1; then acc_fail "the pod resolves a host no policy names"; fi
   run=$(new_run_done "$sb")
   save POD_UID="$(sandbox_pod_uid "$sb")"
@@ -279,8 +280,10 @@ phase_replicas() {
   [ "$(sandbox_status "$SB")" = running ] || acc_fail "the sandbox is $(sandbox_status "$SB") after the failover"
   # Work through the survivor while the lead moved: a changed bundle applies.
   local repo=$ACCEPT_OUT/config-repo
-  bundle v2 > "$repo/bundles/$ACCEPT_TENANT.yaml"
-  git -C "$repo" commit -qam "widen" && (cd "$repo" && SANDBOXD_URL=$survivor SANDBOXD_TOKEN=$ADMIN "$ctl" apply -f "bundles/$ACCEPT_TENANT.yaml" -ref main -repo https://git.example.com/acceptance/config -key "bundles/$ACCEPT_TENANT.yaml@$(git rev-parse HEAD)" -require-commit -markdown) | grep -q "Apply ✅ done" || acc_fail "apply through the survivor"
+  # A change of its own on every run: a phase run again in the same ACCEPT_OUT finds the previous
+  # run's commit in the repository, and an unchanged file left `git commit` nothing to commit.
+  bundle "v2 $(date +%s)" > "$repo/bundles/$ACCEPT_TENANT.yaml"
+  git -C "$repo" commit -qam "widen" && (cd "$repo" && SANDBOXD_URL=$survivor SANDBOXD_TOKEN=$ADMIN "$ctl" apply -f "bundles/$ACCEPT_TENANT.yaml" -ref main -repo https://git.example.com/acceptance/config -key "bundles/$ACCEPT_TENANT.yaml@$(git rev-parse HEAD)" -require-commit -markdown) | acc_contains "Apply ✅ done" || acc_fail "apply through the survivor"
   evidence "leader pod $leaderpod deleted: the survivor answered $probes/$probes requests, $newleader led after ${moved}s; replicas back, one leader; the sandbox stayed running; an apply through the survivor went through"
 }
 
@@ -356,8 +359,8 @@ phase_backup() {
   db pg_dump -U "$ACCEPT_DB_USER" -d "$ACCEPT_DB_NAME" --clean --if-exists > "$dump"
   [ -s "$dump" ] || acc_fail "empty dump"
   # After the backup: a document and a key that the restore must not know.
-  { bundle v2; printf -- '---\nkind: EnvironmentProfile\ntenant: %s\nname: post-dump\nspec: {image: stable}\n' "$ACCEPT_TENANT"; } > "$repo/bundles/$ACCEPT_TENANT.yaml"
-  git -C "$repo" commit -qam "post-dump" && (cd "$repo" && ctl_as "$ADMIN" apply -f "bundles/$ACCEPT_TENANT.yaml" -ref main -repo https://git.example.com/acceptance/config -key "bundles/$ACCEPT_TENANT.yaml@$(git rev-parse HEAD)" -require-commit -markdown) | grep -q "Apply ✅ done" || acc_fail "post-dump apply"
+  { bundle "v2 $(date +%s)"; printf -- '---\nkind: EnvironmentProfile\ntenant: %s\nname: post-dump\nspec: {image: stable}\n' "$ACCEPT_TENANT"; } > "$repo/bundles/$ACCEPT_TENANT.yaml"
+  git -C "$repo" commit -qam "post-dump" && (cd "$repo" && ctl_as "$ADMIN" apply -f "bundles/$ACCEPT_TENANT.yaml" -ref main -repo https://git.example.com/acceptance/config -key "bundles/$ACCEPT_TENANT.yaml@$(git rev-parse HEAD)" -require-commit -markdown) | acc_contains "Apply ✅ done" || acc_fail "post-dump apply"
   post_key=$(ctl_as "$ADMIN" keys create -tenant "$ACCEPT_TENANT" -name post-dump -json | jq -r .secret)
   # Restore: the control plane stopped, the database replaced by the dump, the control plane back.
   kctl scale "deploy/$ACCEPT_RELEASE-sandboxd" --replicas=0 >/dev/null
