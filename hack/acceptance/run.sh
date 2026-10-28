@@ -35,8 +35,6 @@ db() { # psql/pg_dump against the control plane's database, stdin passed through
 }
 # ctl_as TOKEN cmd...: the CLI against the API with that token.
 ctl_as() { local tok=$1; shift; SANDBOXD_URL=$API SANDBOXD_TOKEN=$tok "$ctl" "$@"; }
-# secret_key KEY prints that key of the release's Secret, empty when the Secret or the key is absent.
-secret_key() { kctl get secret agent-sandbox-secrets -o "jsonpath={.data.$1}" 2>/dev/null | base64 -d 2>/dev/null || true; }
 get_json() { curl -sS -m 20 -H "Authorization: Bearer $ADMIN" "$1"; }
 http_code() { # URL [token]
   local hdr=()
@@ -165,14 +163,14 @@ phase_install() {
   # A second install keeps the keys the first one wrote: the preview key signs tickets in flight,
   # and CREDENTIALS_KEY decrypts the tenants' credentials in the database (a new one makes every
   # stored credential unreadable). An explicit input wins; else the Secret's own value.
-  local preview creds lit=()
-  preview=${ACCEPT_PREVIEW_TICKET_KEY:-$(secret_key PREVIEW_TICKET_KEY)}
-  preview=${preview:-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}
-  creds=${ACCEPT_CREDENTIALS_KEY:-$(secret_key CREDENTIALS_KEY)}
+  local data creds lit=()
+  data=$(acc_secret_data "$kubectl" "$ACCEPT_NAMESPACE")
+  acc_secret_keys "$data"
+  creds=$ACC_CREDENTIALS_KEY
   [ -n "$creds" ] && lit+=(--from-literal=CREDENTIALS_KEY="$creds")
   "$kubectl" -n "$ACCEPT_NAMESPACE" create secret generic agent-sandbox-secrets \
     --from-literal=SANDBOXD_API_TOKEN="$ADMIN" --from-literal=DATABASE_URL="$ACCEPT_DATABASE_URL" \
-    --from-literal=PREVIEW_TICKET_KEY="$preview" ${lit[@]+"${lit[@]}"} \
+    --from-literal=PREVIEW_TICKET_KEY="$ACC_PREVIEW_TICKET_KEY" ${lit[@]+"${lit[@]}"} \
     --dry-run=client -o yaml | "$kubectl" apply -f - >/dev/null
   local start
   start=$(date +%s)
