@@ -160,9 +160,17 @@ phase_preflight() {
 phase_install() {
   load
   "$kubectl" get ns "$ACCEPT_NAMESPACE" >/dev/null 2>&1 || "$kubectl" create ns "$ACCEPT_NAMESPACE"
+  # A second install keeps the keys the first one wrote: the preview key signs tickets in flight,
+  # and CREDENTIALS_KEY decrypts the tenants' credentials in the database (a new one makes every
+  # stored credential unreadable). An explicit input wins; else the Secret's own value.
+  local data creds lit=()
+  data=$(acc_secret_data "$kubectl" "$ACCEPT_NAMESPACE")
+  acc_secret_keys "$data"
+  creds=$ACC_CREDENTIALS_KEY
+  [ -n "$creds" ] && lit+=(--from-literal=CREDENTIALS_KEY="$creds")
   "$kubectl" -n "$ACCEPT_NAMESPACE" create secret generic agent-sandbox-secrets \
     --from-literal=SANDBOXD_API_TOKEN="$ADMIN" --from-literal=DATABASE_URL="$ACCEPT_DATABASE_URL" \
-    --from-literal=PREVIEW_TICKET_KEY="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')" \
+    --from-literal=PREVIEW_TICKET_KEY="$ACC_PREVIEW_TICKET_KEY" ${lit[@]+"${lit[@]}"} \
     --dry-run=client -o yaml | "$kubectl" apply -f - >/dev/null
   local start
   start=$(date +%s)
@@ -182,6 +190,14 @@ phase_install() {
   [ "$(echo "$names" | awk '{print $1}' | sort -u | wc -l)" -eq "$ACCEPT_REPLICAS" ] || acc_fail "replicas do not report distinct names: $names"
   evidence "installed in $(( $(date +%s) - start ))s: $ACCEPT_REPLICAS replicas on $nodes nodes, ready, one leader: $(echo "$names" | tr '\n' ';')"
   evidence "build: $(get_json "$API/v1/version" | jq -r .sandboxd)"
+  # The credentials API follows CREDENTIALS_KEY on every replica: on with a key, 503 without.
+  local u code want=503
+  [ -n "$creds" ] && want=200
+  for u in $(replica_urls); do
+    code=$(http_code "$u/v1/credentials" "$ADMIN")
+    [ "$code" = "$want" ] || acc_fail "credentials API at $u answers $code, $want expected (CREDENTIALS_KEY $([ -n "$creds" ] && echo set || echo unset))"
+  done
+  evidence "credentials API: $([ "$want" = 200 ] && echo "on, on every replica" || echo "off (no CREDENTIALS_KEY)")"
 }
 
 phase_config() {

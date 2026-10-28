@@ -152,5 +152,12 @@ createNamespace: false   # true when rendering plain manifests for kubectl apply
 # Policies: every file under policies/ of the chart becomes a key of the ConfigMap (Policy-as-Code:
 # keep that directory a copy of your policy repository, CI runs `sandboxd policy test` before helm upgrade).
 policiesFromFiles: true
+# The deployment's own policies, next to (or, with policiesFromFiles false, instead of) the chart's
+# files: slug file name -> the policy, as YAML text or a map. A name the chart also ships replaces
+# that file. Keep them in your private configuration repository and pass them with -f.
+policies: {}
+#  backend-dev-oauth: |
+#    slug: backend-dev-oauth
+#    allow: [...]
 
 tolerations: []

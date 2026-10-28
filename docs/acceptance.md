@@ -53,6 +53,7 @@ Inputs (environment variables; `hack/acceptance/lib.sh` is the list):
 | `ACCEPT_HARNESS_MARKER` | text a finished run must have printed; empty: the run's completion is the check (a real harness with a real LLM key) | empty |
 | `ACCEPT_VLAN_PREFIX` | the pods' VLAN addresses start with this | `10.77.77.` |
 | `ACCEPT_TENANT`, `ACCEPT_ADMIN_TOKEN` | the tenant the run configures; the admin token (generated when unset) | `acme`, generated |
+| `ACCEPT_CREDENTIALS_KEY`, `ACCEPT_PREVIEW_TICKET_KEY` | the Secret's `CREDENTIALS_KEY` (tenant credentials, `install` checks the API is on at every replica) and `PREVIEW_TICKET_KEY`; unset, a second install keeps what the Secret has | kept |
 | `ACCEPT_WAIT` | seconds a wait may take (a pod ready, a run finished) | `300` |
 | `ACCEPT_KEEP` | leave the release (and, under kind, the cluster) up at the end | unset |
 | `ACCEPT_SANDBOXCTL` | the CLI to use (built from the checkout when unset) | built |
