@@ -21,6 +21,13 @@ services:
     image: ${SANDBOXD_IMAGE:-registry.example.com/agent-sandbox/sandboxd:latest}
     restart: unless-stopped
     network_mode: host
+    # Root without capabilities but NET_BIND_SERVICE: DNS on :53 of the host network (a non-root
+    # uid never holds the capability, and the host's ip_unprivileged_port_start is 1024). A
+    # sandboxd_var volume written by an earlier non-root image: chown -R 0:65532 it once.
+    user: "0:65532"
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
     depends_on: [caddy]
     command: ["-config", "/etc/sandbox/sandboxd.yaml"]
     environment:
