@@ -1,11 +1,14 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.26-alpine AS build
+# The Go stage runs on the builder's own platform and cross-compiles for the target's: a
+# linux/amd64 image built on an arm64 host does not compile under emulation.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/sandboxd ./cmd/sandboxd \
- && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/sandboxctl ./cmd/sandboxctl
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/sandboxd ./cmd/sandboxd \
+ && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/sandboxctl ./cmd/sandboxctl
 
 # sandboxctl for CI jobs (the Git adapters in deploy/git): a shell, curl and jq next to the binary,
 # so a pipeline can post the plan as a comment. Build with `--target sandboxctl`; the default

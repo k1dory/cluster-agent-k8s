@@ -14,9 +14,22 @@ prefix=${IMAGE_PREFIX:-agent-sandbox} tag=${IMAGE_TAG:-ci}
 sandboxd=$prefix/sandboxd:$tag ctl=$prefix/sandboxctl:$tag agent=$prefix/agent:$tag
 
 echo "== build"
-docker build -f images/agent/Dockerfile -t "$agent" .
+docker build -f images/agent/Dockerfile $("$ci_dir/versions.sh" build-args) -t "$agent" .
 docker build -f images/sandboxd/Dockerfile -t "$sandboxd" .
 docker build -f images/sandboxd/Dockerfile --target sandboxctl -t "$ctl" .
+
+echo "== agent image: the harnesses of versions.env, installed and labelled"
+# The label is what an operator reads off a pulled image (docker inspect); the binary is what
+# runs. Both must be the pinned version, or the pin is decoration.
+harness() { # harness LABEL-NAME COMMAND WANT
+  local label seen
+  label=$(docker inspect -f "{{ index .Config.Labels \"io.agent-sandbox.harness.$1.version\" }}" "$agent")
+  [ "$label" = "$3" ] || ci_die "images: label io.agent-sandbox.harness.$1.version is '$label', versions.env says $3"
+  seen=$(docker run --rm --entrypoint /bin/sh "$agent" -lc "$2 --version" 2>&1 || true)
+  case "$seen" in *"$3"*) echo "$1 $3" ;; *) ci_die "images: '$2 --version' in the agent image says '$seen', versions.env says $3" ;; esac
+}
+harness claude-code claude "$CLAUDE_CODE_VERSION"
+harness codex codex "$CODEX_VERSION"
 
 echo "== control plane: git present, nonroot"
 docker run --rm --entrypoint git "$sandboxd" --version

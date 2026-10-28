@@ -10,6 +10,7 @@ echo "== user and tools"
 test "$(run id -u)" = "1000"                      # the pod runs as 1000; must be `agent`, not `node`
 test "$(run id -un)" = "agent"
 run 'claude --version >/dev/null'
+run 'codex --version >/dev/null'
 run 'git --version >/dev/null && /usr/sbin/nft --version >/dev/null && test -x /usr/local/bin/netlock.sh'
 run 'test -x /usr/local/bin/agent-init && test -x /usr/local/bin/agent-runner'
 

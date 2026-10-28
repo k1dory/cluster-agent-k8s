@@ -13,7 +13,7 @@ HELM ?= helm
 CI_GROUPS := build vet unit policy postgres caddy helm images e2e-git
 
 .PHONY: build test vet dev images smoke-image helm-lint policy-test policy-render manifests clean integration \
-	ci ci-fast ci-versions ci-acceptance acceptance $(addprefix ci-,$(CI_GROUPS))
+	ci ci-fast ci-versions ci-acceptance acceptance publish-images verify-images $(addprefix ci-,$(CI_GROUPS))
 
 # The full required set, in order; what a change must pass before it merges.
 ci: $(addprefix ci-,$(CI_GROUPS))
@@ -94,7 +94,19 @@ dev: build
 images:
 	docker build -f images/sandboxd/Dockerfile -t $(REGISTRY)/sandboxd:$(TAG) .
 	docker build -f images/sandboxd/Dockerfile --target sandboxctl -t $(REGISTRY)/sandboxctl:$(TAG) .
-	docker build -f images/agent/Dockerfile -t $(REGISTRY)/agent:$(TAG) .
+	docker build -f images/agent/Dockerfile $$(hack/ci/versions.sh build-args) -t $(REGISTRY)/agent:$(TAG) .
+
+# Publishing is a separate, explicitly configured action (docs/ci-contract.md, rule 5), not a
+# check: linux/amd64 images of sandboxd, sandboxctl and the agent pushed to IMAGE_REPO under the
+# immutable tag sha-<12 characters of COMMIT>, each digest signed with cosign, and a manifest
+# (image, digest, arch, commit, harness versions) written for the record. Inputs and their
+# failures: hack/publish-images.sh. verify-images checks a manifest's signatures against
+# cosign.pub, anonymously when the packages are public.
+publish-images:
+	hack/publish-images.sh
+
+verify-images:
+	hack/verify-images.sh
 
 # Checks inside the built agent image: user 1000 is `agent`, tools present, netlock installs its
 # rules, agent-init and agent-runner start and complain about the right things.
