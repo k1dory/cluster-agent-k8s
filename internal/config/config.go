@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -165,14 +166,28 @@ type Config struct {
 	} `yaml:"preview"`
 }
 
-// Load reads the file, expands ${VARS} and applies defaults.
+// expandEnv is os.ExpandEnv except for the agent's own SANDBOX_* variables (Load).
+func expandEnv(s string) string {
+	return os.Expand(s, func(name string) string {
+		if strings.HasPrefix(name, "SANDBOX_") {
+			return "${" + name + "}"
+		}
+		return os.Getenv(name)
+	})
+}
+
+// Load reads the file, expands ${VARS} from sandboxd's environment and applies defaults.
+// SANDBOX_* names are the agent's, not sandboxd's: the runner sets them for the harness
+// ($SANDBOX_TASK, $SANDBOX_SESSION, $SANDBOX_RESUME_PROMPT, $SANDBOX_MCP_CONFIG), so they stay
+// as written for the agent's shell to expand. Expanding them here made every harness command
+// run with an empty task.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 	var c Config
-	if err := yaml.Unmarshal([]byte(os.ExpandEnv(string(raw))), &c); err != nil {
+	if err := yaml.Unmarshal([]byte(expandEnv(string(raw))), &c); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if c.Listen.API == "" {

@@ -128,7 +128,9 @@ run() {
   export ACCEPT_DB_OUTAGE="$kubectl -n $ACCEPT_NAMESPACE scale deploy/postgres --replicas=0 && $kubectl -n $ACCEPT_NAMESPACE wait --for=delete pod -l app=postgres --timeout=120s"
   export ACCEPT_DB_RESTORE="$kubectl -n $ACCEPT_NAMESPACE scale deploy/postgres --replicas=1 && $kubectl -n $ACCEPT_NAMESPACE rollout status deploy/postgres --timeout=180s"
   export ACCEPT_UPGRADE_TAG="$tag-next"
-  export ACCEPT_HARNESS_MARKER="acceptance: "
+  # The marker includes the start of the task itself: a harness command whose $SANDBOX_TASK
+  # reached the pod empty (expanded by sandboxd) must fail here, not print "acceptance: ".
+  export ACCEPT_HARNESS_MARKER="acceptance: acceptance task "
   ACCEPT_CREDENTIALS_KEY=${ACCEPT_CREDENTIALS_KEY:-$(acc_kept_credentials_key "$ACCEPT_OUT/credentials-key")}
   export ACCEPT_CREDENTIALS_KEY
   export IMAGE_PREFIX=$prefix
