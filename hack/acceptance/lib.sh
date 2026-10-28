@@ -26,9 +26,55 @@ ACCEPT_API_URLS=${ACCEPT_API_URLS:-}
 ACCEPT_HARNESS_MARKER=${ACCEPT_HARNESS_MARKER:-}
 ACCEPT_VLAN_PREFIX=${ACCEPT_VLAN_PREFIX:-10.77.77.}
 ACCEPT_ADMIN_TOKEN=${ACCEPT_ADMIN_TOKEN:-}
+# The Secret's keys that must survive a second install: unset, the value already in the Secret
+# stays (a fresh PREVIEW_TICKET_KEY only when there is none; no CREDENTIALS_KEY, no credentials API).
+ACCEPT_CREDENTIALS_KEY=${ACCEPT_CREDENTIALS_KEY:-}
+ACCEPT_PREVIEW_TICKET_KEY=${ACCEPT_PREVIEW_TICKET_KEY:-}
 ACCEPT_KEEP=${ACCEPT_KEEP:-}
 ACCEPT_WAIT=${ACCEPT_WAIT:-300}
 mkdir -p "$ACCEPT_OUT"
+
+# --- the release's Secret ----------------------------------------------------------------------
+# acc_secret_data KUBECTL NAMESPACE prints the data of Secret agent-sandbox-secrets as JSON ({}
+# when the Secret does not exist). Any other failure to read it fails: an unreadable Secret is
+# not an empty one, and taking it for one would rewrite it without the key that decrypts the
+# tenants' stored credentials.
+acc_secret_data() {
+  local out err
+  err=$(mktemp)
+  if out=$("$1" -n "$2" get secret agent-sandbox-secrets -o json 2>"$err"); then
+    rm -f "$err"
+    jq -c '.data // {}' <<<"$out"
+    return
+  fi
+  if grep -q '(NotFound)' "$err"; then rm -f "$err"; echo '{}'; return; fi
+  out=$(cat "$err"); rm -f "$err"
+  acc_fail "cannot read Secret agent-sandbox-secrets in $2 (refusing to rewrite it): $out"
+}
+# acc_secret_keys DATA sets ACC_CREDENTIALS_KEY and ACC_PREVIEW_TICKET_KEY for the Secret an
+# install writes: the explicit input, else the Secret's own value (DATA from acc_secret_data);
+# a fresh preview key only when there is none. An explicit CREDENTIALS_KEY that differs from the
+# one already in the Secret is refused: the stored credentials are encrypted under the old one.
+acc_secret_keys() {
+  local have_creds have_preview
+  have_creds=$(jq -r '.CREDENTIALS_KEY // empty' <<<"$1" | base64 -d)
+  have_preview=$(jq -r '.PREVIEW_TICKET_KEY // empty' <<<"$1" | base64 -d)
+  if [ -n "$ACCEPT_CREDENTIALS_KEY" ] && [ -n "$have_creds" ] && [ "$ACCEPT_CREDENTIALS_KEY" != "$have_creds" ]; then
+    acc_fail "ACCEPT_CREDENTIALS_KEY differs from the CREDENTIALS_KEY in Secret agent-sandbox-secrets: replacing it makes the stored credentials unreadable (rotate deliberately, not through an install)"
+    return 1
+  fi
+  ACC_CREDENTIALS_KEY=${ACCEPT_CREDENTIALS_KEY:-$have_creds}
+  ACC_PREVIEW_TICKET_KEY=${ACCEPT_PREVIEW_TICKET_KEY:-$have_preview}
+  ACC_PREVIEW_TICKET_KEY=${ACC_PREVIEW_TICKET_KEY:-$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')}
+}
+
+# acc_kept_credentials_key FILE prints the CREDENTIALS_KEY kept in FILE, generating it (0600) the
+# first time: one key per kept cluster, so a repeated `kind.sh run install` never re-keys the
+# credentials stored in its database.
+acc_kept_credentials_key() {
+  [ -s "$1" ] || (umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$1")
+  cat "$1"
+}
 
 acc_log() { printf '%s acceptance: %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 acc_fail() { echo "acceptance: FAIL: $*" >&2; return 1; }
