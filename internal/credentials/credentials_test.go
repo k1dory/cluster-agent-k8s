@@ -36,7 +36,7 @@ func TestBringYourOwnKey(t *testing.T) {
 	}
 	// The gateway resolves it as a provider; a tenant's own wins over a shared one; other
 	// tenants do not see it.
-	r := Resolver{s}
+	r := Resolver{Service: s}
 	if v, err := r.Get(ctx, "acme", "anthropic"); err != nil || v != "sk-ant-SECRET" {
 		t.Fatalf("resolve: %v %q", err, v)
 	}
@@ -108,7 +108,7 @@ func TestBringYourOwnKey(t *testing.T) {
 		t.Fatalf("moved ciphertext must not decrypt: %v", err)
 	}
 	other, _ := New(st, []byte(strings.Repeat("k", 32)))
-	if _, err := (Resolver{other}).Get(ctx, "acme", "token"); err == nil || !strings.Contains(err.Error(), "cannot decrypt") {
+	if _, err := (Resolver{Service: other}).Get(ctx, "acme", "token"); err == nil || !strings.Contains(err.Error(), "cannot decrypt") {
 		t.Fatalf("another key: %v", err)
 	}
 	list, _ := s.List(ctx, "acme")

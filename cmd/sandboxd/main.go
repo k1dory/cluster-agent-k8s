@@ -333,14 +333,25 @@ func serve(cfgPath string, log *slog.Logger) error {
 	log.Info("secrets provider", "provider", cfg.Secrets.Provider)
 	// Credentials tenants bring through the API resolve first, the operator's provider second.
 	var creds *credentials.Service
+	var oauth *credentials.OAuth
 	if key, err := credentials.ParseKey(cfg.Credentials.Key); err != nil {
 		return fmt.Errorf("credentials: %w", err)
 	} else if key != nil {
 		if creds, err = credentials.New(st, key); err != nil {
 			return fmt.Errorf("credentials: %w", err)
 		}
-		secretProvider = secrets.Chain{credentials.Resolver{Service: creds}, secretProvider}
-		log.Info("tenant credentials enabled (BYOK): secret: references resolve from the API's store first")
+		// Sign-ins sandboxd keeps fresh (subscriptions through the OAuth device flow) live next
+		// to the plain credentials, under the same key: every replica polls and refreshes the
+		// due ones, the row lease letting one at a time talk to the provider.
+		providers, err := credentials.MergeOAuthProviders(cfg.Credentials.OAuth.Providers)
+		if err != nil {
+			return err
+		}
+		oauth = credentials.NewOAuth(creds, st, providers, replicaName())
+		oauth.RefreshBefore, oauth.Every, oauth.Log = cfg.Credentials.OAuth.RefreshBefore, cfg.Credentials.OAuth.Every, log.With("log", "oauth")
+		go oauth.Run(ctx)
+		secretProvider = secrets.Chain{credentials.Resolver{Service: creds, OAuth: oauth}, secretProvider}
+		log.Info("tenant credentials enabled (BYOK): secret: references resolve from the API's store first", "oauth_providers", len(providers))
 	} else {
 		log.Warn("no credentials.key: tenants cannot bring their own secrets through the API")
 	}
@@ -373,7 +384,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 		tokenTenants[t.Token] = t.Tenant
 	}
 	platform := &httpapi.Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: cfg.APIToken, Tenants: tokenTenants,
-		Keys: &apikeys.Service{Store: st, MaxTTL: cfg.APIKeys.MaxTTL}, Credentials: creds,
+		Keys: &apikeys.Service{Store: st, MaxTTL: cfg.APIKeys.MaxTTL}, Credentials: creds, OAuth: oauth,
 		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Replica: replicaName(), Log: log.With("log", "api")}
 	services.Install(platform)
 	// CI jobs trade their provider's ID token for a key of the trusting tenant.

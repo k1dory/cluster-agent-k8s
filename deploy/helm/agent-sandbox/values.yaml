@@ -60,6 +60,10 @@ sandboxd:
   # a new tenant never needs a chart change. maxTTL caps a key's lifetime ("0" = may be permanent).
   apiKeys:
     maxTTL: "0"
+  # Subscription sign-ins (OAuth device flow, POST /v1/oauth-credentials/{name}/login): rendered
+  # as credentials.oauth of sandboxd.yaml. Empty = the built-in providers ("chatgpt") with their
+  # defaults. Example: {providers: {chatgpt: {client_id: ...}}, refresh_before: 5m, every: 5s}.
+  credentialsOAuth: {}
   # OIDC: accept JWTs from this issuer next to the static tokens. Leave issuer empty to disable.
   oidc:
     issuer: ""                      # https://login.example.com/realms/platform

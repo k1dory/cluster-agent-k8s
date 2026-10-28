@@ -5,7 +5,10 @@
     - POST api.anthropic.com/v1/messages?beta=true
     - POST api.anthropic.com/v1/messages/count_tokens
     - GET  api.anthropic.com/v1/models
+    - POST chatgpt.com/backend-api/codex/responses
+    - GET  chatgpt.com/backend-api/codex/models
   deny:
     - GET  api.anthropic.com/api/oauth/profile     # account endpoints are not the agent's business
     - POST claude.ai/api/organizations
     - GET  evil.example.com/
+    - GET  chatgpt.com/backend-api/conversation   # the ChatGPT web app is not the agent's

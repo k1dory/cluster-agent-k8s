@@ -67,6 +67,9 @@ type Platform struct {
 	Keys *apikeys.Service
 	// Credentials are the secrets tenants bring through the API (BYOK); nil disables the routes.
 	Credentials *credentials.Service
+	// OAuth are the sign-ins sandboxd keeps fresh (subscriptions through the device flow); nil
+	// disables their routes.
+	OAuth *credentials.OAuth
 	// Verifier checks bearer tokens that are not static ones (OIDC JWTs). nil disables.
 	Verifier TokenVerifier
 	// TTLFromToken caps the lifetime of sandboxes created with a short-lived token (and so
@@ -174,6 +177,7 @@ func (p *Platform) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/version", p.auth(p.version))
 	p.keyRoutes(mux)
 	p.credentialRoutes(mux)
+	p.oauthRoutes(mux)
 	p.ciAuthRoutes(mux)
 	mux.HandleFunc("GET /v1/whoami", p.auth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, principalOf(r))

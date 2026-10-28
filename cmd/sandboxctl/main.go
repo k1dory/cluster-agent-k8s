@@ -64,6 +64,10 @@ const usage = `sandboxctl <command> [flags]
   credentials list [-tenant t] | set <name> [-file f] [-tenant t] | remove <name> [-tenant t]
            your own secrets for secret:NAME references (LLM key, MCP token): the value is read from -file or
            stdin, never from the command line, and never shown again; set replaces, remove revokes
+  oauth    login <name> -provider p [-no-wait] [-tenant t] | list [-tenant t] | show <name> [-tenant t]
+           | remove <name> [-tenant t]      subscription sign-ins (a ChatGPT login for Codex): login prints the
+                                           URL and code to approve in a browser and waits until sandboxd holds
+                                           the sign-in; secret:NAME is then the access token it keeps fresh
   keys     list [-tenant t] | create -tenant t -name n [-ttl 720h] | rotate <id> [-tenant t] [-grace 1h] [-ttl d]
            | revoke <id> [-tenant t]        tenant API keys (sbk_…): the secret is printed once; a tenant key
                                            manages its own tenant's keys, the admin every tenant's
@@ -478,6 +482,8 @@ func (c *cli) run(cmd string, args []string) error {
 		default:
 			return fmt.Errorf("credentials: unknown subcommand %q", sub)
 		}
+	case "oauth":
+		return c.oauth(fs, pos, flags)
 	case "keys":
 		sub := need(pos, 0, "list|create|rotate|revoke")
 		tenant := fs.String("tenant", "", "tenant (default: the one your key or token is scoped to)")

@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -75,5 +76,32 @@ func TestShippedSubscriptionProfile(t *testing.T) {
 	spec := string(it.Spec)
 	if !strings.Contains(spec, `"CLAUDE_CODE_OAUTH_TOKEN":"sk-ant-oat01-placeholder`) || strings.Contains(spec, "ANTHROPIC_API_KEY") {
 		t.Fatalf("the profile must carry a placeholder OAuth token and no API key: %s", spec)
+	}
+}
+
+// The Codex profile applies as shipped: its config.toml names a provider whose key is a
+// placeholder variable the profile sets, and no OpenAI key.
+func TestShippedCodexProfile(t *testing.T) {
+	s := newService()
+	raw, err := os.ReadFile("../../examples/catalog/environment-codex-chatgpt.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := ParseYAML(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	it, err := s.Put(context.Background(), d.Kind, "acme", d, false, "ci")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var spec EnvironmentSpec
+	if err := json.Unmarshal(it.Spec, &spec); err != nil {
+		t.Fatal(err)
+	}
+	cfg := spec.Harness.Files[".codex/config.toml"]
+	if !strings.Contains(cfg, `env_key = "CODEX_GATEWAY_PLACEHOLDER"`) || !strings.Contains(cfg, "https://chatgpt.com/backend-api/codex") ||
+		spec.Env["CODEX_GATEWAY_PLACEHOLDER"] == "" || spec.Env["OPENAI_API_KEY"] != "" {
+		t.Fatalf("codex profile: %+v", spec)
 	}
 }

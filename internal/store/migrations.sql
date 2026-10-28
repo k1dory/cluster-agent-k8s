@@ -208,6 +208,34 @@ CREATE TABLE IF NOT EXISTS credentials (
     PRIMARY KEY (tenant, name)
 );
 
+-- Tenant sign-ins sandboxd keeps fresh (OAuth device flow): metadata in the clear, the device
+-- code or the tokens as ciphertext. lease_owner/lease_until serialize the replicas: one at a
+-- time polls or refreshes a row (a refresh token may be single-use). generation is bumped by
+-- every new sign-in, so a replica still working on the old one cannot save over it.
+CREATE TABLE IF NOT EXISTS oauth_credentials (
+    tenant           text NOT NULL DEFAULT '',
+    name             text NOT NULL,
+    provider         text NOT NULL,
+    status           text NOT NULL,
+    generation       integer NOT NULL DEFAULT 1,
+    verification_url text NOT NULL DEFAULT '',
+    user_code        text NOT NULL DEFAULT '',
+    login_expires_at timestamptz,
+    account_id       text NOT NULL DEFAULT '',
+    expires_at       timestamptz,
+    refreshed_at     timestamptz,
+    next_at          timestamptz NOT NULL,
+    error            text NOT NULL DEFAULT '',
+    ciphertext       bytea NOT NULL,
+    created_by       text NOT NULL DEFAULT '',
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    updated_at       timestamptz NOT NULL DEFAULT now(),
+    lease_owner      text NOT NULL DEFAULT '',
+    lease_until      timestamptz,
+    PRIMARY KEY (tenant, name)
+);
+CREATE INDEX IF NOT EXISTS oauth_credentials_due ON oauth_credentials (next_at) WHERE status <> 'failed';
+
 -- Git repositories: the last check and the last sync of each GitRepository (model.GitSync);
 -- the applies and the revisions carry the history.
 CREATE TABLE IF NOT EXISTS git_syncs (

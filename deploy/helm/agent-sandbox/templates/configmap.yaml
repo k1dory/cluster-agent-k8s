@@ -20,6 +20,9 @@ data:
       max_ttl: {{ .Values.sandboxd.apiKeys.maxTTL | quote }}
     credentials:
       key: "${CREDENTIALS_KEY}"
+      {{- with .Values.sandboxd.credentialsOAuth }}
+      oauth: {{- toYaml . | nindent 8 }}
+      {{- end }}
     database_url: "${DATABASE_URL}"
     policies_dir: /etc/sandbox/policies
     policies_strict: {{ .Values.sandboxd.policiesStrict }}

@@ -40,6 +40,15 @@ secrets_dir: /etc/sandbox/secrets  # file provider: tenants/<tenant>/<name>, sha
 # this key (openssl rand -hex 32); secret:NAME resolves from them first. Empty disables the API.
 credentials:
   key: "${CREDENTIALS_KEY}"
+  # Subscription sign-ins (sandboxctl oauth login NAME -provider chatgpt): sandboxd keeps the
+  # refresh token and resolves secret:NAME to a fresh access token. Built in: chatgpt (a ChatGPT
+  # login as Codex CLI does it); a configured entry overrides its fields, a new name must be
+  # complete (device_style openai|rfc8628, client_id, device_url, token_url, ...).
+  # oauth:
+  #   refresh_before: 5m
+  #   every: 5s
+  #   providers:
+  #     chatgpt: { client_id: app_..., token_url: https://auth.openai.com/oauth/token }
 # secrets:                         # external provider instead of the directory
 #   provider: vault                # vault (HashiCorp Vault or OpenBao, KV v2) | infisical | file
 #   cache_ttl: 60s

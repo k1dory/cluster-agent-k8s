@@ -178,6 +178,36 @@ type Credentials interface {
 	DeleteCredential(ctx context.Context, tenant, name string) error
 }
 
+// OAuthCredentials persists the sign-ins sandboxd keeps fresh (credentials.OAuth): the
+// metadata in the clear, the tokens encrypted by the caller. Polling a pending sign-in and
+// refreshing an active one happen under a lease on the row, so one replica at a time talks to
+// the provider for it: a refresh token may be single-use, and two replicas spending it at once
+// would leave both with a revoked grant.
+type OAuthCredentials interface {
+	// PutOAuthCredential starts a sign-in under (tenant, name): a new row, or the old one
+	// replaced whatever its state (Generation+1, lease dropped, CreatedAt kept). Reports whether
+	// the name was new.
+	PutOAuthCredential(ctx context.Context, c *model.OAuthCredential, ciphertext []byte) (created bool, err error)
+	// GetOAuthCredential returns the metadata and the ciphertext; ErrNotFound when absent.
+	GetOAuthCredential(ctx context.Context, tenant, name string) (*model.OAuthCredential, []byte, error)
+	// ListOAuthCredentials returns a scope's sign-ins, by name.
+	ListOAuthCredentials(ctx context.Context, tenant string) ([]*model.OAuthCredential, error)
+	// DeleteOAuthCredential removes one; ErrNotFound when absent.
+	DeleteOAuthCredential(ctx context.Context, tenant, name string) error
+	// DueOAuthCredentials returns up to limit pending or active rows whose NextAt has come by
+	// now and whose lease is free or lapsed, the most overdue first.
+	DueOAuthCredentials(ctx context.Context, now time.Time, limit int) ([]*model.OAuthCredential, error)
+	// LeaseOAuthCredential takes the row's lease for owner until `until`, when the row is still
+	// of generation gen and its lease is free, lapsed at now, or owner's own; it returns the row
+	// as it is under the lease. ErrConflict when another owner holds it, ErrNotFound when the
+	// row is gone or a new sign-in replaced it.
+	LeaseOAuthCredential(ctx context.Context, tenant, name string, gen int, owner string, now, until time.Time) (*model.OAuthCredential, []byte, error)
+	// SaveOAuthCredential writes the state the lease holder reached and releases the lease;
+	// ErrConflict when owner no longer holds the lease of c.Generation (it lapsed and another
+	// replica took it, or a new sign-in replaced the row): the caller's result is discarded.
+	SaveOAuthCredential(ctx context.Context, c *model.OAuthCredential, ciphertext []byte, owner string) error
+}
+
 // GitSyncs persists the last known state of each GitRepository (model.GitSync): one record
 // per (tenant, name) with two halves written independently. Each Record call replaces its
 // half whole and leaves the other untouched, atomically, with no read before the write: a
@@ -360,6 +390,7 @@ type Store interface {
 	Applies
 	APIKeys
 	Credentials
+	OAuthCredentials
 	GitSyncs
 	GitJobs
 	TokenUses
