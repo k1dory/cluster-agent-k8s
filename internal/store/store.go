@@ -363,6 +363,9 @@ type Store interface {
 	// AppendQueuedTask adds text to the task of a run that is still queued and returns the run;
 	// ErrConflict once it has been claimed (the harness may already have read its task).
 	AppendQueuedTask(ctx context.Context, runID, text string) (*model.Run, error)
+	// ReleaseRun puts a run the caller has just claimed back in the queue (running → queued,
+	// start time cleared), so a later claim gets it again; ErrConflict if it is not running.
+	ReleaseRun(ctx context.Context, runID string) error
 
 	AppendEvent(ctx context.Context, e *model.Event) error
 	ListEvents(ctx context.Context, sandboxID string, afterID int64, limit int) ([]*model.Event, error)

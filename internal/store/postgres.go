@@ -546,6 +546,21 @@ func (p *Postgres) AppendQueuedTask(ctx context.Context, runID, text string) (*m
 	return r, err
 }
 
+func (p *Postgres) ReleaseRun(ctx context.Context, runID string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE runs SET status=$2, started_at=NULL WHERE id=$1 AND status=$3`,
+		runID, model.RunQueued, model.RunRunning)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := p.GetRun(ctx, runID); err != nil {
+			return err
+		}
+		return ErrConflict
+	}
+	return nil
+}
+
 func (p *Postgres) ClaimQueuedRun(ctx context.Context, sandboxID string, startedAt time.Time) (*model.Run, error) {
 	// One statement: pick the oldest queued run, skipping rows another poller is claiming.
 	return scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4 WHERE id = (

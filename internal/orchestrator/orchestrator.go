@@ -849,7 +849,16 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 		r, err := o.Store.ClaimQueuedRun(ctx, sandboxID, time.Now())
 		if err == nil {
 			if r.Mode == model.RunMessage && r.Session == "" && r.ResumeOf != "" {
-				r.Session = o.sessionOf(ctx, r.ResumeOf)
+				session, err := o.sessionOf(ctx, r.ResumeOf)
+				if err != nil {
+					// Started without its session the message would open a new conversation:
+					// the run goes back to the queue and the runner's next poll claims it again.
+					if rerr := o.Store.ReleaseRun(context.WithoutCancel(ctx), r.ID); rerr != nil {
+						o.Log.Warn("release run after a failed session read", "run", r.ID, "err", rerr)
+					}
+					return nil, fmt.Errorf("session of run %s: %w", r.ResumeOf, err)
+				}
+				r.Session = session
 			}
 			// The run records what it executes under; later catalogue changes never touch it.
 			if sb, err := o.Store.GetSandbox(ctx, sandboxID); err == nil {
@@ -877,18 +886,22 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 // sessionOf finds the harness session a message run continues: that of the run it follows, or
 // of the nearest earlier one in the chain when that run never reported one (cancelled early).
 // The message was queued while those runs were pending, so their sessions were not known yet.
-func (o *Orchestrator) sessionOf(ctx context.Context, runID string) string {
+// "" means the chain has no session (or its runs are gone); a failed read is an error, not that.
+func (o *Orchestrator) sessionOf(ctx context.Context, runID string) (string, error) {
 	for i := 0; runID != "" && i < 100; i++ {
 		r, err := o.Store.GetRun(ctx, runID)
+		if errors.Is(err, store.ErrNotFound) {
+			return "", nil
+		}
 		if err != nil {
-			return ""
+			return "", err
 		}
 		if r.Session != "" {
-			return r.Session
+			return r.Session, nil
 		}
 		runID = r.ResumeOf
 	}
-	return ""
+	return "", nil
 }
 
 // Output appends agent output to the event stream. Lines that carry usage (Claude Code's
