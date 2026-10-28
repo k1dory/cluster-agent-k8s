@@ -20,6 +20,10 @@ gateway:
   caddyImage: caddy:2
   previewTls: ""                 # "" = on-demand certificates; or "dns cloudflare {env.CF_API_TOKEN}" with a custom Caddy build
   caddyEnvSecret: ""             # optional Secret with DNS-provider credentials for Caddy
+  # Optional ConfigMap of PEM roots (any keys) trusted for upstream TLS on top of the system
+  # roots: a connection's or policy's upstream signed by a private CA. Mounted into Caddy and
+  # sandboxd (the MCP proxy) as SSL_CERT_DIR next to /etc/ssl/certs.
+  upstreamCAConfigMap: ""
   accessLog: stdout
   apiPort: 8080                  # API clients reach this on the gateway node's address
 

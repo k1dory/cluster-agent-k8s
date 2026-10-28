@@ -54,6 +54,10 @@ spec:
             - secretRef:
                 name: {{ .Values.gateway.caddyEnvSecret }}
           {{- end }}
+          {{- if .Values.gateway.upstreamCAConfigMap }}
+          env:
+            - { name: SSL_CERT_DIR, value: "/etc/sandbox/upstream-ca:/etc/ssl/certs" }
+          {{- end }}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -63,6 +67,9 @@ spec:
             - { name: config, mountPath: /etc/caddy/Caddyfile, subPath: Caddyfile.bootstrap, readOnly: true }
             - { name: caddy-data, mountPath: /data }
             - { name: caddy-config, mountPath: /config }
+            {{- if .Values.gateway.upstreamCAConfigMap }}
+            - { name: upstream-ca, mountPath: /etc/sandbox/upstream-ca, readOnly: true }
+            {{- end }}
             {{- if eq .Values.sandboxd.ca.source "db" }}
             # the gateway root sandboxd writes from the database; Caddy signs its sites under it
             - { name: var, mountPath: /var/lib/sandboxd, readOnly: true }
@@ -74,6 +81,10 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ .Values.existingSecret }}
+          {{- if .Values.gateway.upstreamCAConfigMap }}
+          env:
+            - { name: SSL_CERT_DIR, value: "/etc/sandbox/upstream-ca:/etc/ssl/certs" }
+          {{- end }}
           readinessProbe:
             # the store answers: a replica that lost the database stops taking traffic
             httpGet: { path: /readyz, port: {{ .Values.gateway.apiPort }} }
@@ -103,6 +114,9 @@ spec:
             {{- if .Values.tenantSecretsSecret }}
             - { name: tenant-secrets, mountPath: /etc/sandbox/secrets, readOnly: true }
             {{- end }}
+            {{- if .Values.gateway.upstreamCAConfigMap }}
+            - { name: upstream-ca, mountPath: /etc/sandbox/upstream-ca, readOnly: true }
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
@@ -110,6 +124,10 @@ spec:
           configMap: { name: {{ include "agent-sandbox.fullname" . }}-config }
         - name: policies
           configMap: { name: {{ include "agent-sandbox.fullname" . }}-policies }
+        {{- if .Values.gateway.upstreamCAConfigMap }}
+        - name: upstream-ca
+          configMap: { name: {{ .Values.gateway.upstreamCAConfigMap }} }
+        {{- end }}
         {{- if eq .Values.sandboxd.ca.source "db" }}
         # Nothing on disk is precious with the CAs in the database: scratch volumes, so replicas
         # schedule on any gateway node without a ReadWriteOnce claim pinning them.
