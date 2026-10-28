@@ -50,6 +50,10 @@ up() {
     docker network inspect "$net" -f '{{range .Containers}}{{.Name}} {{end}}' | grep -qw "$node" || docker network connect --ip "10.77.77.$i" "$net" "$node"
   done
   gateways=$(echo "$workers" | head -2 | tr '\n' ' ')
+  # A real node's net.ipv4.ip_unprivileged_port_start is 1024; Docker sets 0 in its containers,
+  # which let a non-root gateway bind DNS on :53 here and nowhere else. The kind nodes' host
+  # network (where the hostNetwork gateway runs) gets the real value back.
+  for node in $gateways; do docker exec "$node" sysctl -qw net.ipv4.ip_unprivileged_port_start=1024; done
   # shellcheck disable=SC2086
   k label nodes $gateways agent-sandbox.io/gateway=true --overwrite >/dev/null
   # shellcheck disable=SC2086
