@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,7 +82,28 @@ func echo() *httptest.Server {
 
 type caddyProc struct {
 	cmd *exec.Cmd
-	out bytes.Buffer
+	out lockedBuffer
+}
+
+// lockedBuffer is Caddy's stdout and stderr. The process writes it from the goroutines exec
+// copies its pipes with for as long as it runs, while a test reads it in the middle (a failed
+// push, a site never issued), not only after Wait; a bare bytes.Buffer is a data race under
+// -race there. Both writes and String go through the lock.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // startCaddy launches caddy with only the admin endpoint configured (the bootstrap Caddyfile
