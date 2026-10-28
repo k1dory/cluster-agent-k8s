@@ -126,7 +126,7 @@ func (s *Service) Validate(ctx context.Context, tenant string, d *res.Document, 
 	if !hostRe.MatchString(sp.Host) {
 		return nil, fmt.Errorf("%w: spec.host must be a lower-case host name without scheme or port", res.ErrInvalid)
 	}
-	if err := s.checkOwnHost(tenant, &sp); err != nil {
+	if err := s.checkOwnHost(tenant, d.Name, &sp); err != nil {
 		return nil, err
 	}
 	for name, v := range sp.Headers {
@@ -154,7 +154,7 @@ func (s *Service) Validate(ctx context.Context, tenant string, d *res.Document, 
 
 // checkOwnHost validates the egress part of a connection for a host the repository does not
 // serve, and refuses it when the tenant may not serve that host on its own.
-func (s *Service) checkOwnHost(tenant string, sp *Spec) error {
+func (s *Service) checkOwnHost(tenant, name string, sp *Spec) error {
 	repoHost := s.Hosts != nil && func() bool { _, ok := s.Hosts.HostInfo(sp.Host); return ok }()
 	if repoHost || s.Hosts == nil {
 		// The policy repository decides upstream, paths and MCP for this host; a connection
@@ -187,10 +187,10 @@ func (s *Service) checkOwnHost(tenant string, sp *Spec) error {
 	if sp.MCP != nil && sp.Type != TypeMCP {
 		return fmt.Errorf("%w: spec.mcp needs type mcp", res.ErrInvalid)
 	}
-	// One host, one upstream and one kind across every live connection: the gateway serves a
-	// host one way.
+	// One host, one upstream and one kind across every live connection but this one's previous
+	// revision: the gateway serves a host one way.
 	for _, it := range s.snap.All() {
-		if it.Tenant == tenant && it.Name == sp.Host {
+		if it.Tenant == tenant && it.Name == name {
 			continue
 		}
 		var other Spec
