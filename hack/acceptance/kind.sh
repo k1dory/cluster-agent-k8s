@@ -125,6 +125,7 @@ run() {
   export ACCEPT_DB_RESTORE="$kubectl -n $ACCEPT_NAMESPACE scale deploy/postgres --replicas=1 && $kubectl -n $ACCEPT_NAMESPACE rollout status deploy/postgres --timeout=180s"
   export ACCEPT_UPGRADE_TAG="$tag-next"
   export ACCEPT_HARNESS_MARKER="acceptance: "
+  export ACCEPT_CREDENTIALS_KEY=${ACCEPT_CREDENTIALS_KEY:-$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')}
   export IMAGE_PREFIX=$prefix
   "$acc_dir/run.sh" "$@"
 }
