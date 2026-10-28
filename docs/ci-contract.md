@@ -93,6 +93,34 @@ The provider files call the targets and nothing else: `.github/workflows/ci.yaml
 select events, arrange jobs, set up Go, start the PostgreSQL service and, for the Docker
 groups, a daemon, and map those to the inputs above.
 
+## Publishing
+
+Publishing is not a check and is not in `make ci`; it is the explicitly configured action of
+rule 5, with the same shape: the logic in `hack/publish-images.sh` and `hack/verify-images.sh`,
+the provider file (`.github/workflows/publish.yaml`, on `main` and by hand) mapping its context
+to the inputs and keeping the record.
+
+| Target | Does | Inputs |
+|---|---|---|
+| `publish-images` | builds linux/amd64 `sandboxd`, `sandboxctl` and `agent` with buildx (provenance attestation, mode=max), pushes each to `IMAGE_REPO/<image>:sha-<12 characters of COMMIT>` (that tag only; an existing tag is never rebuilt), signs each digest with cosign, writes `.ci/publish/images.json` (image, digest, arch, commit, harness versions) | `IMAGE_REPO` (required), `COMMIT` (HEAD of a clean checkout), `SOURCE_URL`, `REGISTRY_USER`/`REGISTRY_PASSWORD`, `COSIGN_PRIVATE_KEY`/`COSIGN_PASSWORD` (a missing key fails the run unless `PUBLISH_UNSIGNED=1`), `PUBLISH_MANIFEST`; docker with buildx, python3 |
+| `verify-images` | every image of the record carries a signature from `cosign.pub`'s key and its tag still names the recorded digest; needs no credentials for public packages | `PUBLISH_MANIFEST`, `COSIGN_PUBLIC_KEY` (default `cosign.pub`) |
+
+cosign is `COSIGN_VERSION` from `versions.env` (downloaded and checked against the release's
+checksums, or `COSIGN_BIN`). The agent image's harnesses (`CLAUDE_CODE_VERSION`,
+`CODEX_VERSION`) are pinned there too and passed as build arguments by every build of that image
+(`hack/ci/versions.sh build-args`); the image shows them as the labels
+`io.agent-sandbox.harness.claude-code.version` and `io.agent-sandbox.harness.codex.version`, and
+`ci-images` fails when a label or the installed binary differs from the pin.
+
+A copy of the project publishes to its own registry with its own key: `IMAGE_REPO` and the two
+cosign secrets are its settings, and its `cosign.pub` replaces this one. To check an image by
+hand:
+
+```
+cosign verify --key cosign.pub ghcr.io/OWNER/REPO/agent:sha-0123456789ab
+docker inspect --format '{{ json .Config.Labels }}' ghcr.io/OWNER/REPO/agent:sha-0123456789ab
+```
+
 ## Adoption
 
 Implemented: the common targets and scripts above; GitHub, Forgejo and GitLab adapters that

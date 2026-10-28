@@ -1,0 +1,40 @@
+# Publishing the images of main (docs/ci-contract.md, rule 5: a separate, explicitly configured
+# action). `make publish-images` does the work: linux/amd64 sandboxd, sandboxctl and agent images
+# pushed to ghcr.io/<this repository>/<image>:sha-<12 characters of the commit>, each digest
+# signed with cosign under the key in the COSIGN_PRIVATE_KEY and COSIGN_PASSWORD secrets (its
+# public half is cosign.pub), and a manifest of what was pushed. This file maps the runner's
+# context to the target's inputs and keeps the manifest as an artifact; `make verify-images`
+# checks the signatures against cosign.pub from anywhere, without credentials.
+name: publish
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+concurrency:
+  group: publish-${{ github.sha }}
+  cancel-in-progress: false
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make publish-images
+        env:
+          IMAGE_REPO: ghcr.io/${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+      - run: make verify-images
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: images-manifest
+          path: .ci/publish/images.json
+          if-no-files-found: ignore

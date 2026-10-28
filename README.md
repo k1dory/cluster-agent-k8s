@@ -168,7 +168,8 @@ graceful termination before creating the next pod under the same name.
 
 ### The agent image
 
-`images/agent/Dockerfile` ships Claude Code, git, nftables and the sandbox binaries; user 1000 is
+`images/agent/Dockerfile` ships Claude Code and Codex CLI (versions pinned in
+`hack/ci/versions.env`, shown as image labels), git, nftables and the sandbox binaries; user 1000 is
 `agent` (the base image's `node` user is removed). At pod start the `netlock` init container locks
 the network, then `agent-init` bootstraps the identity: it trusts the gateway root that sandboxd
 publishes into the `agent-sandbox-gateway-ca` ConfigMap (mounted into every pod), obtains the
@@ -179,6 +180,9 @@ rebuilt on every bootstrap attempt, so a root published after the pod started is
 harness inside it; a checkout whose origin differs from the sandbox's `repo` is moved aside and
 the right repository cloned, never silently reused.
 `make smoke-image` runs the shipped image's pieces in Docker; CI builds both images on every PR.
+Every commit on `main` is published (`make publish-images`, [docs/ci-contract.md](docs/ci-contract.md#publishing))
+as `ghcr.io/k1dory/cluster-agent-k8s/{sandboxd,sandboxctl,agent}:sha-<12 characters of the commit>`,
+linux/amd64, each digest signed with cosign; `cosign verify --key cosign.pub <image>` checks one.
 
 ### Talking to the agent, reaching its workspace
 

@@ -47,6 +47,24 @@ ci_helm() {
   echo "$dir/helm"
 }
 
+# ci_cosign prints the path of cosign: COSIGN_BIN when set, else COSIGN_VERSION downloaded once
+# and checked against the release's checksum list (a truncated or swapped download fails here).
+ci_cosign() {
+  if [ -n "${COSIGN_BIN:-}" ]; then echo "$COSIGN_BIN"; return; fi
+  local dir="$CI_BIN/cosign-$COSIGN_VERSION" name want got
+  name="cosign-$(ci_os)-$(ci_arch)"
+  if [ ! -x "$dir/cosign" ]; then
+    mkdir -p "$dir"
+    ci_fetch "https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION/$name" "$dir/$name"
+    ci_fetch "https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION/cosign_checksums.txt" "$dir/checksums.txt"
+    want=$(awk -v n="$name" '$2 == n { print $1 }' "$dir/checksums.txt")
+    got=$( (sha256sum "$dir/$name" 2>/dev/null || shasum -a 256 "$dir/$name") | awk '{ print $1 }')
+    [ -n "$want" ] && [ "$want" = "$got" ] || { rm -f "$dir/$name"; ci_die "cosign $COSIGN_VERSION: checksum mismatch for $name"; }
+    chmod +x "$dir/$name" && mv "$dir/$name" "$dir/cosign"
+  fi
+  echo "$dir/cosign"
+}
+
 # ci_docker makes sure a docker CLI is on PATH (the static CLI is downloaded once when the
 # runner has none) and that a daemon answers; a check that needs Docker fails here otherwise.
 ci_docker() {
