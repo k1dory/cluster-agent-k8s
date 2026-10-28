@@ -210,8 +210,10 @@ host and the rule immediately. The admin's shared connections (`-tenant ""`) may
 
 An `upstream` behind a private CA is trusted once the operator names a ConfigMap of its PEM
 roots in `gateway.upstreamCAConfigMap`: Caddy and the MCP proxy add them to the system roots.
-The gateway sends the connection's host name as `Host`, and no SNI to an IP upstream, so the
-server must accept that name and present the IP in its certificate.
+The gateway sends the connection's host name as `Host` and, for an IP upstream, checks the
+certificate against that name. A server that answers only to its own address (an IP site, a
+certificate with the IP alone) takes `upstream_host: true`: the upstream's `host:port` is then
+both the `Host` header and the name its certificate is checked against.
 
 ## 4. The agent, and the sandbox that runs it
 

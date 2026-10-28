@@ -257,6 +257,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.Out.Host = host // the policy host name, whatever address the upstream listens on
+			if info.UpstreamHost {
+				pr.Out.Host = target.Host
+			}
 			for k := range pr.Out.Header {
 				if strings.HasPrefix(k, "X-Sandbox-") || k == "X-Agent-Cert" || k == "X-Agent-San" {
 					pr.Out.Header.Del(k)

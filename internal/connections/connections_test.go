@@ -196,6 +196,7 @@ func TestSelfServiceHostsAreTheConnection(t *testing.T) {
 		`{"type":"mcp","host":"tools.acme.example.com","upstream":"https://user:pw@x"}`,
 		`{"type":"mcp","host":"tools.acme.example.com","paths":["mcp"]}`,
 		`{"type":"http","host":"tools.acme.example.com","mcp":{"read_only":true}}`,
+		`{"type":"mcp","host":"tools.acme.example.com","upstream_host":true}`,
 	} {
 		if _, err := s.Put(ctx, "acme", doc("bad", bad), false, "x"); !errors.Is(err, res.ErrInvalid) {
 			t.Errorf("%s must be invalid: %v", bad, err)
@@ -214,6 +215,12 @@ func TestSelfServiceHostsAreTheConnection(t *testing.T) {
 	}
 	if _, err := s.Put(ctx, "acme", doc("vendor2", `{"type":"http","host":"tools.acme.example.com","upstream":"https://10.0.0.5:8443"}`), false, "alice"); !errors.Is(err, res.ErrInvalid) {
 		t.Fatalf("conflicting kind: %v", err)
+	}
+	if _, err := s.Put(ctx, "acme", doc("vendor2", `{"type":"mcp","host":"tools.acme.example.com","upstream":"https://10.0.0.5:8443","upstream_host":true}`), false, "alice"); !errors.Is(err, res.ErrInvalid) {
+		t.Fatalf("conflicting Host header: %v", err)
+	}
+	if _, err := s.Put(ctx, "acme", doc("gh2", `{"type":"http","host":"api.github.com","upstream_host":true}`), false, "x"); !errors.Is(err, res.ErrInvalid) {
+		t.Fatalf("upstream_host on a repository host: %v", err)
 	}
 	// The hosts the gateway must serve beyond the repository's, with their header names.
 	own, fp := s.OwnHosts()

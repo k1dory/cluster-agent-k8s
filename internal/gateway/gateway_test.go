@@ -51,6 +51,19 @@ func TestRender(t *testing.T) {
 		t.Fatalf("without a shared root Caddy's own chain is the one published:\n%s", out)
 	}
 	cfg.RootCert, cfg.RootKey = "", ""
+	// upstream_host: the IP site is asked for as itself, Host and TLS name alike.
+	own := append(testSet().Hosts(), policy.Host{Name: "argus.example.com", Upstream: "https://192.0.2.7:8443", UpstreamHost: true})
+	if out, err = Render(cfg, own, c.PEM()); err != nil {
+		t.Fatal(err)
+	}
+	site := out[strings.Index(out, "argus.example.com {"):]
+	site = site[:strings.Index(site, "\n}\n")]
+	if !strings.Contains(site, "header_up Host {upstream_hostport}") || strings.Contains(site, "tls_server_name") {
+		t.Fatalf("upstream_host site:\n%s", site)
+	}
+	if strings.Count(out, "header_up Host") != 1 {
+		t.Fatalf("only the upstream_host site rewrites Host:\n%s", out)
+	}
 	if path, err := exec.LookPath("caddy"); err == nil {
 		cmd := exec.Command(path, "validate", "--adapter", "caddyfile", "--config", "/dev/stdin")
 		cmd.Stdin = strings.NewReader(out)

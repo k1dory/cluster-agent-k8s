@@ -458,14 +458,24 @@ func TestRealCaddyGateway(t *testing.T) {
 	// answers for it, the proxy enforces the connection's read-only rule, and a sandbox without
 	// the connection is refused at forward_auth.
 	t.Run("SelfServiceMCPHost", func(t *testing.T) {
-		if _, err := services.Tenants.Put(ctx, "alice", &resource.Document{Spec: json.RawMessage(`{"hosts":["mcp.tools.example.com"]}`)}, "admin"); err != nil {
+		if _, err := services.Tenants.Put(ctx, "alice", &resource.Document{Spec: json.RawMessage(`{"hosts":["mcp.tools.example.com","ip-mcp.tools.example.com","ip-api.tools.example.com"]}`)}, "admin"); err != nil {
 			t.Fatal(err)
 		}
 		conn := `{"type":"mcp","host":"mcp.tools.example.com","upstream":"` + up.URL + `","paths":["/mcp","/mcp/**"],"mcp":{"read_only":true,"tools":["get_*"]},"headers":{"Authorization":"Bearer secret:tools"}}`
 		if _, err := services.Connections.Put(ctx, "alice", &resource.Document{Name: "tools", Spec: json.RawMessage(conn)}, false, "alice"); err != nil {
 			t.Fatal(err)
 		}
-		sb2, err := orch.Create(ctx, orchestrator.CreateRequest{Name: "tools", Slug: "backend-dev", Owner: "alice", Tenant: "alice", Admin: true, Connections: []string{"tools"}})
+		// A server that answers only to its own address (an IP site): upstream_host sends the
+		// upstream's host:port as Host, through the MCP proxy and through Caddy alike.
+		for name, spec := range map[string]string{
+			"ip-mcp": `{"type":"mcp","host":"ip-mcp.tools.example.com","upstream":"` + up.URL + `","upstream_host":true,"paths":["/"]}`,
+			"ip-api": `{"type":"http","host":"ip-api.tools.example.com","upstream":"` + up.URL + `","upstream_host":true,"paths":["/api/**"]}`,
+		} {
+			if _, err := services.Connections.Put(ctx, "alice", &resource.Document{Name: name, Spec: json.RawMessage(spec)}, false, "alice"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		sb2, err := orch.Create(ctx, orchestrator.CreateRequest{Name: "tools", Slug: "backend-dev", Owner: "alice", Tenant: "alice", Admin: true, Connections: []string{"tools", "ip-mcp", "ip-api"}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -479,7 +489,7 @@ func TestRealCaddyGateway(t *testing.T) {
 		if err := syncer.SyncOnce(ctx, false); err != nil {
 			t.Fatalf("re-sync: %v\n%s", err, proc.out.String())
 		}
-		waitForCertificates(t, proc, httpsPort, pool, "mcp.tools.example.com")
+		waitForCertificates(t, proc, httpsPort, pool, "mcp.tools.example.com", "ip-mcp.tools.example.com", "ip-api.tools.example.com")
 		// A second pod, bootstrapped for the sandbox that carries the connection.
 		key2, csr2, _ := ca.NewCSR("backend-dev")
 		body2, _ := json.Marshal(registrar.BootstrapRequest{CSR: string(csr2)})
@@ -521,6 +531,22 @@ func TestRealCaddyGateway(t *testing.T) {
 		// The first sandbox does not carry the connection: refused by forward_auth.
 		if code, _, raw := do(agent, `{"jsonrpc":"2.0","id":3,"method":"tools/list"}`); code != 403 {
 			t.Fatalf("sandbox without the connection: %d %s", code, raw)
+		}
+		upHost := strings.TrimPrefix(up.URL, "http://")
+		for _, u := range []string{"https://ip-mcp.tools.example.com/", "https://ip-api.tools.example.com/api/x"} {
+			req, _ := http.NewRequest(http.MethodPost, u, strings.NewReader(`{"jsonrpc":"2.0","id":4,"method":"tools/list"}`))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := agent2.Do(req)
+			if err != nil {
+				t.Fatalf("POST %s: %v\n%s", u, err, proc.out.String())
+			}
+			raw, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			var seen map[string]string
+			_ = json.Unmarshal(raw, &seen)
+			if resp.StatusCode != 200 || seen["host"] != upHost {
+				t.Fatalf("upstream_host: %s must reach the upstream as Host %s: %d %s", u, upHost, resp.StatusCode, raw)
+			}
 		}
 	})
 

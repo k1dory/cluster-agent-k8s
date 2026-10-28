@@ -2204,6 +2204,7 @@ components:
           additionalProperties: { type: string }
           description: "Headers the gateway adds for agents using this connection. Values are templates: secret:NAME is resolved from the tenant's secrets at request time. A credential header (Authorization, Cookie, anything named like a key or token) must be a reference such as \"Bearer secret:NAME\"; a literal value is refused and never echoed"
         upstream: { type: string, description: "Self-service hosts only: where the gateway sends the traffic (http(s) URL; default https://<host>). Every live connection for a host must agree" }
+        upstream_host: { type: boolean, description: "Self-service hosts with an upstream only: send the upstream's own host[:port] as Host and verify its TLS certificate against that address (a server that answers only to its own address); default the connection's host name. Every live connection for a host must agree" }
         paths: { type: array, items: { type: string }, description: "Self-service hosts only: policy path patterns the agent may call (default /**)" }
         mcp:
           type: object

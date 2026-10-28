@@ -49,6 +49,10 @@ type Spec struct {
 	// Upstream is where the gateway sends traffic for a host the policy repository does not
 	// serve (default https://<host>); ignored for a repository host, whose policy decides.
 	Upstream string `yaml:"upstream,omitempty" json:"upstream,omitempty"`
+	// UpstreamHost sends the upstream's own host[:port] as Host and checks its certificate
+	// against that address, for a server that answers only to its own address (an IP site).
+	// Default: the connection's host name, with an IP upstream verified under that name.
+	UpstreamHost bool `yaml:"upstream_host,omitempty" json:"upstream_host,omitempty"`
 	// Paths an agent may call on such a host (policy path patterns; default "/**").
 	Paths []string `yaml:"paths,omitempty" json:"paths,omitempty"`
 	// MCP is what the proxy enforces on a type mcp connection for such a host: read_only with
@@ -155,7 +159,7 @@ func (s *Service) checkOwnHost(tenant string, sp *Spec) error {
 	if repoHost || s.Hosts == nil {
 		// The policy repository decides upstream, paths and MCP for this host; a connection
 		// declaring them would promise what it cannot deliver.
-		if sp.Upstream != "" || len(sp.Paths) > 0 || sp.MCP != nil {
+		if sp.Upstream != "" || sp.UpstreamHost || len(sp.Paths) > 0 || sp.MCP != nil {
 			if repoHost {
 				return fmt.Errorf("%w: %s is served by the policy repository: a connection for it adds headers only (no upstream, paths or mcp)", res.ErrInvalid, sp.Host)
 			}
@@ -171,6 +175,9 @@ func (s *Service) checkOwnHost(tenant string, sp *Spec) error {
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 			return fmt.Errorf("%w: spec.upstream must be an http(s) URL with a host and nothing else", res.ErrInvalid)
 		}
+	}
+	if sp.UpstreamHost && sp.Upstream == "" {
+		return fmt.Errorf("%w: spec.upstream_host needs spec.upstream", res.ErrInvalid)
 	}
 	for _, p := range sp.Paths {
 		if !strings.HasPrefix(p, "/") {
@@ -192,6 +199,9 @@ func (s *Service) checkOwnHost(tenant string, sp *Spec) error {
 		}
 		if upstreamOf(&other) != upstreamOf(sp) {
 			return fmt.Errorf("%w: %s already goes to %s (connection %s): a host has one upstream", res.ErrInvalid, sp.Host, upstreamOf(&other), res.RefOf(it, tenant))
+		}
+		if other.UpstreamHost != sp.UpstreamHost {
+			return fmt.Errorf("%w: %s already sets upstream_host %v (connection %s): a host has one Host header", res.ErrInvalid, sp.Host, other.UpstreamHost, res.RefOf(it, tenant))
 		}
 		if (other.Type == TypeMCP) != (sp.Type == TypeMCP) {
 			return fmt.Errorf("%w: %s is already a %s connection (%s): a host has one type", res.ErrInvalid, sp.Host, other.Type, res.RefOf(it, tenant))
@@ -229,7 +239,7 @@ func (s *Service) OwnHosts() ([]policy.Host, string) {
 		}
 		h, ok := byName[sp.Host]
 		if !ok {
-			h = &policy.Host{Name: sp.Host, Upstream: upstreamOf(&sp), MCP: sp.Type == TypeMCP}
+			h = &policy.Host{Name: sp.Host, Upstream: upstreamOf(&sp), MCP: sp.Type == TypeMCP, UpstreamHost: sp.UpstreamHost}
 			byName[sp.Host] = h
 		}
 		for name := range sp.Headers {
@@ -247,7 +257,7 @@ func (s *Service) OwnHosts() ([]policy.Host, string) {
 		h := byName[n]
 		sort.Strings(h.Injected)
 		out = append(out, *h)
-		fmt.Fprintf(hash, "%s %s mcp=%v %s\n", h.Name, h.Upstream, h.MCP, strings.Join(h.Injected, ","))
+		fmt.Fprintf(hash, "%s %s mcp=%v upstream_host=%v %s\n", h.Name, h.Upstream, h.MCP, h.UpstreamHost, strings.Join(h.Injected, ","))
 	}
 	return out, hex.EncodeToString(hash.Sum(nil))[:12]
 }
