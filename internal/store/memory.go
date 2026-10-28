@@ -438,6 +438,21 @@ func (m *Memory) ClaimQueuedRun(_ context.Context, sandboxID string, startedAt t
 	return nil, ErrNotFound
 }
 
+func (m *Memory) AppendQueuedTask(_ context.Context, runID, text string) (*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[runID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if r.Status != model.RunQueued {
+		return nil, ErrConflict
+	}
+	r.Task += text
+	out := *r
+	return &out, nil
+}
+
 func (m *Memory) RunningRun(_ context.Context, sandboxID string) (*model.Run, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

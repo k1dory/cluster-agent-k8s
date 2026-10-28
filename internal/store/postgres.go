@@ -532,6 +532,20 @@ func (p *Postgres) ListRuns(ctx context.Context, sandboxID string) ([]*model.Run
 	return p.queryRuns(ctx, `SELECT `+runCols+` FROM runs WHERE sandbox_id=$1 ORDER BY created_at`, sandboxID)
 }
 
+func (p *Postgres) AppendQueuedTask(ctx context.Context, runID, text string) (*model.Run, error) {
+	// The status condition is re-checked against a concurrent claim: once the runner has the
+	// run, nothing is appended.
+	r, err := scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET task = task || $2 WHERE id=$1 AND status=$3
+		RETURNING `+runCols, runID, text, model.RunQueued))
+	if errors.Is(err, ErrNotFound) {
+		if _, gerr := p.GetRun(ctx, runID); gerr != nil {
+			return nil, gerr
+		}
+		return nil, ErrConflict
+	}
+	return r, err
+}
+
 func (p *Postgres) ClaimQueuedRun(ctx context.Context, sandboxID string, startedAt time.Time) (*model.Run, error) {
 	// One statement: pick the oldest queued run, skipping rows another poller is claiming.
 	return scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4 WHERE id = (

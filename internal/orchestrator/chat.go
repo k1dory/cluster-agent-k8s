@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -18,7 +19,9 @@ const (
 )
 
 // Say sends the next message of the sandbox's conversation. A run in progress (or queued)
-// receives it as input; otherwise a new run continues the last finished run's harness session
+// receives it as input when its harness reads input in stream-json mode. A text-mode harness
+// gets only its task on stdin: the message joins the task of a run still queued, or else becomes
+// the next run, which continues the conversation once the running one finishes. Otherwise a new run continues the last finished run's harness session
 // (the message is its prompt), or starts a fresh conversation when none exists. The run that
 // carries the message is returned with how it was delivered.
 func (o *Orchestrator) Say(ctx context.Context, sandboxID, text string) (run *model.Run, how string, err error) {
@@ -52,14 +55,15 @@ func (o *Orchestrator) say(ctx context.Context, sandboxID, text string) (*model.
 	if err != nil {
 		return nil, "", false, err
 	}
-	var active, last *model.Run
+	var active, newest, last *model.Run
 	for _, r := range runs {
 		switch r.Status {
-		case model.RunRunning:
-			active = r
-		case model.RunQueued:
-			if active == nil {
+		case model.RunRunning, model.RunQueued:
+			if r.Status == model.RunRunning || active == nil {
 				active = r
+			}
+			if newest == nil || r.CreatedAt.After(newest.CreatedAt) {
+				newest = r
 			}
 		default:
 			// The conversation to continue is the latest settled run whose harness session is
@@ -68,6 +72,26 @@ func (o *Orchestrator) say(ctx context.Context, sandboxID, text string) (*model.
 				last = r
 			}
 		}
+	}
+	if active != nil && !streamsInput(sb) {
+		if newest.Status == model.RunQueued {
+			r, err := o.Store.AppendQueuedTask(ctx, newest.ID, "\n\n"+text)
+			if err == nil {
+				o.Touch(ctx, sandboxID)
+				return r, DeliveredInput, false, nil
+			}
+			if !errors.Is(err, store.ErrConflict) {
+				return nil, "", false, err
+			}
+			// The runner has just claimed it: the message follows as the next run.
+		}
+		// The session of the run it continues is known once that run has spoken; NextRun
+		// resolves it when this one starts.
+		r, wake, err := o.enqueue(ctx, sandboxID, &model.Run{Task: text, ResumeOf: newest.ID, Session: newest.Session, Mode: model.RunMessage})
+		if err != nil {
+			return nil, "", false, err
+		}
+		return r, DeliveredResumed, wake, nil
 	}
 	if active != nil {
 		if err := o.Input(ctx, sandboxID, active.ID, text); err != nil {
@@ -87,6 +111,12 @@ func (o *Orchestrator) say(ctx context.Context, sandboxID, text string) (*model.
 		return nil, "", false, err
 	}
 	return r, DeliveredNew, wake, nil
+}
+
+// streamsInput says whether the sandbox's harness takes messages during a run (stream-json).
+// Anything else is text mode, as the runner reads it: stdin carries the task and is closed.
+func streamsInput(sb *model.Sandbox) bool {
+	return sb.Launch != nil && sb.Launch.HarnessInput == harness.InputStreamJSON
 }
 
 // CloseRun asks the runner to close the harness's input: an open conversation ends, the run

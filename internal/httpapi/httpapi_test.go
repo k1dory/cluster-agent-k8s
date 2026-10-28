@@ -155,6 +155,7 @@ func TestEndToEnd(t *testing.T) {
 	}
 
 	// Queue a run, agent picks it up, streams output, gets input, finishes.
+	streamJSON(t, s, sb.ID)
 	resp, body = call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/runs", "t0k", map[string]string{"task": "write tests"}, nil)
 	if resp.StatusCode != 202 {
 		t.Fatalf("create run: %d %s", resp.StatusCode, body)

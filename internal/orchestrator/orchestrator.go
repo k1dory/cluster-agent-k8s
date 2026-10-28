@@ -804,7 +804,8 @@ func (o *Orchestrator) Input(ctx context.Context, sandboxID, runID, text string)
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("%w: text is required", ErrBadRequest)
 	}
-	if _, err := o.Store.GetSandbox(ctx, sandboxID); err != nil {
+	sb, err := o.Store.GetSandbox(ctx, sandboxID)
+	if err != nil {
 		return err
 	}
 	r, err := o.Store.GetRun(ctx, runID)
@@ -815,6 +816,11 @@ func (o *Orchestrator) Input(ctx context.Context, sandboxID, runID, text string)
 	case model.RunQueued, model.RunRunning:
 	default:
 		return fmt.Errorf("%w: run is %s", ErrConflict, r.Status)
+	}
+	if !streamsInput(sb) {
+		// The runner closes a text-mode harness's stdin after the task: an input event would be
+		// recorded and never read.
+		return fmt.Errorf("%w: a text-mode harness takes no input during a run; send it as a message (it becomes the next run)", ErrConflict)
 	}
 	o.Touch(ctx, sandboxID)
 	return o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventInput, Data: text})
@@ -842,6 +848,9 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 		}
 		r, err := o.Store.ClaimQueuedRun(ctx, sandboxID, time.Now())
 		if err == nil {
+			if r.Mode == model.RunMessage && r.Session == "" && r.ResumeOf != "" {
+				r.Session = o.sessionOf(ctx, r.ResumeOf)
+			}
 			// The run records what it executes under; later catalogue changes never touch it.
 			if sb, err := o.Store.GetSandbox(ctx, sandboxID); err == nil {
 				r.AgentVersion, r.AgentRef, r.AgentRevision = sb.AgentVersion, sb.AgentRef, sb.AgentRevision
@@ -863,6 +872,23 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+// sessionOf finds the harness session a message run continues: that of the run it follows, or
+// of the nearest earlier one in the chain when that run never reported one (cancelled early).
+// The message was queued while those runs were pending, so their sessions were not known yet.
+func (o *Orchestrator) sessionOf(ctx context.Context, runID string) string {
+	for i := 0; runID != "" && i < 100; i++ {
+		r, err := o.Store.GetRun(ctx, runID)
+		if err != nil {
+			return ""
+		}
+		if r.Session != "" {
+			return r.Session
+		}
+		runID = r.ResumeOf
+	}
+	return ""
 }
 
 // Output appends agent output to the event stream. Lines that carry usage (Claude Code's

@@ -315,7 +315,8 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	// message); CLI-arg harnesses just ignore it. In text mode that is all stdin ever carries, so
 	// it is closed right after: `claude -p` (and any harness reading a non-terminal stdin) reads
 	// stdin to its end before it starts, and an open pipe kept it waiting for the whole run.
-	// Follow-up messages of a text-mode harness come as the next run (the resume command).
+	// The control plane delivers a text-mode harness's follow-up messages as the next run (the
+	// resume command), never as input to this one.
 	go func() {
 		_, _ = io.WriteString(stdin, harness.FormatInput(chat.mode, run.Task))
 		if chat.mode != harness.InputStreamJSON {
@@ -540,9 +541,10 @@ func forwardInput(ctx context.Context, c *client, runID string, w io.WriteCloser
 				return
 			}
 			if chat.mode != harness.InputStreamJSON {
-				// stdin is closed (see execute); the control plane's cancel and close above
-				// still apply, so the loop goes on listening for them.
-				fmt.Println("agent-runner: a message during a text-mode run reaches the harness with the next run")
+				// stdin is closed (see execute). The control plane turns a message for a
+				// text-mode harness into the next run and refuses input, so this is an event
+				// from before the sandbox's mode changed; cancel and close above still apply.
+				fmt.Println("agent-runner: input event ignored: a text-mode harness reads only its task")
 				continue
 			}
 			if _, err := io.WriteString(w, harness.FormatInput(chat.mode, e.Data)); err != nil {

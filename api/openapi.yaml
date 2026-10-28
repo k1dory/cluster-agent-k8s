@@ -285,6 +285,10 @@ paths:
     post:
       tags: [runs]
       summary: Send a user message to a queued or running run
+      description: |
+        Only for a stream-json harness: a text-mode harness reads its task and nothing more, so
+        the call is refused with 409; send the message with POST /v1/sandboxes/{id}/messages,
+        which queues it as the next run.
       requestBody:
         required: true
         content:
@@ -298,15 +302,17 @@ paths:
         "204": { description: Persisted in the event stream (a storage failure is a 500, never a silent 204) }
         "400": { $ref: "#/components/responses/Error" }
         "404": { $ref: "#/components/responses/Error" }
-        "409": { description: "Run already finished", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "Run already finished, or the sandbox's harness takes no input during a run (text mode)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/sandboxes/{id}/messages:
     parameters: [{ $ref: "#/components/parameters/id" }]
     post:
       tags: [conversation]
       summary: Send the next message of the conversation
       description: |
-        A run in progress (or queued) receives the message as input (delivery `input`; with a
-        stream-json harness it is answered in the same process). Otherwise a new run continues the
+        With a stream-json harness a run in progress (or queued) receives the message as input
+        (delivery `input`), answered in the same process. A text-mode harness reads only its task:
+        the message joins the task of a run still queued (`input`), or is queued as the next run
+        that continues the session once the running one finishes (`resumed`). Otherwise a new run continues the
         latest harness session with the message as its prompt (`resumed`), or starts a fresh
         conversation when there is none (`new`). JSON `{text, attachments}` names workspace files
         already uploaded; multipart/form-data with a `text` field and `file` parts uploads each file

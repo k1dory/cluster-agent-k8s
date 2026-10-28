@@ -360,6 +360,9 @@ type Store interface {
 	// returns it; concurrent callers never get the same run. ErrNotFound when none is queued.
 	ClaimQueuedRun(ctx context.Context, sandboxID string, startedAt time.Time) (*model.Run, error)
 	RunningRun(ctx context.Context, sandboxID string) (*model.Run, error)
+	// AppendQueuedTask adds text to the task of a run that is still queued and returns the run;
+	// ErrConflict once it has been claimed (the harness may already have read its task).
+	AppendQueuedTask(ctx context.Context, runID, text string) (*model.Run, error)
 
 	AppendEvent(ctx context.Context, e *model.Event) error
 	ListEvents(ctx context.Context, sandboxID string, afterID int64, limit int) ([]*model.Event, error)
