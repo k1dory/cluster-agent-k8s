@@ -56,13 +56,17 @@ type Launch struct {
 	Env map[string]string `json:"env,omitempty"`
 	// MCPServers are the MCP endpoints the agent's connections give it, exported to the pod as
 	// SANDBOX_MCP_SERVERS (JSON) so the harness can register them.
-	MCPServers    []MCPServer `json:"mcp_servers,omitempty"`
-	CPURequest    string      `json:"cpu_request,omitempty"`
-	CPULimit      string      `json:"cpu_limit,omitempty"`
-	MemoryRequest string      `json:"memory_request,omitempty"`
-	MemoryLimit   string      `json:"memory_limit,omitempty"`
-	VolumeSize    string      `json:"volume_size,omitempty"`
-	RuntimeClass  string      `json:"runtime_class,omitempty"`
+	MCPServers []MCPServer `json:"mcp_servers,omitempty"`
+	// HarnessFiles are the harness's configuration files (path relative to the agent's home →
+	// content), exported to the pod as SANDBOX_HARNESS_FILES (JSON); the runner writes them
+	// before every run.
+	HarnessFiles  map[string]string `json:"harness_files,omitempty"`
+	CPURequest    string            `json:"cpu_request,omitempty"`
+	CPULimit      string            `json:"cpu_limit,omitempty"`
+	MemoryRequest string            `json:"memory_request,omitempty"`
+	MemoryLimit   string            `json:"memory_limit,omitempty"`
+	VolumeSize    string            `json:"volume_size,omitempty"`
+	RuntimeClass  string            `json:"runtime_class,omitempty"`
 }
 
 // MCPServer is one MCP endpoint of a launch: the connection's name and its URL.

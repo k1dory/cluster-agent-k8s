@@ -1806,6 +1806,7 @@ components:
         model: { type: string, description: "Exported as SANDBOX_MODEL and ANTHROPIC_MODEL" }
         instructions: { type: string, description: "Exported as SANDBOX_INSTRUCTIONS" }
         env: { type: object, additionalProperties: { type: string } }
+        harness_files: { type: object, additionalProperties: { type: string }, description: "The profile's harness files (path relative to the agent's home → content); exported to the pod as SANDBOX_HARNESS_FILES" }
         cpu_request: { type: string }
         cpu_limit: { type: string }
         memory_request: { type: string }
@@ -2029,6 +2030,11 @@ components:
             resume_prompt: { type: string, description: "What a rollout resume tells the harness (default: continue the task)" }
             input: { type: string, enum: [text, stream-json], description: "How messages reach the harness: a line on stdin, or Claude Code's streaming JSON input (keeps the conversation open)" }
             chat_idle: { type: integer, minimum: 0, description: "stream-json: seconds without a message after a turn before the runner closes the conversation (0 = 600)" }
+            files:
+              type: object
+              maxProperties: 16
+              additionalProperties: { type: string }
+              description: "The harness's configuration files: a clean relative path inside the agent's home (e.g. .codex/config.toml) → its content, at most 32 KiB together. Written by the runner before every run (SANDBOX_HARNESS_FILES). Configuration, stored in the clear: secrets stay `secret:NAME` references the gateway injects."
         model:
           type: object
           additionalProperties: false

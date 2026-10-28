@@ -23,6 +23,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -66,6 +67,38 @@ type HarnessSpec struct {
 	// ResumeCommand with $SANDBOX_SESSION and the message in $SANDBOX_RESUME_PROMPT.
 	Input    string `yaml:"input,omitempty" json:"input,omitempty"`
 	ChatIdle *int   `yaml:"chat_idle,omitempty" json:"chat_idle,omitempty"`
+	// Files are the harness's own configuration files, path (relative to the agent's home) →
+	// content: a Codex config.toml naming its provider, a Claude Code settings.json. The runner
+	// writes them before every run (SANDBOX_HARNESS_FILES). They are configuration, stored in
+	// the clear with the profile and visible in the pod spec: a secret never goes here, it is a
+	// `secret:NAME` the gateway injects, and the file names a placeholder.
+	Files map[string]string `yaml:"files,omitempty" json:"files,omitempty"`
+}
+
+// Limits on a profile's harness files: they travel in the pod's environment.
+const (
+	MaxHarnessFiles     = 16
+	MaxHarnessFilesSize = 32 << 10 // paths and contents together
+)
+
+// validateHarnessFiles accepts relative paths that stay inside the home directory, spelled in
+// their clean form, within the limits.
+func validateHarnessFiles(files map[string]string) error {
+	if len(files) > MaxHarnessFiles {
+		return fmt.Errorf("%w: spec.harness.files: at most %d files", ErrInvalid, MaxHarnessFiles)
+	}
+	total := 0
+	for p, content := range files {
+		clean := path.Clean(p)
+		if p == "" || p != clean || path.IsAbs(p) || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || strings.ContainsAny(p, "\x00\\") {
+			return fmt.Errorf("%w: spec.harness.files: %q must be a clean relative path inside the home directory (e.g. .codex/config.toml)", ErrInvalid, p)
+		}
+		total += len(p) + len(content)
+	}
+	if total > MaxHarnessFilesSize {
+		return fmt.Errorf("%w: spec.harness.files: %d bytes, at most %d", ErrInvalid, total, MaxHarnessFilesSize)
+	}
+	return nil
 }
 
 // ModelSpec names the model and its client settings.
@@ -194,6 +227,9 @@ func (s *Service) validate(ctx context.Context, kind, tenant string, raw json.Ra
 		}
 		if e.Harness.ChatIdle != nil && *e.Harness.ChatIdle < 0 {
 			return nil, fmt.Errorf("%w: spec.harness.chat_idle must be >= 0", ErrInvalid)
+		}
+		if err := validateHarnessFiles(e.Harness.Files); err != nil {
+			return nil, err
 		}
 		if e.Lifecycle.IdleTimeout != nil && *e.Lifecycle.IdleTimeout < 0 || e.Lifecycle.TTL != nil && *e.Lifecycle.TTL < 0 {
 			return nil, fmt.Errorf("%w: spec.lifecycle values must be >= 0", ErrInvalid)
@@ -414,7 +450,7 @@ func (s *Service) Resolve(ctx context.Context, tenant, agentRef string, admin bo
 		Launch: model.Launch{
 			Image: image, HarnessCommand: es.Harness.Command, HarnessResumeCommand: es.Harness.ResumeCommand,
 			ResumePrompt: es.Harness.ResumePrompt, HarnessInput: es.Harness.Input, ChatIdle: intOf(es.Harness.ChatIdle),
-			Model: es.Model.Name, Instructions: as.Instructions, Env: envVars,
+			Model: es.Model.Name, Instructions: as.Instructions, Env: envVars, HarnessFiles: es.Harness.Files,
 			CPURequest: es.Resources.CPURequest, CPULimit: es.Resources.CPULimit,
 			MemoryRequest: es.Resources.MemoryRequest, MemoryLimit: es.Resources.MemoryLimit,
 			VolumeSize: es.Resources.VolumeSize, RuntimeClass: es.RuntimeClass,

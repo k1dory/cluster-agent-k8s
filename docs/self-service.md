@@ -51,6 +51,72 @@ needs it fails at the gateway (502, nothing partial is sent); if a shared or ope
 of the same name exists, that one is used again. A key the tenant wants gone everywhere is
 removed where it lives.
 
+## 1c. Subscriptions instead of API keys
+
+A harness can run on its vendor's subscription rather than on an API key, with the same rule as
+every other credential: the secret stays with the gateway, the pod holds a placeholder.
+
+**Claude Code on a Claude subscription.** `claude setup-token` (on the tenant's own machine)
+prints a long-lived OAuth token, `sk-ant-oat01-…`. The tenant stores it like any credential:
+
+```sh
+claude setup-token                                    # sign in in the browser, copy the token
+sandboxctl credentials set claude-oauth               # paste it on stdin (Ctrl-D)
+```
+
+The policy injects it as the bearer, and nothing else
+([examples/policies/llm-subscriptions.yaml](../examples/policies/llm-subscriptions.yaml)):
+
+```yaml
+- host: api.anthropic.com
+  paths: ["/v1/**"]
+  inject:
+    Authorization: "Bearer secret:claude-oauth"
+```
+
+The environment profile gives Claude Code a placeholder token and no API key
+([examples/catalog/environment-claude-subscription.yaml](../examples/catalog/environment-claude-subscription.yaml)):
+
+```yaml
+env:
+  CLAUDE_CODE_OAUTH_TOKEN: sk-ant-oat01-placeholder-the-gateway-injects-the-real-token
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+```
+
+What happens on the wire (checked against Claude Code 2.1.308, the version the agent image
+pins): with `CLAUDE_CODE_OAUTH_TOKEN` set, Claude Code calls `POST /v1/messages?beta=true` with
+`Authorization: Bearer <placeholder>` and `anthropic-beta: claude-code-20250219,
+oauth-2025-04-20,…`, and no `x-api-key`. The gateway strips every header a policy injects for the
+host before it asks sandboxd, then copies sandboxd's verdict: the placeholder is gone, the
+tenant's token is in its place. `anthropic-beta` is not injected, so the agent's own list,
+including the `oauth-2025-04-20` beta the API requires for OAuth tokens, passes untouched;
+injecting it would replace the list. Two things break the swap: an `ANTHROPIC_API_KEY` in the
+profile (Claude Code prefers it and sends `x-api-key`, which the API then prefers over the
+bearer), and a rule for the same host that injects `x-api-key` for this slug.
+`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` keeps Claude Code to the Messages API, so nothing
+else needs a rule. The token is the tenant's; rotating it is `credentials set` again, `credentials
+remove` stops its use here at once, and the grant itself is revoked on the Anthropic account.
+
+**Harness configuration files.** A harness that reads its settings from a file (Codex's
+`~/.codex/config.toml`, Claude Code's `~/.claude/settings.json`) gets them from the profile:
+
+```yaml
+spec:
+  harness:
+    files:                            # path inside the agent's home → content
+      .codex/config.toml: |
+        model_provider = "gateway"
+```
+
+The runner writes them before every run (mode 0600), replacing what the harness changed in
+between, so the profile stays the truth. Paths are clean relative paths inside the home
+directory; at most 16 files and 32 KiB together, since they travel in the pod's environment
+(`SANDBOX_HARNESS_FILES`). They are configuration, stored in the clear with the profile and
+visible in the pod spec: a secret in them is a mistake, a `secret:NAME` the gateway injects is
+the way. A deployment keeps its real profiles (provider endpoints, model names) in its own
+configuration repository and applies them with `sandboxctl apply`; the repository's examples
+stay generic.
+
 ## 2. The admin decides what the tenant may reach
 
 Two admin-written resources, both through the API (`sandboxctl apply`, a PUT, or a bundle from
