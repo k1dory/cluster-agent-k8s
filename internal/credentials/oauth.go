@@ -78,10 +78,13 @@ func NewOAuth(svc *Service, st store.OAuthCredentials, providers map[string]OAut
 
 // oauthSecret is what a row keeps encrypted: the device code while pending, the tokens after.
 type oauthSecret struct {
-	DeviceCode   string `json:"device_code,omitempty"`
-	Interval     int64  `json:"interval,omitempty"` // seconds
-	AccessToken  string `json:"access_token,omitempty"`
-	RefreshToken string `json:"refresh_token,omitempty"`
+	DeviceCode string `json:"device_code,omitempty"`
+	Interval   int64  `json:"interval,omitempty"` // seconds
+	// An approved OpenAI login whose code exchange failed transiently (deviceStart).
+	AuthorizationCode string `json:"authorization_code,omitempty"`
+	CodeVerifier      string `json:"code_verifier,omitempty"`
+	AccessToken       string `json:"access_token,omitempty"`
+	RefreshToken      string `json:"refresh_token,omitempty"`
 }
 
 func (o *OAuth) now() time.Time {
@@ -286,7 +289,11 @@ func (o *OAuth) poll(ctx context.Context, cl *oauthClient, c *model.OAuthCredent
 		o.fail(c, sec, "the sign-in was not approved before it expired: start it again")
 		return
 	}
-	t, err := cl.poll(ctx, &deviceStart{Code: sec.DeviceCode, UserCode: c.UserCode})
+	d := &deviceStart{Code: sec.DeviceCode, UserCode: c.UserCode, AuthorizationCode: sec.AuthorizationCode, CodeVerifier: sec.CodeVerifier}
+	t, err := cl.poll(ctx, d)
+	// Kept (sealed with the row) while an exchange waits for the provider; cleared once it went
+	// through or the login failed.
+	sec.AuthorizationCode, sec.CodeVerifier = d.AuthorizationCode, d.CodeVerifier
 	var oe *OAuthError
 	switch {
 	case errors.Is(err, errPending):

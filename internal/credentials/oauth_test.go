@@ -43,6 +43,10 @@ type fakeIdP struct {
 	refreshes int
 	gen       int
 	slowDowns int
+	// exchangeDown answers the code exchange 503; codesIssued counts the approved polls that
+	// handed the authorization code out (the real endpoint does that once).
+	exchangeDown bool
+	codesIssued  int
 }
 
 func newFakeIdP(t *testing.T, now func() time.Time) *fakeIdP {
@@ -99,10 +103,15 @@ func (f *fakeIdP) serve(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusForbidden) // codex-rs: 403/404 while the user has not approved
 			return
 		}
+		f.codesIssued++
 		writeJSON(w, 200, map[string]any{"authorization_code": "code-1", "code_challenge": "c", "code_verifier": "ver-1"})
 	case "/oauth/token":
 		switch body["grant_type"] {
 		case "authorization_code":
+			if f.exchangeDown {
+				writeJSON(w, 503, map[string]any{"error": "temporarily_unavailable"})
+				return
+			}
 			if body["code"] != "code-1" || body["code_verifier"] != "ver-1" || body["redirect_uri"] != f.srv.URL+"/deviceauth/callback" {
 				writeJSON(w, 400, map[string]any{"error": "invalid_grant"})
 				return
@@ -237,6 +246,45 @@ func TestDeviceSignInOpenAIDialect(t *testing.T) {
 	b, _ := json.Marshal(c)
 	if strings.Contains(string(b), tok) || strings.Contains(string(b), "rt-1") {
 		t.Fatalf("metadata leaks a token: %s", b)
+	}
+}
+
+// An outage of the token endpoint during the code exchange refuses nothing: the sign-in stays
+// pending with the approved code kept (sealed), and once the provider is back the next tick
+// exchanges that code (without asking the poll endpoint, which hands it out once) and the
+// sign-in is active.
+func TestDeviceSignInCodeExchangeOutageIsRetried(t *testing.T) {
+	ctx := context.Background()
+	clk := &clock{t: time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)}
+	idp := newFakeIdP(t, clk.now)
+	st := store.NewMemory()
+	o := newOAuth(t, st, idp, clk, "replica-a")
+	if _, _, err := o.Start(ctx, "acme", "chatgpt", "chatgpt", "alice"); err != nil {
+		t.Fatal(err)
+	}
+	idp.mu.Lock()
+	idp.approved, idp.exchangeDown = true, true
+	idp.mu.Unlock()
+	clk.add(5 * time.Second)
+	o.Tick(ctx)
+	c, _ := o.Get(ctx, "acme", "chatgpt")
+	if c.Status != model.OAuthPending || !strings.Contains(c.Error, "503") {
+		t.Fatalf("an exchange outage ended the sign-in: %+v", c)
+	}
+	idp.mu.Lock()
+	idp.exchangeDown = false
+	idp.mu.Unlock()
+	clk.add(5 * time.Second)
+	o.Tick(ctx)
+	c, _ = o.Get(ctx, "acme", "chatgpt")
+	if c.Status != model.OAuthActive || c.AccountID != "acct-42" {
+		t.Fatalf("after the provider is back: %+v", c)
+	}
+	idp.mu.Lock()
+	issued := idp.codesIssued
+	idp.mu.Unlock()
+	if issued != 1 {
+		t.Fatalf("the retry asked the poll endpoint again (%d codes issued); it must exchange the kept code", issued)
 	}
 }
 

@@ -148,6 +148,11 @@ type deviceStart struct {
 	VerificationURL string
 	Interval        time.Duration
 	ExpiresAt       time.Time
+	// OpenAI's approved login: the authorization code and its PKCE verifier, kept when their
+	// exchange failed for a reason that may pass (an outage). The poll that follows exchanges
+	// them again instead of asking the poll endpoint, which hands the code out once.
+	AuthorizationCode string
+	CodeVerifier      string
 }
 
 // oauthTokens is a token endpoint's answer.
@@ -327,32 +332,39 @@ func (c *oauthClient) start(ctx context.Context) (*deviceStart, error) {
 // an error (an *OAuthError with Permanent set when the login is over).
 func (c *oauthClient) poll(ctx context.Context, d *deviceStart) (*oauthTokens, error) {
 	if c.p.DeviceStyle == DeviceStyleOpenAI {
-		var code struct {
-			AuthorizationCode string `json:"authorization_code"`
-			CodeVerifier      string `json:"code_verifier"`
-		}
-		err := c.post(ctx, c.p.PollURL, true, map[string]string{"device_auth_id": d.Code, "user_code": d.UserCode}, &code)
 		var oe *OAuthError
-		if errors.As(err, &oe) && (oe.Status == http.StatusForbidden || oe.Status == http.StatusNotFound) {
-			return nil, errPending // not approved yet (codex-rs: device_code_auth.rs poll_for_token)
-		}
-		if err != nil {
-			return nil, err
-		}
-		if code.AuthorizationCode == "" || code.CodeVerifier == "" {
-			return nil, errors.New("device login: approved, but the provider returned no authorization code")
+		if d.AuthorizationCode == "" {
+			var code struct {
+				AuthorizationCode string `json:"authorization_code"`
+				CodeVerifier      string `json:"code_verifier"`
+			}
+			err := c.post(ctx, c.p.PollURL, true, map[string]string{"device_auth_id": d.Code, "user_code": d.UserCode}, &code)
+			if errors.As(err, &oe) && (oe.Status == http.StatusForbidden || oe.Status == http.StatusNotFound) {
+				return nil, errPending // not approved yet (codex-rs: device_code_auth.rs poll_for_token)
+			}
+			if err != nil {
+				return nil, err
+			}
+			if code.AuthorizationCode == "" || code.CodeVerifier == "" {
+				return nil, errors.New("device login: approved, but the provider returned no authorization code")
+			}
+			d.AuthorizationCode, d.CodeVerifier = code.AuthorizationCode, code.CodeVerifier
 		}
 		var t oauthTokens
-		err = c.post(ctx, c.p.TokenURL, false, map[string]string{
-			"grant_type": "authorization_code", "client_id": c.p.ClientID, "code": code.AuthorizationCode,
-			"redirect_uri": c.p.RedirectURL, "code_verifier": code.CodeVerifier,
+		err := c.post(ctx, c.p.TokenURL, false, map[string]string{
+			"grant_type": "authorization_code", "client_id": c.p.ClientID, "code": d.AuthorizationCode,
+			"redirect_uri": c.p.RedirectURL, "code_verifier": d.CodeVerifier,
 		}, &t)
-		if errors.As(err, &oe) {
-			oe.Permanent = true // the code is single-use: a refused exchange ends this login
+		// The code is single-use and the provider refused it (a 4xx: invalid_grant, an expired
+		// code): this login is over. An outage (5xx, 408, 429) or a network error refused
+		// nothing: the code stays in d and the next poll exchanges it again.
+		if errors.As(err, &oe) && !transientStatus(oe.Status) {
+			oe.Permanent = true
 		}
 		if err != nil {
 			return nil, err
 		}
+		d.AuthorizationCode, d.CodeVerifier = "", ""
 		return &t, checkTokens(&t)
 	}
 	var t oauthTokens
@@ -375,6 +387,11 @@ func (c *oauthClient) poll(ctx context.Context, d *deviceStart) (*oauthTokens, e
 		return nil, err
 	}
 	return &t, checkTokens(&t)
+}
+
+// transientStatus: a provider answer that refuses nothing, so the same request may succeed later.
+func transientStatus(status int) bool {
+	return status >= 500 || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests
 }
 
 // refresh trades the refresh token for new tokens. A refusal that means the grant is gone
