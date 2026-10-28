@@ -312,8 +312,16 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	}
 	chat := newChat(os.Getenv("HARNESS_INPUT"), chatIdle())
 	// Harnesses that take the task on stdin get it first (in stream-json mode as the first user
-	// message); CLI-arg harnesses just ignore it.
-	go func() { _, _ = io.WriteString(stdin, harness.FormatInput(chat.mode, run.Task)) }()
+	// message); CLI-arg harnesses just ignore it. In text mode that is all stdin ever carries, so
+	// it is closed right after: `claude -p` (and any harness reading a non-terminal stdin) reads
+	// stdin to its end before it starts, and an open pipe kept it waiting for the whole run.
+	// Follow-up messages of a text-mode harness come as the next run (the resume command).
+	go func() {
+		_, _ = io.WriteString(stdin, harness.FormatInput(chat.mode, run.Task))
+		if chat.mode != harness.InputStreamJSON {
+			_ = stdin.Close()
+		}
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -530,6 +538,12 @@ func forwardInput(ctx context.Context, c *client, runID string, w io.WriteCloser
 			case model.EventRunClose:
 				fmt.Println("agent-runner: conversation closed by the control plane")
 				return
+			}
+			if chat.mode != harness.InputStreamJSON {
+				// stdin is closed (see execute); the control plane's cancel and close above
+				// still apply, so the loop goes on listening for them.
+				fmt.Println("agent-runner: a message during a text-mode run reaches the harness with the next run")
+				continue
 			}
 			if _, err := io.WriteString(w, harness.FormatInput(chat.mode, e.Data)); err != nil {
 				return
