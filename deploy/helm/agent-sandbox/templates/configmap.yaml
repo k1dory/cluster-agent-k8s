@@ -121,8 +121,20 @@ kind: ConfigMap
 metadata:
   name: {{ include "agent-sandbox.fullname" . }}-policies
   labels: {{- include "agent-sandbox.labels" . | nindent 4 }}
-data:
+{{- /* The chart's policy files, then the deployment's own (values `policies`): a key of the same
+       name replaces the file, so a private policy repository needs no copy of the chart. */}}
+{{- $policies := dict }}
 {{- if .Values.policiesFromFiles }}
-{{ (.Files.Glob "policies/*.yaml").AsConfig | indent 2 }}
+{{- range $path, $_ := .Files.Glob "policies/*.yaml" }}
+{{- $_ := set $policies (base $path) ($.Files.Get $path) }}
+{{- end }}
+{{- end }}
+{{- range $name, $body := .Values.policies }}
+{{- $_ := set $policies (printf "%s.yaml" (trimSuffix ".yaml" $name)) (ternary $body (toYaml $body) (kindIs "string" $body)) }}
+{{- end }}
+data:
+{{- range $file, $body := $policies }}
+  {{ $file }}: |
+{{ $body | trimSuffix "\n" | indent 4 }}
 {{- end }}
 {{- end }}
