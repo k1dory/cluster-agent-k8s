@@ -1253,6 +1253,137 @@ func (p *Postgres) DeleteCredential(ctx context.Context, tenant, name string) er
 	return nil
 }
 
+// --- OAuth sign-ins -----------------------------------------------------------------------
+
+const oauthCols = `tenant, name, provider, status, generation, verification_url, user_code, login_expires_at, account_id,
+	expires_at, refreshed_at, next_at, error, created_by, created_at, updated_at, lease_owner, lease_until`
+
+func scanOAuth(row pgx.Row, extra ...any) (*model.OAuthCredential, error) {
+	var c model.OAuthCredential
+	dest := append([]any{&c.Tenant, &c.Name, &c.Provider, &c.Status, &c.Generation, &c.VerificationURL, &c.UserCode, &c.LoginExpiresAt,
+		&c.AccountID, &c.ExpiresAt, &c.RefreshedAt, &c.NextAt, &c.Error, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &c.LeaseOwner, &c.LeaseUntil}, extra...)
+	if err := row.Scan(dest...); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (p *Postgres) PutOAuthCredential(ctx context.Context, c *model.OAuthCredential, ciphertext []byte) (bool, error) {
+	// One statement: a new sign-in, or the old row replaced whole (the generation bumped so a
+	// replica still polling or refreshing the old one cannot save over it, the lease dropped,
+	// the creation kept). xmax = 0 tells an insert from an update.
+	var created bool
+	err := p.pool.QueryRow(ctx, `INSERT INTO oauth_credentials (tenant, name, provider, status, generation, verification_url, user_code,
+			login_expires_at, account_id, expires_at, refreshed_at, next_at, error, ciphertext, created_by, created_at, updated_at, lease_owner, lease_until)
+		VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),now(),'',NULL)
+		ON CONFLICT (tenant, name) DO UPDATE SET provider=EXCLUDED.provider, status=EXCLUDED.status, generation=oauth_credentials.generation+1,
+			verification_url=EXCLUDED.verification_url, user_code=EXCLUDED.user_code, login_expires_at=EXCLUDED.login_expires_at,
+			account_id=EXCLUDED.account_id, expires_at=EXCLUDED.expires_at, refreshed_at=EXCLUDED.refreshed_at, next_at=EXCLUDED.next_at,
+			error=EXCLUDED.error, ciphertext=EXCLUDED.ciphertext, created_by=EXCLUDED.created_by, updated_at=now(), lease_owner='', lease_until=NULL
+		RETURNING generation, created_at, updated_at, (xmax = 0)`,
+		c.Tenant, c.Name, c.Provider, c.Status, c.VerificationURL, c.UserCode, c.LoginExpiresAt, c.AccountID, c.ExpiresAt, c.RefreshedAt,
+		c.NextAt, c.Error, ciphertext, c.CreatedBy).Scan(&c.Generation, &c.CreatedAt, &c.UpdatedAt, &created)
+	c.LeaseOwner, c.LeaseUntil = "", nil
+	return created, err
+}
+
+func (p *Postgres) GetOAuthCredential(ctx context.Context, tenant, name string) (*model.OAuthCredential, []byte, error) {
+	var ciphertext []byte
+	c, err := scanOAuth(p.pool.QueryRow(ctx, `SELECT `+oauthCols+`, ciphertext FROM oauth_credentials WHERE tenant=$1 AND name=$2`, tenant, name), &ciphertext)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return c, ciphertext, nil
+}
+
+func (p *Postgres) listOAuth(ctx context.Context, q string, args ...any) ([]*model.OAuthCredential, error) {
+	rows, err := p.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*model.OAuthCredential
+	for rows.Next() {
+		c, err := scanOAuth(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func (p *Postgres) ListOAuthCredentials(ctx context.Context, tenant string) ([]*model.OAuthCredential, error) {
+	return p.listOAuth(ctx, `SELECT `+oauthCols+` FROM oauth_credentials WHERE tenant=$1 ORDER BY name`, tenant)
+}
+
+func (p *Postgres) DeleteOAuthCredential(ctx context.Context, tenant, name string) error {
+	tag, err := p.pool.Exec(ctx, `DELETE FROM oauth_credentials WHERE tenant=$1 AND name=$2`, tenant, name)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (p *Postgres) DueOAuthCredentials(ctx context.Context, now time.Time, limit int) ([]*model.OAuthCredential, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	return p.listOAuth(ctx, `SELECT `+oauthCols+` FROM oauth_credentials
+		WHERE status <> 'failed' AND next_at <= $1 AND (lease_owner = '' OR lease_until IS NULL OR lease_until <= $1)
+		ORDER BY next_at LIMIT $2`, now, limit)
+}
+
+func (p *Postgres) LeaseOAuthCredential(ctx context.Context, tenant, name string, gen int, owner string, now, until time.Time) (*model.OAuthCredential, []byte, error) {
+	// The lease is taken in the statement that checks it is free: two replicas racing for the
+	// same row are serialized by the row lock, and the second finds the first one's lease.
+	var ciphertext []byte
+	c, err := scanOAuth(p.pool.QueryRow(ctx, `UPDATE oauth_credentials SET lease_owner=$4, lease_until=$6
+		WHERE tenant=$1 AND name=$2 AND generation=$3 AND (lease_owner='' OR lease_owner=$4 OR lease_until IS NULL OR lease_until <= $5)
+		RETURNING `+oauthCols+`, ciphertext`, tenant, name, gen, owner, now, until), &ciphertext)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var cur int
+		switch err := p.pool.QueryRow(ctx, `SELECT generation FROM oauth_credentials WHERE tenant=$1 AND name=$2`, tenant, name).Scan(&cur); {
+		case errors.Is(err, pgx.ErrNoRows):
+			return nil, nil, ErrNotFound
+		case err != nil:
+			return nil, nil, err
+		case cur != gen:
+			return nil, nil, ErrNotFound
+		}
+		return nil, nil, ErrConflict
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return c, ciphertext, nil
+}
+
+func (p *Postgres) SaveOAuthCredential(ctx context.Context, c *model.OAuthCredential, ciphertext []byte, owner string) error {
+	if owner == "" {
+		return ErrConflict
+	}
+	saved, err := scanOAuth(p.pool.QueryRow(ctx, `UPDATE oauth_credentials SET status=$5, verification_url=$6, user_code=$7, login_expires_at=$8,
+			account_id=$9, expires_at=$10, refreshed_at=$11, next_at=$12, error=$13, ciphertext=$14, updated_at=now(), lease_owner='', lease_until=NULL
+		WHERE tenant=$1 AND name=$2 AND generation=$3 AND lease_owner=$4
+		RETURNING `+oauthCols, c.Tenant, c.Name, c.Generation, owner, c.Status, c.VerificationURL, c.UserCode, c.LoginExpiresAt,
+		c.AccountID, c.ExpiresAt, c.RefreshedAt, c.NextAt, c.Error, ciphertext))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrConflict
+	}
+	if err != nil {
+		return err
+	}
+	*c = *saved
+	return nil
+}
+
 // --- Git repositories: last known state -------------------------------------------------------
 
 // recordGitHalf writes one half of the record: the document is created with that half, or

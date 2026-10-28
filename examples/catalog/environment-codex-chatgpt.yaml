@@ -1,0 +1,28 @@
+# EnvironmentProfile: Codex CLI on a ChatGPT subscription. The tenant signs in once with the
+# device flow (`sandboxctl oauth login chatgpt -provider chatgpt`); sandboxd keeps the refresh
+# token and the gateway injects a fresh access token and the account id
+# (examples/policies/llm-subscriptions.yaml). Codex in the pod has a provider whose key is a
+# placeholder; nothing it could leak is a credential. docs/self-service.md, "Subscriptions".
+# A generic example: a deployment keeps its real profile (model, flags) in its own repository.
+# Apply:  sandboxctl apply -f examples/catalog/environment-codex-chatgpt.yaml
+kind: EnvironmentProfile
+name: codex-chatgpt
+description: Codex CLI on the tenant's ChatGPT subscription, the tokens held by sandboxd and the gateway
+spec:
+  image: stable
+  harness:
+    command: 'codex exec --json "$SANDBOX_TASK"'
+    files:
+      # Written to $HOME/.codex/config.toml before every run (CODEX_HOME defaults to ~/.codex).
+      .codex/config.toml: |
+        model_provider = "chatgpt-gateway"
+
+        [model_providers.chatgpt-gateway]
+        name = "ChatGPT subscription through the sandbox gateway"
+        base_url = "https://chatgpt.com/backend-api/codex"
+        wire_api = "responses"
+        # Codex sends this variable as `Authorization: Bearer …`: a placeholder the gateway
+        # replaces with the tenant's access token; it adds ChatGPT-Account-ID itself.
+        env_key = "CODEX_GATEWAY_PLACEHOLDER"
+  env:
+    CODEX_GATEWAY_PLACEHOLDER: placeholder-the-gateway-injects-the-real-token

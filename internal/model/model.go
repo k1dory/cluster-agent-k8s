@@ -515,6 +515,42 @@ type Credential struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 }
 
+// OAuth sign-in states (OAuthCredential.Status).
+const (
+	OAuthPending = "pending" // a device sign-in was started; the user has not approved it yet
+	OAuthActive  = "active"  // sandboxd holds a refresh token and keeps an access token fresh
+	OAuthFailed  = "failed"  // the sign-in was refused, expired, or its refresh token was revoked: sign in again
+)
+
+// OAuthCredential is the metadata of a sign-in a tenant made through the API (a ChatGPT
+// subscription signed in with the device flow): sandboxd keeps the refresh token, mints the
+// access tokens before they expire and resolves `secret:NAME` to the current one (and
+// `secret:NAME.account_id` to the account id). The tokens are encrypted at rest and never
+// leave the gateway's decision; the API returns this record only.
+type OAuthCredential struct {
+	Tenant     string `json:"tenant"` // "" = shared, written by the admin
+	Name       string `json:"name"`
+	Provider   string `json:"provider"` // a key of credentials.oauth.providers (sandboxd.yaml)
+	Status     string `json:"status"`
+	Generation int    `json:"generation"` // bumped by every new sign-in under the name
+	// While pending: where the user approves the sign-in, with which code, and until when.
+	VerificationURL string     `json:"verification_url,omitempty"`
+	UserCode        string     `json:"user_code,omitempty"`
+	LoginExpiresAt  *time.Time `json:"login_expires_at,omitempty"`
+	AccountID       string     `json:"account_id,omitempty"` // from the ID token's claims (the provider's account claim)
+	ExpiresAt       *time.Time `json:"expires_at,omitempty"` // when the current access token expires
+	RefreshedAt     *time.Time `json:"refreshed_at,omitempty"`
+	NextAt          time.Time  `json:"next_at"`         // when sandboxd polls or refreshes next
+	Error           string     `json:"error,omitempty"` // the last failure, kept until the next success
+	CreatedBy       string     `json:"created_by,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+	// The lease of the replica polling or refreshing it right now (one at a time cluster-wide:
+	// a refresh token may be single-use).
+	LeaseOwner string     `json:"-"`
+	LeaseUntil *time.Time `json:"-"`
+}
+
 // Active reports a key that authenticates at t: not revoked, not expired.
 func (k *APIKey) Active(t time.Time) bool {
 	if k.RevokedAt != nil && !k.RevokedAt.After(t) {

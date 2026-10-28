@@ -97,6 +97,52 @@ bearer), and a rule for the same host that injects `x-api-key` for this slug.
 else needs a rule. The token is the tenant's; rotating it is `credentials set` again, `credentials
 remove` stops its use here at once, and the grant itself is revoked on the Anthropic account.
 
+**Codex on a ChatGPT subscription.** A ChatGPT login is not a token one can paste: its access
+token lives about an hour and its refresh token rotates on every use. So sandboxd signs in
+itself, with the device flow Codex CLI uses (`codex login --device-auth`), and keeps the tokens:
+
+```sh
+sandboxctl oauth login chatgpt -provider chatgpt
+# Open https://auth.openai.com/codex/device and enter the code ABCD-EFGH before 14:05.
+# oauth chatgpt: active (provider chatgpt, account …); secret:chatgpt is its access token, …
+sandboxctl oauth list                     # status, account, when the access token expires, last error
+sandboxctl oauth remove chatgpt           # forget it (revoke the grant itself at OpenAI)
+```
+
+`POST /v1/oauth-credentials/{name}/login` with `{"provider": "chatgpt"}` asks the provider for a
+user code and returns the pending sign-in (`verification_url`, `user_code`,
+`login_expires_at`); the person opens the URL, signs in and types the code. Every replica polls
+the pending sign-ins at the provider's interval and refreshes the active ones five minutes before
+their access token expires; a lease on the row lets one replica at a time talk to the provider
+for a sign-in, because a refresh token spent twice is a revoked grant. Then `secret:chatgpt`
+resolves to the current access token and `secret:chatgpt.account_id` to the ChatGPT account id
+from the ID token, so the policy injects both
+([examples/policies/llm-subscriptions.yaml](../examples/policies/llm-subscriptions.yaml)):
+
+```yaml
+- host: chatgpt.com
+  paths: ["/backend-api/codex/**"]
+  inject:
+    Authorization: "Bearer secret:chatgpt"
+    ChatGPT-Account-ID: "secret:chatgpt.account_id"
+```
+
+Codex in the pod uses a provider pointed at the ChatGPT backend whose key is a placeholder
+([examples/catalog/environment-codex-chatgpt.yaml](../examples/catalog/environment-codex-chatgpt.yaml),
+which writes `~/.codex/config.toml` through the harness files below), so neither the refresh
+token nor the access token is ever in the pod. A sign-in nobody approves within fifteen minutes,
+a denied one, and a refresh token the provider revokes, expires or finds reused end as `failed`
+with the reason: the gateway then answers 502 with it, and `oauth login` again is the fix. A
+provider outage keeps the sign-in and retries. The tokens are encrypted under
+`credentials.key` like every credential; the API returns only state, never a token or the
+device code. A name is a sign-in or a plain credential in a scope, never both.
+
+The providers are server configuration (`credentials.oauth.providers` in sandboxd.yaml,
+`sandboxd.credentialsOAuth` in the chart). `chatgpt` is built in with the endpoints and the
+public client id of Codex CLI (openai/codex, `codex-rs/login`); an entry overrides any of its
+fields, and another provider speaking RFC 8628 (`device_style: rfc8628`) can be added the same
+way.
+
 **Harness configuration files.** A harness that reads its settings from a file (Codex's
 `~/.codex/config.toml`, Claude Code's `~/.claude/settings.json`) gets them from the profile:
 

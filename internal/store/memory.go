@@ -30,6 +30,7 @@ type Memory struct {
 	gitSyncs  map[string]*model.GitSync
 	gitJobs   map[string]*model.GitJob
 	creds     map[string]*memCredential // tenant|name
+	oauth     map[string]*memOAuth      // tenant|name
 	nextInst  int
 	nextEvent int64
 }
@@ -51,6 +52,7 @@ func NewMemory() *Memory {
 		gitSyncs:  map[string]*model.GitSync{},
 		gitJobs:   map[string]*model.GitJob{},
 		creds:     map[string]*memCredential{},
+		oauth:     map[string]*memOAuth{},
 	}
 }
 
@@ -1115,6 +1117,123 @@ func (m *Memory) DeleteCredential(_ context.Context, tenant, name string) error 
 	}
 	delete(m.creds, key)
 	return nil
+}
+
+// --- OAuth sign-ins -----------------------------------------------------------------------
+
+type memOAuth struct {
+	meta       model.OAuthCredential
+	ciphertext []byte
+}
+
+func (o *memOAuth) copyOut() (*model.OAuthCredential, []byte) {
+	meta := o.meta
+	return &meta, append([]byte(nil), o.ciphertext...)
+}
+
+func (m *Memory) PutOAuthCredential(_ context.Context, c *model.OAuthCredential, ciphertext []byte) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := c.Tenant + "|" + c.Name
+	now := time.Now()
+	cur, ok := m.oauth[key]
+	c.Generation, c.CreatedAt, c.UpdatedAt = 1, now, now
+	if ok {
+		c.Generation, c.CreatedAt = cur.meta.Generation+1, cur.meta.CreatedAt
+	}
+	c.LeaseOwner, c.LeaseUntil = "", nil
+	m.oauth[key] = &memOAuth{meta: *c, ciphertext: append([]byte(nil), ciphertext...)}
+	return !ok, nil
+}
+
+func (m *Memory) GetOAuthCredential(_ context.Context, tenant, name string) (*model.OAuthCredential, []byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.oauth[tenant+"|"+name]
+	if !ok {
+		return nil, nil, ErrNotFound
+	}
+	c, ct := cur.copyOut()
+	return c, ct, nil
+}
+
+func (m *Memory) ListOAuthCredentials(_ context.Context, tenant string) ([]*model.OAuthCredential, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.OAuthCredential
+	for _, o := range m.oauth {
+		if o.meta.Tenant == tenant {
+			c, _ := o.copyOut()
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, nil
+}
+
+func (m *Memory) DeleteOAuthCredential(_ context.Context, tenant, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	key := tenant + "|" + name
+	if _, ok := m.oauth[key]; !ok {
+		return ErrNotFound
+	}
+	delete(m.oauth, key)
+	return nil
+}
+
+func (m *Memory) DueOAuthCredentials(_ context.Context, now time.Time, limit int) ([]*model.OAuthCredential, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []*model.OAuthCredential
+	for _, o := range m.oauth {
+		c := o.meta
+		if c.Status == model.OAuthFailed || c.NextAt.After(now) || leaseHeld(c.LeaseOwner, c.LeaseUntil, "", now) {
+			continue
+		}
+		out = append(out, &c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NextAt.Before(out[j].NextAt) })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+func (m *Memory) LeaseOAuthCredential(_ context.Context, tenant, name string, gen int, owner string, now, until time.Time) (*model.OAuthCredential, []byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.oauth[tenant+"|"+name]
+	if !ok || cur.meta.Generation != gen {
+		return nil, nil, ErrNotFound
+	}
+	if leaseHeld(cur.meta.LeaseOwner, cur.meta.LeaseUntil, owner, now) {
+		return nil, nil, ErrConflict
+	}
+	u := until
+	cur.meta.LeaseOwner, cur.meta.LeaseUntil = owner, &u
+	c, ct := cur.copyOut()
+	return c, ct, nil
+}
+
+func (m *Memory) SaveOAuthCredential(_ context.Context, c *model.OAuthCredential, ciphertext []byte, owner string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.oauth[c.Tenant+"|"+c.Name]
+	if !ok || cur.meta.Generation != c.Generation || cur.meta.LeaseOwner != owner || owner == "" {
+		return ErrConflict
+	}
+	next := *c
+	next.Provider, next.CreatedBy, next.CreatedAt = cur.meta.Provider, cur.meta.CreatedBy, cur.meta.CreatedAt
+	next.UpdatedAt, next.LeaseOwner, next.LeaseUntil = time.Now(), "", nil
+	m.oauth[c.Tenant+"|"+c.Name] = &memOAuth{meta: next, ciphertext: append([]byte(nil), ciphertext...)}
+	*c = next
+	return nil
+}
+
+// leaseHeld reports a lease someone other than owner holds at now.
+func leaseHeld(holder string, until *time.Time, owner string, now time.Time) bool {
+	return holder != "" && holder != owner && until != nil && until.After(now)
 }
 
 // --- Git repositories: last known state -------------------------------------------------------

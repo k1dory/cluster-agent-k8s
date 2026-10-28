@@ -13,7 +13,7 @@
 # injected on this rule: an API key next to the bearer would take precedence upstream.
 slug: llm-subscriptions
 meta:
-  description: Claude Code on a Claude subscription token, held by the gateway
+  description: Claude Code and Codex on their subscriptions, the credentials held by the gateway
 tenants: ["*"]
 allow:
   - host: api.anthropic.com
@@ -21,3 +21,14 @@ allow:
     methods: [POST, GET]
     inject:
       Authorization: "Bearer secret:claude-oauth"
+  # Codex on a ChatGPT subscription: the tenant signs in once with the device flow
+  # (`sandboxctl oauth login chatgpt -provider chatgpt`); sandboxd keeps the refresh token and
+  # resolves secret:chatgpt to a fresh access token, secret:chatgpt.account_id to the account.
+  # Codex in the pod talks to the ChatGPT backend through a provider whose key is a placeholder
+  # (examples/catalog/environment-codex-chatgpt.yaml); the gateway swaps in both headers.
+  - host: chatgpt.com
+    paths: ["/backend-api/codex/**"]
+    methods: [POST, GET]
+    inject:
+      Authorization: "Bearer secret:chatgpt"
+      ChatGPT-Account-ID: "secret:chatgpt.account_id"

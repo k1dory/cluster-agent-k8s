@@ -1196,6 +1196,80 @@ paths:
         "403": { $ref: "#/components/responses/ScopeForbidden" }
         "404": { $ref: "#/components/responses/Error" }
         "503": { $ref: "#/components/responses/CredentialsDisabled" }
+  /v1/oauth-credentials:
+    get:
+      tags: [tenancy]
+      summary: The scope's sign-ins (metadata only)
+      description: |
+        Subscriptions a tenant signed in to with the OAuth device flow (a ChatGPT login for
+        Codex): sandboxd holds the refresh token, encrypted under `credentials.key`, refreshes
+        the access token before it expires (one replica at a time, under a lease on the row) and
+        resolves `secret:NAME` to the current access token, `secret:NAME.account_id` to the
+        account id the provider put in the ID token. No response carries a token or the device
+        code. Providers and their endpoints are server configuration
+        (`credentials.oauth.providers`; built in: `chatgpt`). A name is a sign-in or a plain
+        credential in a scope, never both.
+      parameters: [{ $ref: "#/components/parameters/scope" }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { $ref: "#/components/schemas/OAuthCredential" } } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "503": { $ref: "#/components/responses/CredentialsDisabled" }
+  /v1/oauth-credentials/{name}:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string } }
+      - { $ref: "#/components/parameters/scope" }
+    get:
+      tags: [tenancy]
+      summary: One sign-in's state
+      description: "`pending` until the user approves (verification_url and user_code say where and with what), then `active`; `failed` with `error` when the sign-in expired or was refused or the refresh token was revoked: start it again."
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { $ref: "#/components/schemas/OAuthCredential" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/CredentialsDisabled" }
+    delete:
+      tags: [tenancy]
+      summary: Forget the sign-in
+      description: The next request that needs it fails at the gateway. The grant itself stays valid at the provider until the user revokes it there.
+      responses:
+        "204": { description: Removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "404": { $ref: "#/components/responses/Error" }
+        "503": { $ref: "#/components/responses/CredentialsDisabled" }
+  /v1/oauth-credentials/{name}/login:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$" } }
+      - { $ref: "#/components/parameters/scope" }
+    post:
+      tags: [tenancy]
+      summary: Start a device sign-in (replaces one under the name)
+      description: |
+        Asks the provider for a user code and returns the pending sign-in: the user opens
+        `verification_url`, signs in and enters `user_code` before `login_expires_at`. sandboxd
+        polls the provider meanwhile; the sign-in turns `active` (or `failed`). A sign-in already
+        under the name is replaced, whatever its state: its tokens stop resolving at once.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [provider]
+              properties:
+                provider: { type: string, example: chatgpt, description: "A key of credentials.oauth.providers" }
+      responses:
+        "200": { description: Replaced the sign-in under the name, content: { application/json: { schema: { $ref: "#/components/schemas/OAuthCredential" } } } }
+        "201": { description: Started, content: { application/json: { schema: { $ref: "#/components/schemas/OAuthCredential" } } } }
+        "400": { description: "Malformed JSON or an unknown field", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "422": { description: "Bad name (letters, digits, '_' or '-'), unknown provider, or a plain credential holds the name", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "502": { description: "The provider refused or failed to issue a user code", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { $ref: "#/components/responses/CredentialsDisabled" }
   /v1/tenants/{tenant}/keys:
     parameters: [{ name: tenant, in: path, required: true, schema: { type: string } }]
     get:
@@ -1939,6 +2013,26 @@ components:
         name: { type: string }
         version: { type: integer, description: "Bumped by every replacement" }
         fingerprint: { type: string, description: "First 12 hex of sha256(value)" }
+        created_by: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    OAuthCredential:
+      type: object
+      description: A sign-in sandboxd keeps fresh; tokens and the device code are never part of it
+      properties:
+        tenant: { type: string, description: "Empty for the shared scope" }
+        name: { type: string }
+        provider: { type: string }
+        status: { type: string, enum: [pending, active, failed] }
+        generation: { type: integer, description: "Bumped by every new sign-in under the name" }
+        verification_url: { type: string, description: "pending: where the user approves the sign-in" }
+        user_code: { type: string, description: "pending: the code to enter there" }
+        login_expires_at: { type: string, format: date-time, description: "pending: approve before this" }
+        account_id: { type: string, description: "From the ID token (the provider's account claim); what secret:NAME.account_id resolves to" }
+        expires_at: { type: string, format: date-time, description: "When the current access token expires" }
+        refreshed_at: { type: string, format: date-time }
+        next_at: { type: string, format: date-time, description: "When sandboxd polls or refreshes next" }
+        error: { type: string, description: "The last failure; for failed, why the sign-in ended" }
         created_by: { type: string }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }

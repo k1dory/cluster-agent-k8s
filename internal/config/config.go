@@ -10,6 +10,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"agent-sandbox/internal/credentials"
 	"agent-sandbox/internal/oidc"
 	"agent-sandbox/internal/orchestrator"
 	"agent-sandbox/internal/secrets"
@@ -43,8 +44,20 @@ type Config struct {
 	// Credentials: secrets tenants bring through the API (PUT /v1/credentials/{name}), encrypted
 	// at rest under key (64 hex characters or the base64 of 32 bytes; `openssl rand -hex 32`).
 	// Empty disables the API; `secret:NAME` then resolves from the secrets provider alone.
+	//
+	// OAuth: the providers a tenant may sign in to with the device flow (POST
+	// /v1/oauth-credentials/{name}/login), sandboxd then keeping the access token fresh.
+	// Entries lay over the built-in defaults field by field (credentials.DefaultOAuthProviders:
+	// "chatgpt", a ChatGPT sign-in as Codex CLI does it); a new name must be complete.
+	// refresh_before: how long before expiry an access token is replaced (default 5m); every:
+	// how often each replica looks for sign-ins to poll or refresh (default 5s).
 	Credentials struct {
-		Key string `yaml:"key"`
+		Key   string `yaml:"key"`
+		OAuth struct {
+			Providers     map[string]credentials.OAuthProvider `yaml:"providers"`
+			RefreshBefore time.Duration                        `yaml:"refresh_before"`
+			Every         time.Duration                        `yaml:"every"`
+		} `yaml:"oauth"`
 	} `yaml:"credentials"`
 	// Quotas per tenant; `default` applies to tenants not listed. Zero = unlimited.
 	Quotas struct {

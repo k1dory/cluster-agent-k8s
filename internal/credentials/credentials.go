@@ -43,6 +43,9 @@ var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 type Service struct {
 	Store store.Credentials
 	aead  cipher.AEAD
+	// signIns is the OAuth sign-ins' store once NewOAuth wired them: Put refuses a name a
+	// sign-in holds.
+	signIns store.OAuthCredentials
 }
 
 // New returns a service encrypting under key (32 bytes: AES-256-GCM).
@@ -88,13 +91,16 @@ func (s *Service) Put(ctx context.Context, tenant, name, value, by string) (*mod
 	if len(value) > MaxValue {
 		return nil, false, fmt.Errorf("%w: value is larger than %d bytes", ErrInvalid, MaxValue)
 	}
-	nonce := make([]byte, s.aead.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, false, err
+	// One name, one kind: `secret:NAME` must not mean a sign-in to one reader and a plain
+	// credential to another.
+	if s.signIns != nil {
+		if _, _, err := s.signIns.GetOAuthCredential(ctx, tenant, name); err == nil {
+			return nil, false, fmt.Errorf("%w: %q is an OAuth sign-in in this scope; remove it first", ErrInvalid, name)
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return nil, false, err
+		}
 	}
-	// The scope and the name are authenticated with the value: a ciphertext moved to another
-	// tenant's row or renamed does not decrypt.
-	ciphertext := s.aead.Seal(nonce, nonce, []byte(value), []byte(tenant+"\x00"+name))
+	ciphertext := s.seal(tenant, name, []byte(value))
 	c := &model.Credential{Tenant: tenant, Name: name, Fingerprint: fingerprint(value), CreatedBy: by}
 	created, err := s.Store.PutCredential(ctx, c, ciphertext)
 	if err != nil {
@@ -120,8 +126,12 @@ func (s *Service) Delete(ctx context.Context, tenant, name string) error {
 }
 
 // Resolver is the service as a secrets.Provider (the gateway side): a tenant's own
-// credential first, then a shared one under the same name.
-type Resolver struct{ *Service }
+// credential first, then a shared one under the same name. OAuth, when set, resolves the names no plain credential carries from the sign-ins sandboxd
+// keeps fresh.
+type Resolver struct {
+	*Service
+	OAuth *OAuth
+}
 
 func (r Resolver) Get(ctx context.Context, tenant, name string) (string, error) {
 	if tenant != "" {
@@ -135,20 +145,42 @@ func (r Resolver) Get(ctx context.Context, tenant, name string) (string, error) 
 func (r Resolver) open(ctx context.Context, tenant, name string) (string, error) {
 	_, ciphertext, err := r.Store.GetCredential(ctx, tenant, name)
 	if errors.Is(err, store.ErrNotFound) {
+		// Not a plain credential: perhaps a sign-in sandboxd keeps fresh (NAME, NAME.account_id).
+		if r.OAuth != nil {
+			return r.OAuth.resolve(ctx, tenant, name)
+		}
 		return "", secrets.ErrNotFound
 	}
 	if err != nil {
 		return "", err
 	}
-	n := r.aead.NonceSize()
-	if len(ciphertext) < n {
-		return "", fmt.Errorf("credential %s/%s: ciphertext too short", tenant, name)
-	}
-	plain, err := r.aead.Open(nil, ciphertext[:n], ciphertext[n:], []byte(tenant+"\x00"+name))
+	plain, err := r.unseal(tenant, name, ciphertext)
 	if err != nil {
-		return "", fmt.Errorf("credential %s/%s: cannot decrypt (wrong credentials.key?)", tenant, name)
+		return "", err
 	}
 	return string(plain), nil
+}
+
+// seal encrypts under the server key. The scope and the name are authenticated with the
+// value: a ciphertext moved to another tenant's row or renamed does not decrypt.
+func (s *Service) seal(tenant, name string, plain []byte) []byte {
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		panic("credentials: no randomness: " + err.Error())
+	}
+	return s.aead.Seal(nonce, nonce, plain, []byte(tenant+"\x00"+name))
+}
+
+func (s *Service) unseal(tenant, name string, ciphertext []byte) ([]byte, error) {
+	n := s.aead.NonceSize()
+	if len(ciphertext) < n {
+		return nil, fmt.Errorf("credential %s/%s: ciphertext too short", tenant, name)
+	}
+	plain, err := s.aead.Open(nil, ciphertext[:n], ciphertext[n:], []byte(tenant+"\x00"+name))
+	if err != nil {
+		return nil, fmt.Errorf("credential %s/%s: cannot decrypt (wrong credentials.key?)", tenant, name)
+	}
+	return plain, nil
 }
 
 func fingerprint(value string) string {
