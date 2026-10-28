@@ -280,7 +280,9 @@ phase_replicas() {
   [ "$(sandbox_status "$SB")" = running ] || acc_fail "the sandbox is $(sandbox_status "$SB") after the failover"
   # Work through the survivor while the lead moved: a changed bundle applies.
   local repo=$ACCEPT_OUT/config-repo
-  bundle v2 > "$repo/bundles/$ACCEPT_TENANT.yaml"
+  # A change of its own on every run: a phase run again in the same ACCEPT_OUT finds the previous
+  # run's commit in the repository, and an unchanged file left `git commit` nothing to commit.
+  bundle "v2 $(date +%s)" > "$repo/bundles/$ACCEPT_TENANT.yaml"
   git -C "$repo" commit -qam "widen" && (cd "$repo" && SANDBOXD_URL=$survivor SANDBOXD_TOKEN=$ADMIN "$ctl" apply -f "bundles/$ACCEPT_TENANT.yaml" -ref main -repo https://git.example.com/acceptance/config -key "bundles/$ACCEPT_TENANT.yaml@$(git rev-parse HEAD)" -require-commit -markdown) | acc_contains "Apply ✅ done" || acc_fail "apply through the survivor"
   evidence "leader pod $leaderpod deleted: the survivor answered $probes/$probes requests, $newleader led after ${moved}s; replicas back, one leader; the sandbox stayed running; an apply through the survivor went through"
 }
@@ -357,7 +359,7 @@ phase_backup() {
   db pg_dump -U "$ACCEPT_DB_USER" -d "$ACCEPT_DB_NAME" --clean --if-exists > "$dump"
   [ -s "$dump" ] || acc_fail "empty dump"
   # After the backup: a document and a key that the restore must not know.
-  { bundle v2; printf -- '---\nkind: EnvironmentProfile\ntenant: %s\nname: post-dump\nspec: {image: stable}\n' "$ACCEPT_TENANT"; } > "$repo/bundles/$ACCEPT_TENANT.yaml"
+  { bundle "v2 $(date +%s)"; printf -- '---\nkind: EnvironmentProfile\ntenant: %s\nname: post-dump\nspec: {image: stable}\n' "$ACCEPT_TENANT"; } > "$repo/bundles/$ACCEPT_TENANT.yaml"
   git -C "$repo" commit -qam "post-dump" && (cd "$repo" && ctl_as "$ADMIN" apply -f "bundles/$ACCEPT_TENANT.yaml" -ref main -repo https://git.example.com/acceptance/config -key "bundles/$ACCEPT_TENANT.yaml@$(git rev-parse HEAD)" -require-commit -markdown) | acc_contains "Apply ✅ done" || acc_fail "post-dump apply"
   post_key=$(ctl_as "$ADMIN" keys create -tenant "$ACCEPT_TENANT" -name post-dump -json | jq -r .secret)
   # Restore: the control plane stopped, the database replaced by the dump, the control plane back.
