@@ -1,0 +1,23 @@
+# yaml-language-server: $schema=../../policies/schema.json
+# llm-subscriptions: harnesses on their vendors' subscriptions instead of API keys, the
+# credential held by the gateway (docs/self-service.md, "Subscriptions"). An example to copy
+# into a deployment's own policy repository; `make ci-policy` validates it with the tests next
+# to it.
+#
+# Claude Code on a Claude subscription: the tenant stores the token `claude setup-token` prints
+# (sk-ant-oat01-…) as the credential claude-oauth. The pod runs Claude Code with a placeholder
+# CLAUDE_CODE_OAUTH_TOKEN, so Claude Code speaks the OAuth dialect itself: `Authorization:
+# Bearer <placeholder>` and `anthropic-beta: …,oauth-2025-04-20,…`. The gateway strips the
+# agent's Authorization and puts the real token in its place; anthropic-beta is not injected,
+# so the agent's own list (with the OAuth beta) reaches the API untouched. No x-api-key is
+# injected on this rule: an API key next to the bearer would take precedence upstream.
+slug: llm-subscriptions
+meta:
+  description: Claude Code on a Claude subscription token, held by the gateway
+tenants: ["*"]
+allow:
+  - host: api.anthropic.com
+    paths: ["/v1/**"]
+    methods: [POST, GET]
+    inject:
+      Authorization: "Bearer secret:claude-oauth"

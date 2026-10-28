@@ -67,6 +67,7 @@ type PodConfig struct {
 	Model              string
 	Instructions       string
 	MCPServers         []model.MCPServer // exported as SANDBOX_MCP_SERVERS (JSON)
+	HarnessFiles       map[string]string // exported as SANDBOX_HARNESS_FILES (JSON); the runner writes them
 	PriorityClassName  string
 	TerminationSeconds int64
 	// PodFirewall adds an init container (NET_ADMIN, dropped afterwards) that installs nftables
@@ -138,6 +139,7 @@ func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 	pick(&e.Model, l.Model)
 	pick(&e.Instructions, l.Instructions)
 	e.MCPServers = l.MCPServers
+	e.HarnessFiles = l.HarnessFiles
 	e.UserEnv = l.Env
 	e.CPURequest, e.CPULimit = reconcile(e.CPURequest, e.CPULimit, l.CPURequest, l.CPULimit, defaultCPURequest, defaultCPULimit)
 	e.MemoryRequest, e.MemoryLimit = reconcile(e.MemoryRequest, e.MemoryLimit, l.MemoryRequest, l.MemoryLimit, defaultMemoryRequest, defaultMemoryLimit)
@@ -289,6 +291,10 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 	if len(c.MCPServers) > 0 {
 		servers, _ := json.Marshal(c.MCPServers)
 		env = append(env, corev1.EnvVar{Name: "SANDBOX_MCP_SERVERS", Value: string(servers)})
+	}
+	if len(c.HarnessFiles) > 0 {
+		files, _ := json.Marshal(c.HarnessFiles) // map keys marshal sorted: the same spec, the same pod
+		env = append(env, corev1.EnvVar{Name: "SANDBOX_HARNESS_FILES", Value: string(files)})
 	}
 	image := c.Image
 	env = append(env, sortedEnv(c.Env, nil)...)

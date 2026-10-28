@@ -185,11 +185,13 @@ func TestRealCaddyGateway(t *testing.T) {
 		{Host: "git.example.com", Upstream: up.URL, Paths: []string{"/*/*/info/refs", "/*/*/git-upload-pack"},
 			Inject: map[string]string{"Authorization": "Basic secret:forgejo"}},
 		{Host: "mcp.example.com", Upstream: up.URL, Paths: []string{"/mcp", "/mcp/**"}, MCP: &policy.MCPRule{ReadOnly: true, Tools: []string{"get_*"}}},
+		// A Claude subscription token held by the gateway (examples/policies/llm-subscriptions.yaml).
+		{Host: "api.anthropic.com", Upstream: up.URL, Paths: []string{"/v1/**"}, Inject: map[string]string{"Authorization": "Bearer secret:claude-oauth"}},
 	}})
 	// The real wiring: the guard adds the live bindings and the connections (headers and the
 	// hosts tenants declare on their own) to the repository, for authz, the MCP proxy, the DNS
 	// and the gateway config alike.
-	secretStore := secrets.Static{"shared/forgejo": "forgejo-injected", "alice/tools": "tools-token"}
+	secretStore := secrets.Static{"shared/forgejo": "forgejo-injected", "alice/tools": "tools-token", "alice/claude-oauth": "sk-ant-oat01-REAL"}
 	services, err := app.Wire(ctx, app.Deps{Store: st, Policies: pols, Secrets: secretStore, Orch: orch})
 	if err != nil {
 		t.Fatal(err)
@@ -229,7 +231,7 @@ func TestRealCaddyGateway(t *testing.T) {
 	// the config is loaded; until then every handshake fails with "internal error". The init
 	// container retries bootstrap for that reason; the test waits for every site once so that no
 	// request below can hit a site that is still being issued.
-	waitForCertificates(t, proc, httpsPort, pool, "git.example.com", "mcp.example.com", "api.sandbox.internal")
+	waitForCertificates(t, proc, httpsPort, pool, "git.example.com", "mcp.example.com", "api.anthropic.com", "api.sandbox.internal")
 	waitForCertificates(t, proc, regPort, pool, "registrar.sandbox.internal")
 
 	// --- the pod: bootstrap without a client certificate ----------------------------------
@@ -329,6 +331,20 @@ func TestRealCaddyGateway(t *testing.T) {
 	case seen["path"] != "/org/repo.git/info/refs":
 		t.Fatalf("path: %s", raw)
 	}
+	// --- a subscription token: Claude Code with a placeholder CLAUDE_CODE_OAUTH_TOKEN sends a
+	// bearer placeholder and the OAuth beta; upstream sees the tenant's token in place of the
+	// placeholder and the beta list exactly as the agent sent it.
+	const betas = "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14"
+	code, seen, raw = get(agent, "POST", "https://api.anthropic.com/v1/messages?beta=true",
+		map[string]string{"Authorization": "Bearer sk-ant-oat01-placeholder", "Anthropic-Beta": betas, "Anthropic-Version": "2023-06-01"})
+	switch {
+	case code != 200:
+		t.Fatalf("subscription request: %d %s\n%s", code, raw, proc.out.String())
+	case seen["h:Authorization"] != "Bearer sk-ant-oat01-REAL":
+		t.Fatalf("upstream must receive the tenant's token instead of the placeholder, got %q (%s)", seen["h:Authorization"], raw)
+	case seen["h:Anthropic-Beta"] != betas || seen["h:Anthropic-Version"] != "2023-06-01":
+		t.Fatalf("the agent's anthropic headers must pass untouched: %s", raw)
+	}
 	// Denied by policy (push), with the gateway's own 403, before reaching the upstream.
 	if code, _, raw := get(agent, "POST", "https://git.example.com/org/repo.git/git-receive-pack", nil); code != 403 {
 		t.Fatalf("push must be denied by policy: %d %s", code, raw)
@@ -410,7 +426,7 @@ func TestRealCaddyGateway(t *testing.T) {
 			deny++
 		}
 	}
-	if allow != 4 || deny != 2 {
+	if allow != 5 || deny != 2 { // the subscription call is the fifth allow
 		t.Fatalf("egress trace: allow=%d deny=%d", allow, deny)
 	}
 

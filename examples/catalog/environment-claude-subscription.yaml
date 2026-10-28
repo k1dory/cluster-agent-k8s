@@ -1,0 +1,26 @@
+# EnvironmentProfile: Claude Code on a Claude subscription instead of an API key. The token
+# (`claude setup-token`, sk-ant-oat01-…) is the tenant's credential claude-oauth and never
+# enters the pod: Claude Code runs with a placeholder, the gateway puts the real token in the
+# Authorization header (examples/policies/llm-subscriptions.yaml). docs/self-service.md,
+# "Subscriptions", has the whole path.
+# Apply:  sandboxctl apply -f examples/catalog/environment-claude-subscription.yaml
+kind: EnvironmentProfile
+name: claude-subscription
+description: Claude Code on the tenant's Claude subscription, the token held by the gateway
+spec:
+  image: stable
+  harness:
+    command: 'claude -p --input-format stream-json --output-format stream-json --verbose'
+    input: stream-json
+    resume_command: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose'
+  model:
+    name: claude-opus-5-5
+    env:
+      ANTHROPIC_BASE_URL: https://api.anthropic.com
+  env:
+    # A placeholder in the token's shape: with it Claude Code sends `Authorization: Bearer …`
+    # and the `oauth-2025-04-20` beta, which the gateway keeps while it swaps the token.
+    # No ANTHROPIC_API_KEY here: Claude Code would prefer it and speak x-api-key instead.
+    CLAUDE_CODE_OAUTH_TOKEN: sk-ant-oat01-placeholder-the-gateway-injects-the-real-token
+    # The subscription path needs only the Messages API; nothing else leaves the pod.
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"

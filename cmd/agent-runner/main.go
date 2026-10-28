@@ -240,6 +240,15 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 		cmdline = `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose`
 	}
 	env := append(os.Environ(), "SANDBOX_TASK="+run.Task, "SANDBOX_RUN_ID="+run.ID)
+	// The profile's harness files (a Codex config.toml, Claude Code settings) are in place
+	// before the harness reads them. A file that cannot be written fails the run: a harness
+	// started without its provider settings would talk to the wrong endpoint.
+	if n, err := writeHarnessFiles(os.Getenv("SANDBOX_HARNESS_FILES"), os.Getenv("HOME")); err != nil {
+		c.post(run.ID, []string{"[agent-runner] harness files: " + err.Error()})
+		return 1
+	} else if n > 0 {
+		fmt.Printf("agent-runner: %d harness file(s) written from the profile\n", n)
+	}
 	// The MCP servers the agent's connections give it (SANDBOX_MCP_SERVERS, JSON) become a
 	// Claude Code mcp-config file. Every command that runs claude loads it (the run command and
 	// the resume command, however the deployment spelled them) unless it names the file itself;
