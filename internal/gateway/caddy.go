@@ -163,6 +163,9 @@ issuer internal
 		}
 {{- else }}
 		reverse_proxy {{ .Upstream }} {
+{{- if .UpstreamHost }}
+			header_up Host {upstream_hostport}
+{{- end }}
 {{- if .TLSServerName }}
 			transport http {
 				tls_server_name {{ .TLSServerName }}
@@ -229,7 +232,7 @@ issuer internal
 
 type hostView struct {
 	Name, Upstream, TLSServerName string
-	MCP                           bool
+	MCP, UpstreamHost             bool
 	Strip                         []string // headers removed from the agent's request
 	Copy                          string   // headers copied from the authz response (space-separated)
 }
@@ -275,9 +278,10 @@ func Render(cfg Config, hosts []policy.Host, agentCAPEM []byte) (string, error) 
 		if h.Name == cfg.APIHost || h.Name == cfg.RegistrarHost {
 			continue // served by the built-in blocks
 		}
-		hv := hostView{Name: h.Name, Upstream: h.Upstream, MCP: h.MCP}
-		// Upstream by IP but TLS for the real name: tell the transport which SNI/verification name to use.
-		if strings.HasPrefix(h.Upstream, "https://") {
+		hv := hostView{Name: h.Name, Upstream: h.Upstream, MCP: h.MCP, UpstreamHost: h.UpstreamHost}
+		// Upstream by IP but TLS for the real name: tell the transport which SNI/verification name
+		// to use (unless the upstream is addressed as itself).
+		if strings.HasPrefix(h.Upstream, "https://") && !h.UpstreamHost {
 			up := strings.TrimPrefix(h.Upstream, "https://")
 			if i := strings.Index(up, "/"); i >= 0 {
 				up = up[:i]

@@ -99,6 +99,9 @@ type Host struct {
 	// MCP: some rule marks this host as an MCP endpoint, so the gateway routes it through
 	// sandboxd's MCP proxy (JSON-RPC inspection) instead of straight to the upstream.
 	MCP bool
+	// UpstreamHost: the upstream's own host[:port] is the Host header and the TLS name (a
+	// self-service connection's choice; repository hosts keep their name).
+	UpstreamHost bool
 }
 
 // Set is the loaded collection of policies with hot reload.
