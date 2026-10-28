@@ -804,7 +804,8 @@ func (o *Orchestrator) Input(ctx context.Context, sandboxID, runID, text string)
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("%w: text is required", ErrBadRequest)
 	}
-	if _, err := o.Store.GetSandbox(ctx, sandboxID); err != nil {
+	sb, err := o.Store.GetSandbox(ctx, sandboxID)
+	if err != nil {
 		return err
 	}
 	r, err := o.Store.GetRun(ctx, runID)
@@ -815,6 +816,11 @@ func (o *Orchestrator) Input(ctx context.Context, sandboxID, runID, text string)
 	case model.RunQueued, model.RunRunning:
 	default:
 		return fmt.Errorf("%w: run is %s", ErrConflict, r.Status)
+	}
+	if !streamsInput(sb) {
+		// The runner closes a text-mode harness's stdin after the task: an input event would be
+		// recorded and never read.
+		return fmt.Errorf("%w: a text-mode harness takes no input during a run; send it as a message (it becomes the next run)", ErrConflict)
 	}
 	o.Touch(ctx, sandboxID)
 	return o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: runID, Type: model.EventInput, Data: text})
@@ -840,7 +846,7 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 			}
 			continue
 		}
-		r, err := o.Store.ClaimQueuedRun(ctx, sandboxID, time.Now())
+		r, err := o.claim(ctx, sandboxID)
 		if err == nil {
 			// The run records what it executes under; later catalogue changes never touch it.
 			if sb, err := o.Store.GetSandbox(ctx, sandboxID); err == nil {
@@ -863,6 +869,50 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+// claim takes the oldest queued run of the sandbox. A message run queued while the run it
+// follows had no session yet gets that session now: it is read first and written by the claim
+// itself (one conditional update), so a failed read leaves the run queued with nothing to undo.
+func (o *Orchestrator) claim(ctx context.Context, sandboxID string) (*model.Run, error) {
+	for {
+		q, err := o.Store.QueuedRun(ctx, sandboxID)
+		if err != nil {
+			return nil, err
+		}
+		session := q.Session
+		if q.Mode == model.RunMessage && session == "" && q.ResumeOf != "" {
+			if session, err = o.sessionOf(ctx, q.ResumeOf); err != nil {
+				return nil, fmt.Errorf("session of run %s: %w", q.ResumeOf, err)
+			}
+		}
+		r, err := o.Store.ClaimRun(ctx, q.ID, time.Now(), session)
+		if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
+			continue // claimed by another poller or cancelled meanwhile: the next one in line
+		}
+		return r, err
+	}
+}
+
+// sessionOf finds the harness session a message run continues: that of the run it follows, or
+// of the nearest earlier one in the chain when that run never reported one (cancelled early).
+// The message was queued while those runs were pending, so their sessions were not known yet.
+// "" means the chain has no session (or its runs are gone); a failed read is an error, not that.
+func (o *Orchestrator) sessionOf(ctx context.Context, runID string) (string, error) {
+	for i := 0; runID != "" && i < 100; i++ {
+		r, err := o.Store.GetRun(ctx, runID)
+		if errors.Is(err, store.ErrNotFound) {
+			return "", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		if r.Session != "" {
+			return r.Session, nil
+		}
+		runID = r.ResumeOf
+	}
+	return "", nil
 }
 
 // Output appends agent output to the event stream. Lines that carry usage (Claude Code's

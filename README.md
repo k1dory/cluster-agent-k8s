@@ -187,9 +187,10 @@ linux/amd64, each digest signed with cosign; `cosign verify --key cosign.pub <im
 ### Talking to the agent, reaching its workspace
 
 A sandbox is a conversation, not a one-shot task. `sandboxctl chat <sandbox>` replays what was
-said and lets you keep talking: a message reaches the running harness as input (with Claude
-Code's streaming input, `harness.input: stream-json`, the conversation stays open and the
-agent answers each message in the same process), and when no run is active the next message
+said and lets you keep talking: with Claude Code's streaming input (`harness.input:
+stream-json`) a message reaches the running harness as input, the conversation stays open and
+the agent answers each message in the same process; a text-mode harness gets a message sent
+during a run as the next run, queued behind it; and when no run is active the next message
 resumes the harness session in a new run (`resume_command` with `$SANDBOX_SESSION` and the
 message in `$SANDBOX_RESUME_PROMPT`). `/attach <file>` uploads into `/workspace/uploads/` and tells
 the agent; `/close` ends the open conversation cleanly. The transcript (`GET /messages`, SSE at

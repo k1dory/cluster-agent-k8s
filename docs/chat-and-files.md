@@ -38,9 +38,9 @@ Choosing the run that carries a message and recording it happen under one lock p
 shared by every replica (an advisory lock in PostgreSQL), so two messages sent at the same
 moment join the same conversation instead of starting two.
 
-1. **A message reaches a run in progress as input.** `POST /messages` on a sandbox whose run is
-   running (or queued) appends an `input` event; the runner hands it to the harness's stdin. For
-   Claude Code that is useful only when the harness was started in streaming-input mode:
+1. **A message reaches a run in progress as input — in stream-json mode.** `POST /messages` on a
+   sandbox whose run is running (or queued) appends an `input` event; the runner hands it to the
+   harness's stdin. That needs a harness started in streaming-input mode:
 
    ```yaml
    harness:
@@ -52,6 +52,13 @@ moment join the same conversation instead of starting two.
    In `stream-json` mode the runner sends the task as the first user message and every later
    message as another one, so the harness keeps its context and answers each in the same
    process. The delivery is reported as `input`.
+
+   A `text`-mode harness (the default) gets its task on stdin and then EOF: `claude -p` reads a
+   non-terminal stdin to its end before it starts. Its messages never become `input` events. A
+   message for a run that is still queued joins that run's task (reported as `input`; the task
+   is what the harness reads), and one sent while the run is executing is queued as the next run
+   (`resumed`, `resume_of` the running run): it starts when that run finishes and continues the
+   session it reported. `POST /runs/{run}/input` on a text-mode sandbox is refused with 409.
 
 2. **Between runs the session is resumed.** When no run is active, `POST /messages` queues a new
    run with `mode: message`, `resume_of` the latest run of the session and the message as the

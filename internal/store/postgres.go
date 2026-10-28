@@ -532,11 +532,58 @@ func (p *Postgres) ListRuns(ctx context.Context, sandboxID string) ([]*model.Run
 	return p.queryRuns(ctx, `SELECT `+runCols+` FROM runs WHERE sandbox_id=$1 ORDER BY created_at`, sandboxID)
 }
 
+func (p *Postgres) AppendQueuedTask(ctx context.Context, runID, text string) (*model.Run, error) {
+	// The status condition is re-checked against a concurrent claim: once the runner has the
+	// run, nothing is appended.
+	r, err := scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET task = task || $2 WHERE id=$1 AND status=$3
+		RETURNING `+runCols, runID, text, model.RunQueued))
+	if errors.Is(err, ErrNotFound) {
+		if _, gerr := p.GetRun(ctx, runID); gerr != nil {
+			return nil, gerr
+		}
+		return nil, ErrConflict
+	}
+	return r, err
+}
+
+func (p *Postgres) ReleaseRun(ctx context.Context, runID string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE runs SET status=$2, started_at=NULL WHERE id=$1 AND status=$3`,
+		runID, model.RunQueued, model.RunRunning)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := p.GetRun(ctx, runID); err != nil {
+			return err
+		}
+		return ErrConflict
+	}
+	return nil
+}
+
 func (p *Postgres) ClaimQueuedRun(ctx context.Context, sandboxID string, startedAt time.Time) (*model.Run, error) {
 	// One statement: pick the oldest queued run, skipping rows another poller is claiming.
 	return scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4 WHERE id = (
 			SELECT id FROM runs WHERE sandbox_id=$1 AND status=$2 ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED)
 		RETURNING `+runCols, sandboxID, model.RunQueued, model.RunRunning, startedAt))
+}
+
+func (p *Postgres) QueuedRun(ctx context.Context, sandboxID string) (*model.Run, error) {
+	return scanRun(p.pool.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE sandbox_id=$1 AND status=$2
+		ORDER BY created_at, id LIMIT 1`, sandboxID, model.RunQueued))
+}
+
+func (p *Postgres) ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string) (*model.Run, error) {
+	r, err := scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4,
+		session = CASE WHEN session = '' THEN $5 ELSE session END
+		WHERE id=$1 AND status=$2 RETURNING `+runCols, runID, model.RunQueued, model.RunRunning, startedAt, session))
+	if errors.Is(err, ErrNotFound) {
+		if _, gerr := p.GetRun(ctx, runID); gerr != nil {
+			return nil, gerr
+		}
+		return nil, ErrConflict
+	}
+	return r, err
 }
 
 func (p *Postgres) RunningRun(ctx context.Context, sandboxID string) (*model.Run, error) {

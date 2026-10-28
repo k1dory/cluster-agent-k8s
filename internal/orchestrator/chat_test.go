@@ -9,9 +9,83 @@ import (
 	"time"
 
 	"agent-sandbox/internal/events"
+	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/store"
 )
+
+// streamJSON switches a sandbox's harness to stream-json input, the mode that takes messages
+// during a run.
+func streamJSON(t *testing.T, st store.Store, id string) {
+	t.Helper()
+	sb, err := st.GetSandbox(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.Launch == nil {
+		sb.Launch = &model.Launch{}
+	}
+	sb.Launch.HarnessInput = harness.InputStreamJSON
+	if err := st.UpdateSandbox(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A text-mode harness reads only its task: a message for a queued run joins its task, a message
+// during a run becomes the next run, which resumes the session the running one reports. The
+// runner never sees an input event it would have to drop, and the input endpoint refuses.
+func TestSayToATextModeHarnessIsTheNextRun(t *testing.T) {
+	ctx := context.Background()
+	o := New(store.NewMemory(), NewFakeRuntime(), nil, events.New(), Config{}, nil)
+	o.leading.Store(true)
+	sb, err := o.Create(ctx, CreateRequest{Name: "t", Slug: "backend-dev", Owner: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStatus(t, o, sb.ID, model.StatusRunning)
+	r1, how, err := o.Say(ctx, sb.ID, "add tests")
+	if err != nil || how != DeliveredNew {
+		t.Fatalf("first message: %v %s", err, how)
+	}
+	// Still queued: the message joins the task the harness will read.
+	r, how, err := o.Say(ctx, sb.ID, "use pytest")
+	if err != nil || how != DeliveredInput || r.ID != r1.ID || r.Task != "add tests\n\nuse pytest" {
+		t.Fatalf("queued: %v %s %+v", err, how, r)
+	}
+	got, err := o.NextRun(ctx, sb.ID, time.Second)
+	if err != nil || got.ID != r1.ID || got.Task != "add tests\n\nuse pytest" {
+		t.Fatalf("claimed: %v %+v", err, got)
+	}
+	if err := o.Input(ctx, sb.ID, r1.ID, "hi"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("input to a text-mode run: %v", err)
+	}
+	// Running: two messages become the next run and the one after it, in order.
+	r2, how, err := o.Say(ctx, sb.ID, "also cover the edge cases")
+	if err != nil || how != DeliveredResumed || r2.ID == r1.ID || r2.Status != model.RunQueued || r2.ResumeOf != r1.ID || r2.Mode != model.RunMessage {
+		t.Fatalf("during the run: %v %s %+v", err, how, r2)
+	}
+	r3, how, err := o.Say(ctx, sb.ID, "and the docs")
+	if err != nil || how != DeliveredInput || r3.ID != r2.ID || r3.Task != "also cover the edge cases\n\nand the docs" {
+		t.Fatalf("second message during the run: %v %s %+v", err, how, r3)
+	}
+	evs, _ := o.Store.QueryEvents(ctx, store.Filter{SandboxID: sb.ID, Types: []string{model.EventInput}})
+	if len(evs) != 0 {
+		t.Fatalf("no input event for a text-mode harness: %+v", evs)
+	}
+	if err := o.Output(ctx, sb.ID, r1.ID, `{"type":"system","subtype":"init","session_id":"sess-t"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.FinishRun(ctx, sb.ID, r1.ID, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	next, err := o.NextRun(ctx, sb.ID, time.Second)
+	if err != nil || next.ID != r2.ID || next.Session != "sess-t" || next.Task != "also cover the edge cases\n\nand the docs" {
+		t.Fatalf("next run resumes the session: %v %+v", err, next)
+	}
+	if stored, _ := o.Store.GetRun(ctx, r2.ID); stored.Session != "sess-t" {
+		t.Fatalf("resolved session not stored: %+v", stored)
+	}
+}
 
 func TestSayContinuesTheConversation(t *testing.T) {
 	ctx := context.Background()
@@ -22,12 +96,13 @@ func TestSayContinuesTheConversation(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitStatus(t, o, sb.ID, model.StatusRunning)
+	streamJSON(t, o.Store, sb.ID)
 	// First message: a fresh conversation.
 	r1, how, err := o.Say(ctx, sb.ID, "add tests")
 	if err != nil || how != DeliveredNew || r1.Mode != model.RunTask || r1.Task != "add tests" {
 		t.Fatalf("first message: %v %s %+v", err, how, r1)
 	}
-	// A second message while the run is queued or running is input to it.
+	// A second message while the run is queued or running is input to it (stream-json).
 	if _, err := o.NextRun(ctx, sb.ID, time.Second); err != nil {
 		t.Fatal(err)
 	}

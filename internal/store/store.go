@@ -359,7 +359,19 @@ type Store interface {
 	// ClaimQueuedRun atomically moves the oldest queued run of the sandbox to running and
 	// returns it; concurrent callers never get the same run. ErrNotFound when none is queued.
 	ClaimQueuedRun(ctx context.Context, sandboxID string, startedAt time.Time) (*model.Run, error)
+	// QueuedRun returns the oldest queued run of the sandbox (the one a claim takes next);
+	// ErrNotFound when none is queued.
+	QueuedRun(ctx context.Context, sandboxID string) (*model.Run, error)
+	// ClaimRun moves that run to running, recording session if the run has none yet, in one
+	// conditional write; ErrConflict when it is no longer queued (claimed or cancelled).
+	ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string) (*model.Run, error)
 	RunningRun(ctx context.Context, sandboxID string) (*model.Run, error)
+	// AppendQueuedTask adds text to the task of a run that is still queued and returns the run;
+	// ErrConflict once it has been claimed (the harness may already have read its task).
+	AppendQueuedTask(ctx context.Context, runID, text string) (*model.Run, error)
+	// ReleaseRun puts a run the caller has just claimed back in the queue (running → queued,
+	// start time cleared), so a later claim gets it again; ErrConflict if it is not running.
+	ReleaseRun(ctx context.Context, runID string) error
 
 	AppendEvent(ctx context.Context, e *model.Event) error
 	ListEvents(ctx context.Context, sandboxID string, afterID int64, limit int) ([]*model.Event, error)

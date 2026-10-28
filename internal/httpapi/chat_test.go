@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"agent-sandbox/internal/ca"
+	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/identity"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/registrar"
@@ -44,6 +45,23 @@ func agentOf(t *testing.T, s *stack, name string) (model.Sandbox, map[string]str
 		t.Fatal(err)
 	}
 	return sb, map[string]string{identity.HeaderCertDER: base64.StdEncoding.EncodeToString(blk.Bytes)}
+}
+
+// streamJSON switches a sandbox's harness to stream-json input, the mode that takes messages
+// during a run (a text-mode harness gets them as the next run).
+func streamJSON(t *testing.T, s *stack, id string) {
+	t.Helper()
+	sb, err := s.orch.Store.GetSandbox(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.Launch == nil {
+		sb.Launch = &model.Launch{}
+	}
+	sb.Launch.HarnessInput = harness.InputStreamJSON
+	if err := s.orch.Store.UpdateSandbox(context.Background(), sb); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // fakeRunner answers file requests the way agent-runner does, from an in-memory tree.
@@ -101,6 +119,7 @@ func TestConversationAndWorkspaceFiles(t *testing.T) {
 	s := newStack(t)
 	api, gw := s.platform.URL, s.gateway.URL
 	sb, hdr := agentOf(t, s, "chat")
+	streamJSON(t, s, sb.ID) // messages during a run go to the harness as input
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	files := map[string]string{"repo/main.go": "package main\n", "repo/README.md": "# shop\n"}
