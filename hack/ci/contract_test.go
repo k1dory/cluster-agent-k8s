@@ -154,6 +154,53 @@ func TestImagesMoveTheCheckoutThroughTheAPI(t *testing.T) {
 	}
 }
 
+// The image archives the scan exports (a few GiB each) are removed however the check ends: a
+// failing verdict exits through ci_die, and the exit trap must still clean the directory.
+func TestImagesRemoveTheExportedArchivesWhenTheVerdictFails(t *testing.T) {
+	bin := t.TempDir()
+	tmp := t.TempDir()
+	// A docker that builds nothing but records an id per build, exports an "archive", and
+	// answers every other call; a trivy that passes the report and fails the verdict.
+	stub(t, bin, "docker", `case "$1 $2" in
+  "build "*) while [ $# -gt 0 ]; do case "$1" in --iidfile) echo sha256:0123 > "$2"; shift 2 ;; *) shift ;; esac; done ;;
+  "image save") while [ $# -gt 0 ]; do case "$1" in -o) head -c 4096 /dev/zero > "$2"; shift 2 ;; *) shift ;; esac; done ;;
+  "image inspect") echo sha256:0123 ;;
+  "inspect "*) echo "$STUB_LABEL" ;;
+  "run "*) echo "$STUB_RUN" ;;
+  *) : ;;
+esac`)
+	stub(t, bin, "trivy", "case \" $* \" in *' --exit-code 0 '*) exit 0 ;; esac; exit 1\n")
+	stub(t, bin, "python3", "exit 0\n")
+	// The harness checks before the scan read labels and command output; the stub cannot
+	// satisfy every one, so the scan is reached only if the script gets there. Run the scan
+	// part directly instead: the same functions, the same trap.
+	script := `. hack/ci/lib.sh
+iids=$(mktemp -d "${TMPDIR:-/tmp}/agent-sandbox-ci-iid.XXXXXX")
+ci_images_cleanup() { rm -rf "$iids"; }
+trap ci_images_cleanup EXIT
+echo sha256:0123 > "$iids/sandboxd"
+id=$(cat "$iids/sandboxd")
+docker image save -o "$iids/sandboxd.tar" "$id" || ci_die "images: cannot export"
+ci_trivy_scan image "" --input "$iids/sandboxd.tar" || ci_die "images: fixable HIGH or CRITICAL vulnerabilities"
+ci_ok images`
+	cmd := exec.Command("bash", "-c", script)
+	cmd.Dir = repoRoot(t)
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "TMPDIR="+tmp, "TRIVY_BIN="+filepath.Join(bin, "trivy"), "CI_BIN="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	if err == nil || strings.Contains(string(out), "ci: images: ok") {
+		t.Fatalf("a failing verdict must fail the check: %v\n%s", err, out)
+	}
+	if left, _ := filepath.Glob(filepath.Join(tmp, "agent-sandbox-ci-iid.*")); len(left) != 0 {
+		t.Fatalf("the exported archives must be removed when the verdict fails: %v", left)
+	}
+	// And the script itself registers that trap right where the directory is created, before
+	// any build, and keeps it in the later Docker cleanup.
+	src, _ := os.ReadFile(filepath.Join(repoRoot(t), "hack/ci/images.sh"))
+	if !strings.Contains(string(src), "trap ci_images_cleanup EXIT") || strings.Count(string(src), `rm -rf "$iids"`) < 2 {
+		t.Fatal("images.sh must remove the archive directory from its exit trap, in both cleanup definitions")
+	}
+}
+
 // The acceptance scripts parse, name the same phases the runbook documents, and take their
 // tool versions from versions.env like every other check.
 func TestAcceptanceScriptsParseAndNameEveryPhase(t *testing.T) {

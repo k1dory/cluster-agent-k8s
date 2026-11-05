@@ -18,6 +18,9 @@ echo "== build"
 # at the end reads that id, so a tag another job on the same daemon re-pointed meanwhile
 # cannot put a different image under the scanner.
 iids=$(mktemp -d "${TMPDIR:-/tmp}/agent-sandbox-ci-iid.XXXXXX")
+# The archives the scan exports there are a few GiB: removed however the check ends.
+ci_images_cleanup() { rm -rf "$iids"; }
+trap ci_images_cleanup EXIT
 docker build -f images/agent/Dockerfile $("$ci_dir/versions.sh" build-args) -t "$agent" --iidfile "$iids/agent" .
 docker build -f images/sandboxd/Dockerfile -t "$sandboxd" --iidfile "$iids/sandboxd" .
 docker build -f images/sandboxd/Dockerfile --target sandboxctl -t "$ctl" --iidfile "$iids/sandboxctl" .
@@ -70,7 +73,7 @@ echo "== sandboxctl: a checkout owned by another user is read and its SHA record
 # docker-in-docker service) sees none of this job's files.
 vol=agent-sandbox-ci-checkout-$$
 docker volume create "$vol" >/dev/null
-trap 'docker rm -f "$vol-copy" >/dev/null 2>&1 || true; docker volume rm -f "$vol" >/dev/null 2>&1 || true' EXIT
+ci_images_cleanup() { docker rm -f "$vol-copy" >/dev/null 2>&1 || true; docker volume rm -f "$vol" >/dev/null 2>&1 || true; rm -rf "$iids"; }
 docker create --name "$vol-copy" -v "$vol:/w" --user 0 --entrypoint sh "$ctl" -c 'chown -R 0:0 /w' >/dev/null
 docker cp . "$vol-copy:/w"
 docker start -a "$vol-copy" >/dev/null
@@ -163,5 +166,4 @@ for name in sandboxd sandboxctl agent agent-hermes; do
     || ci_die "images: fixable HIGH or CRITICAL vulnerabilities in $prefix/$name:$tag (upgrade the base image or a harness in hack/ci/versions.env, or accept the finding in .trivyignore.yaml with an expiry)"
   rm -f "$iids/$name.tar"
 done
-rm -rf "$iids"
 ci_ok images
