@@ -277,14 +277,37 @@ const eventsChannel = "agent_sandbox_events"
 // NOTIFY wakes the loop; the query by id guarantees nothing is skipped or duplicated even
 // when notifications coalesce or the connection is replaced.
 func (p *Postgres) ListenEvents(ctx context.Context, fn func(e *model.Event)) {
-	var last int64
-	_ = p.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM events`).Scan(&last)
+	last, ok := listenStart(ctx, func(ctx context.Context) (int64, error) {
+		var id int64
+		err := p.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM events`).Scan(&id)
+		return id, err
+	}, 2*time.Second)
+	if !ok {
+		return
+	}
 	for ctx.Err() == nil {
 		if err := p.listenOnce(ctx, &last, fn); err != nil && ctx.Err() == nil {
 			select {
 			case <-ctx.Done():
 			case <-time.After(2 * time.Second):
 			}
+		}
+	}
+}
+
+// listenStart reads where the feed begins (the newest event now: older ones were published by
+// whoever appended them), retrying until it succeeds. Starting from 0 after a failed read would
+// replay the whole events table into the hub. ok=false when ctx ended first.
+func listenStart(ctx context.Context, read func(context.Context) (int64, error), wait time.Duration) (int64, bool) {
+	for {
+		last, err := read(ctx)
+		if err == nil {
+			return last, true
+		}
+		select {
+		case <-ctx.Done():
+			return 0, false
+		case <-time.After(wait):
 		}
 	}
 }
