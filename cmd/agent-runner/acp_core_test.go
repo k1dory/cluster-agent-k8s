@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -660,5 +661,58 @@ func TestACPCostAcrossRuns(t *testing.T) {
 	_, lines = runCore(t, agent(&cl, 0.00001), cl, next)
 	if got := costOf(lines); len(got) != 1 || !near(got[0], 0.00001) {
 		t.Fatalf("reset: %v", got)
+	}
+}
+
+// chunkedReader returns at most n bytes per Read, as a pipe may.
+type chunkedReader struct {
+	r io.Reader
+	n int
+}
+
+func (c chunkedReader) Read(p []byte) (int, error) {
+	if len(p) > c.n {
+		p = p[:c.n]
+	}
+	return c.r.Read(p)
+}
+
+// The capability is read off the initialize response however the agent's output is cut into
+// reads: byte by byte, CRLF, among other lines, after an over-long line, and a large response
+// (up to the connection's own line limit) whole or in pieces. A line over the limit is ignored
+// whole in every cutting (the connection cannot read it either). The bytes pass unchanged.
+func TestACPWireCapabilityDoesNotDependOnReads(t *testing.T) {
+	init := `{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"systemPrompt":{"mode":{"override":{}}}}}}}`
+	padded := func(n int) string {
+		return `{"jsonrpc":"2.0","id":0,"result":{"_meta":{"padding":"` + strings.Repeat("x", n) +
+			`"},"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"systemPrompt":{}}}}}` + "\n"
+	}
+	large := padded(3 << 20)               // well over the old 1 MiB, under the limit
+	tooLong := padded(maxSniffLine + 8192) // over the limit
+	for _, tc := range []struct {
+		name, input string
+		want        bool
+	}{
+		{"bytes", init + "\n", true},
+		{"crlf", init + "\r\n", true},
+		{"among lines", "{}\n" + init + "\n{}\n", true},
+		{"after an over-long line", strings.Repeat("x", maxSniffLine+8192) + "\n" + init + "\n", true},
+		{"large", large, true},
+		{"over the limit", tooLong, false},
+		{"over the limit, then the real one", tooLong + init + "\n", true},
+	} {
+		for _, chunk := range []int{1, 7, 4096, 1 << 20, len(tc.input)} {
+			if chunk == 1 && len(tc.input) > 1<<16 {
+				continue // byte by byte is covered by the short inputs
+			}
+			w := newACPWire(io.Discard, chunkedReader{strings.NewReader(tc.input), chunk})
+			got, err := io.ReadAll(w)
+			if err != nil || string(got) != tc.input {
+				t.Fatalf("%s/%d: bytes changed (%v)", tc.name, chunk, err)
+			}
+			if w.SystemPrompt() != tc.want {
+				t.Errorf("%s, reads of %d: capability %v, want %v", tc.name, chunk, w.SystemPrompt(), tc.want)
+			}
+		}
 	}
 }

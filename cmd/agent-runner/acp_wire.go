@@ -22,9 +22,10 @@ import (
 // resume. It never reaches the agent.
 const systemPromptMetaKey = "agent-sandbox/systemPrompt"
 
-// maxSniffLine bounds what the reader keeps of one line while it looks for the initialize
-// response; a longer line is not it.
-const maxSniffLine = 1 << 20
+// maxSniffLine is the longest line the reader looks at: the connection's own limit (acp-go-sdk
+// reads lines with a 10 MiB bufio.Scanner and cannot take a longer one). Whatever the agent's
+// output is cut into by the pipe, a line up to it is looked at whole and a longer one not at all.
+const maxSniffLine = 10 << 20
 
 type acpWire struct {
 	w io.Writer
@@ -33,8 +34,9 @@ type acpWire struct {
 	systemPrompt atomic.Bool // the agent declared sessionCapabilities.systemPrompt
 	done         atomic.Bool // the initialize response has been seen: stop looking
 
-	mu  sync.Mutex
-	buf []byte
+	mu   sync.Mutex
+	buf  []byte
+	skip bool // the current line is longer than maxSniffLine: ignored up to its newline
 }
 
 func newACPWire(agentStdin io.Writer, agentStdout io.Reader) *acpWire {
@@ -60,21 +62,28 @@ func (x *acpWire) sniff(b []byte) {
 	defer x.mu.Unlock()
 	for len(b) > 0 && !x.done.Load() {
 		i := bytes.IndexByte(b, '\n')
-		if i < 0 {
-			if len(x.buf)+len(b) <= maxSniffLine {
-				x.buf = append(x.buf, b...)
+		part := b
+		if i >= 0 {
+			part = b[:i]
+		}
+		if !x.skip {
+			if len(x.buf)+len(part) > maxSniffLine {
+				x.buf, x.skip = x.buf[:0], true
 			} else {
-				x.buf = x.buf[:0]
+				x.buf = append(x.buf, part...)
 			}
+		}
+		if i < 0 {
 			return
 		}
-		line := b[:i]
-		if len(x.buf) > 0 {
-			line = append(x.buf, line...)
+		if !x.skip {
+			x.inspect(bytes.TrimSuffix(x.buf, []byte("\r")))
 		}
-		x.inspect(line)
-		x.buf = x.buf[:0]
+		x.buf, x.skip = x.buf[:0], false
 		b = b[i+1:]
+	}
+	if x.done.Load() {
+		x.buf = nil // nothing more to look at
 	}
 }
 
