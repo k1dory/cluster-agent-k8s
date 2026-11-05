@@ -23,7 +23,7 @@ spec:
   harness:
     command: claude-agent-acp
     input: acp
-    permissions: allow
+    permissions: allow       # ask: a person answers each request and Claude's questions (POST /requests/{id})
     mode: default
     # claude-agent-acp's session options (_meta.claudeCode.options of every session request):
     # no predicted next prompt after each turn (a generation nobody reads). maxTurns and

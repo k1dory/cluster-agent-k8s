@@ -3,6 +3,8 @@ package harness
 import (
 	"encoding/json"
 	"strings"
+
+	"github.com/k1dory/acpx"
 )
 
 // InputACP: the runner speaks the Agent Client Protocol (https://agentclientprotocol.com) to the
@@ -26,6 +28,10 @@ const (
 	ACPNotice      = "acp.notice"       // severity, title, text: a notice for the user (a limit, an error it recovered from)
 	ACPCompaction  = "acp.compaction"   // compaction_id, status, error, text (its summary): the agent compacted its context
 	ACPSessionInfo = "acp.session_info" // title: the session's title as the agent names it
+	// What the agent asks a person, and the agent's commands.
+	ACPRequest  = "acp.request"          // request: what the agent asks (a permission, a form, a link) and waits for
+	ACPResolved = "acp.request_resolved" // request_id, outcome, by: how a request was answered
+	ACPCommands = "acp.commands"         // commands: the slash commands the agent offers, the whole list each time it changes
 )
 
 // ACPLine is one line of an ACP harness's output as the runner writes it.
@@ -53,6 +59,22 @@ type ACPLine struct {
 	// Compaction: its id and, when it failed, why.
 	CompactionID string `json:"compaction_id,omitempty"`
 	Error        string `json:"error,omitempty"`
+	// Request: what the agent asks a person (acpx.Request: request_id, kind, options, schema, url…).
+	Request *acpx.Request `json:"request,omitempty"`
+	// Resolution: the request answered, how (the option's kind, accept, decline, cancelled), and
+	// by whom: user, timeout, policy (the profile answered), invalid (an answer that did not fit).
+	RequestID string `json:"request_id,omitempty"`
+	Outcome   string `json:"outcome,omitempty"`
+	By        string `json:"by,omitempty"`
+	// Commands: name, description and the hint for its input.
+	Commands []ACPCommand `json:"commands,omitempty"`
+}
+
+// ACPCommand is one slash command an agent offers.
+type ACPCommand struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Hint        string `json:"hint,omitempty"`
 }
 
 // ACPPlanEntry is one step of an agent's plan: pending, in_progress or completed.
@@ -101,4 +123,7 @@ const (
 const (
 	PermissionsAllow = "allow" // pick the agent's allow option: the sandbox is the boundary
 	PermissionsDeny  = "deny"  // pick its reject option
+	// PermissionsAsk: a person answers (acp.request, POST /requests/{id}); the agent may also ask
+	// them questions (elicitation). Unanswered within the ask timeout: refused.
+	PermissionsAsk = "ask"
 )

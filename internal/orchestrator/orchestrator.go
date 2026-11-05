@@ -102,6 +102,9 @@ type Config struct {
 	// EnvVersion fingerprints the environment a pod is started under (policy content, harness
 	// command, image, pod env); stored on the sandbox so drift is visible. nil → "".
 	EnvVersion func(sb *model.Sandbox) string
+	// DefaultHarnessInput is the input mode of the deployment's default harness (kube.harness_input):
+	// a sandbox whose profile names no harness of its own runs it.
+	DefaultHarnessInput string
 }
 
 // SlugQuota: the static configuration has no per-slug limits.
@@ -817,7 +820,7 @@ func (o *Orchestrator) Input(ctx context.Context, sandboxID, runID, text string)
 	default:
 		return fmt.Errorf("%w: run is %s", ErrConflict, r.Status)
 	}
-	if !streamsInput(sb) {
+	if !o.streamsInput(sb) {
 		// The runner closes a text-mode harness's stdin after the task: an input event would be
 		// recorded and never read.
 		return fmt.Errorf("%w: a text-mode harness takes no input during a run; send it as a message (it becomes the next run)", ErrConflict)

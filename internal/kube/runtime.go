@@ -64,6 +64,7 @@ type PodConfig struct {
 	HarnessThoughtLevel  string // acp: the reasoning level
 	HarnessSessionMeta   string // acp: the sessions' _meta (JSON)
 	HarnessInstructions  string // acp: "", file or env:NAME
+	HarnessAskTimeout    int    // acp, permissions ask: seconds a request waits for a person (0: 900)
 	// Env is the operator's environment (deployment configuration): trusted, set on every
 	// container of the pod. UserEnv is the sandbox's profile environment: it reaches the agent
 	// container only, and never under a platform name (model.PlatformEnv) or one Env sets.
@@ -137,6 +138,7 @@ func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 		e.HarnessInput, e.HarnessPermissions, e.HarnessAuthMethod = l.HarnessInput, l.HarnessPermissions, l.HarnessAuthMethod
 		e.HarnessMode, e.HarnessMCP = l.HarnessMode, l.HarnessMCP
 		e.HarnessThoughtLevel, e.HarnessSessionMeta, e.HarnessInstructions = l.HarnessThoughtLevel, l.HarnessSessionMeta, l.HarnessInstructions
+		e.HarnessAskTimeout = l.HarnessAskTimeout
 	} else {
 		pick(&e.HarnessResumeCommand, l.HarnessResumeCommand)
 		pick(&e.HarnessInput, l.HarnessInput)
@@ -147,6 +149,9 @@ func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 		pick(&e.HarnessThoughtLevel, l.HarnessThoughtLevel)
 		pick(&e.HarnessSessionMeta, l.HarnessSessionMeta)
 		pick(&e.HarnessInstructions, l.HarnessInstructions)
+		if l.HarnessAskTimeout > 0 {
+			e.HarnessAskTimeout = l.HarnessAskTimeout
+		}
 	}
 	pick(&e.ResumePrompt, l.ResumePrompt)
 	if l.ChatIdle > 0 {
@@ -304,6 +309,7 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 		{Name: "HARNESS_THOUGHT_LEVEL", Value: c.HarnessThoughtLevel},
 		{Name: "HARNESS_SESSION_META", Value: c.HarnessSessionMeta},
 		{Name: "HARNESS_INSTRUCTIONS", Value: c.HarnessInstructions},
+		{Name: "HARNESS_ASK_TIMEOUT", Value: strconv.Itoa(c.HarnessAskTimeout)},
 		{Name: "SANDBOX_AGENT_VERSION", Value: c.Image},
 		{Name: "SANDBOX_ENV_VERSION", Value: sb.EnvVersion},
 		{Name: "SANDBOX_AGENT_REF", Value: sb.AgentRef},

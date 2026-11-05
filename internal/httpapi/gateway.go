@@ -220,7 +220,7 @@ func (g *Gateway) pollInput(w http.ResponseWriter, r *http.Request, id *identity
 		// Type and run scope are both applied in the store, before LIMIT: events of other runs
 		// in this sandbox cannot fill the page and hide ours.
 		out, err := g.Orch.Store.QueryEvents(r.Context(), store.Filter{SandboxID: id.SandboxID, AfterID: after,
-			Types: []string{model.EventInput, model.EventRunCancel, model.EventRunClose}, RunScope: run.ID, Limit: 200})
+			Types: []string{model.EventInput, model.EventReply, model.EventRunCancel, model.EventRunClose}, RunScope: run.ID, Limit: 200})
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return

@@ -660,6 +660,12 @@ func forwardInput(ctx context.Context, c *client, runID string, w inputSink, can
 			case model.EventRunClose:
 				fmt.Println("agent-runner: conversation closed by the control plane")
 				return
+			case model.EventReply:
+				// A person's answer to a request of the agent: to the conversation that holds it.
+				if r, ok := w.(interface{ Reply(string) error }); ok {
+					_ = r.Reply(e.Data)
+				}
+				continue
 			}
 			if !chat.streams() {
 				// stdin is closed (see execute). The control plane turns a message for a

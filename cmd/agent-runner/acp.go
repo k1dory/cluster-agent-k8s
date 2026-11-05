@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -96,7 +97,8 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	// has the wire before the connection delivers anything.
 	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{Notices: true, Compaction: true})
 	cl := &acpClient{emit: emit, permissions: os.Getenv("HARNESS_PERMISSIONS"), instructionsDelivered: delivered,
-		usageDir: filepath.Join(os.Getenv("HOME"), ".sandbox-acp-usage"), wire: wire, systemPrompt: wire.SystemPrompt}
+		usageDir: filepath.Join(os.Getenv("HOME"), ".sandbox-acp-usage"), wire: wire, systemPrompt: wire.SystemPrompt,
+		pending: acpx.NewPending(), askTimeout: askTimeout(os.Getenv("HARNESS_ASK_TIMEOUT"))}
 	conn := wire.Connect(cl)
 	exit := driveACP(runCtx, conn, cl, run, emit, chat, func(inputs inputSink) {
 		go forwardInput(runCtx, c, run.ID, inputs, cancel, chat)
@@ -119,6 +121,14 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	_ = outW.Close()
 	outputDone.Wait()
 	return exit
+}
+
+// askTimeout is how long a request waits for a person (HARNESS_ASK_TIMEOUT seconds; 0 or unset: 15 minutes).
+func askTimeout(v string) time.Duration {
+	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
+		return time.Duration(n) * time.Second
+	}
+	return 15 * time.Minute
 }
 
 // signalGroup sends sig to the process group the command leads.
@@ -221,8 +231,9 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 	init, err := conn.Initialize(ctx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		// The agent works in its own pod with its own tools: the runner offers no file system
-		// or terminal of its own.
-		ClientCapabilities: acp.ClientCapabilities{},
+		// or terminal of its own. With permissions ask a person is there: the agent may ask them
+		// questions (a form, a sign-in link).
+		ClientCapabilities: clientCapabilities(cl.permissions),
 	})
 	if err != nil {
 		notice("acp initialize: %v", err)
@@ -355,6 +366,7 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 	usage := newACPUsage(sess.agent, string(sessionID), cl)
 
 	inputs := newPromptQueue()
+	inputs.onReply = cl.reply
 	// A message sent while a turn runs joins it when the agent takes steering; otherwise, or when
 	// no turn is running after all, it waits for the turn to end and is the next prompt. A slash
 	// command always waits: an agent runs its commands from a prompt, steered text is only text.
@@ -364,6 +376,9 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 		inputs.steer = func(text string) bool {
 			if escapeACPPrompt(text, cl.isCommand) == text && strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "/") {
 				return false // an advertised command
+			}
+			if _, files := harness.SplitAttachments(text); len(files) > 0 {
+				return false // steering carries text only: files go with a prompt
 			}
 			sctx, done := context.WithTimeout(ctx, steerTimeout)
 			defer done()
@@ -446,7 +461,10 @@ var steerTimeout = 30 * time.Second
 // lost when its gateway restarted (unknown_execution) until the lost turn is discarded with
 // `/discard <id>`: the runner discards the turns it names and sends the prompt once more.
 func promptACP(ctx context.Context, conn acpConn, cl *acpClient, sid acp.SessionId, text string, notice func(string, ...any)) (acp.PromptResponse, error) {
-	resp, err := conn.Prompt(ctx, acp.PromptRequest{SessionId: sid, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
+	// The files a message attached (listed after its text by the control plane) go as resource
+	// links: the agent sees them as files.
+	body, files := harness.SplitAttachments(text)
+	resp, err := conn.Prompt(ctx, acp.PromptRequest{SessionId: sid, Prompt: acpx.PromptBlocks(body, files)})
 	if err == nil || ctx.Err() != nil {
 		return resp, err
 	}
@@ -463,7 +481,7 @@ func promptACP(ctx context.Context, conn acpConn, cl *acpClient, sid acp.Session
 		}
 		cl.flush()
 	}
-	return conn.Prompt(ctx, acp.PromptRequest{SessionId: sid, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
+	return conn.Prompt(ctx, acp.PromptRequest{SessionId: sid, Prompt: acpx.PromptBlocks(body, files)})
 }
 
 // lostTurnRe finds the turns Hermes's unknown_execution refusal names: "Send `/discard <id>`".
@@ -517,6 +535,15 @@ func firstPrompt(run *model.Run, fresh bool, instructions, resumePrompt string, 
 		return "<instructions>\n" + strings.TrimSpace(instructions) + "\n</instructions>\n\n" + task
 	}
 	return task
+}
+
+// clientCapabilities is what the runner offers the agent: elicitation when a person answers.
+func clientCapabilities(permissions string) acp.ClientCapabilities {
+	if permissions != harness.PermissionsAsk {
+		return acp.ClientCapabilities{}
+	}
+	return acp.ClientCapabilities{Elicitation: &acp.ElicitationCapabilities{
+		Form: &acp.ElicitationFormCapabilities{}, Url: &acp.ElicitationUrlCapabilities{}}}
 }
 
 // authMethodIDs lists the ids of the authentication methods an agent advertises.
@@ -579,6 +606,16 @@ type promptQueue struct {
 	steer     func(text string) bool
 	steering  []string // messages waiting for the worker, in order
 	steerBusy bool     // the worker is running
+	// onReply takes a person's answer to a request of the agent (a reply input event).
+	onReply func(data string)
+}
+
+// Reply hands a reply input event to the conversation (forwardInput).
+func (q *promptQueue) Reply(data string) error {
+	if q.onReply != nil {
+		q.onReply(data)
+	}
+	return nil
 }
 
 func newPromptQueue() *promptQueue { return &promptQueue{wake: make(chan struct{}, 1)} }
@@ -694,6 +731,11 @@ type acpClient struct {
 	// wire tells the SDK's updates from those it does not know (notices, compactions); nil: every
 	// update is the SDK's.
 	wire *acpx.Wire
+	// pending holds the requests waiting for a person (permissions ask), askTimeout how long.
+	pending    *acpx.Pending
+	askTimeout time.Duration
+	// lastCommands is the list of commands last written (acp.commands is written when it changes).
+	lastCommands string
 	// usageDir keeps the last cumulative usage of the sessions of an agent that reports one
 	// (acpUsage); "" keeps it in memory only.
 	usageDir string
@@ -810,8 +852,19 @@ func (a *acpClient) SessionUpdate(_ context.Context, n acp.SessionNotification) 
 	// The agent's commands are state, whenever they come (a load announces them too).
 	if u.AvailableCommandsUpdate != nil {
 		a.commands = map[string]bool{}
+		l := harness.ACPLine{Type: harness.ACPCommands, Commands: []harness.ACPCommand{}}
 		for _, c := range u.AvailableCommandsUpdate.AvailableCommands {
 			a.commands[c.Name] = true
+			cmd := harness.ACPCommand{Name: c.Name, Description: c.Description}
+			if c.Input != nil && c.Input.Unstructured != nil {
+				cmd.Hint = c.Input.Unstructured.Hint
+			}
+			l.Commands = append(l.Commands, cmd)
+		}
+		// A client lists them for its user (role commands); written when the list changes.
+		if line := l.String(); line != a.lastCommands {
+			a.lastCommands = line
+			a.emit(line)
 		}
 		return nil
 	}
@@ -943,17 +996,22 @@ func diffChange(meta map[string]any, path string) (change, oldPath string) {
 	return change, oldPath
 }
 
-// RequestPermission picks the agent's own option that matches the profile's policy (allow:
-// allow_once, else allow_always; deny: reject_once, else reject_always) and records it. With no
-// matching option the request is cancelled, which the agent treats as a refusal.
-func (a *acpClient) RequestPermission(_ context.Context, p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
-	want := []acp.PermissionOptionKind{acp.PermissionOptionKindAllowOnce, acp.PermissionOptionKindAllowAlways}
-	if a.permissions == harness.PermissionsDeny {
-		want = []acp.PermissionOptionKind{acp.PermissionOptionKindRejectOnce, acp.PermissionOptionKindRejectAlways}
-	}
+// RequestPermission answers the agent's permission request by the profile's policy: allow picks
+// the agent's allow_once (else allow_always) option, deny its reject_once (else reject_always);
+// with no matching option the request is cancelled, which the agent treats as a refusal. With
+// ask a person answers (askPerson). Every request and its decision are recorded.
+func (a *acpClient) RequestPermission(ctx context.Context, p acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
 	l := harness.ACPLine{Type: harness.ACPPermission, ToolCallID: string(p.ToolCall.ToolCallId), Decision: "cancelled"}
 	if p.ToolCall.Title != nil {
 		l.Title = *p.ToolCall.Title
+	}
+	diffs := acpDiffs(p.ToolCall.Content)
+	if a.permissions == harness.PermissionsAsk {
+		return a.askPermission(ctx, p, l, diffs)
+	}
+	want := []acp.PermissionOptionKind{acp.PermissionOptionKindAllowOnce, acp.PermissionOptionKindAllowAlways}
+	if a.permissions == harness.PermissionsDeny {
+		want = []acp.PermissionOptionKind{acp.PermissionOptionKindRejectOnce, acp.PermissionOptionKindRejectAlways}
 	}
 	out := acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}}
 pick:
@@ -969,13 +1027,121 @@ pick:
 	a.mu.Lock()
 	// OpenCode and Hermes send the change's full diff only here, in the tool call the request is
 	// about; the call's own updates may refine it (withDiffsLocked).
-	a.withDiffsLocked(&l, acpDiffs(p.ToolCall.Content))
+	a.withDiffsLocked(&l, diffs)
 	// Requests are dispatched independently of ordered session notifications.
 	// A permission callback may overtake text chunks, so only the notification
 	// stream and the prompt response may flush the pending assistant message.
 	a.emit(l.String())
 	a.mu.Unlock()
 	return out, nil
+}
+
+// askPermission puts the request to a person: an acp.request line (the agent's options and the
+// change's diff) the control plane shows, then the answer the person sends
+// (POST /requests/{id} → a reply input event → reply), within the ask timeout. Unanswered, or
+// answered with something the request did not offer, it is refused (cancelled outcome). The
+// decision is recorded as an acp.permission line and the resolution as acp.request_resolved.
+func (a *acpClient) askPermission(ctx context.Context, p acp.RequestPermissionRequest, l harness.ACPLine, diffs []harness.ACPDiff) (acp.RequestPermissionResponse, error) {
+	req := a.pending.Open(acpx.PermissionRequest(p))
+	rl := harness.ACPLine{Type: harness.ACPRequest, Request: &req, ToolCallID: req.ToolCallID}
+	a.mu.Lock()
+	a.withDiffsLocked(&rl, diffs)
+	a.emit(rl.String())
+	a.mu.Unlock()
+
+	reply, by := a.awaitReply(ctx, req.ID)
+	resp := acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}}
+	outcome := "cancelled"
+	if by == "user" {
+		var err error
+		if resp, outcome, err = acpx.PermissionResponse(req, reply); err != nil {
+			by = "invalid"
+			a.notice("request %s: %v: refused", req.ID, err)
+		}
+	}
+	l.Decision = outcome
+	a.mu.Lock()
+	a.emit(l.String())
+	a.emit(harness.ACPLine{Type: harness.ACPResolved, RequestID: req.ID, Outcome: outcome, By: by}.String())
+	a.mu.Unlock()
+	return resp, nil
+}
+
+// awaitReply waits for a person's reply to an open request; by is "user", or "timeout" / "cancelled"
+// when none came.
+func (a *acpClient) awaitReply(ctx context.Context, id string) (acpx.Reply, string) {
+	reply, ok := a.pending.Wait(ctx, id, a.askTimeout)
+	switch {
+	case ok:
+		return reply, "user"
+	case ctx.Err() != nil:
+		return reply, "cancelled"
+	}
+	return reply, "timeout"
+}
+
+// UnstableCreateElicitation puts the agent's question to a person (permissions ask, which is when
+// the runner advertises elicitation): a form (AskUserQuestion, an MCP server's form) or a link
+// (an MCP server's OAuth sign-in). The answer is checked against the form; unanswered, or not
+// fitting, the question is cancelled.
+func (a *acpClient) UnstableCreateElicitation(ctx context.Context, p acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error) {
+	if a.permissions != harness.PermissionsAsk || a.pending == nil {
+		return acpx.CancelledElicitation(), nil // nobody to ask (not advertised either)
+	}
+	r, err := acpx.ElicitationRequest(p)
+	if err != nil {
+		return acpx.CancelledElicitation(), nil
+	}
+	req := a.pending.Open(r)
+	a.mu.Lock()
+	a.flushLocked() // the question follows what the agent said before it
+	a.emit(harness.ACPLine{Type: harness.ACPRequest, Request: &req}.String())
+	a.mu.Unlock()
+
+	reply, by := a.awaitReply(ctx, req.ID)
+	resp, outcome := acpx.CancelledElicitation(), "cancelled"
+	if by == "user" {
+		if resp, err = acpx.ElicitationResponse(req, reply); err != nil {
+			by = "invalid"
+			a.notice("request %s: %v: cancelled", req.ID, err)
+		} else {
+			outcome = reply.Action
+		}
+	}
+	a.mu.Lock()
+	a.emit(harness.ACPLine{Type: harness.ACPResolved, RequestID: req.ID, Outcome: outcome, By: by}.String())
+	a.mu.Unlock()
+	return resp, nil
+}
+
+// UnstableCompleteElicitation: the agent says a link question was completed on its side (the
+// sign-in finished); the request has been answered already.
+func (a *acpClient) UnstableCompleteElicitation(context.Context, acp.UnstableCompleteElicitationNotification) error {
+	return nil
+}
+
+// reply hands a person's answer (a reply input event: acpx.Reply JSON) to the request it names.
+// One that names no request waiting (answered already, timed out) is recorded and dropped.
+func (a *acpClient) reply(data string) {
+	var r acpx.Reply
+	if err := json.Unmarshal([]byte(data), &r); err != nil {
+		a.notice("reply: %v", err)
+		return
+	}
+	if a.pending == nil {
+		return
+	}
+	if err := a.pending.Resolve(r); err != nil {
+		a.mu.Lock()
+		a.emit(harness.ACPLine{Type: harness.ACPResolved, RequestID: r.RequestID, Outcome: "not_waiting", By: "user"}.String())
+		a.mu.Unlock()
+	}
+}
+
+func (a *acpClient) notice(format string, args ...any) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.emit("[agent-runner] " + fmt.Sprintf(format, args...))
 }
 
 var errNoClientCapability = errors.New("agent-runner offers no client file system or terminal")

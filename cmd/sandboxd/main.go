@@ -308,6 +308,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 		ReadyTimeout: cfg.Sandbox.ReadyTimeout, IdleCheckEvery: cfg.Sandbox.IdleCheckEvery,
 		DefaultQuota: cfg.Quotas.Default, Quotas: cfg.Quotas.Tenants,
 		DefaultAgentVersion: cfg.Agent.Default, Versions: cfg.Agent.Versions, EnvVersion: envVersion,
+		DefaultHarnessInput: cfg.Kube.HarnessInput,
 	}, log)
 	orch.ListenerPublishes = hasListener
 	orchDone := make(chan struct{})

@@ -44,6 +44,7 @@ type coreConn struct {
 	mu       sync.Mutex
 	calls    []string
 	prompts  []string
+	blocks   [][]acp.ContentBlock
 	newReq   *acp.NewSessionRequest
 	loadReq  *acp.LoadSessionRequest
 	resumReq *acp.ResumeSessionRequest
@@ -105,6 +106,7 @@ func (c *coreConn) Prompt(_ context.Context, p acp.PromptRequest) (acp.PromptRes
 	n := len(c.prompts)
 	text := p.Prompt[0].Text.Text
 	c.prompts = append(c.prompts, text)
+	c.blocks = append(c.blocks, p.Prompt)
 	c.mu.Unlock()
 	if c.prompt == nil {
 		return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"agent-sandbox/internal/catalog"
+	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"github.com/k1dory/acpx"
 )
@@ -225,11 +226,16 @@ func TestACPClaudeExampleTakesTheSystemPromptAndMode(t *testing.T) {
 	}
 	defer stopAdapter(stdin, cancel, cmd)
 	var notices []string
-	emit := func(l string) { notices = append(notices, l) }
+	emit := func(l string) {
+		if strings.HasPrefix(l, "[agent-runner] ") { // a notice; ACP lines (acp.commands…) are output
+			notices = append(notices, l)
+		}
+	}
 	// The runner's own wiring: notices and compaction updates asked for, the profile's session
 	// options in _meta (the adapter refuses options it cannot take).
 	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{Notices: true, Compaction: true})
-	cl := &acpClient{emit: emit, wire: wire, systemPrompt: wire.SystemPrompt}
+	// A person answers (permissions ask): the client offers elicitation, which the adapter takes.
+	cl := &acpClient{emit: emit, wire: wire, systemPrompt: wire.SystemPrompt, permissions: harness.PermissionsAsk}
 	conn := wire.Connect(cl)
 	meta, _ := json.Marshal(profile.Harness.SessionMeta)
 	t.Setenv("HARNESS_SESSION_META", string(meta))

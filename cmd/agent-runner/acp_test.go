@@ -502,7 +502,11 @@ func openRealACP(t *testing.T, isolate []string, agent, home string, env []strin
 		t.Fatal(err)
 	}
 	defer stopAdapter(stdin, cancel, cmd)
-	emit := func(l string) { notices = append(notices, l) }
+	emit := func(l string) {
+		if strings.HasPrefix(l, "[agent-runner] ") { // a notice; ACP lines (acp.commands…) are output
+			notices = append(notices, l)
+		}
+	}
 	// The runner's own wiring (executeACP): the wire carries the system prompt.
 	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{})
 	cl := &acpClient{emit: emit, systemPrompt: wire.SystemPrompt}
