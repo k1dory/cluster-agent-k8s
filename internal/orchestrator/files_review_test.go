@@ -36,3 +36,26 @@ func TestReviewPendingFSContinuesPastAnsweredPage(t *testing.T) {
 		t.Fatalf("one unanswered request follows a completed page, got %d pending requests", len(pending))
 	}
 }
+
+// The FS waiter subscribed to every event of the sandbox; a run streaming output while the
+// runner answered filled its 64-slot buffer, the hub dropped the fs.result and the request
+// timed out although it had been answered.
+func TestReviewFSAnswerSurvivesOutputBurst(t *testing.T) {
+	o, _, sb := reviewRunningSandbox(t)
+	ctx := t.Context()
+	reqs, cancel := o.Hub.SubscribeTypes(sb.ID, model.EventFSRequest)
+	defer cancel()
+	go func() {
+		e := <-reqs
+		var req model.FSRequest
+		_ = json.Unmarshal([]byte(e.Data), &req)
+		for range 200 {
+			o.Hub.Publish(model.Event{SandboxID: sb.ID, Type: model.EventRunOutput, Data: "line"})
+		}
+		_ = o.AnswerFS(ctx, sb.ID, model.FSResult{Request: req.ID, OK: true, Size: 5})
+	}()
+	res, err := o.FS(ctx, sb.ID, model.FSRequest{Op: model.FSList, Path: "repo"}, false, 2*time.Second)
+	if err != nil || !res.OK || res.Size != 5 {
+		t.Fatalf("answer after an output burst: %v %+v", err, res)
+	}
+}

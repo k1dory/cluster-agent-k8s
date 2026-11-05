@@ -10,23 +10,41 @@ import (
 // Hub is a per-sandbox broadcast channel set.
 type Hub struct {
 	mu   sync.Mutex
-	subs map[string]map[chan model.Event]struct{}
+	subs map[string]map[chan model.Event]filter
 }
 
+// filter is the set of event types a subscriber takes; nil takes every type.
+type filter map[string]bool
+
 // New returns an empty hub.
-func New() *Hub { return &Hub{subs: map[string]map[chan model.Event]struct{}{}} }
+func New() *Hub { return &Hub{subs: map[string]map[chan model.Event]filter{}} }
 
 // All is the subscription key that receives every sandbox's events (tenant-wide traces).
 const All = "*"
 
 // Subscribe returns a channel receiving events for sandboxID (or All) and a cancel func.
 func (h *Hub) Subscribe(sandboxID string) (<-chan model.Event, func()) {
+	return h.subscribe(sandboxID, nil)
+}
+
+// SubscribeTypes is Subscribe restricted to the given event types, filtered before the buffer:
+// a caller waiting for one answer (an fs.result) does not lose it to a burst of run output
+// filling the channel, which Publish drops on rather than block.
+func (h *Hub) SubscribeTypes(sandboxID string, types ...string) (<-chan model.Event, func()) {
+	f := filter{}
+	for _, t := range types {
+		f[t] = true
+	}
+	return h.subscribe(sandboxID, f)
+}
+
+func (h *Hub) subscribe(sandboxID string, f filter) (<-chan model.Event, func()) {
 	ch := make(chan model.Event, 64)
 	h.mu.Lock()
 	if h.subs[sandboxID] == nil {
-		h.subs[sandboxID] = map[chan model.Event]struct{}{}
+		h.subs[sandboxID] = map[chan model.Event]filter{}
 	}
-	h.subs[sandboxID][ch] = struct{}{}
+	h.subs[sandboxID][ch] = f
 	h.mu.Unlock()
 	return ch, func() {
 		h.mu.Lock()
@@ -46,7 +64,10 @@ func (h *Hub) Publish(e model.Event) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, key := range [2]string{e.SandboxID, All} {
-		for ch := range h.subs[key] {
+		for ch, f := range h.subs[key] {
+			if f != nil && !f[e.Type] {
+				continue
+			}
 			select {
 			case ch <- e:
 			default:
