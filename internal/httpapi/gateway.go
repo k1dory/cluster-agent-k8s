@@ -56,8 +56,8 @@ func (g *Gateway) Routes() http.Handler {
 func (g *Gateway) bootstrap(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	var req registrar.BootstrapRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeStrict(w, r, &req, smallBodyLimit); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	res, err := g.Registrar.Bootstrap(r.Context(), token, req)
@@ -291,8 +291,8 @@ func (g *Gateway) fsRequests(w http.ResponseWriter, r *http.Request, id *identit
 // fsResult records the pod's answer to a file request.
 func (g *Gateway) fsResult(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
 	var res model.FSResult
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxBodyBytes)).Decode(&res); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeStrict(w, r, &res, MaxBodyBytes); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	if res.Blob != "" && !orchestrator.OwnsFSBlob(id.SandboxID, res.Blob) {

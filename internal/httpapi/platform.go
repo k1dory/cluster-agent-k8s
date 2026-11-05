@@ -188,8 +188,8 @@ func (p *Platform) Routes() http.Handler {
 // rollout answers POST /v1/rollouts: move agents to another version (see orchestrator.RolloutRequest).
 func (p *Platform) rollout(w http.ResponseWriter, r *http.Request) {
 	var req orchestrator.RolloutRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	pr := principalOf(r)
@@ -355,9 +355,12 @@ func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, errors.New("Idempotency-Key longer than 200 bytes"))
 			return
 		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		// The routes it wraps take JSON (or, for messages, multipart) under the body policy's
+		// cap: the hash is over the whole body, never a prefix of it, so two requests that differ
+		// past some offset are never taken for the same one. Over the cap is 413.
+		body, err := readBody(w, r, messageBodyLimit(r))
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			writeBodyErr(w, err)
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
@@ -447,8 +450,8 @@ func (p *Platform) list(w http.ResponseWriter, r *http.Request) {
 
 func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 	var req orchestrator.CreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	pr := principalOf(r)
@@ -495,8 +498,8 @@ func (p *Platform) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req orchestrator.UpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	if p.TTLFromToken {
@@ -596,8 +599,8 @@ func (p *Platform) createRun(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Task string `json:"task"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	run, err := p.Orch.CreateRun(r.Context(), r.PathValue("id"), req.Task)
@@ -645,8 +648,8 @@ func (p *Platform) input(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Text string `json:"text"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	if err := p.Orch.Input(r.Context(), r.PathValue("id"), r.PathValue("run"), req.Text); err != nil {
@@ -754,8 +757,8 @@ func (p *Platform) setPreview(w http.ResponseWriter, r *http.Request) {
 		Port   int    `json:"port"`
 		Access string `json:"access"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	sb, err := p.Orch.SetPreview(r.Context(), r.PathValue("id"), req.Port, req.Access)
@@ -775,8 +778,8 @@ func (p *Platform) previewTicket(w http.ResponseWriter, r *http.Request) {
 		User string `json:"user"`
 		Next string `json:"next"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	if sb.Preview == nil {

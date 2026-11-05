@@ -1,0 +1,182 @@
+package httpapi
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"strings"
+	"testing"
+
+	"agent-sandbox/internal/orchestrator"
+)
+
+// errorOf decodes the error envelope and fails unless the response is one.
+func errorOf(t *testing.T, resp *http.Response, body []byte) ErrorBody {
+	t.Helper()
+	var e ErrorBody
+	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") || json.Unmarshal(body, &e) != nil || e.Code == "" || e.Error == "" {
+		t.Fatalf("not the error envelope: %d %s %q", resp.StatusCode, resp.Header.Get("Content-Type"), body)
+	}
+	if e.RequestID == "" || e.RequestID != resp.Header.Get("X-Request-Id") {
+		t.Fatalf("request_id %q does not match the header %q", e.RequestID, resp.Header.Get("X-Request-Id"))
+	}
+	return e
+}
+
+func wantErr(t *testing.T, what string, resp *http.Response, body []byte, status int, code string) {
+	t.Helper()
+	if resp.StatusCode != status {
+		t.Fatalf("%s: %d %s, want %d", what, resp.StatusCode, body, status)
+	}
+	if e := errorOf(t, resp, body); e.Code != code {
+		t.Fatalf("%s: code %q, want %q (%s)", what, e.Code, code, body)
+	}
+}
+
+// multipartBody is a message with a text field and files, under the given boundary.
+func multipartBody(t *testing.T, boundary, text string, files ...[2]string) (string, []byte) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	if boundary != "" {
+		if err := mw.SetBoundary(boundary); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = mw.WriteField("text", text)
+	for _, f := range files {
+		fw, _ := mw.CreateFormFile("file", f[0])
+		_, _ = fw.Write([]byte(f[1]))
+	}
+	_ = mw.Close()
+	return mw.FormDataContentType(), buf.Bytes()
+}
+
+func postRaw(t *testing.T, url, token, contentType string, body io.Reader, hdr map[string]string) (*http.Response, []byte) {
+	t.Helper()
+	req, _ := http.NewRequest("POST", url, body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", contentType)
+	for k, v := range hdr {
+		req.Header.Set(k, v)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	out, _ := io.ReadAll(resp.Body)
+	return resp, out
+}
+
+// Small JSON bodies are one class: capped at jsonBodyLimit (413 over it, also when the
+// idempotency middleware reads the body first) and strict (400 for unknown fields or
+// trailing data), on every route of the class.
+func TestReviewJSONBodiesAreCappedAndStrict(t *testing.T) {
+	s := newStack(t)
+	api := s.platform.URL
+	resp, body := call(t, "POST", api+"/v1/sandboxes", "t0k", map[string]any{"name": "caps", "slug": "backend-dev", "owner": "alice"}, nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("create: %d %s", resp.StatusCode, body)
+	}
+	var sb struct{ ID string }
+	_ = json.Unmarshal(body, &sb)
+	big := `{"name":"x","pad":"` + strings.Repeat("a", jsonBodyLimit) + `"}`
+	routes := []struct{ method, path string }{
+		{"POST", "/v1/sandboxes"},
+		{"PATCH", "/v1/sandboxes/" + sb.ID},
+		{"POST", "/v1/sandboxes/" + sb.ID + "/runs"},
+		{"POST", "/v1/sandboxes/" + sb.ID + "/runs/r1/input"},
+		{"POST", "/v1/sandboxes/" + sb.ID + "/messages"},
+		{"POST", "/v1/sandboxes/" + sb.ID + "/requests/q1"},
+		{"PUT", "/v1/sandboxes/" + sb.ID + "/preview"},
+		{"POST", "/v1/sandboxes/" + sb.ID + "/preview/ticket"},
+		{"POST", "/v1/rollouts"},
+	}
+	for _, rt := range routes {
+		resp, body := call(t, rt.method, api+rt.path, "t0k", big, nil)
+		wantErr(t, rt.method+" "+rt.path+" over the cap", resp, body, 413, CodeTooLarge)
+		resp, body = call(t, rt.method, api+rt.path, "t0k", `{"no_such_field":1}`, nil)
+		wantErr(t, rt.method+" "+rt.path+" unknown field", resp, body, 400, CodeBadRequest)
+		resp, body = call(t, rt.method, api+rt.path, "t0k", `{} {}`, nil)
+		wantErr(t, rt.method+" "+rt.path+" trailing data", resp, body, 400, CodeBadRequest)
+	}
+	// With an Idempotency-Key the middleware reads first: still 413, never a hash of a prefix.
+	for _, path := range []string{"/v1/sandboxes", "/v1/sandboxes/" + sb.ID + "/runs", "/v1/sandboxes/" + sb.ID + "/messages"} {
+		resp, body := call(t, "POST", api+path, "t0k", big, map[string]string{"Idempotency-Key": "k-" + path})
+		wantErr(t, "keyed "+path+" over the cap", resp, body, 413, CodeTooLarge)
+	}
+}
+
+// Documents and bundles are capped too, with 413 rather than a parse error on a cut body.
+func TestReviewDocumentAndBundleBodiesAreCapped(t *testing.T) {
+	s, _ := configStack(t)
+	api := s.platform.URL
+	doc := `{"kind":"EnvironmentProfile","name":"py","spec":{"image":"stable","env":{"PAD":"` + strings.Repeat("a", documentBodyLimit) + `"}}}`
+	resp, body := call(t, "PUT", api+"/v1/environments/py", "alice-tok", doc, nil)
+	wantErr(t, "document over the cap", resp, body, 413, CodeTooLarge)
+	bundle := `[` + strings.Repeat(`{"kind":"EnvironmentProfile","name":"py","spec":{"image":"stable"}},`, bundleBodyLimit/60) + `{}]`
+	for _, path := range []string{"/v1/plan", "/v1/apply"} {
+		resp, body := call(t, "POST", api+path, "alice-tok", bundle, nil)
+		wantErr(t, path+" over the cap", resp, body, 413, CodeTooLarge)
+	}
+	resp, body = call(t, "POST", api+"/v1/rollback", "alice-tok", `{"apply":"a","bogus":true}`, nil)
+	wantErr(t, "rollback unknown field", resp, body, 400, CodeBadRequest)
+}
+
+// A keyed multipart message over 1 MiB used to be cut by the idempotency middleware and
+// fail with 400 "unexpected EOF"; it is accepted now, and the multipart class has its own caps.
+func TestReviewMultipartMessagesHaveTheirOwnCap(t *testing.T) {
+	s := newStack(t)
+	api, gw := s.platform.URL, s.gateway.URL
+	sb, hdr := agentOf(t, s, "upload")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	files := map[string]string{}
+	go fakeRunner(ctx, t, gw, hdr, files)
+
+	big := strings.Repeat("x", 2<<20)
+	ct, mp := multipartBody(t, "", "the big one", [2]string{"big.bin", big})
+	resp, body := postRaw(t, api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", ct, bytes.NewReader(mp), map[string]string{"Idempotency-Key": "upload-1"})
+	if resp.StatusCode != 202 || files["uploads/big.bin"] != big {
+		t.Fatalf("keyed 2 MiB upload: %d %s (stored %d bytes)", resp.StatusCode, body, len(files["uploads/big.bin"]))
+	}
+
+	var many [][2]string
+	for i := 0; i <= MaxUploadFiles; i++ {
+		many = append(many, [2]string{fmt.Sprintf("f%d.txt", i), "x"})
+	}
+	ct, mp = multipartBody(t, "", "too many", many...)
+	resp, body = postRaw(t, api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", ct, bytes.NewReader(mp), nil)
+	wantErr(t, "too many files", resp, body, 413, CodeTooLarge)
+
+	ct, mp = multipartBody(t, "", "one file over its cap", [2]string{"huge.bin", strings.Repeat("x", orchestrator.MaxFileBytes+1)})
+	resp, body = postRaw(t, api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", ct, bytes.NewReader(mp), map[string]string{"Idempotency-Key": "upload-2"})
+	wantErr(t, "file over its cap", resp, body, 413, CodeTooLarge)
+
+	if testing.Short() {
+		return
+	}
+	// The whole body is capped: a stream longer than every file at its cap is cut off at the
+	// cap with 413, before the parser can spill it all to disk.
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		fw, _ := mw.CreateFormFile("file", "endless.bin")
+		chunk := bytes.Repeat([]byte("y"), 1<<20)
+		for i := int64(0); i <= multipartBodyLimit>>20+1; i++ {
+			if _, err := fw.Write(chunk); err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+		}
+		pw.CloseWithError(mw.Close())
+	}()
+	resp, body = postRaw(t, api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", mw.FormDataContentType(), pr, nil)
+	pr.Close()
+	wantErr(t, "multipart over the total cap", resp, body, 413, CodeTooLarge)
+}

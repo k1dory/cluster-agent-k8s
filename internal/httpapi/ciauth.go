@@ -22,7 +22,7 @@ func (p *Platform) ciAuthRoutes(mux *http.ServeMux) {
 			Token string `json:"token"`
 		}
 		if err := decodeStrict(w, r, &body, 2*ciauth.MaxTokenBytes); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			writeBodyErr(w, err)
 			return
 		}
 		if body.Token == "" {

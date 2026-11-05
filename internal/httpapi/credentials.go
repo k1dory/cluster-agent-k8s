@@ -59,7 +59,7 @@ func (p *Platform) credentialRoutes(mux *http.ServeMux) {
 		// byte) inside a wrapper: a value of exactly MaxValue bytes must pass, the service then
 		// judges the value itself.
 		if err := decodeStrict(w, r, &req, 6*credentials.MaxValue+1024); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			writeBodyErr(w, err)
 			return
 		}
 		c, created, err := p.Credentials.Put(r.Context(), tenant, r.PathValue("name"), req.Value, principalOf(r).Subject)

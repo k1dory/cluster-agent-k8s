@@ -410,12 +410,18 @@ func serve(cfgPath string, log *slog.Logger) error {
 	gw := &httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, Log: log.With("log", "gateway-api"),
 		MCP: &mcpproxy.Handler{Authz: az, Hosts: services.Guard, Log: log.With("log", "mcp")}}
 
-	servers := []*http.Server{
-		{Addr: cfg.Listen.API, Handler: platform.Routes(), ReadHeaderTimeout: 10 * time.Second},
-		{Addr: cfg.Listen.Gateway, Handler: gw.Routes(), ReadHeaderTimeout: 10 * time.Second},
+	// Timeouts: a client gets 10s to send its headers and a kept-alive connection is dropped
+	// after 2 minutes of silence. There is deliberately no ReadTimeout or WriteTimeout: both
+	// count from the start of the request, so either would cut the SSE streams (events, trace,
+	// messages), the agent long-polls (up to 2 minutes of wait) and a slow multipart upload.
+	// Bodies are bounded by size instead (internal/httpapi/body.go), and handlers that wait
+	// end with the request's context.
+	server := func(addr string, h http.Handler) *http.Server {
+		return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
 	}
+	servers := []*http.Server{server(cfg.Listen.API, platform.Routes()), server(cfg.Listen.Gateway, gw.Routes())}
 	if ing != nil {
-		servers = append(servers, &http.Server{Addr: cfg.Listen.Ingress, Handler: ing, ReadHeaderTimeout: 10 * time.Second})
+		servers = append(servers, server(cfg.Listen.Ingress, ing))
 	}
 	errCh := make(chan error, len(servers))
 	for _, s := range servers {

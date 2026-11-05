@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"path"
 	"regexp"
@@ -66,14 +65,22 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req MessageRequest
 	var uploaded []string
-	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if ct == "multipart/form-data" {
-		if err := r.ParseMultipartForm(orchestrator.MaxFileBytes); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+	if isMultipart(r) {
+		// Capped as a whole (every file at its cap, see body.go), so what ParseMultipartForm
+		// spills to disk is bounded too; a form the idempotency middleware already parsed is
+		// not parsed again.
+		capBody(w, r, multipartBodyLimit)
+		if err := r.ParseMultipartForm(multipartMemory); err != nil {
+			writeBodyErr(w, err)
 			return
 		}
 		req.Text = r.FormValue("text")
-		for _, fh := range r.MultipartForm.File["file"] {
+		files := r.MultipartForm.File["file"]
+		if len(files) > MaxUploadFiles {
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("at most %d files per message", MaxUploadFiles))
+			return
+		}
+		for _, fh := range files {
 			name := uploadNameRe.ReplaceAllString(path.Base(fh.Filename), "_")
 			if name == "" || name == "." || name == ".." {
 				writeErr(w, http.StatusBadRequest, fmt.Errorf("attachment %q has no usable name", fh.Filename))
@@ -99,8 +106,8 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Attachments = append(req.Attachments, uploaded...)
 	} else {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeBodyErr(w, err)
 			return
 		}
 	}
@@ -398,8 +405,8 @@ func (p *Platform) replyRequest(w http.ResponseWriter, r *http.Request) {
 		acpx.Reply
 		RunID string `json:"run_id"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 128<<10)).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	reply := body.Reply

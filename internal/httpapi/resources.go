@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -160,9 +159,9 @@ func (p *Platform) resourceRoutes(mux *http.ServeMux, path string, get func() ve
 // caller's rights (the admin may write into any scope, a tenant only into its own) and
 // becomes the scope; a name in the body must agree with the path.
 func readDocument(w http.ResponseWriter, r *http.Request, tenant *string) (*resource.Document, bool) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	body, err := readBody(w, r, documentBodyLimit)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeBodyErr(w, err)
 		return nil, false
 	}
 	d, err := resource.ParseJSON(body)
@@ -381,10 +380,8 @@ func (p *Platform) rollback(w http.ResponseWriter, r *http.Request) {
 		Key      string `json:"key"`
 		DryRun   bool   `json:"dry_run"`
 	}
-	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, fmt.Errorf("%w: %v", resource.ErrInvalid, err))
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	if body.Key == "" {
@@ -421,9 +418,9 @@ func (p *Platform) applyBundle(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	body, err := readBody(w, r, bundleBodyLimit)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeBodyErr(w, err)
 		return
 	}
 	req, err := parseApplyBody(r, body)
@@ -581,9 +578,9 @@ func (p *Platform) planBundle(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	body, err := readBody(w, r, bundleBodyLimit)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+		writeBodyErr(w, err)
 		return
 	}
 	docs, err := parseBundle(r.Header.Get("Content-Type"), body)

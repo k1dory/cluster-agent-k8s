@@ -57,7 +57,7 @@ func (p *Platform) oauthRoutes(mux *http.ServeMux) {
 			Provider string `json:"provider"`
 		}
 		if err := decodeStrict(w, r, &req, 4096); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			writeBodyErr(w, err)
 			return
 		}
 		c, created, err := p.OAuth.Start(r.Context(), tenant, r.PathValue("name"), req.Provider, principalOf(r).Subject)
