@@ -394,11 +394,14 @@ func TestFirstPrompt(t *testing.T) {
 	}
 }
 
-// A real ACP adapter (ACP_REAL_AGENT=<command>, e.g. the codex-acp of the agent image) opens a
-// session through the runner's own setup (openACPSession: initialize, authenticate with
-// ACP_REAL_AUTH_METHOD, session/new). Nothing is prompted, and the adapter runs without network:
-// under sandbox-exec (macOS) or in a new network namespace (Linux, unshare -rn). Where neither is
-// available the test is skipped rather than allowed to reach the vendor. Opt-in.
+// A real ACP adapter (ACP_REAL_AGENT=<command>, e.g. the codex-acp or opencode of the agent
+// image) opens a session through the runner's own setup (openACPSession: initialize,
+// authenticate with ACP_REAL_AUTH_METHOD, session/new), and a second process of it — the next
+// run — tries to load that session when the agent says it can. An agent may keep no session that
+// has had no turn (codex-acp: "no rollout found"), so the load is only required with
+// ACP_REAL_LOAD_EMPTY=1 (opencode). Nothing is prompted, and the adapter runs with
+// loopback only: under sandbox-exec (macOS) or in a new network namespace (Linux, unshare -rn).
+// Where neither is available the test is skipped rather than allowed to reach the vendor. Opt-in.
 func TestACPRealAdapterOpensASession(t *testing.T) {
 	agent := os.Getenv("ACP_REAL_AGENT")
 	if agent == "" {
@@ -406,44 +409,84 @@ func TestACPRealAdapterOpensASession(t *testing.T) {
 	}
 	isolate := noNetwork(t)
 	home := t.TempDir()
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, isolate[0], append(isolate[1:], "/bin/sh", "-c", "exec "+agent)...)
-	// The adapter and whatever it starts form one process group, ended as a whole.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	cmd.Dir = home
-	cmd.Env = append(os.Environ(), "HOME="+home, "CODEX_HOME="+home, "NO_BROWSER=1")
-	cmd.WaitDelay = 2 * time.Second
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	stdin, _ := cmd.StdinPipe()
-	stdout, _ := cmd.StdoutPipe()
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = stdin.Close(); cancel(); _ = cmd.Wait() }()
 	t.Setenv("HARNESS_AUTH_METHOD", os.Getenv("ACP_REAL_AUTH_METHOD"))
 	t.Setenv("SANDBOX_MCP_SERVERS", "")
 	t.Setenv("PWD", home)
 	t.Setenv("SANDBOX_REPO_DIR", home+"/no-repo")
-	var notices []string
-	emit := func(l string) { notices = append(notices, l) }
-	cl := &acpClient{emit: emit}
-	session, _, ok := openACPSession(ctx, acp.NewClientSideConnection(cl, stdin, stdout), cl, &model.Run{ID: "run_real"}, emit)
-	if !ok || session == "" {
-		t.Fatalf("no session: %q\nadapter stderr:\n%s", notices, stderr.String())
+	open := func(run *model.Run) (session acp.SessionId, fresh bool, notices []string, canLoad bool) {
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, isolate[0], append(isolate[1:], "/bin/sh", "-c", "exec "+agent)...)
+		// The adapter and whatever it starts form one process group, ended as a whole.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+		cmd.Dir = home
+		cmd.Env = append(os.Environ(), "HOME="+home, "CODEX_HOME="+home, "NO_BROWSER=1")
+		cmd.WaitDelay = 2 * time.Second
+		var stderr strings.Builder
+		cmd.Stderr = &stderr
+		stdin, _ := cmd.StdinPipe()
+		stdout, _ := cmd.StdoutPipe()
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = stdin.Close(); cancel(); _ = cmd.Wait() }()
+		emit := func(l string) { notices = append(notices, l) }
+		cl := &acpClient{emit: emit}
+		conn := &loggedInit{ClientSideConnection: acp.NewClientSideConnection(cl, stdin, stdout), t: t}
+		session, fresh, ok := openACPSession(ctx, conn, cl, run, emit)
+		if !ok || session == "" {
+			t.Fatalf("no session: %q\nadapter stderr:\n%s", notices, stderr.String())
+		}
+		return session, fresh, notices, conn.loadSession
+	}
+	session, _, notices, canLoad := open(&model.Run{ID: "run_real"})
+	t.Logf("session %s; runner notices: %q", session, notices)
+	if !canLoad {
+		return
+	}
+	again, fresh, notices, _ := open(&model.Run{ID: "run_real_next", ResumeOf: "run_real", Session: string(session), Mode: model.RunMessage})
+	switch {
+	case !fresh && again == session:
+		t.Logf("the next run loaded session %s", session)
+	case os.Getenv("ACP_REAL_LOAD_EMPTY") == "1":
+		t.Fatalf("the next run must load session %s, got %s (fresh %v); notices %q", session, again, fresh, notices)
+	default:
+		t.Logf("the agent did not load the empty session (the runner started %s): %q", again, notices)
 	}
 }
 
-// noNetwork is the command prefix that runs a program without network access, or skips the test.
+// loggedInit logs what the agent says about itself in initialize: capabilities, auth methods.
+type loggedInit struct {
+	*acp.ClientSideConnection
+	t           *testing.T
+	loadSession bool
+}
+
+func (c *loggedInit) Initialize(ctx context.Context, p acp.InitializeRequest) (acp.InitializeResponse, error) {
+	r, err := c.ClientSideConnection.Initialize(ctx, p)
+	if err == nil {
+		b, _ := json.Marshal(struct {
+			Agent        any `json:"agent"`
+			Capabilities any `json:"capabilities"`
+			Auth         any `json:"auth_methods"`
+		}{r.AgentInfo, r.AgentCapabilities, authMethodIDs(r.AuthMethods)})
+		c.t.Logf("initialize: %s", b)
+		c.loadSession = r.AgentCapabilities.LoadSession
+	}
+	return r, err
+}
+
+// noNetwork is the command prefix that runs a program with loopback only (an agent may talk to a
+// server of its own on localhost, as opencode acp does), or skips the test.
 func noNetwork(t *testing.T) []string {
 	t.Helper()
 	if _, err := exec.LookPath("sandbox-exec"); err == nil {
-		return []string{"sandbox-exec", "-p", `(version 1)(allow default)(deny network-outbound (remote ip))`}
+		return []string{"sandbox-exec", "-p", `(version 1)(allow default)(deny network-outbound (remote ip))(allow network-outbound (remote ip "localhost:*"))`}
 	}
 	if err := exec.Command("unshare", "-rn", "true").Run(); err == nil {
-		return []string{"unshare", "-rn"}
+		// A new network namespace has only lo, and it starts down.
+		return []string{"unshare", "-rn", "/bin/sh", "-c", `ip link set lo up 2>/dev/null; exec "$@"`, "sh"}
 	}
 	t.Skip("no way to run the adapter without network here (sandbox-exec, unshare -rn)")
 	return nil
