@@ -195,21 +195,27 @@ func ensureRepo(ctx context.Context) error {
 	dir := repoDir()
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 		// The workspace volume persists; it must hold the repository that was asked for, not the
-		// one a previous configuration cloned. A different origin is moved aside, never reused;
-		// one checkout is kept aside (the latest), so changing the repository back and forth does
-		// not fill the volume.
-		out, err := exec.CommandContext(ctx, "git", "-C", dir, "remote", "get-url", "origin").Output()
-		origin := strings.TrimSpace(string(out))
-		if err == nil && origin == repo {
+		// one a previous configuration cloned. A different origin is moved aside, never reused and
+		// never deleted: it may hold work nobody pushed (uncommitted files, local commits).
+		origin := gitOrigin(ctx, dir)
+		if origin == repo {
 			return nil
 		}
-		aside := dir + ".replaced"
+		aside := fmt.Sprintf("%s.replaced-%d", dir, time.Now().UnixNano())
 		fmt.Printf("agent-runner: workspace holds %q, sandbox repo is %q: moving the old checkout to %s\n", origin, repo, aside)
-		if err := os.RemoveAll(aside); err != nil {
-			return fmt.Errorf("workspace at %s belongs to another repository (%s) and %s could not be cleared: %w", dir, origin, aside, err)
-		}
 		if err := os.Rename(dir, aside); err != nil {
 			return fmt.Errorf("workspace at %s belongs to another repository (%s) and could not be moved: %w", dir, origin, err)
+		}
+	}
+	// A checkout of this repository moved aside earlier (the repository changed and changed back)
+	// comes back as it was, with its work: switching back and forth neither clones again nor
+	// leaves one more copy each time.
+	if back := displacedCheckout(ctx, dir, repo); back != "" {
+		if _, err := os.Lstat(dir); os.IsNotExist(err) {
+			fmt.Printf("agent-runner: restoring the checkout of %q from %s\n", repo, back)
+			if err := os.Rename(back, dir); err == nil {
+				return nil
+			}
 		}
 	}
 	// An empty directory is git's to create; one with content is not touched (the clone refuses it).
@@ -241,6 +247,28 @@ func ensureRepo(ctx context.Context) error {
 		return fmt.Errorf("git clone of %s: %v: %s", repo, err, msg)
 	}
 	return fmt.Errorf("git clone of %s: %w", repo, err)
+}
+
+// gitOrigin is the origin URL of the checkout at dir ("" when it has none).
+func gitOrigin(ctx context.Context, dir string) string {
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "remote", "get-url", "origin").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// displacedCheckout is the latest checkout of repo moved aside from dir (dir.replaced*), "" when
+// there is none.
+func displacedCheckout(ctx context.Context, dir, repo string) string {
+	aside, _ := filepath.Glob(dir + ".replaced*")
+	slices.Sort(aside) // .replaced-<unix nanoseconds>: the latest last
+	for i := len(aside) - 1; i >= 0; i-- {
+		if _, err := os.Stat(filepath.Join(aside[i], ".git")); err == nil && gitOrigin(ctx, aside[i]) == repo {
+			return aside[i]
+		}
+	}
+	return ""
 }
 
 // tailWriter keeps the end of what is written to it (git's last words on a failed clone).

@@ -118,7 +118,57 @@ func TestReplacedCheckoutsDoNotAccumulate(t *testing.T) {
 	for _, e := range entries {
 		names = append(names, e.Name())
 	}
-	if strings.Join(names, ",") != "repo,repo.replaced" {
+	if len(names) != 2 || names[0] != "repo" || !strings.HasPrefix(names[1], "repo.replaced-") {
 		t.Fatalf("workspace: %v", names)
 	}
+}
+
+// Switching A → B → A → B never deletes a checkout: the one moved aside comes back with its
+// uncommitted files and its local commits.
+func TestRepositorySwitchKeepsTheWork(t *testing.T) {
+	isolatedGit(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	a, b, checkout := filepath.Join(root, "a"), filepath.Join(root, "b"), filepath.Join(root, "ws", "repo")
+	git := func(args ...string) string {
+		t.Helper()
+		out, err := exec.CommandContext(ctx, "git", args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "--bare", a)
+	git("init", "--bare", b)
+	t.Setenv("SANDBOX_REPO_DIR", checkout)
+	work := func(repo, name string) {
+		t.Helper()
+		t.Setenv("SANDBOX_REPO", repo)
+		if err := ensureRepo(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(checkout, name+".txt"), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git("-C", checkout, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "local "+name)
+	}
+	has := func(repo, name string) {
+		t.Helper()
+		t.Setenv("SANDBOX_REPO", repo)
+		if err := ensureRepo(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if b, err := os.ReadFile(filepath.Join(checkout, name+".txt")); err != nil || string(b) != name {
+			t.Fatalf("the uncommitted file of %s is gone: %v", name, err)
+		}
+		if log := git("-C", checkout, "log", "--format=%s"); !strings.Contains(log, "local "+name) {
+			t.Fatalf("the local commit of %s is gone: %q", name, log)
+		}
+	}
+	work(a, "work-a")
+	work(b, "work-b")
+	has(a, "work-a")
+	has(b, "work-b")
+	has(a, "work-a")
 }
