@@ -699,6 +699,15 @@ type chatState struct {
 	// turnEnd is when the harness last completed a turn with nothing sent since (zero: a turn
 	// is in progress, or nothing has been said yet).
 	turnEnd time.Time
+	// now is the clock (nil: time.Now); a test sets its own.
+	now func() time.Time
+}
+
+func (s *chatState) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }
 
 func newChat(mode string, idle time.Duration) *chatState {
@@ -733,7 +742,7 @@ func (s *chatState) sawLine(line string) {
 
 func (s *chatState) turnEnded() {
 	s.mu.Lock()
-	s.turnEnd = time.Now()
+	s.turnEnd = s.clock()
 	s.mu.Unlock()
 }
 
@@ -743,14 +752,16 @@ func (s *chatState) sent() {
 	s.mu.Unlock()
 }
 
-// idleFor is how long the conversation has been waiting for the user since the last turn.
-func (s *chatState) idleFor() time.Duration {
+// idleFor is how long the conversation has been waiting for the user since the last turn; waiting
+// is false while a turn runs or before the first one ended. (A turn that ended within the clock's
+// last tick has waited 0 and is waiting all the same.)
+func (s *chatState) idleFor() (idle time.Duration, waiting bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.turnEnd.IsZero() {
-		return 0
+		return 0, false
 	}
-	return time.Since(s.turnEnd)
+	return s.clock().Sub(s.turnEnd), true
 }
 
 // inputSink is where forwardInput hands the user's messages: the harness's stdin, or the
@@ -800,7 +811,7 @@ func forwardInput(ctx context.Context, c *client, runID string, w inputSink, can
 	for ctx.Err() == nil {
 		wait := 30 * time.Second
 		if chat.streams() && !closed {
-			if idle := chat.idleFor(); idle > 0 {
+			if idle, waiting := chat.idleFor(); waiting {
 				if idle >= chat.idle {
 					closeInput(fmt.Sprintf("no message for %s after the last turn, closing the conversation", chat.idle))
 					continue

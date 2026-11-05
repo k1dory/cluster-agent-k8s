@@ -37,17 +37,22 @@ func TestReadLinesDropsOversizedLinesAndGoesOn(t *testing.T) {
 // stream-json: a message queued during a turn is answered after that turn's result line; the
 // agent speaking again stops the idle clock the result started.
 func TestIdleClockStopsWhenTheHarnessGoesOn(t *testing.T) {
+	// A clock of the test's own: the real one may not move between two lines (it did not, one run
+	// in six, under -race), and an idle time of 0 is no evidence either way.
+	now := time.Unix(1_000_000, 0)
 	chat := newChat(harness.InputStreamJSON, time.Minute)
+	chat.now = func() time.Time { return now }
 	chat.sawLine(`{"type":"result","session_id":"s"}`)
-	if chat.idleFor() == 0 {
+	if _, waiting := chat.idleFor(); !waiting {
 		t.Fatal("a turn end starts the idle clock")
 	}
+	now = now.Add(3 * time.Second)
 	chat.sawLine(`{"type":"system","subtype":"init"}`)
-	if chat.idleFor() == 0 {
-		t.Fatal("a non-turn line does not stop it")
+	if idle, waiting := chat.idleFor(); !waiting || idle != 3*time.Second {
+		t.Fatalf("a non-turn line does not stop it: %v %v", idle, waiting)
 	}
 	chat.sawLine(`{"type":"assistant","message":{"content":[{"type":"text","text":"next answer"}]}}`)
-	if chat.idleFor() != 0 {
+	if _, waiting := chat.idleFor(); waiting {
 		t.Fatal("the agent answering the queued message stops the idle clock")
 	}
 }
