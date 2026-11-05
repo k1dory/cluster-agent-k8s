@@ -23,9 +23,14 @@ import (
 // notification queue (1024) overflows, so a control plane stalled for less than a minute during a
 // verbose turn killed the run.
 var (
-	// spoolMaxBytes bounds the output waiting for the control plane. Past it lines are dropped
-	// (announced by one notice line), except the few that carry the run's state.
-	spoolMaxBytes = 32 << 20
+	// spoolMaxBytes and spoolMaxLines bound the output waiting for the control plane; every line
+	// counts spoolLineOverhead bytes more than its text, so blank lines are bounded too. Past the
+	// bounds lines are dropped (announced by one notice line), except the lines that carry the
+	// run's state, which have a bounded reserve of their own above them (stateLine).
+	spoolMaxBytes     = 32 << 20
+	spoolMaxLines     = 100_000
+	spoolReserveBytes = 1 << 20
+	spoolReserveLines = 4096
 	// spoolBatchLines, spoolBatchBytes and spoolBatchDelay shape a batch: a full one goes at
 	// once, a partial one after the delay. The bytes stay under the control plane's body limit
 	// (4 MiB); a batch over it is split on 413 anyway.
@@ -43,23 +48,36 @@ var (
 	shutdownGrace = 15 * time.Second
 )
 
-// vitalLineBytes: a line this short that carries the run's state (the session, a turn end, the
-// usage) is spooled even when the spool is full. Losing it starts the next message in a new
-// session and undercounts the cost; it is small, so keeping it costs nothing.
-const vitalLineBytes = 64 << 10
+// spoolLineOverhead is what a queued line costs besides its text (its slice entry, its string
+// header, the newline of the batch).
+const spoolLineOverhead = 32
 
-func vitalLine(l string) bool {
-	if len(l) > vitalLineBytes {
+// stateLineBytes: a line longer than this is never a state line.
+const stateLineBytes = 16 << 10
+
+// stateLine reports whether a line carries the run's state: a turn end, a usage record, or the
+// line that announces the session (the runner's acp.session, Claude Code's system init, Codex's
+// thread.started). Losing one starts the next message in a new session or undercounts the cost.
+// Ordinary messages carry a session_id too (stream-json): they are output like any other, or
+// every line would pass the bound. It is only asked of lines that do not fit.
+func stateLine(l string) bool {
+	if len(l) > stateLineBytes {
 		return false
 	}
 	if harness.IsTurnEnd(l) {
 		return true
 	}
-	if _, ok := harness.ParseSession(l); ok {
+	if _, _, ok := harness.ParseUsage(l); ok {
 		return true
 	}
-	_, _, ok := harness.ParseUsage(l)
-	return ok
+	if _, ok := harness.ParseSession(l); !ok {
+		return false
+	}
+	var v struct {
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal([]byte(l), &v)
+	return v.Type == harness.ACPSession || v.Type == "system" || v.Type == "thread.started"
 }
 
 // backoff is the wait before attempt n (n ≥ 1): base·2^(n-1) capped at max, with jitter (the
@@ -151,21 +169,29 @@ func (s *outputSpool) signal() {
 }
 
 // add queues a line and never blocks. A line that does not fit is dropped and counted; the next
-// one that fits is preceded by a single notice saying what was lost.
+// one that fits is preceded by a single notice saying what was lost. A state line that does not
+// fit goes into the reserve above the bounds; past the reserve it is dropped too. The notice
+// itself is small and always goes in, so the spool never holds more than the bounds, the reserve
+// and one notice per drop announced.
 func (s *outputSpool) add(line string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return
 	}
-	if s.bytes+len(line) > spoolMaxBytes && !vitalLine(line) {
+	cost := len(line) + spoolLineOverhead
+	fits := func(maxBytes, maxLines int) bool {
+		return s.bytes+cost <= maxBytes && len(s.lines) < maxLines
+	}
+	if !fits(spoolMaxBytes, spoolMaxLines) &&
+		!(fits(spoolMaxBytes+spoolReserveBytes, spoolMaxLines+spoolReserveLines) && stateLine(line)) {
 		s.dropped++
 		s.droppedBytes += len(line)
 		return
 	}
 	s.noticeDropsLocked()
 	s.lines = append(s.lines, line)
-	s.bytes += len(line)
+	s.bytes += cost
 	s.signal()
 }
 
@@ -211,7 +237,7 @@ func (s *outputSpool) noticeDropsLocked() {
 		s.dropped, s.droppedBytes, spoolMaxBytes)
 	s.dropped, s.droppedBytes = 0, 0
 	s.lines = append(s.lines, n)
-	s.bytes += len(n)
+	s.bytes += len(n) + spoolLineOverhead
 }
 
 // close ends the output: what is queued is delivered within budget (or the shutdown grace), then
@@ -248,8 +274,9 @@ func (s *outputSpool) take() (batch []string, ok bool) {
 		full := n == spoolBatchLines || n < len(s.lines)
 		if n > 0 && (full || waited || s.closed) {
 			batch = append([]string(nil), s.lines[:n]...)
+			clear(s.lines[:n]) // the strings are the batch's now, not the backing array's
 			s.lines = s.lines[n:]
-			s.bytes -= size
+			s.bytes -= size + n*spoolLineOverhead
 			s.mu.Unlock()
 			return batch, true
 		}
