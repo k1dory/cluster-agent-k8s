@@ -38,6 +38,10 @@ func (p *Platform) keyRoutes(mux *http.ServeMux) {
 	// tenant's key is not found, never "forbidden" (ids are not enumerable either way).
 	keyOf := func(w http.ResponseWriter, r *http.Request, tenant string) (*model.APIKey, bool) {
 		k, err := p.Keys.Get(r.Context(), r.PathValue("id"))
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusInternalServerError, err) // the store failed: not a missing key
+			return nil, false
+		}
 		if err != nil || k.Tenant != tenant {
 			writeErr(w, http.StatusNotFound, store.ErrNotFound)
 			return nil, false

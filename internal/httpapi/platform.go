@@ -469,7 +469,8 @@ type recorder struct {
 	body bytes.Buffer
 }
 
-func (rc *recorder) WriteHeader(c int) { rc.code = c; rc.ResponseWriter.WriteHeader(c) }
+func (rc *recorder) WriteHeader(c int)           { rc.code = c; rc.ResponseWriter.WriteHeader(c) }
+func (rc *recorder) Unwrap() http.ResponseWriter { return rc.ResponseWriter }
 func (rc *recorder) Write(b []byte) (int, error) {
 	rc.body.Write(b)
 	return rc.ResponseWriter.Write(b)
@@ -675,6 +676,10 @@ func (p *Platform) ownRun(w http.ResponseWriter, r *http.Request) (*model.Run, b
 		return nil, false
 	}
 	run, err := p.Orch.Store.GetRun(r.Context(), r.PathValue("run"))
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusInternalServerError, err) // the store failed: not a missing run
+		return nil, false
+	}
 	if err != nil || run.SandboxID != r.PathValue("id") {
 		writeErr(w, http.StatusNotFound, fmt.Errorf("run %s: %w", r.PathValue("run"), store.ErrNotFound))
 		return nil, false
@@ -1021,14 +1026,21 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 // ErrorBody is the JSON every error response carries. `error` stays for older clients;
-// `code` is the stable machine-readable class, `request_id` matches the server log line.
+// `code` is the stable machine-readable class, `request_id` matches the server log line. A
+// few errors travel with the record they are about (the sync of a repository, the plan of a
+// refused apply, the rollback that could not run, the apply a conflict is with).
 type ErrorBody struct {
 	Error     string `json:"error"`
 	Code      string `json:"code"`
 	RequestID string `json:"request_id,omitempty"`
+	Sync      any    `json:"sync,omitempty"`
+	Plan      any    `json:"plan,omitempty"`
+	Rollback  any    `json:"rollback,omitempty"`
+	Apply     any    `json:"apply,omitempty"`
 }
 
-// Stable error codes (see openapi.yaml → Error).
+// Stable error codes (see openapi.yaml → Error). Most follow from the status (codeFor); the
+// rest name a refusal more precisely than its status does.
 const (
 	CodeBadRequest   = "bad_request"
 	CodeUnauthorized = "unauthorized"
@@ -1038,9 +1050,17 @@ const (
 	CodeTooLarge     = "too_large"
 	CodeQuota        = "quota_exceeded"
 	CodeUpstream     = "upstream_failed"
+	CodeTimeout      = "timeout" // 504: the cluster or the pod did not answer in time
 	CodeInternal     = "internal"
 	CodeUnavailable  = "unavailable"
 	CodeInvalid      = "invalid" // 422: the request was understood and refused by validation
+
+	CodeInvalidPlan       = "invalid_plan"         // 422: a bundle does not validate; the plan is attached
+	CodeNothingToRollBack = "nothing_to_roll_back" // 422: the rollback would change nothing
+	CodeUnreachable       = "unreachable"          // 502: a Git repository could not be read
+	CodeCredential        = "credential"           // 422: the credential a spec names is not available
+	CodeStopped           = "stopped"              // 409: an apply of a sync did not finish
+	CodeRateLimited       = "rate_limited"         // 429: too many attempts from this address
 )
 
 func codeFor(status int) string {
@@ -1061,6 +1081,8 @@ func codeFor(status int) string {
 		return CodeQuota
 	case http.StatusBadGateway:
 		return CodeUpstream
+	case http.StatusGatewayTimeout:
+		return CodeTimeout
 	case http.StatusUnprocessableEntity:
 		return CodeInvalid
 	case http.StatusServiceUnavailable:
@@ -1069,8 +1091,45 @@ func codeFor(status int) string {
 	return CodeInternal
 }
 
-func writeErr(w http.ResponseWriter, code int, err error) {
-	writeJSON(w, code, ErrorBody{Error: err.Error(), Code: codeFor(code), RequestID: w.Header().Get("X-Request-Id")})
+// writeErr is the error response of every handler: the envelope, the code its status implies.
+func writeErr(w http.ResponseWriter, status int, err error) {
+	writeErrWith(w, status, ErrorBody{}, err)
+}
+
+// writeErrWith writes the envelope from base: its code (empty: the status's) and the record
+// the error travels with. A 500 never carries the error text: what failed inside (the store,
+// the cluster) is logged under the request id, and the client gets the id to quote.
+func writeErrWith(w http.ResponseWriter, status int, base ErrorBody, err error) {
+	if base.Code == "" {
+		base.Code = codeFor(status)
+	}
+	base.RequestID = w.Header().Get("X-Request-Id")
+	base.Error = err.Error()
+	if status == http.StatusInternalServerError {
+		noteInternal(w, err)
+		base.Error = "internal error"
+		if base.RequestID != "" {
+			base.Error += " (request " + base.RequestID + ")"
+		}
+	}
+	writeJSON(w, status, base)
+}
+
+// noteInternal hands the detail of a 500 to the request log line (logRequests), or logs it on
+// its own when the writer is not under logRequests.
+func noteInternal(w http.ResponseWriter, err error) {
+	for cur := w; cur != nil; {
+		if sw, ok := cur.(*statusWriter); ok && sw.log {
+			sw.err = err
+			return
+		}
+		u, ok := cur.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		cur = u.Unwrap()
+	}
+	slog.Default().Error("internal error", "rid", w.Header().Get("X-Request-Id"), "err", err)
 }
 
 func writeOrchErr(w http.ResponseWriter, err error) {
@@ -1199,7 +1258,11 @@ func (q *query) oneOf(name, def string, allowed ...string) string {
 type statusWriter struct {
 	http.ResponseWriter
 	code int
+	log  bool  // the request log line's writer (logRequests)
+	err  error // what failed inside, for that line (writeErr on a 500)
 }
+
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 func (s *statusWriter) WriteHeader(c int) { s.code = c; s.ResponseWriter.WriteHeader(c) }
 func (s *statusWriter) Flush() {
@@ -1226,9 +1289,13 @@ func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 			rid = newRequestID()
 		}
 		w.Header().Set("X-Request-Id", rid)
-		sw := &statusWriter{ResponseWriter: w, code: 200}
+		sw := &statusWriter{ResponseWriter: w, code: 200, log: true}
 		start := time.Now()
 		next.ServeHTTP(sw, r)
+		if sw.err != nil {
+			log.Error("http", "rid", rid, "method", r.Method, "path", r.URL.Path, "code", sw.code, "took_ms", time.Since(start).Milliseconds(), "err", sw.err)
+			return
+		}
 		log.Info("http", "rid", rid, "method", r.Method, "path", r.URL.Path, "code", sw.code, "took_ms", time.Since(start).Milliseconds())
 	})
 }

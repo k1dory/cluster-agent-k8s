@@ -394,9 +394,9 @@ func (p *Platform) rollback(w http.ResponseWriter, r *http.Request) {
 	case err == nil:
 		writeJSON(w, http.StatusOK, rb)
 	case errors.As(err, &invalid):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error(), "code": "invalid_plan", "rollback": rb})
+		writeErrWith(w, http.StatusUnprocessableEntity, ErrorBody{Code: CodeInvalidPlan, Rollback: rb}, err)
 	case errors.Is(err, apply.ErrNothingToRollBack):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error(), "code": "nothing_to_roll_back", "rollback": rb})
+		writeErrWith(w, http.StatusUnprocessableEntity, ErrorBody{Code: CodeNothingToRollBack, Rollback: rb}, err)
 	case errors.Is(err, resource.ErrInvalid):
 		writeErr(w, http.StatusBadRequest, err)
 	default:
@@ -503,10 +503,10 @@ func writeApply(w http.ResponseWriter, a *model.Apply, err error) {
 	case err == nil:
 		writeJSON(w, http.StatusOK, a)
 	case errors.As(err, &invalid):
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{"error": err.Error(), "code": "invalid_plan", "plan": invalid.Plan})
+		writeErrWith(w, http.StatusUnprocessableEntity, ErrorBody{Code: CodeInvalidPlan, Plan: invalid.Plan}, err)
 	case errors.Is(err, apply.ErrPlanMismatch), errors.Is(err, apply.ErrKeyReused), errors.Is(err, store.ErrConflict):
 		if a != nil {
-			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "code": "conflict", "apply": a})
+			writeErrWith(w, http.StatusConflict, ErrorBody{Apply: a}, err)
 			return
 		}
 		writeErr(w, http.StatusConflict, err)
