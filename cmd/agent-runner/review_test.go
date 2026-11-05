@@ -110,7 +110,7 @@ func TestMCPServersBecomeAHarnessConfig(t *testing.T) {
 	var cfg struct {
 		Servers map[string]map[string]string `json:"mcpServers"`
 	}
-	if err := json.Unmarshal(b, &cfg); err != nil || len(cfg.Servers) != 2 || cfg.Servers["registry"]["url"] != "https://mcp.registry.example.com/mcp" || cfg.Servers["registry"]["type"] != "http" || cfg.Servers["shared/tools"]["url"] != "https://tools.example.com/rpc" {
+	if err := json.Unmarshal(b, &cfg); err != nil || len(cfg.Servers) != 2 || cfg.Servers["registry"]["url"] != "http://127.0.0.1:4480/https/mcp.registry.example.com/mcp" || cfg.Servers["registry"]["type"] != "http" || cfg.Servers["shared/tools"]["url"] != "http://127.0.0.1:4480/https/tools.example.com/rpc" {
 		t.Fatalf("config: %v %s", err, b)
 	}
 	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
@@ -118,27 +118,11 @@ func TestMCPServersBecomeAHarnessConfig(t *testing.T) {
 	}
 }
 
-// The chart ships explicit harness commands (run and resume); both must load the MCP
-// configuration like the built-in default does, and a command that is not claude must be
-// left alone.
+// A claude command (run or resume, however spelled) loads the MCP configuration; a command that
+// is not claude, or names the configuration itself, is left alone. (The chart's default harness
+// is ACP: its MCP servers go into the session, TestReviewShippedHarnessLoadsMCPOnStartAndResume.)
 func TestEveryClaudeCommandLoadsTheMCPConfig(t *testing.T) {
-	values, err := os.ReadFile("../../deploy/helm/agent-sandbox/values.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
 	var fromChart []string
-	for _, line := range strings.Split(string(values), "\n") {
-		line = strings.TrimSpace(line)
-		for _, key := range []string{"harnessCommand:", "harnessResumeCommand:"} {
-			if strings.HasPrefix(line, key) {
-				v := strings.TrimSpace(strings.TrimPrefix(line, key))
-				fromChart = append(fromChart, strings.Trim(v, `'"`))
-			}
-		}
-	}
-	if len(fromChart) != 2 {
-		t.Fatalf("values.yaml harness commands: %q", fromChart)
-	}
 	for _, cmd := range append(fromChart, `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose`, `ANTHROPIC_LOG=debug claude -p "$SANDBOX_TASK"`, `/usr/local/bin/claude -p "$SANDBOX_TASK"`) {
 		got := withMCPConfig(cmd)
 		if !strings.HasSuffix(got, ` --mcp-config "$SANDBOX_MCP_CONFIG"`) || !strings.HasPrefix(got, cmd) {

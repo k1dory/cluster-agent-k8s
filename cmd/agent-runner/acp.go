@@ -9,6 +9,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -77,8 +79,10 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	}()
 	emit := func(line string) { _, _ = io.WriteString(outW, line+"\n") }
 
-	cl := &acpClient{emit: emit, permissions: os.Getenv("HARNESS_PERMISSIONS")}
-	conn := acp.NewClientSideConnection(cl, stdin, stdout)
+	wire := newACPWire(stdin, stdout)
+	cl := &acpClient{emit: emit, permissions: os.Getenv("HARNESS_PERMISSIONS"), systemPrompt: wire.SystemPrompt,
+		usageDir: filepath.Join(os.Getenv("HOME"), ".sandbox-acp-usage")}
+	conn := acp.NewClientSideConnection(cl, wire, wire)
 	exit := driveACP(runCtx, conn, cl, run, emit, chat, func(inputs inputSink) {
 		go forwardInput(runCtx, c, run.ID, inputs, cancel, chat)
 	})
@@ -115,11 +119,21 @@ type acpAuthenticator interface {
 	Authenticate(ctx context.Context, params acp.AuthenticateRequest) (acp.AuthenticateResponse, error)
 }
 
+// acpOpened is the session a conversation runs in: its id, whether it is new (fresh), whether the
+// agent took the instructions as its system prompt, and who the agent is.
+type acpOpened struct {
+	id           acp.SessionId
+	fresh        bool
+	instructions bool   // given as the session's system prompt: no prefix on the first prompt
+	agent        string // initialize agentInfo.name
+}
+
 // openACPSession initializes the agent, authenticates it when the profile names a method, and
-// loads the run's session (a continuing conversation) or starts a new one; fresh says which.
-// Nothing is prompted here: a failure has been reported through emit when ok is false.
-func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, emit func(string)) (sessionID acp.SessionId, fresh, ok bool) {
-	notice := func(format string, a ...any) { emit("[agent-runner] " + fmt.Sprintf(format, a...)) }
+// continues the run's session (session/resume when the agent declares it, else session/load) or
+// starts a new one. The session is then put in the profile's mode and on its model. Nothing is
+// prompted here: a failure has been reported through emit when ok is false.
+func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, emit func(string)) (s acpOpened, ok bool) {
+	notice := noticeFunc(emit)
 	init, err := conn.Initialize(ctx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		// The agent works in its own pod with its own tools: the runner offers no file system
@@ -128,7 +142,10 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 	})
 	if err != nil {
 		notice("acp initialize: %v", err)
-		return "", false, false
+		return s, false
+	}
+	if init.AgentInfo != nil {
+		s.agent = init.AgentInfo.Name
 	}
 	// The profile names the agent's authentication method (spec.harness.auth_method): an API key
 	// in the environment, say. Without one the agent is not asked, and one that needs it refuses
@@ -136,16 +153,16 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 	if method := os.Getenv("HARNESS_AUTH_METHOD"); method != "" {
 		if ids := authMethodIDs(init.AuthMethods); !slices.Contains(ids, method) {
 			notice("acp authenticate: the agent offers %v, not %q (spec.harness.auth_method)", ids, method)
-			return "", false, false
+			return s, false
 		}
 		auth, ok := conn.(acpAuthenticator)
 		if !ok {
 			notice("acp authenticate: the connection cannot authenticate")
-			return "", false, false
+			return s, false
 		}
 		if _, err := auth.Authenticate(ctx, acp.AuthenticateRequest{MethodId: method}); err != nil {
 			notice("acp authenticate %s: %v", method, err)
-			return "", false, false
+			return s, false
 		}
 	}
 	authNeeded := func(op string, err error) {
@@ -163,36 +180,68 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
-	servers, skipped := acpMCPServers(os.Getenv("SANDBOX_MCP_SERVERS"), init.AgentCapabilities.McpCapabilities.Http)
+	// harness.mcp: always passes the servers to an agent that takes them without declaring MCP
+	// over HTTP (Hermes); auto (the default) only to one that declares it.
+	httpMCP := init.AgentCapabilities.McpCapabilities.Http || os.Getenv("HARNESS_MCP") == harness.MCPAlways
+	servers, skipped := acpMCPServers(os.Getenv("SANDBOX_MCP_SERVERS"), httpMCP)
 	if skipped > 0 {
-		notice("%d mcp server(s) not passed: the agent does not take MCP servers over HTTP", skipped)
+		notice("%d mcp server(s) not passed: the agent does not declare MCP servers over HTTP (spec.harness.mcp: always passes them anyway)", skipped)
 	}
+	// The instructions are the session's system prompt when the agent takes one: they then
+	// survive the agent compacting its context, which a prefix of the first prompt may not.
+	// A system prompt is not part of the session's history, so a loaded or resumed session gets
+	// it again.
+	instructions := strings.TrimSpace(os.Getenv("SANDBOX_INSTRUCTIONS"))
+	if instructions != "" && cl.systemPrompt != nil && cl.systemPrompt() {
+		s.instructions = true
+	} else {
+		instructions = ""
+	}
+	meta := sessionMeta(instructions)
 
+	var st acpSessionState
 	if run.Session != "" && run.ResumeOf != "" {
-		if init.AgentCapabilities.LoadSession {
+		prev := acp.SessionId(run.Session)
+		caps := init.AgentCapabilities
+		resumer, canResume := conn.(acpResumer)
+		if caps.SessionCapabilities.Resume != nil && canResume {
+			// session/resume continues without replaying the history.
+			r, err := resumer.ResumeSession(ctx, acp.ResumeSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
+			if err == nil {
+				s.id, st = prev, acpSessionState{modes: r.Modes, options: r.ConfigOptions}
+			} else {
+				authNeeded("session/resume "+run.Session, err)
+			}
+		}
+		if s.id == "" && caps.LoadSession {
 			// session/load replays the conversation as updates: the transcript already has it.
 			cl.setReplaying(true)
-			_, err := conn.LoadSession(ctx, acp.LoadSessionRequest{SessionId: acp.SessionId(run.Session), Cwd: cwd, McpServers: servers})
+			r, err := conn.LoadSession(ctx, acp.LoadSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
 			cl.setReplaying(false)
 			if err == nil {
-				sessionID = acp.SessionId(run.Session)
+				s.id, st = prev, acpSessionState{modes: r.Modes, options: r.ConfigOptions}
 			} else {
 				authNeeded("session/load "+run.Session, err)
-				notice("starting a new session")
 			}
-		} else {
-			notice("the agent cannot load session %s (no loadSession capability): starting a new session", run.Session)
+		}
+		switch {
+		case s.id != "":
+		case caps.SessionCapabilities.Resume == nil && !caps.LoadSession:
+			notice("the agent cannot continue session %s (neither resume nor loadSession): starting a new session", run.Session)
+		default:
+			notice("starting a new session")
 		}
 	}
-	if sessionID == "" {
-		ns, err := conn.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: servers})
+	if s.id == "" {
+		ns, err := conn.NewSession(ctx, acp.NewSessionRequest{Meta: meta, Cwd: cwd, McpServers: servers})
 		if err != nil {
 			authNeeded("session/new", err)
-			return "", false, false
+			return s, false
 		}
-		sessionID, fresh = ns.SessionId, true
+		s.id, s.fresh, st = ns.SessionId, true, acpSessionState{modes: ns.Modes, options: ns.ConfigOptions}
 	}
-	return sessionID, fresh, true
+	configureACPSession(ctx, conn, s.id, st, os.Getenv("HARNESS_MODE"), os.Getenv("SANDBOX_MODEL"), notice)
+	return s, true
 }
 
 // driveACP holds the conversation: the session (openACPSession), then one prompt per message
@@ -200,18 +249,24 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 // starts delivering the user's messages into the sink it is given. The result is the run's exit
 // code.
 func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, emit func(string), chat *chatState, startInput func(inputSink)) int {
-	sessionID, fresh, ok := openACPSession(ctx, conn, cl, run, emit)
+	sess, ok := openACPSession(ctx, conn, cl, run, emit)
 	if !ok {
 		return 1
 	}
+	sessionID := sess.id
 	emit(harness.ACPLine{Type: harness.ACPSession, SessionID: string(sessionID)}.String())
-	notice := func(format string, a ...any) { emit("[agent-runner] " + fmt.Sprintf(format, a...)) }
+	notice := noticeFunc(emit)
+	usage := newACPUsage(sess.agent, string(sessionID), cl)
 
 	inputs := newPromptQueue()
 	startInput(inputs)
-	prompt := firstPrompt(run, fresh, os.Getenv("SANDBOX_INSTRUCTIONS"), os.Getenv("SANDBOX_RESUME_PROMPT"))
+	instructions := os.Getenv("SANDBOX_INSTRUCTIONS")
+	if sess.instructions {
+		instructions = "" // the session's system prompt has them
+	}
+	prompt := firstPrompt(run, sess.fresh, instructions, os.Getenv("SANDBOX_RESUME_PROMPT"))
 	for {
-		resp, err := conn.Prompt(ctx, acp.PromptRequest{SessionId: sessionID, Prompt: []acp.ContentBlock{acp.TextBlock(prompt)}})
+		resp, err := promptACP(ctx, conn, cl, sessionID, prompt, notice)
 		cl.flush()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -224,8 +279,8 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 			notice("acp session/prompt: %v", err)
 			return 1
 		}
-		if u := resp.Usage; u != nil {
-			emit(usageLine(*u))
+		if line, ok := usage.turn(resp.Usage); ok {
+			emit(line)
 		}
 		emit(harness.ACPLine{Type: harness.ACPTurnEnd, StopReason: string(resp.StopReason)}.String())
 		if resp.StopReason == acp.StopReasonCancelled {
@@ -238,13 +293,64 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 		}
 		// A message that waited for this turn is a new turn: the idle clock stops until it ends.
 		chat.sent()
-		prompt = next
+		prompt = escapeACPPrompt(next)
 	}
 }
 
-// firstPrompt is the text of the run's first prompt. ACP has no system prompt of its own, so a
-// new session starts with the agent definition's instructions ahead of the task; a loaded one
-// already has them. A run that resumes an interrupted one (a rollout) continues it.
+// promptACP sends one prompt. Hermes refuses every prompt of a session whose previous turn was
+// lost when its gateway restarted (unknown_execution) until the lost turn is discarded with
+// `/discard <id>`: the runner discards the turns it names and sends the prompt once more.
+func promptACP(ctx context.Context, conn acpConn, cl *acpClient, sid acp.SessionId, text string, notice func(string, ...any)) (acp.PromptResponse, error) {
+	resp, err := conn.Prompt(ctx, acp.PromptRequest{SessionId: sid, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
+	if err == nil || ctx.Err() != nil {
+		return resp, err
+	}
+	lost := lostTurns(err.Error())
+	if len(lost) == 0 {
+		return resp, err
+	}
+	cl.flush()
+	for _, id := range lost {
+		notice("the agent lost a turn (unknown_execution): discarding %s and sending the prompt again", id)
+		if _, derr := conn.Prompt(ctx, acp.PromptRequest{SessionId: sid, Prompt: []acp.ContentBlock{acp.TextBlock("/discard " + id)}}); derr != nil {
+			notice("/discard %s: %v", id, derr)
+			return resp, err
+		}
+		cl.flush()
+	}
+	return conn.Prompt(ctx, acp.PromptRequest{SessionId: sid, Prompt: []acp.ContentBlock{acp.TextBlock(text)}})
+}
+
+// lostTurnRe finds the turns Hermes's unknown_execution refusal names: "Send `/discard <id>`".
+var lostTurnRe = regexp.MustCompile("`/discard ([^`\\s]+)`")
+
+func lostTurns(msg string) []string {
+	if !strings.Contains(msg, "unknown_execution") {
+		return nil
+	}
+	var ids []string
+	for _, m := range lostTurnRe.FindAllStringSubmatch(msg, 4) {
+		if !slices.Contains(ids, m[1]) {
+			ids = append(ids, m[1])
+		}
+	}
+	return ids
+}
+
+// escapeACPPrompt keeps a message that starts with "/" from being taken for one of the agent's
+// slash commands (OpenCode runs a known command and ends the turn empty on an unknown one;
+// claude-agent-acp has its own). The agents trim whitespace before they look, so the escape is
+// a zero-width space, which they do not trim and the model reads past.
+func escapeACPPrompt(text string) string {
+	if strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "/") {
+		return "\u200b" + text
+	}
+	return text
+}
+
+// firstPrompt is the text of the run's first prompt. For an agent that takes no system prompt
+// (sessionCapabilities.systemPrompt), a new session starts with the agent definition's
+// instructions ahead of the task; a loaded one already has them. A run that resumes an interrupted one (a rollout) continues it.
 func firstPrompt(run *model.Run, fresh bool, instructions, resumePrompt string) string {
 	task := run.Task
 	if run.ResumeOf != "" && run.Mode != model.RunMessage {
@@ -256,6 +362,7 @@ func firstPrompt(run *model.Run, fresh bool, instructions, resumePrompt string) 
 			task = run.Task // nothing to continue: do the task again
 		}
 	}
+	task = escapeACPPrompt(task)
 	if fresh && strings.TrimSpace(instructions) != "" {
 		return "<instructions>\n" + strings.TrimSpace(instructions) + "\n</instructions>\n\n" + task
 	}
@@ -306,22 +413,6 @@ func acpMCPServers(raw string, http bool) (servers []acp.McpServer, skipped int)
 		servers = append(servers, acp.McpServer{Http: &acp.McpServerHttpInline{Name: s.Name, Url: gatewayBridgeURL(s.URL), Headers: []acp.HttpHeader{}, Type: "http"}})
 	}
 	return servers, skipped
-}
-
-// usageLine renders a prompt turn's usage as the generic usage record the control plane adds up.
-func usageLine(u acp.Usage) string {
-	rec := model.Usage{InputTokens: int64(u.InputTokens), OutputTokens: int64(u.OutputTokens), Turns: 1}
-	if u.CachedReadTokens != nil {
-		rec.CacheRead = int64(*u.CachedReadTokens)
-	}
-	if u.CachedWriteTokens != nil {
-		rec.CacheWrite = int64(*u.CachedWriteTokens)
-	}
-	b, _ := json.Marshal(struct {
-		Type string `json:"type"`
-		model.Usage
-	}{"usage", rec})
-	return string(b)
 }
 
 // promptQueue is the inputSink of an ACP conversation: messages wait for the turn in progress
@@ -391,10 +482,22 @@ func (q *promptQueue) next(ctx context.Context) (string, bool) {
 type acpClient struct {
 	emit        func(string)
 	permissions string // harness.PermissionsAllow (default) or PermissionsDeny
+	// systemPrompt reports whether the agent takes the client's system prompt (acpWire); nil:
+	// it does not.
+	systemPrompt func() bool
+	// usageDir keeps the last cumulative usage of the sessions of an agent that reports one
+	// (acpUsage); "" keeps it in memory only.
+	usageDir string
 
 	mu        sync.Mutex
 	msg       strings.Builder // the agent message being streamed in chunks
 	replaying bool            // session/load: history the transcript already has
+	// diffs are the diffs last written for each tool call: a later line with the same ones
+	// leaves them out, one with others replaces them (harness.ACPLine.DiffsReplace).
+	diffs map[string][]harness.ACPDiff
+	// cost is the session's cost as the agent last reported it (usage_update, cumulative).
+	cost     float64
+	costSeen bool
 }
 
 var _ acp.Client = (*acpClient)(nil)
@@ -422,10 +525,18 @@ func (a *acpClient) flushLocked() {
 func (a *acpClient) SessionUpdate(_ context.Context, n acp.SessionNotification) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	u := n.Update
+	// A cost reported while a load replays the history is the session's total so far: kept (the
+	// run's usage counts from it), not written.
+	if u.UsageUpdate != nil {
+		if c := u.UsageUpdate.Cost; c != nil && (c.Currency == "" || strings.EqualFold(c.Currency, "USD")) {
+			a.cost, a.costSeen = c.Amount, true
+		}
+		return nil
+	}
 	if a.replaying {
 		return nil
 	}
-	u := n.Update
 	switch {
 	case u.AgentMessageChunk != nil:
 		if t := u.AgentMessageChunk.Content.Text; t != nil {
@@ -434,11 +545,14 @@ func (a *acpClient) SessionUpdate(_ context.Context, n acp.SessionNotification) 
 	case u.ToolCall != nil:
 		a.flushLocked()
 		tc := u.ToolCall
-		a.emit(harness.ACPLine{Type: harness.ACPToolCall, ToolCallID: string(tc.ToolCallId), Title: tc.Title,
-			Kind: string(tc.Kind), Status: string(tc.Status), Diffs: acpDiffs(tc.Content)}.String())
+		l := harness.ACPLine{Type: harness.ACPToolCall, ToolCallID: string(tc.ToolCallId), Title: tc.Title,
+			Kind: string(tc.Kind), Status: string(tc.Status)}
+		a.withDiffsLocked(&l, acpDiffs(tc.Content))
+		a.emit(l.String())
 	case u.ToolCallUpdate != nil:
 		tu := u.ToolCallUpdate
-		l := harness.ACPLine{Type: harness.ACPToolUpdate, ToolCallID: string(tu.ToolCallId), Diffs: acpDiffs(tu.Content)}
+		l := harness.ACPLine{Type: harness.ACPToolUpdate, ToolCallID: string(tu.ToolCallId)}
+		a.withDiffsLocked(&l, acpDiffs(tu.Content))
 		if tu.Status != nil {
 			l.Status = string(*tu.Status)
 		}
@@ -451,6 +565,30 @@ func (a *acpClient) SessionUpdate(_ context.Context, n acp.SessionNotification) 
 		}
 	}
 	return nil
+}
+
+// withDiffsLocked puts diffs on a tool call's line unless the call's last line already carried
+// the same ones; diffs that differ from earlier ones replace them. Called with a.mu held.
+func (a *acpClient) withDiffsLocked(l *harness.ACPLine, diffs []harness.ACPDiff) {
+	if len(diffs) == 0 {
+		return
+	}
+	if a.diffs == nil {
+		a.diffs = map[string][]harness.ACPDiff{}
+	}
+	prev, seen := a.diffs[l.ToolCallID]
+	if seen && reflect.DeepEqual(prev, diffs) {
+		return
+	}
+	a.diffs[l.ToolCallID] = diffs
+	l.Diffs, l.DiffsReplace = diffs, seen
+}
+
+// sessionCost is the cost the agent reported last (ok false: none).
+func (a *acpClient) sessionCost() (float64, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cost, a.costSeen
 }
 
 // maxACPDiffText caps the text of one diff on an ACP line: a larger change keeps its path and
@@ -466,6 +604,7 @@ func acpDiffs(content []acp.ToolCallContent) []harness.ACPDiff {
 			continue
 		}
 		diff := harness.ACPDiff{Path: d.Path, OldText: d.OldText, NewText: d.NewText, NewSize: len(d.NewText)}
+		diff.Change, diff.OldPath = diffChange(d.Meta, d.Path)
 		if d.OldText != nil {
 			diff.OldSize = len(*d.OldText)
 		}
@@ -475,6 +614,30 @@ func acpDiffs(content []acp.ToolCallContent) []harness.ACPDiff {
 		out = append(out, diff)
 	}
 	return out
+}
+
+// diffChange reads what kind of change a diff is from its _meta, where codex-acp says it (kind:
+// add, update, delete) and keeps the patch it came from (diff_git_patch.oldPath: a different
+// path is a rename). Other agents say nothing: "".
+func diffChange(meta map[string]any, path string) (change, oldPath string) {
+	if meta == nil {
+		return "", ""
+	}
+	change, _ = meta["kind"].(string)
+	switch change {
+	case "add", "update", "delete", "rename":
+	default:
+		change = ""
+	}
+	if patch, ok := meta["diff_git_patch"].(map[string]any); ok {
+		if old, _ := patch["oldPath"].(string); old != "" && old != path {
+			oldPath = old
+			if change == "" || change == "update" {
+				change = "rename"
+			}
+		}
+	}
+	return change, oldPath
 }
 
 // RequestPermission picks the agent's own option that matches the profile's policy (allow:
@@ -501,6 +664,9 @@ pick:
 		}
 	}
 	a.mu.Lock()
+	// OpenCode and Hermes send the change's full diff only here, in the tool call the request is
+	// about; the call's own updates may refine it (withDiffsLocked).
+	a.withDiffsLocked(&l, acpDiffs(p.ToolCall.Content))
 	// Requests are dispatched independently of ordered session notifications.
 	// A permission callback may overtake text chunks, so only the notification
 	// stream and the prompt response may flush the pending assistant message.
@@ -515,8 +681,11 @@ func (a *acpClient) ReadTextFile(context.Context, acp.ReadTextFileRequest) (acp.
 	return acp.ReadTextFileResponse{}, errNoClientCapability
 }
 
+// WriteTextFile answers success without writing. The runner declares no file system, yet
+// OpenCode tells the client about an approved edit it has already made on disk (and leaves an
+// error unhandled): the file is in the workspace, there is nothing for the runner to do.
 func (a *acpClient) WriteTextFile(context.Context, acp.WriteTextFileRequest) (acp.WriteTextFileResponse, error) {
-	return acp.WriteTextFileResponse{}, errNoClientCapability
+	return acp.WriteTextFileResponse{}, nil
 }
 
 func (a *acpClient) CreateTerminal(context.Context, acp.CreateTerminalRequest) (acp.CreateTerminalResponse, error) {

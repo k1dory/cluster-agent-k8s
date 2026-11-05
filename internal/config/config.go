@@ -134,11 +134,21 @@ type Config struct {
 		// HarnessResumeCommand continues a run interrupted by a forced rollout: $SANDBOX_SESSION
 		// is the harness session id captured from its output, $SANDBOX_RESUME_PROMPT the text to
 		// continue with. Default: Claude Code's --resume. Codex: 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'.
-		HarnessResumeCommand string            `yaml:"harness_resume_command"`
-		ResumePrompt         string            `yaml:"resume_prompt"`
-		Env                  map[string]string `yaml:"env"`
-		PriorityClassName    string            `yaml:"priority_class"`
-		TerminationSeconds   int64             `yaml:"termination_seconds"`
+		HarnessResumeCommand string `yaml:"harness_resume_command"`
+		ResumePrompt         string `yaml:"resume_prompt"`
+		// The default harness's input mode and, for an ACP agent, how it is run: the same
+		// settings as an EnvironmentProfile's harness (input, permissions, mode, mcp,
+		// auth_method), for sandboxes whose profile does not set its own. The default harness is
+		// Claude over ACP: harness_command claude-agent-acp, harness_input acp, harness_mode
+		// default (its permission checks on, requests answered by harness_permissions).
+		HarnessInput       string            `yaml:"harness_input"`
+		HarnessPermissions string            `yaml:"harness_permissions"`
+		HarnessMode        string            `yaml:"harness_mode"`
+		HarnessMCP         string            `yaml:"harness_mcp"`
+		HarnessAuthMethod  string            `yaml:"harness_auth_method"`
+		Env                map[string]string `yaml:"env"`
+		PriorityClassName  string            `yaml:"priority_class"`
+		TerminationSeconds int64             `yaml:"termination_seconds"`
 		// PodFirewall (default true): an init container locks the pod's egress to the gateway with
 		// nftables, which is what isolates pods on different nodes of the shared VLAN.
 		PodFirewall *bool `yaml:"pod_firewall"`
@@ -249,8 +259,17 @@ func Load(path string) (*Config, error) {
 		n := "agent-sandbox-gateway-ca"
 		c.Kube.GatewayCAConfigMap = &n
 	}
-	if c.Kube.HarnessResumeCommand == "" {
-		c.Kube.HarnessResumeCommand = `claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose`
+	// Without a harness of its own the deployment runs Claude over ACP. A deployment that names a
+	// command keeps its own input mode (text unless it says otherwise).
+	if c.Kube.HarnessCommand == "" && c.Kube.HarnessInput == "" {
+		c.Kube.HarnessCommand, c.Kube.HarnessInput = "claude-agent-acp", "acp"
+		if c.Kube.HarnessMode == "" {
+			c.Kube.HarnessMode = "default"
+		}
+	}
+	// An ACP agent continues its own session (session/resume or load): no resume command.
+	if c.Kube.HarnessResumeCommand == "" && c.Kube.HarnessInput != "acp" {
+		c.Kube.HarnessResumeCommand = `claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none`
 	}
 	if c.Runtime == "" {
 		c.Runtime = "kube"

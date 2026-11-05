@@ -229,7 +229,9 @@ func serve(cfgPath string, log *slog.Logger) error {
 			TokenAudience: k.TokenAudience, RuntimeClassName: k.RuntimeClassName, StorageClass: k.StorageClass,
 			VolumeSize: k.VolumeSize, CPURequest: k.CPURequest, CPULimit: k.CPULimit, MemoryRequest: k.MemoryRequest,
 			MemoryLimit: k.MemoryLimit, HarnessCommand: k.HarnessCommand, HarnessResumeCommand: k.HarnessResumeCommand,
-			ResumePrompt: k.ResumePrompt, Env: k.Env, PriorityClassName: k.PriorityClassName,
+			ResumePrompt: k.ResumePrompt, HarnessInput: k.HarnessInput, HarnessPermissions: k.HarnessPermissions,
+			HarnessMode: k.HarnessMode, HarnessMCP: k.HarnessMCP, HarnessAuthMethod: k.HarnessAuthMethod,
+			Env: k.Env, PriorityClassName: k.PriorityClassName,
 			TerminationSeconds: k.TerminationSeconds, PodFirewall: *k.PodFirewall, GatewayCAConfigMap: *k.GatewayCAConfigMap,
 		}}
 		reg.Resolver = &kube.Resolver{Client: client, Namespace: k.Namespace, Audience: k.TokenAudience}
@@ -283,6 +285,9 @@ func serve(cfgPath string, log *slog.Logger) error {
 	envVersion := func(sb *model.Sandbox) string {
 		h := sha256.New()
 		fmt.Fprintf(h, "policy=%s\nimage=%s\nharness=%s\nresume=%s\n", pols.ContentHash(sb.Slug), sb.AgentVersion, cfg.Kube.HarnessCommand, cfg.Kube.HarnessResumeCommand)
+		if k := cfg.Kube; k.HarnessInput != "" || k.HarnessPermissions != "" || k.HarnessMode != "" || k.HarnessMCP != "" || k.HarnessAuthMethod != "" {
+			fmt.Fprintf(h, "input=%s\npermissions=%s\nmode=%s\nmcp=%s\nauth=%s\n", k.HarnessInput, k.HarnessPermissions, k.HarnessMode, k.HarnessMCP, k.HarnessAuthMethod)
+		}
 		if sb.Launch != nil {
 			b, _ := json.Marshal(sb.Launch)
 			fmt.Fprintf(h, "launch=%s\nagent=%s@%d\nenvironment=%s@%d\n", b, sb.AgentRef, sb.AgentRevision, sb.EnvironmentRef, sb.EnvironmentRevision)

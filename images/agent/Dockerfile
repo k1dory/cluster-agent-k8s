@@ -46,6 +46,9 @@ COPY images/agent/netlock.sh /usr/local/bin/netlock.sh
 COPY images/agent/profile.sh /etc/profile.d/sandbox.sh
 # A gateway root can be baked in for layouts without the ConfigMap mount (compose/VM): put it at this path.
 ENV GATEWAY_CA_FILE=/etc/sandbox/gateway-ca/gateway-ca.crt
+# codex-acp starts the codex named here, the one pinned above (CODEX_VERSION), not the copy it
+# carries in its own dependencies.
+ENV CODEX_PATH=/usr/local/bin/codex
 # Every login shell (agent-runner uses `sh -lc`) sources the identity environment.
 ENV ENV=/etc/profile.d/sandbox.sh \
     BASH_ENV=/etc/profile.d/sandbox.sh \

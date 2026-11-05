@@ -94,6 +94,7 @@ func TestLaunchShapesThePod(t *testing.T) {
 	sb := &model.Sandbox{ID: "sb_launch", Slug: "dev", Tenant: "acme", AgentVersion: "agent:py-1.2", AgentRef: "backend", AgentRevision: 3,
 		EnvironmentRef: "py", EnvironmentRevision: 2, Launch: &model.Launch{
 			Image: "agent:py-1.2", HarnessCommand: "codex exec \"$SANDBOX_TASK\" --json", Model: "claude-opus-5-5", Instructions: "Be brief.",
+			HarnessInput: "acp", HarnessMode: "agent-full-access", HarnessMCP: "always",
 			// GATEWAY_IP, SANDBOX_ID and KEEP must not win: platform and operator names stay theirs.
 			Env:      map[string]string{"PIP_INDEX_URL": "https://pypi.example.com", "GATEWAY_IP": "192.0.2.9", "SANDBOX_ID": "forged", "KEEP": "2"},
 			CPULimit: "3", MemoryRequest: "2Gi", VolumeSize: "20Gi", RuntimeClass: "gvisor"}}
@@ -119,6 +120,8 @@ func TestLaunchShapesThePod(t *testing.T) {
 		t.Fatalf("image: %s", c.Image)
 	case env["HARNESS_CMD"] != "codex exec \"$SANDBOX_TASK\" --json":
 		t.Fatalf("harness: %q", env["HARNESS_CMD"])
+	case env["HARNESS_INPUT"] != "acp" || env["HARNESS_MODE"] != "agent-full-access" || env["HARNESS_MCP"] != "always":
+		t.Fatalf("acp launch env: %v", env)
 	case env["ANTHROPIC_MODEL"] != "claude-opus-5-5" || env["SANDBOX_MODEL"] != "claude-opus-5-5" || env["SANDBOX_INSTRUCTIONS"] != "Be brief." || env["PIP_INDEX_URL"] == "" || env["KEEP"] != "1" || env["ANTHROPIC_BASE_URL"] == "":
 		t.Fatalf("env merge: %v", env)
 	case env["GATEWAY_IP"] != "10.77.77.1" || env["SANDBOX_ID"] != "sb_launch":
@@ -147,6 +150,36 @@ func TestLaunchShapesThePod(t *testing.T) {
 	pod, _ = client.CoreV1().Pods("review").Get(ctx, name, metav1.GetOptions{})
 	if res := pod.Spec.Containers[0].Resources; res.Requests.Cpu().String() != "4" || res.Limits.Cpu().String() != "4" {
 		t.Fatalf("request above limit: %+v", res)
+	}
+}
+
+// The deployment's default harness (Claude over ACP) reaches a sandbox without a harness of its
+// own; a profile that names its command brings its whole harness, never the default's ACP input
+// or mode.
+func TestProfileHarnessReplacesTheDefaultAsAWhole(t *testing.T) {
+	ctx := context.Background()
+	client := fake.NewSimpleClientset()
+	rt := &Runtime{Client: client, Cfg: PodConfig{Namespace: "review", Image: "agent:default", GatewayIP: "10.77.77.1",
+		HarnessCommand: "claude-agent-acp", HarnessInput: "acp", HarnessMode: "default", HarnessPermissions: "allow"}}
+	envOf := func(sb *model.Sandbox) map[string]string {
+		name, err := rt.CreatePod(ctx, sb)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pod, _ := client.CoreV1().Pods("review").Get(ctx, name, metav1.GetOptions{})
+		env := map[string]string{}
+		for _, e := range pod.Spec.Containers[0].Env {
+			env[e.Name] = e.Value
+		}
+		return env
+	}
+	env := envOf(&model.Sandbox{ID: "sb_default", Slug: "dev", Tenant: "acme", Launch: &model.Launch{Model: "claude-opus-5-5"}})
+	if env["HARNESS_CMD"] != "claude-agent-acp" || env["HARNESS_INPUT"] != "acp" || env["HARNESS_MODE"] != "default" || env["HARNESS_PERMISSIONS"] != "allow" {
+		t.Fatalf("default harness: %v", env)
+	}
+	env = envOf(&model.Sandbox{ID: "sb_codex", Slug: "dev2", Tenant: "acme", Launch: &model.Launch{HarnessCommand: `codex exec --json "$SANDBOX_TASK"`}})
+	if env["HARNESS_CMD"] != `codex exec --json "$SANDBOX_TASK"` || env["HARNESS_INPUT"] != "" || env["HARNESS_MODE"] != "" || env["HARNESS_PERMISSIONS"] != "" {
+		t.Fatalf("profile harness mixed with the default: %v", env)
 	}
 }
 

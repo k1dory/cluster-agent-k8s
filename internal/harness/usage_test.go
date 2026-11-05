@@ -15,7 +15,12 @@ func TestParseUsage(t *testing.T) {
 	if !ok || mode != Increment || u.InputTokens != 100 || u.Model != "gpt-x" {
 		t.Fatalf("generic usage: ok=%v mode=%v %+v", ok, mode, u)
 	}
-	for _, l := range []string{"plain text", `{"type":"assistant","message":{}}`, `{"type":"result"}`, "", "{"} {
+	// codex exec --json: one record per turn.
+	u, mode, ok = ParseUsage(`{"type":"turn.completed","usage":{"input_tokens":24763,"cached_input_tokens":24448,"output_tokens":122,"reasoning_output_tokens":64}}`)
+	if !ok || mode != Increment || u.InputTokens != 24763 || u.CacheRead != 24448 || u.OutputTokens != 122 || u.Turns != 1 {
+		t.Fatalf("codex turn: ok=%v mode=%v %+v", ok, mode, u)
+	}
+	for _, l := range []string{"plain text", `{"type":"turn.completed"}`, `{"type":"item.completed","item":{"text":"turn.completed"}}`, `{"type":"assistant","message":{}}`, `{"type":"result"}`, "", "{"} {
 		if _, _, ok := ParseUsage(l); ok {
 			t.Fatalf("%q must not parse as usage", l)
 		}

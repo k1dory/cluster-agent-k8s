@@ -201,7 +201,9 @@ func withMCPConfig(cmdline string) string {
 
 // writeMCPConfig renders SANDBOX_MCP_SERVERS ([{name, url}]) as a Claude Code MCP
 // configuration ({"mcpServers": {name: {type: http, url}}}) at path. Returns how many servers
-// it wrote; nothing is written for an empty value.
+// it wrote; nothing is written for an empty value. The URLs are the gateway bridge's
+// (bridge.go), as for an ACP agent: whether Claude Code's MCP client presents the pod's client
+// certificate itself is not something the platform should depend on.
 func writeMCPConfig(servers, path string) (string, int, error) {
 	if strings.TrimSpace(servers) == "" {
 		return "", 0, nil
@@ -218,7 +220,7 @@ func writeMCPConfig(servers, path string) (string, int, error) {
 		if s.Name == "" || s.URL == "" {
 			continue
 		}
-		cfg["mcpServers"][s.Name] = map[string]string{"type": "http", "url": s.URL}
+		cfg["mcpServers"][s.Name] = map[string]string{"type": "http", "url": gatewayBridgeURL(s.URL)}
 	}
 	if len(cfg["mcpServers"]) == 0 {
 		return "", 0, nil
@@ -240,13 +242,22 @@ func repoDir() string {
 	return "/workspace/repo"
 }
 
+// harnessOf is the harness a run starts: the configured one, or without one Claude over ACP
+// (claude-agent-acp in the image).
+func harnessOf(cmdline, input string) (string, string) {
+	if cmdline == "" {
+		cmdline = "claude-agent-acp"
+		if input == "" {
+			input = harness.InputACP
+		}
+	}
+	return cmdline, input
+}
+
 // execute runs the harness for one task. Output lines are batched to the control plane;
 // user input events are written to the harness stdin.
 func execute(ctx context.Context, c *client, run *model.Run) int {
-	cmdline := os.Getenv("HARNESS_CMD")
-	if cmdline == "" {
-		cmdline = `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose`
-	}
+	cmdline, input := harnessOf(os.Getenv("HARNESS_CMD"), os.Getenv("HARNESS_INPUT"))
 	env := append(os.Environ(), "SANDBOX_TASK="+run.Task, "SANDBOX_RUN_ID="+run.ID)
 	// The profile's harness files (a Codex config.toml, Claude Code settings) are in place
 	// before the harness reads them. A file that cannot be written fails the run: a harness
@@ -284,7 +295,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	}
 	// An ACP harness is one program for the whole conversation: a resume is session/load of the
 	// same agent, MCP servers go into session/new, the runner is its client (acp.go).
-	if os.Getenv("HARNESS_INPUT") == harness.InputACP {
+	if input == harness.InputACP {
 		return executeACP(ctx, c, run, cmdline, env)
 	}
 	if run.ResumeOf != "" {
@@ -305,7 +316,22 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "/bin/sh", "-lc", cmdline)
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	// A cancelled run is interrupted first: `claude -p` ends its turn and writes its result on
+	// SIGINT, while after SIGTERM alone the turn never completes. SIGTERM follows if the harness
+	// is still there, SIGKILL after WaitDelay.
+	exited := make(chan struct{})
+	grace := interruptGrace
+	cmd.Cancel = func() error {
+		err := cmd.Process.Signal(syscall.SIGINT)
+		go func() {
+			select {
+			case <-exited:
+			case <-time.After(grace):
+				_ = cmd.Process.Signal(syscall.SIGTERM)
+			}
+		}()
+		return err
+	}
 	cmd.WaitDelay = 20 * time.Second
 	cmd.Env = env
 	cmd.Dir = os.Getenv("PWD")
@@ -345,6 +371,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	go func() { defer wg.Done(); forwardInput(runCtx, c, run.ID, stdinSink{stdin, chat.mode}, cancel, chat) }()
 
 	err = cmd.Wait()
+	close(exited)
 	cancel()
 	wg.Wait()
 	var ee *exec.ExitError
@@ -356,6 +383,9 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	}
 	return 0
 }
+
+// interruptGrace is how long a cancelled harness has after SIGINT before SIGTERM.
+var interruptGrace = 5 * time.Second
 
 // maxOutputLine is the longest output line the runner forwards. A longer one is dropped with a
 // notice and reading goes on: a reader that stopped would leave the harness (or the ACP bridge)

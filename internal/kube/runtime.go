@@ -59,6 +59,8 @@ type PodConfig struct {
 	ChatIdleSeconds      int
 	HarnessPermissions   string // acp: allow | deny
 	HarnessAuthMethod    string // acp: the authenticate method id
+	HarnessMode          string // acp: the session mode set after the session opens
+	HarnessMCP           string // acp: auto | always
 	// Env is the operator's environment (deployment configuration): trusted, set on every
 	// container of the pod. UserEnv is the sandbox's profile environment: it reaches the agent
 	// container only, and never under a platform name (model.PlatformEnv) or one Env sets.
@@ -125,12 +127,21 @@ func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 			*dst = v
 		}
 	}
-	pick(&e.HarnessCommand, l.HarnessCommand)
-	pick(&e.HarnessResumeCommand, l.HarnessResumeCommand)
+	// A profile that names its own harness brings all of its harness settings: the deployment's
+	// default (Claude over ACP) must not lend its input mode or ACP mode to, say, `codex exec`.
+	if l.HarnessCommand != "" {
+		e.HarnessCommand, e.HarnessResumeCommand = l.HarnessCommand, l.HarnessResumeCommand
+		e.HarnessInput, e.HarnessPermissions, e.HarnessAuthMethod = l.HarnessInput, l.HarnessPermissions, l.HarnessAuthMethod
+		e.HarnessMode, e.HarnessMCP = l.HarnessMode, l.HarnessMCP
+	} else {
+		pick(&e.HarnessResumeCommand, l.HarnessResumeCommand)
+		pick(&e.HarnessInput, l.HarnessInput)
+		pick(&e.HarnessPermissions, l.HarnessPermissions)
+		pick(&e.HarnessAuthMethod, l.HarnessAuthMethod)
+		pick(&e.HarnessMode, l.HarnessMode)
+		pick(&e.HarnessMCP, l.HarnessMCP)
+	}
 	pick(&e.ResumePrompt, l.ResumePrompt)
-	pick(&e.HarnessInput, l.HarnessInput)
-	pick(&e.HarnessPermissions, l.HarnessPermissions)
-	pick(&e.HarnessAuthMethod, l.HarnessAuthMethod)
 	if l.ChatIdle > 0 {
 		e.ChatIdleSeconds = l.ChatIdle
 	}
@@ -281,6 +292,8 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 		{Name: "HARNESS_CHAT_IDLE", Value: strconv.Itoa(c.ChatIdleSeconds)},
 		{Name: "HARNESS_PERMISSIONS", Value: c.HarnessPermissions},
 		{Name: "HARNESS_AUTH_METHOD", Value: c.HarnessAuthMethod},
+		{Name: "HARNESS_MODE", Value: c.HarnessMode},
+		{Name: "HARNESS_MCP", Value: c.HarnessMCP},
 		{Name: "SANDBOX_AGENT_VERSION", Value: c.Image},
 		{Name: "SANDBOX_ENV_VERSION", Value: sb.EnvVersion},
 		{Name: "SANDBOX_AGENT_REF", Value: sb.AgentRef},

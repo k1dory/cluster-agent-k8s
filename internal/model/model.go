@@ -54,8 +54,12 @@ type Launch struct {
 	HarnessPermissions string `json:"harness_permissions,omitempty"`
 	// HarnessAuthMethod is the authentication method an "acp" harness is told to use.
 	HarnessAuthMethod string `json:"harness_auth_method,omitempty"`
-	Model             string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
-	Instructions      string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
+	// HarnessMode is the session mode an "acp" harness is put in (session/set_mode).
+	HarnessMode string `json:"harness_mode,omitempty"`
+	// HarnessMCP is when an "acp" harness gets the MCP servers: auto (default) or always.
+	HarnessMCP   string `json:"harness_mcp,omitempty"`
+	Model        string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
+	Instructions string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
 	// Env is the profile's own variables for the agent container. They never reach the init
 	// containers and never shadow a platform variable (see PlatformEnv).
 	Env map[string]string `json:"env,omitempty"`
@@ -90,7 +94,8 @@ func PlatformEnv(name string) bool {
 	}
 	switch name {
 	case "GATEWAY_IP", "GATEWAY_CA_FILE", "REGISTRAR_URL", "API_URL", "CERT_DIR", "HOME",
-		"HARNESS_CMD", "HARNESS_RESUME_CMD", "HARNESS_INPUT", "HARNESS_CHAT_IDLE", "HARNESS_PERMISSIONS", "HARNESS_AUTH_METHOD":
+		"HARNESS_CMD", "HARNESS_RESUME_CMD", "HARNESS_INPUT", "HARNESS_CHAT_IDLE", "HARNESS_PERMISSIONS", "HARNESS_AUTH_METHOD",
+		"HARNESS_MODE", "HARNESS_MCP":
 		return true
 	}
 	return false

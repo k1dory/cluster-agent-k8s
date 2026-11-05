@@ -3,16 +3,25 @@
 # enters the pod: Claude Code runs with a placeholder, the gateway puts the real token in the
 # Authorization header (examples/policies/llm-subscriptions.yaml). docs/self-service.md,
 # "Subscriptions", has the whole path.
+#
+# Claude runs over the Agent Client Protocol (claude-agent-acp, the same agent as
+# environment-claude-acp.yaml) with the subscription token instead of an API key: its permission
+# requests reach the runner as session/request_permission, are answered by `permissions` and
+# recorded. (`claude -p` in a pod refuses every edit and non-read-only command since 2.1.302:
+# nobody is there to approve them.) The Agent SDK's terms ask products built on it for an API
+# key, not a claude.ai login (https://code.claude.com/docs/en/agent-sdk/overview): use this
+# profile only where that subscription may be used this way.
 # Apply:  sandboxctl apply -f examples/catalog/environment-claude-subscription.yaml
 kind: EnvironmentProfile
 name: claude-subscription
-description: Claude Code on the tenant's Claude subscription, the token held by the gateway
+description: Claude over ACP on the tenant's Claude subscription, the token held by the gateway
 spec:
   image: stable
   harness:
-    command: 'claude -p --input-format stream-json --output-format stream-json --verbose'
-    input: stream-json
-    resume_command: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose'
+    command: claude-agent-acp
+    input: acp
+    permissions: allow
+    mode: default
   model:
     name: claude-opus-5-5
     env:

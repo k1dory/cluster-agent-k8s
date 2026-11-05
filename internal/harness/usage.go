@@ -22,7 +22,8 @@ const (
 	Total
 )
 
-// ParseUsage recognises a usage record in one output line. It returns ok=false for
+// ParseUsage recognises a usage record in one output line: the generic usage lines (and the
+// runner's ACP ones), Claude Code's final result, Codex's turn.completed. It returns ok=false for
 // everything that is not one, cheaply: lines are only decoded when they look like JSON
 // with a usage-bearing type.
 func ParseUsage(line string) (u model.Usage, mode Mode, ok bool) {
@@ -38,8 +39,34 @@ func ParseUsage(line string) (u model.Usage, mode Mode, ok bool) {
 		return u, Increment, true
 	case strings.Contains(t, `"type":"result"`), strings.Contains(t, `"type": "result"`):
 		return parseClaudeResult(t)
+	case strings.Contains(t, `"turn.completed"`):
+		return parseCodexTurn(t)
 	}
 	return u, 0, false
+}
+
+// codexTurn is the end of a turn in `codex exec --json`: the turn's usage. input_tokens counts
+// the cached ones too (as codex-acp's inputTokens does, which the ACP path records as they are).
+// reasoning_output_tokens are part of output_tokens.
+type codexTurn struct {
+	Type  string `json:"type"`
+	Usage struct {
+		InputTokens       int64 `json:"input_tokens"`
+		CachedInputTokens int64 `json:"cached_input_tokens"`
+		OutputTokens      int64 `json:"output_tokens"`
+	} `json:"usage"`
+}
+
+func parseCodexTurn(t string) (model.Usage, Mode, bool) {
+	var v codexTurn
+	if err := json.Unmarshal([]byte(t), &v); err != nil || v.Type != "turn.completed" {
+		return model.Usage{}, 0, false
+	}
+	u := model.Usage{InputTokens: v.Usage.InputTokens, OutputTokens: v.Usage.OutputTokens, CacheRead: v.Usage.CachedInputTokens, Turns: 1}
+	if u.InputTokens == 0 && u.OutputTokens == 0 && u.CacheRead == 0 {
+		return model.Usage{}, 0, false
+	}
+	return u, Increment, true
 }
 
 // ParseSession pulls the harness's conversation id out of one output line, when it carries

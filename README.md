@@ -187,12 +187,17 @@ linux/amd64, each digest signed with cosign; `cosign verify --key cosign.pub <im
 ### Talking to the agent, reaching its workspace
 
 A sandbox is a conversation, not a one-shot task. `sandboxctl chat <sandbox>` replays what was
-said and lets you keep talking: with Claude Code's streaming input (`harness.input:
-stream-json`) a message reaches the running harness as input, the conversation stays open and
-the agent answers each message in the same process; a text-mode harness gets a message sent
-during a run as the next run, queued behind it; and when no run is active the next message
-resumes the harness session in a new run (`resume_command` with `$SANDBOX_SESSION` and the
-message in `$SANDBOX_RESUME_PROMPT`). `/attach <file>` uploads into `/workspace/uploads/` and tells
+said and lets you keep talking. The main path is the Agent Client Protocol (`harness.input: acp`,
+`examples/catalog/environment-{claude,codex,opencode,hermes}-acp.yaml`): the agent is an ACP
+agent and agent-runner its client, every message is a prompt of one session, and the same
+mechanisms apply to every agent: the session mode (`harness.mode`), the model, the instructions
+as the system prompt, the diff of every change, permission requests answered by
+`harness.permissions` and recorded, usage per turn, the session continued by the next run. The
+other input modes stay for harnesses without ACP: with Claude Code's streaming input
+(`stream-json`) a message reaches the running harness as input and the conversation stays open;
+a text-mode harness gets a message sent during a run as the next run, queued behind it; and when
+no run is active the next message resumes the harness session in a new run (`resume_command`
+with `$SANDBOX_SESSION` and the message in `$SANDBOX_RESUME_PROMPT`). `/attach <file>` uploads into `/workspace/uploads/` and tells
 the agent; `/close` ends the open conversation cleanly. The transcript (`GET /messages`, SSE at
 `/messages/stream`) is derived from the event stream: user turns, assistant text, tool calls,
 run boundaries. Workspace access goes through the runner over the same mTLS channel:
@@ -231,6 +236,7 @@ A profile's `env` (and `model.env`) is the agent container's only: it never reac
 containers that lock the network and bootstrap the identity, and it cannot set a platform name
 (`SANDBOX_*`, `GATEWAY_IP`, `REGISTRAR_URL`, `API_URL`, `CERT_DIR`, `HOME`, `HARNESS_CMD`,
 `HARNESS_RESUME_CMD`, `HARNESS_INPUT`, `HARNESS_CHAT_IDLE`, `HARNESS_PERMISSIONS`, `HARNESS_AUTH_METHOD`,
+`HARNESS_MODE`, `HARNESS_MCP`,
 `GATEWAY_CA_FILE`: refused with 422) or shadow the operator's `agent.env`.
 The model name and the instructions are exported by the platform (`SANDBOX_MODEL`,
 `ANTHROPIC_MODEL`, `SANDBOX_INSTRUCTIONS`). Resources are Kubernetes quantities, positive, with

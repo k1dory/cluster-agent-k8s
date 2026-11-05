@@ -7,6 +7,13 @@
 # Credentials: the Agent SDK's terms ask for an API key, not a claude.ai login, in products built
 # on it (https://code.claude.com/docs/en/agent-sdk/overview). The pod holds a placeholder; the
 # policy rule for api.anthropic.com injects `x-api-key: secret:anthropic` (docs/self-service.md).
+#
+# mode `default` keeps Claude's own permission checks on, so every edit and command it wants
+# reaches the runner as an ACP permission request, decided by `permissions` and recorded. The
+# agent takes the definition's instructions as its system prompt (sessionCapabilities.systemPrompt).
+# Nothing but the Messages API leaves the pod: no telemetry or update checks
+# (CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC), and WebFetch skips its domain preflight to
+# claude.ai, which the gateway would deny (skipWebFetchPreflight).
 # Apply:  sandboxctl apply -f examples/catalog/environment-claude-acp.yaml
 kind: EnvironmentProfile
 name: claude-acp
@@ -17,7 +24,13 @@ spec:
     command: claude-agent-acp
     input: acp
     permissions: allow
+    mode: default
+    files:
+      # $HOME/.claude/settings.json, Claude Code's user settings.
+      .claude/settings.json: |
+        { "skipWebFetchPreflight": true }
   model:
     name: claude-opus-5-5
   env:
     ANTHROPIC_API_KEY: placeholder-the-gateway-injects-the-real-key
+    CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
