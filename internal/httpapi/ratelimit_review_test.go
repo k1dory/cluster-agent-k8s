@@ -1,9 +1,13 @@
 package httpapi
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -101,5 +105,71 @@ func TestReviewLimiterRefillsAndForgets(t *testing.T) {
 	l.wait("b") // a sweep runs on access
 	if _, ok := l.buckets.Load("a"); ok {
 		t.Fatal("an idle full bucket is kept")
+	}
+}
+
+// blockingVerifier holds every verification until released and counts them.
+type blockingVerifier struct {
+	calls   atomic.Int32
+	release chan struct{}
+}
+
+func (v *blockingVerifier) Verify(ctx context.Context, _ string) (Principal, error) {
+	v.calls.Add(1)
+	select {
+	case <-v.release:
+	case <-ctx.Done():
+	}
+	return Principal{}, errors.New("bad signature")
+}
+
+// Concurrent guesses from one address spend the budget before they are checked: with a
+// burst of 3 and a verifier that is slow, only 3 of 10 reach it, the others are 429 at once.
+// A token that authenticates gives its attempt back.
+func TestReviewConcurrentGuessesCannotOutrunTheLimit(t *testing.T) {
+	s := newStack(t)
+	v := &blockingVerifier{release: make(chan struct{})}
+	s.p.Verifier = v
+	s.p.AuthLimit = RateLimit{Burst: 3, Every: time.Hour}
+	srv := httptest.NewServer(s.p.Routes())
+	defer srv.Close()
+	var once sync.Once
+	release := func() { once.Do(func() { close(v.release) }) }
+	defer release() // before srv.Close, which waits for the handlers held in the verifier
+
+	// Successes do not spend: many valid requests leave the whole burst for guesses.
+	for i := 0; i < 10; i++ {
+		if resp, body := call(t, "GET", srv.URL+"/v1/whoami", "t0k", nil, nil); resp.StatusCode != 200 {
+			t.Fatalf("valid token %d: %d %s", i, resp.StatusCode, body)
+		}
+	}
+	codes := make(chan int, 10)
+	for i := 0; i < 10; i++ {
+		go func() {
+			resp, _ := call(t, "GET", srv.URL+"/v1/whoami", "a.b.c", nil, nil)
+			codes <- resp.StatusCode
+		}()
+	}
+	limited := 0
+	timeout := time.After(10 * time.Second)
+	for limited < 7 {
+		select {
+		case c := <-codes:
+			if c != 429 {
+				t.Fatalf("a guess was answered %d while the first three were still being checked", c)
+			}
+			limited++
+		case <-timeout:
+			t.Fatalf("only %d guesses refused; %d reached the verifier", limited, v.calls.Load())
+		}
+	}
+	if n := v.calls.Load(); n != 3 {
+		t.Fatalf("%d guesses reached the verifier, want 3", n)
+	}
+	release()
+	for i := 0; i < 3; i++ {
+		if c := <-codes; c != 401 {
+			t.Fatalf("a checked guess: %d", c)
+		}
 	}
 }

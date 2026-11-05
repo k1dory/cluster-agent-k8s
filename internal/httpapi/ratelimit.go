@@ -90,6 +90,16 @@ func (l *limiter) take(key string) time.Duration {
 	return 0
 }
 
+// refund gives back an attempt take spent (an authentication that succeeded).
+func (l *limiter) refund(key string) {
+	now := l.now()
+	b := l.bucket(key, now)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	l.refill(b, now)
+	b.tokens = min(float64(l.cfg.Burst), b.tokens+1)
+}
+
 func (l *limiter) until(b *bucket) time.Duration {
 	if b.tokens >= 1 {
 		return 0

@@ -314,19 +314,23 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		got := []byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-		// Failed attempts are counted per source address; once its bucket is empty, every token
-		// from there is refused unchecked (a check would still tell a guess that is right), until
-		// the bucket refills. Requests without a token are not counted.
+		// Attempts are counted per source address. Each presented token reserves one before it
+		// is checked, so concurrent guesses cannot all pass while the first are still being
+		// verified; a token that authenticates (or a check that failed inside) gives it back.
+		// Once the bucket is empty every token from there is refused unchecked (a check would
+		// still tell a guess that is right). Requests without a token are not counted.
 		lim, src := p.authLimiter(), "auth|"+sourceOf(r)
+		reserved := false
 		if lim != nil && len(got) > 0 {
-			if d := lim.wait(src); d > 0 {
+			if d := lim.take(src); d > 0 {
 				writeRateLimited(w, d)
 				return
 			}
+			reserved = true
 		}
-		failed := func() {
-			if lim != nil && len(got) > 0 {
-				lim.take(src)
+		refund := func() {
+			if reserved {
+				lim.refund(src)
 			}
 		}
 		var pr *Principal
@@ -342,9 +346,9 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 			k, err := p.Keys.Authenticate(r.Context(), string(got))
 			if err != nil {
 				if errors.Is(err, apikeys.ErrBadKey) {
-					failed()
 					writeErr(w, http.StatusUnauthorized, errors.New("bad token"))
 				} else {
+					refund()
 					writeErr(w, http.StatusInternalServerError, fmt.Errorf("api key: %w", err))
 				}
 				return
@@ -354,17 +358,16 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 		if pr == nil && p.Verifier != nil && strings.Count(string(got), ".") == 2 {
 			v, err := p.Verifier.Verify(r.Context(), string(got))
 			if err != nil {
-				failed()
 				writeErr(w, http.StatusUnauthorized, fmt.Errorf("token: %w", err))
 				return
 			}
 			pr = &v
 		}
 		if pr == nil {
-			failed()
 			writeErr(w, http.StatusUnauthorized, errors.New("bad token"))
 			return
 		}
+		refund()
 		next(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, *pr)))
 	}
 }
