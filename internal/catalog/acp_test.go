@@ -10,7 +10,8 @@ import (
 )
 
 // An ACP profile names the agent program and, optionally, how its permission requests are
-// answered; both reach the launch. permissions means nothing outside acp and is refused there.
+// answered, its session mode and when it gets MCP servers; all reach the launch. These mean
+// nothing outside acp and are refused there.
 func TestACPProfileValidationAndLaunch(t *testing.T) {
 	s := newService()
 	ctx := context.Background()
@@ -21,12 +22,16 @@ func TestACPProfileValidationAndLaunch(t *testing.T) {
 		`{"image":"stable","harness":{"input":"stream-json","permissions":"allow"}}`,
 		`{"image":"stable","harness":{"auth_method":"api-key"}}`,
 		`{"image":"stable","harness":{"command":"codex-acp","input":"acp","auth_method":"api key"}}`,
+		`{"image":"stable","harness":{"mode":"build"}}`,
+		`{"image":"stable","harness":{"command":"codex-acp","input":"acp","mode":"full access"}}`,
+		`{"image":"stable","harness":{"command":"hermes acp","input":"acp","mcp":"never"}}`,
+		`{"image":"stable","harness":{"input":"text","mcp":"always"}}`,
 	} {
 		if _, err := s.Put(ctx, model.KindEnvironment, "acme", doc(t, "acp", bad, nil), false, "alice"); !errors.Is(err, ErrInvalid) {
 			t.Errorf("must be invalid: %s → %v", bad, err)
 		}
 	}
-	spec := `{"image":"stable","harness":{"command":"codex-acp","input":"acp","permissions":"deny","auth_method":"api-key"}}`
+	spec := `{"image":"stable","harness":{"command":"codex-acp","input":"acp","permissions":"deny","auth_method":"api-key","mode":"agent-full-access","mcp":"always"}}`
 	if _, err := s.Put(ctx, model.KindEnvironment, "acme", doc(t, "acp", spec, nil), false, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +39,8 @@ func TestACPProfileValidationAndLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	r, err := s.Resolve(ctx, "acme", "coder", false)
-	if err != nil || r.Launch.HarnessCommand != "codex-acp" || r.Launch.HarnessInput != "acp" || r.Launch.HarnessPermissions != "deny" || r.Launch.HarnessAuthMethod != "api-key" {
+	if err != nil || r.Launch.HarnessCommand != "codex-acp" || r.Launch.HarnessInput != "acp" || r.Launch.HarnessPermissions != "deny" || r.Launch.HarnessAuthMethod != "api-key" ||
+		r.Launch.HarnessMode != "agent-full-access" || r.Launch.HarnessMCP != "always" {
 		t.Fatalf("resolve: %v %+v", err, r.Launch)
 	}
 }

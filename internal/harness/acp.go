@@ -32,6 +32,11 @@ type ACPLine struct {
 	Kind       string    `json:"kind,omitempty"`
 	Status     string    `json:"status,omitempty"`
 	Diffs      []ACPDiff `json:"diffs,omitempty"`
+	// DiffsReplace: this line's diffs replace those an earlier line of the same tool call
+	// carried (an agent that sends a preview first and the real hunks later, or a permission
+	// request whose diff is refined by the call's update). The diffs of a tool call are always
+	// those of its last line that has any.
+	DiffsReplace bool `json:"diffs_replace,omitempty"`
 	// Permission: the option the runner chose (its kind: allow_once, reject_once…) and why.
 	Decision   string `json:"decision,omitempty"`
 	StopReason string `json:"stop_reason,omitempty"`
@@ -39,8 +44,12 @@ type ACPLine struct {
 
 // ACPDiff is a file change an ACP agent reported on a tool call. OldText is absent for a new file.
 // A change too large for the output keeps its path and sizes, without the texts (Truncated).
+// Change is what the agent said the change is, when it says (codex-acp: add, update, delete,
+// rename); OldPath is a renamed file's previous path.
 type ACPDiff struct {
 	Path      string  `json:"path"`
+	Change    string  `json:"change,omitempty"`
+	OldPath   string  `json:"old_path,omitempty"`
 	OldText   *string `json:"old_text,omitempty"`
 	NewText   string  `json:"new_text"`
 	OldSize   int     `json:"old_size,omitempty"`
@@ -61,6 +70,12 @@ func parseACP(t string) (l ACPLine, ok bool) {
 	}
 	return l, true
 }
+
+// How an ACP agent gets the sandbox's MCP servers (spec.harness.mcp).
+const (
+	MCPAuto   = "auto"   // the default: in session/new when the agent declares mcpCapabilities.http
+	MCPAlways = "always" // always: for an agent that takes HTTP servers without declaring it (Hermes)
+)
 
 // Answers to an ACP agent's permission requests (spec.harness.permissions).
 const (

@@ -35,7 +35,8 @@ import (
 	"agent-sandbox/internal/store"
 )
 
-// authMethodRe is what an ACP authentication method id may look like (spec.harness.auth_method).
+// authMethodRe is what an ACP authentication method or session mode id may look like
+// (spec.harness.auth_method, spec.harness.mode).
 var authMethodRe = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
 
 // Errors the API maps to status codes (shared by every resource kind, see package resource).
@@ -81,6 +82,15 @@ type HarnessSpec struct {
 	// (ACP authenticate, one of the agent's advertised authMethods), e.g. codex-acp's api-key.
 	// Empty: the agent is not asked to authenticate.
 	AuthMethod string `yaml:"auth_method,omitempty" json:"auth_method,omitempty"`
+	// Mode is the session mode an "acp" harness is put in after its session opens (ACP
+	// session/set_mode, or the agent's config option of category mode): one of the ids the
+	// agent advertises, e.g. codex-acp's agent-full-access or OpenCode's build. Empty: the
+	// agent's own default. An id the agent does not offer is reported in the run's output.
+	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
+	// MCP says when an "acp" harness gets the sandbox's MCP servers in session/new: "auto"
+	// (the default: when it declares MCP over HTTP) or "always" (for an agent that takes them
+	// without declaring it, such as Hermes).
+	MCP string `yaml:"mcp,omitempty" json:"mcp,omitempty"`
 	// Files are the harness's own configuration files, path (relative to the agent's home) →
 	// content: a Codex config.toml naming its provider, a Claude Code settings.json. The runner
 	// writes them before every run (SANDBOX_HARNESS_FILES). They are configuration, stored in
@@ -257,6 +267,23 @@ func (s *Service) validate(ctx context.Context, kind, tenant string, raw json.Ra
 			if !authMethodRe.MatchString(m) {
 				return nil, fmt.Errorf("%w: spec.harness.auth_method must be an authentication method id (letters, digits, . _ : -, at most 64)", ErrInvalid)
 			}
+		}
+		if m := e.Harness.Mode; m != "" {
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.mode applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+			if !authMethodRe.MatchString(m) {
+				return nil, fmt.Errorf("%w: spec.harness.mode must be a session mode id (letters, digits, . _ : -, at most 64)", ErrInvalid)
+			}
+		}
+		switch e.Harness.MCP {
+		case "":
+		case harness.MCPAuto, harness.MCPAlways:
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.mcp applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+		default:
+			return nil, fmt.Errorf("%w: spec.harness.mcp must be %s or %s", ErrInvalid, harness.MCPAuto, harness.MCPAlways)
 		}
 		if e.Harness.ChatIdle != nil && *e.Harness.ChatIdle < 0 {
 			return nil, fmt.Errorf("%w: spec.harness.chat_idle must be >= 0", ErrInvalid)
@@ -484,6 +511,7 @@ func (s *Service) Resolve(ctx context.Context, tenant, agentRef string, admin bo
 			Image: image, HarnessCommand: es.Harness.Command, HarnessResumeCommand: es.Harness.ResumeCommand,
 			ResumePrompt: es.Harness.ResumePrompt, HarnessInput: es.Harness.Input, ChatIdle: intOf(es.Harness.ChatIdle),
 			HarnessPermissions: es.Harness.Permissions, HarnessAuthMethod: es.Harness.AuthMethod,
+			HarnessMode: es.Harness.Mode, HarnessMCP: es.Harness.MCP,
 			Model: es.Model.Name, Instructions: as.Instructions, Env: envVars, HarnessFiles: es.Harness.Files,
 			CPURequest: es.Resources.CPURequest, CPULimit: es.Resources.CPULimit,
 			MemoryRequest: es.Resources.MemoryRequest, MemoryLimit: es.Resources.MemoryLimit,
