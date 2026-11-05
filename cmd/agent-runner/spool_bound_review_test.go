@@ -62,3 +62,28 @@ func TestSpoolStaysBoundedUnderSaturation(t *testing.T) {
 		t.Fatal("no turn end was kept in the reserve")
 	}
 }
+
+// A result larger than a short line (Claude Code's carries the whole answer) is a state line all
+// the same: with ordinary output filling the spool it goes into the reserve, turn end and usage
+// with it.
+func TestLargeResultUsesTheReserve(t *testing.T) {
+	smallSpool(t, 10_000, 100, 64_000, 10)
+	stall := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-stall:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(stall)
+	s := newOutputSpool(t.Context(), &client{base: srv.URL, http: srv.Client()}, "run_big_result")
+	defer s.stop()
+	for i := range 1_000 {
+		s.add(fmt.Sprintf(`{"type":"assistant","message":{"content":[{"type":"text","text":"message %d"}]}}`, i))
+	}
+	result := `{"type":"result","session_id":"sess_1","result":"` + strings.Repeat("a", 40<<10) + `","usage":{"input_tokens":1,"output_tokens":1}}`
+	if !s.add(result) {
+		t.Fatalf("a %d-byte result was dropped with the reserve empty", len(result))
+	}
+}

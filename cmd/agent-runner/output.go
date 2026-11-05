@@ -29,7 +29,7 @@ var (
 	// run's state, which have a bounded reserve of their own above them (stateLine).
 	spoolMaxBytes     = 32 << 20
 	spoolMaxLines     = 100_000
-	spoolReserveBytes = 1 << 20
+	spoolReserveBytes = 4 << 20 // a few results of the largest size an output line may have
 	spoolReserveLines = 4096
 	// spoolRequestBytes and spoolRequestLines are the reserve, above both, of what a person must
 	// see to answer the agent: its requests (permissions ask, a form, a sign-in link), their
@@ -108,16 +108,26 @@ func stopAtShutdown(parent context.Context, kill func()) (stop func()) {
 // header, the newline of the batch).
 const spoolLineOverhead = 32
 
-// stateLineBytes: a line longer than this is never a state line.
-const stateLineBytes = 16 << 10
-
 // stateLine reports whether a line carries the run's state: a turn end, a usage record, or the
 // line that announces the session (the runner's acp.session, Claude Code's system init, Codex's
 // thread.started). Losing one starts the next message in a new session or undercounts the cost.
 // Ordinary messages carry a session_id too (stream-json): they are output like any other, or
-// every line would pass the bound. It is only asked of lines that do not fit.
+// every line would pass the bound. A state line may be as large as any output line (Claude
+// Code's result carries the answer): the reserve bounds them. It is only asked of lines that do
+// not fit, and looks for the type's name before it decodes anything.
 func stateLine(l string) bool {
-	if len(l) > stateLineBytes {
+	t := strings.TrimSpace(l)
+	if len(t) < 2 || t[0] != '{' {
+		return false
+	}
+	named := false
+	for _, typ := range []string{"result", "turn.completed", harness.ACPTurnEnd, "usage", harness.ACPSession, "system", "thread.started"} {
+		if strings.Contains(t, `"`+typ+`"`) {
+			named = true
+			break
+		}
+	}
+	if !named {
 		return false
 	}
 	if harness.IsTurnEnd(l) {
