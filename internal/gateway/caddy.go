@@ -362,14 +362,34 @@ func rejectedHost(caddyfile string, err error) string {
 	return hostAtLine(caddyfile, n)
 }
 
+// adminClient talks to Caddy's admin API only. Not http.DefaultClient: that one has no timeout,
+// so a hung admin socket would block the syncer for good, and it honours HTTP_PROXY, which
+// would send the Caddyfile (with the agent CA and, in a shared setup, key paths) to a proxy.
+// The per-call deadline comes from the context (adminTimeout), so a hung socket fails the
+// attempt and the caller's retry loop goes on.
+var adminClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:           nil,
+		DialContext:     (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
+		MaxIdleConns:    2,
+		IdleConnTimeout: time.Minute,
+	},
+}
+
+// adminTimeout bounds one admin call; a /load provisions every site, so it is generous. A
+// variable so tests need not wait it out.
+var adminTimeout = 30 * time.Second
+
 // Push loads the Caddyfile into a running Caddy through its admin API.
 func Push(ctx context.Context, adminURL, caddyfile string) error {
+	ctx, cancel := context.WithTimeout(ctx, adminTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(adminURL, "/")+"/load", strings.NewReader(caddyfile))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "text/caddyfile")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := adminClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("caddy admin: %w", err)
 	}
@@ -383,11 +403,13 @@ func Push(ctx context.Context, adminURL, caddyfile string) error {
 
 // FetchRoot returns Caddy's internal CA root certificate (PEM), the one pods must trust.
 func FetchRoot(ctx context.Context, adminURL string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, adminTimeout)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(adminURL, "/")+"/pki/ca/local", nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := adminClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("caddy admin: %w", err)
 	}
