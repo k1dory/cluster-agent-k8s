@@ -413,32 +413,8 @@ func TestACPRealAdapterOpensASession(t *testing.T) {
 	t.Setenv("SANDBOX_MCP_SERVERS", "")
 	t.Setenv("PWD", home)
 	t.Setenv("SANDBOX_REPO_DIR", home+"/no-repo")
-	open := func(run *model.Run) (session acp.SessionId, fresh bool, notices []string, canLoad bool) {
-		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, isolate[0], append(isolate[1:], "/bin/sh", "-c", "exec "+agent)...)
-		// The adapter and whatever it starts form one process group, ended as a whole.
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-		cmd.Dir = home
-		cmd.Env = append(os.Environ(), "HOME="+home, "CODEX_HOME="+home, "NO_BROWSER=1")
-		cmd.WaitDelay = 2 * time.Second
-		var stderr strings.Builder
-		cmd.Stderr = &stderr
-		stdin, _ := cmd.StdinPipe()
-		stdout, _ := cmd.StdoutPipe()
-		if err := cmd.Start(); err != nil {
-			t.Fatal(err)
-		}
-		defer func() { _ = stdin.Close(); cancel(); _ = cmd.Wait() }()
-		emit := func(l string) { notices = append(notices, l) }
-		cl := &acpClient{emit: emit}
-		conn := &loggedInit{ClientSideConnection: acp.NewClientSideConnection(cl, stdin, stdout), t: t}
-		session, fresh, ok := openACPSession(ctx, conn, cl, run, emit)
-		if !ok || session == "" {
-			t.Fatalf("no session: %q\nadapter stderr:\n%s", notices, stderr.String())
-		}
-		return session, fresh, notices, conn.loadSession
+	open := func(run *model.Run) (acp.SessionId, bool, []string, bool) {
+		return openRealACP(t, isolate, agent, home, nil, run)
 	}
 	session, _, notices, canLoad := open(&model.Run{ID: "run_real"})
 	t.Logf("session %s; runner notices: %q", session, notices)
@@ -475,6 +451,38 @@ func (c *loggedInit) Initialize(ctx context.Context, p acp.InitializeRequest) (a
 		c.loadSession = r.AgentCapabilities.LoadSession
 	}
 	return r, err
+}
+
+// openRealACP starts the adapter command under isolate with home as its HOME (plus env), opens
+// the run's session with the runner's own setup, and stops the adapter. It returns the session,
+// whether it is new, the runner's notices and whether the agent advertises loadSession.
+func openRealACP(t *testing.T, isolate []string, agent, home string, env []string, run *model.Run) (session acp.SessionId, fresh bool, notices []string, canLoad bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, isolate[0], append(isolate[1:], "/bin/sh", "-c", "exec "+agent)...)
+	// The adapter and whatever it starts form one process group, ended as a whole.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.Dir = home
+	cmd.Env = append(append(os.Environ(), "HOME="+home, "CODEX_HOME="+home, "NO_BROWSER=1"), env...)
+	cmd.WaitDelay = 2 * time.Second
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stdin.Close(); cancel(); _ = cmd.Wait() }()
+	emit := func(l string) { notices = append(notices, l) }
+	cl := &acpClient{emit: emit}
+	conn := &loggedInit{ClientSideConnection: acp.NewClientSideConnection(cl, stdin, stdout), t: t}
+	session, fresh, ok := openACPSession(ctx, conn, cl, run, emit)
+	if !ok || session == "" {
+		t.Fatalf("no session: %q\nadapter stderr:\n%s", notices, stderr.String())
+	}
+	return session, fresh, notices, conn.loadSession
 }
 
 // noNetwork is the command prefix that runs a program with loopback only (an agent may talk to a

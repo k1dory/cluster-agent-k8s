@@ -1,0 +1,36 @@
+# EnvironmentProfile: OpenCode (opencode-ai, pinned in the agent image) as an ACP agent:
+# `opencode acp` speaks the Agent Client Protocol itself, agent-runner is its client. A
+# conversation is one OpenCode session (the next run loads it), the sandbox's MCP connections
+# reach it in session/new, file edits come with their diffs. docs/chat-and-files.md, "ACP harnesses".
+#
+# OpenCode's own permission rules are set to `ask`, so every edit and shell command it wants
+# reaches the runner as an ACP permission request, decided by `permissions` and recorded in the
+# run's output. The config also turns off what a pod has no use for: self-update, sharing
+# sessions to opencode.ai, the remote model catalogue (each would be an egress the policy denies).
+#
+# Credentials: the pod holds a placeholder API key; the policy rule for api.anthropic.com injects
+# `x-api-key: secret:anthropic` (docs/self-service.md).
+# Apply:  sandboxctl apply -f examples/catalog/environment-opencode-acp.yaml
+kind: EnvironmentProfile
+name: opencode-acp
+description: OpenCode over ACP, the API key held by the gateway
+spec:
+  image: stable
+  harness:
+    command: opencode acp
+    input: acp
+    permissions: allow
+    files:
+      # $HOME/.config/opencode/opencode.json, OpenCode's global configuration.
+      .config/opencode/opencode.json: |
+        {
+          "$schema": "https://opencode.ai/config.json",
+          "model": "anthropic/claude-sonnet-5-5",
+          "autoupdate": false,
+          "share": "disabled",
+          "permission": { "edit": "ask", "bash": "ask" }
+        }
+  env:
+    ANTHROPIC_API_KEY: placeholder-the-gateway-injects-the-real-key
+    OPENCODE_DISABLE_AUTOUPDATE: "1"
+    OPENCODE_DISABLE_MODELS_FETCH: "1"

@@ -125,9 +125,9 @@ publish sandboxctl images/sandboxd/Dockerfile sandboxctl
 publish agent images/agent/Dockerfile
 
 python3 - "$work/digests" "$manifest" "$IMAGE_REPO" "$tag" "$COMMIT" "$platform" "$created" "$signed" \
-  "$CLAUDE_CODE_VERSION" "$CODEX_VERSION" "$CLAUDE_AGENT_ACP_VERSION" "$CODEX_ACP_VERSION" "$COSIGN_VERSION" <<'PY'
+  "$CLAUDE_CODE_VERSION" "$CODEX_VERSION" "$CLAUDE_AGENT_ACP_VERSION" "$CODEX_ACP_VERSION" "$OPENCODE_VERSION" "$COSIGN_VERSION" <<'PY'
 import json, sys
-digests, out, repo, tag, commit, platform, created, signed, claude, codex, claude_acp, codex_acp, cosign = sys.argv[1:]
+digests, out, repo, tag, commit, platform, created, signed, claude, codex, claude_acp, codex_acp, opencode, cosign = sys.argv[1:]
 images = []
 for line in open(digests):
     name, digest = line.split()
@@ -136,7 +136,7 @@ for line in open(digests):
 json.dump({"commit": commit, "tag": tag, "created": created, "repository": repo,
            "signed": signed == "true", "public_key": "cosign.pub", "cosign": cosign,
            "harness": {"claude-code": claude, "codex": codex,
-                       "claude-agent-acp": claude_acp, "codex-acp": codex_acp}, "images": images},
+                       "claude-agent-acp": claude_acp, "codex-acp": codex_acp, "opencode": opencode}, "images": images},
           open(out, "w"), indent=2)
 PY
 rm -rf "$work"

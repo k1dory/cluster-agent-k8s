@@ -89,11 +89,11 @@ Forced rollouts keep working on the same mechanism: the interrupted run is re-qu
 
 `input: acp` makes the profile's command an [Agent Client Protocol](https://agentclientprotocol.com)
 agent and agent-runner its client, over the agent's stdio (JSON-RPC). The image carries the
-adapters for both vendors, pinned in `hack/ci/versions.env`:
+adapters for both vendors and OpenCode, pinned in `hack/ci/versions.env`:
 
 ```yaml
 harness:
-  command: claude-agent-acp        # or codex-acp, or any agent that speaks ACP (gemini --experimental-acp…)
+  command: claude-agent-acp        # or codex-acp, opencode acp, any agent that speaks ACP (gemini --experimental-acp…)
   input: acp
   permissions: allow               # allow (default) | deny
   auth_method: api-key             # optional: the agent's authentication method (ACP authenticate)
@@ -132,6 +132,12 @@ harness:
   A diff whose texts exceed 128 KiB keeps its path and sizes and is marked `truncated` (the file
   is in the workspace). A prompt's usage, when the agent reports it, is a `{"type":"usage",…}` line the run's
   accounting adds up. The agent's stderr is passed through as it is.
+- **OpenCode** (`command: opencode acp`, `examples/catalog/environment-opencode-acp.yaml`) is an
+  ACP agent itself: it loads sessions (a conversation continues across runs), takes the MCP
+  connections over HTTP and needs no `auth_method` with a provider key in its environment. Its
+  configuration is a harness file, `.config/opencode/opencode.json`: with its `permission` rules
+  at `ask`, every edit and shell command reaches `permissions` and the run's output; `autoupdate`
+  off, `share` disabled and `OPENCODE_DISABLE_MODELS_FETCH` keep it from egress a pod has no use for.
 - **Long lines.** For every harness, an output line over 1 MiB is replaced by a
   `[agent-runner] dropped an output line …` notice and reading goes on, so the harness never
   blocks on a reader that gave up.

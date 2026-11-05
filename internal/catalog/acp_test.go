@@ -42,7 +42,8 @@ func TestACPProfileValidationAndLaunch(t *testing.T) {
 // The shipped ACP profiles apply as they are.
 func TestShippedACPProfiles(t *testing.T) {
 	s := newService()
-	for _, f := range []string{"../../examples/catalog/environment-claude-acp.yaml", "../../examples/catalog/environment-codex-acp.yaml"} {
+	for _, f := range []string{"../../examples/catalog/environment-claude-acp.yaml", "../../examples/catalog/environment-codex-acp.yaml",
+		"../../examples/catalog/environment-opencode-acp.yaml"} {
 		raw, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatal(err)

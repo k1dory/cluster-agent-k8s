@@ -30,6 +30,7 @@ harness() { # harness LABEL-NAME COMMAND WANT
 }
 harness claude-code claude "$CLAUDE_CODE_VERSION"
 harness codex codex "$CODEX_VERSION"
+harness opencode opencode "$OPENCODE_VERSION"
 # The ACP adapters speak JSON-RPC on stdio and have no --version: the label and the installed
 # package are what pin them.
 acp_adapter() { # acp_adapter LABEL-NAME PACKAGE WANT
