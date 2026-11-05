@@ -91,9 +91,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "agent-runner:", err)
 		os.Exit(1)
 	}
-	if err := ensureRepo(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, "agent-runner: repository:", err)
-	}
+	workspaceRepo.ensure(ctx) // a failure is said again in the next run, which tries once more
 	go serveFiles(ctx, c, workspaceRoot())
 	// Harnesses that cannot present the client certificate reach the gateway through the
 	// bridge (bridge.go); its address is in their environment.
@@ -160,6 +158,37 @@ func (c *client) finish(ctx context.Context, runID string, exit int) {
 	}
 }
 
+// cloneTimeout bounds one clone of $SANDBOX_REPO: a clone the gateway holds open, or a remote
+// that never answers, would otherwise keep the runner from ever taking a run.
+var cloneTimeout = 15 * time.Minute
+
+// workspaceRepo remembers which repository the workspace holds a checkout of. A clone that
+// failed (refused by the policy, timed out) is tried again before the next run, and the run's
+// output says so: the harness then starts outside a checkout.
+var workspaceRepo repoSync
+
+type repoSync struct {
+	mu    sync.Mutex
+	ready string // "repo\x00dir" once the checkout is there
+}
+
+// ensure makes sure of the checkout; the result is a notice for the run's output, "" when there
+// is nothing to say.
+func (r *repoSync) ensure(ctx context.Context) string {
+	key := os.Getenv("SANDBOX_REPO") + "\x00" + repoDir()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ready == key {
+		return ""
+	}
+	if err := ensureRepo(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "agent-runner: repository:", err)
+		return "[agent-runner] repository: " + err.Error() + ": the run starts outside the checkout"
+	}
+	r.ready = key
+	return ""
+}
+
 // ensureRepo clones $SANDBOX_REPO into /workspace/repo once (the workspace volume persists
 // across pods) so a run starts inside a checkout. Git goes through the gateway with the
 // identity agent-init configured; the policy decides whether the clone is allowed.
@@ -171,23 +200,74 @@ func ensureRepo(ctx context.Context) error {
 	dir := repoDir()
 	if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
 		// The workspace volume persists; it must hold the repository that was asked for, not the
-		// one a previous configuration cloned. A different origin is moved aside, never reused.
+		// one a previous configuration cloned. A different origin is moved aside, never reused;
+		// one checkout is kept aside (the latest), so changing the repository back and forth does
+		// not fill the volume.
 		out, err := exec.CommandContext(ctx, "git", "-C", dir, "remote", "get-url", "origin").Output()
 		origin := strings.TrimSpace(string(out))
 		if err == nil && origin == repo {
 			return nil
 		}
-		aside := fmt.Sprintf("%s.replaced-%d", dir, time.Now().Unix())
+		aside := dir + ".replaced"
 		fmt.Printf("agent-runner: workspace holds %q, sandbox repo is %q: moving the old checkout to %s\n", origin, repo, aside)
+		if err := os.RemoveAll(aside); err != nil {
+			return fmt.Errorf("workspace at %s belongs to another repository (%s) and %s could not be cleared: %w", dir, origin, aside, err)
+		}
 		if err := os.Rename(dir, aside); err != nil {
 			return fmt.Errorf("workspace at %s belongs to another repository (%s) and could not be moved: %w", dir, origin, err)
 		}
 	}
+	// An empty directory is git's to create; one with content is not touched (the clone refuses it).
+	_ = os.Remove(dir)
+	_, statErr := os.Stat(dir)
+	created := os.IsNotExist(statErr)
 	fmt.Println("agent-runner: cloning", repo, "into", dir)
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-lc", `git clone -- "$SANDBOX_REPO" "$SANDBOX_REPO_DIR"`)
+	cctx, done := context.WithTimeout(ctx, cloneTimeout)
+	defer done()
+	cmd := exec.CommandContext(cctx, "/bin/sh", "-lc", `git clone -- "$SANDBOX_REPO" "$SANDBOX_REPO_DIR"`)
 	cmd.Env = append(os.Environ(), "SANDBOX_REPO_DIR="+dir)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	return cmd.Run()
+	// git runs helpers (git-remote-https) that hold its output: the group goes as a whole.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return signalGroup(cmd, syscall.SIGKILL) }
+	cmd.WaitDelay = 5 * time.Second
+	var tail tailWriter
+	cmd.Stdout, cmd.Stderr = os.Stdout, io.MultiWriter(os.Stderr, &tail)
+	err := cmd.Run()
+	if err == nil {
+		return nil
+	}
+	if created {
+		_ = os.RemoveAll(dir) // a clone cut short leaves a .git that would pass for a checkout
+	}
+	if errors.Is(cctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("git clone of %s did not finish within %s", repo, cloneTimeout)
+	}
+	if msg := tail.last(); msg != "" {
+		return fmt.Errorf("git clone of %s: %v: %s", repo, err, msg)
+	}
+	return fmt.Errorf("git clone of %s: %w", repo, err)
+}
+
+// tailWriter keeps the end of what is written to it (git's last words on a failed clone).
+type tailWriter struct{ b []byte }
+
+func (t *tailWriter) Write(p []byte) (int, error) {
+	t.b = append(t.b, p...)
+	if len(t.b) > 4096 {
+		t.b = t.b[len(t.b)-4096:]
+	}
+	return len(p), nil
+}
+
+// last is the last non-empty line written (progress lines end in \r, not \n).
+func (t *tailWriter) last() string {
+	lines := strings.FieldsFunc(string(t.b), func(r rune) bool { return r == '\n' || r == '\r' })
+	for i := len(lines) - 1; i >= 0; i-- {
+		if l := strings.TrimSpace(lines[i]); l != "" {
+			return truncate(l, 500)
+		}
+	}
+	return ""
 }
 
 // withMCPConfig makes a harness command load $SANDBOX_MCP_CONFIG: a command that runs claude
@@ -271,6 +351,9 @@ func harnessOf(cmdline, input string) (string, string) {
 // user input events are written to the harness stdin.
 func execute(ctx context.Context, c *client, run *model.Run) int {
 	cmdline, input := harnessOf(os.Getenv("HARNESS_CMD"), os.Getenv("HARNESS_INPUT"))
+	if notice := workspaceRepo.ensure(ctx); notice != "" {
+		c.post(ctx, run.ID, []string{notice})
+	}
 	env := append(os.Environ(), "SANDBOX_TASK="+run.Task, "SANDBOX_RUN_ID="+run.ID)
 	// The profile's harness files (a Codex config.toml, Claude Code settings) are in place
 	// before the harness reads them. A file that cannot be written fails the run: a harness
