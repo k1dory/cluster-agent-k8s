@@ -358,18 +358,27 @@ func (p *Platform) sandbox(w http.ResponseWriter, r *http.Request) (*model.Sandb
 	return sb, true
 }
 
-// tenantScope narrows a requested tenant filter to what the caller may see.
-func tenantScope(w http.ResponseWriter, r *http.Request, requested string) (string, bool) {
+// scopeTenant is the one tenant-scope rule of the API: the admin works in the tenant it names
+// (empty: the shared scope, or every tenant for a filter); a tenant principal works in its own,
+// and naming another tenant is 403. With required, naming none is 400.
+func scopeTenant(w http.ResponseWriter, r *http.Request, requested string, required bool) (string, bool) {
+	if required && requested == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("tenant is required"))
+		return "", false
+	}
 	pr := principalOf(r)
 	if pr.admin() {
 		return requested, true
 	}
 	if requested != "" && requested != pr.Tenant {
-		writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.Tenant))
+		writeErr(w, http.StatusForbidden, errOtherTenant(pr))
 		return "", false
 	}
 	return pr.Tenant, true
 }
+
+// errOtherTenant is the refusal of a tenant principal that names another tenant.
+func errOtherTenant(pr Principal) error { return errors.New("token is scoped to tenant " + pr.Tenant) }
 
 // idempotent replays the stored response when the client repeats a request with the same
 // Idempotency-Key (per tenant and route, 24h). Only 2xx responses are stored.
@@ -512,7 +521,7 @@ func (p *Platform) list(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, q.err)
 		return
 	}
-	tenant, ok := tenantScope(w, r, q.str("tenant"))
+	tenant, ok := scopeTenant(w, r, q.str("tenant"), false)
 	if !ok {
 		return
 	}
@@ -542,11 +551,11 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 	}
 	pr := principalOf(r)
 	if !pr.admin() {
-		if req.Tenant != "" && req.Tenant != pr.Tenant {
-			writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.Tenant))
+		tenant, ok := scopeTenant(w, r, req.Tenant, false)
+		if !ok {
 			return
 		}
-		req.Tenant = pr.Tenant
+		req.Tenant = tenant
 	}
 	req.Admin = pr.admin()
 	if p.TTLFromToken {
@@ -901,7 +910,7 @@ func (p *Platform) usage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, q.err)
 		return
 	}
-	tenant, ok := tenantScope(w, r, q.str("tenant"))
+	tenant, ok := scopeTenant(w, r, q.str("tenant"), false)
 	if !ok {
 		return
 	}
@@ -943,7 +952,7 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, q.err)
 		return
 	}
-	tenant, ok := tenantScope(w, r, q.str("tenant"))
+	tenant, ok := scopeTenant(w, r, q.str("tenant"), false)
 	if !ok {
 		return
 	}

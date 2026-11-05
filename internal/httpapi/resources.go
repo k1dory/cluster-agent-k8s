@@ -171,8 +171,9 @@ func readDocument(w http.ResponseWriter, r *http.Request, tenant *string) (*reso
 	}
 	pr := principalOf(r)
 	if d.Tenant != nil {
+		// Not scopeTenant: a tenant that names the shared scope ("") in the body is refused too.
 		if !pr.admin() && *d.Tenant != pr.Tenant {
-			writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.Tenant))
+			writeErr(w, http.StatusForbidden, errOtherTenant(pr))
 			return nil, false
 		}
 		*tenant = *d.Tenant
@@ -210,17 +211,11 @@ func (p *Platform) tenantSettingsRoutes(mux *routeMux) {
 			writeErr(w, http.StatusServiceUnavailable, errors.New("tenant settings disabled"))
 			return "", false
 		}
-		pr := principalOf(r)
-		tenant := r.PathValue("tenant")
-		if write && !pr.admin() {
+		if write && !principalOf(r).admin() {
 			writeErr(w, http.StatusForbidden, errors.New("admin only"))
 			return "", false
 		}
-		if !pr.admin() && tenant != pr.Tenant {
-			writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.Tenant))
-			return "", false
-		}
-		return tenant, true
+		return scopeTenant(w, r, r.PathValue("tenant"), true)
 	}
 	mux.HandleFunc("GET /v1/tenants/{tenant}/settings", p.auth(func(w http.ResponseWriter, r *http.Request) {
 		tenant, ok := own(w, r, false)
@@ -339,18 +334,28 @@ func (p *Platform) configRoutes(mux *routeMux) {
 	mux.HandleFunc("POST /v1/rollback", p.auth(p.rollback))
 }
 
+// applier is the apply controller, or a 503 when the platform has none (evaluated per
+// request, like the services of resourceRoutes).
+func (p *Platform) applier(w http.ResponseWriter) (*apply.Controller, bool) {
+	if p.Applier == nil {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+		return nil, false
+	}
+	return p.Applier, true
+}
+
 // driftReport lists the items of the scope that moved away from what an apply last wrote:
 // changed through the resource API, or deleted. Computed from the store alone.
 func (p *Platform) driftReport(w http.ResponseWriter, r *http.Request) {
-	if p.Applier == nil {
-		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+	applier, ok := p.applier(w)
+	if !ok {
 		return
 	}
 	tenant, ok := p.catalogScope(w, r)
 	if !ok {
 		return
 	}
-	rep, err := drift.Detect(r.Context(), p.Applier.Store, tenant, time.Now())
+	rep, err := drift.Detect(r.Context(), applier.Store, tenant, time.Now())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
@@ -362,8 +367,8 @@ func (p *Platform) driftReport(w http.ResponseWriter, r *http.Request) {
 // revision, as a new plan and apply under the caller's current rights. Grants are never
 // restored. `dry_run` plans without writing; an invalid plan is 422 with the plan.
 func (p *Platform) rollback(w http.ResponseWriter, r *http.Request) {
-	if p.Applier == nil {
-		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+	applier, ok := p.applier(w)
+	if !ok {
 		return
 	}
 	pr := principalOf(r)
@@ -387,7 +392,7 @@ func (p *Platform) rollback(w http.ResponseWriter, r *http.Request) {
 	if body.Key == "" {
 		body.Key = r.Header.Get("Idempotency-Key")
 	}
-	rb, err := p.Applier.Rollback(r.Context(), apply.RollbackRequest{Apply: body.Apply, Kind: body.Kind, Tenant: body.Tenant, Name: body.Name,
+	rb, err := applier.Rollback(r.Context(), apply.RollbackRequest{Apply: body.Apply, Kind: body.Kind, Tenant: body.Tenant, Name: body.Name,
 		Revision: body.Revision, Key: body.Key, DryRun: body.DryRun, Scope: plan.Scope{Tenant: tenant, Admin: pr.admin(), Subject: pr.Subject}})
 	var invalid *apply.InvalidPlan
 	switch {
@@ -409,8 +414,8 @@ func (p *Platform) rollback(w http.ResponseWriter, r *http.Request) {
 // wrapper, ?key=, the Idempotency-Key header, or the plan fingerprint. The same key with the
 // same bundle returns (and finishes) the same apply; another bundle under it is 409.
 func (p *Platform) applyBundle(w http.ResponseWriter, r *http.Request) {
-	if p.Applier == nil {
-		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+	applier, ok := p.applier(w)
+	if !ok {
 		return
 	}
 	pr := principalOf(r)
@@ -429,7 +434,7 @@ func (p *Platform) applyBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Scope = plan.Scope{Tenant: tenant, Admin: pr.admin(), Subject: pr.Subject}
-	a, err := p.Applier.Submit(r.Context(), req)
+	a, err := applier.Submit(r.Context(), req)
 	writeApply(w, a, err)
 }
 
@@ -527,33 +532,33 @@ func (p *Platform) applyScope(r *http.Request) plan.Scope {
 }
 
 func (p *Platform) getApply(w http.ResponseWriter, r *http.Request) {
-	if p.Applier == nil {
-		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+	applier, ok := p.applier(w)
+	if !ok {
 		return
 	}
-	a, err := p.Applier.Get(r.Context(), r.PathValue("id"), p.applyScope(r))
+	a, err := applier.Get(r.Context(), r.PathValue("id"), p.applyScope(r))
 	writeApply(w, a, err)
 }
 
 func (p *Platform) resumeApply(w http.ResponseWriter, r *http.Request) {
-	if p.Applier == nil {
-		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+	applier, ok := p.applier(w)
+	if !ok {
 		return
 	}
-	a, err := p.Applier.Resume(r.Context(), r.PathValue("id"), p.applyScope(r))
+	a, err := applier.Resume(r.Context(), r.PathValue("id"), p.applyScope(r))
 	writeApply(w, a, err)
 }
 
 func (p *Platform) listApplies(w http.ResponseWriter, r *http.Request) {
-	if p.Applier == nil {
-		writeErr(w, http.StatusServiceUnavailable, errors.New("apply disabled"))
+	applier, ok := p.applier(w)
+	if !ok {
 		return
 	}
 	tenant, ok := p.catalogScope(w, r)
 	if !ok {
 		return
 	}
-	list, err := p.Applier.List(r.Context(), tenant, 100)
+	list, err := applier.List(r.Context(), tenant, 100)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, err)
 		return

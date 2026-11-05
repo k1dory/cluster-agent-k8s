@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"errors"
 	"fmt"
 	"net/http"
 
@@ -13,18 +12,10 @@ import (
 // shape every versioned resource shares (resources.go). What is specific to the catalogue is
 // here: the scope rule and how an agent reference becomes a creation request.
 
-// catalogScope is the tenant the request works in. Tenants are confined to their own; the
-// admin picks one with ?tenant= and defaults to the shared scope.
+// catalogScope is the tenant the request works in: ?tenant= under scopeTenant (the admin
+// defaults to the shared scope).
 func (p *Platform) catalogScope(w http.ResponseWriter, r *http.Request) (string, bool) {
-	pr := principalOf(r)
-	if pr.admin() {
-		return r.URL.Query().Get("tenant"), true
-	}
-	if t := r.URL.Query().Get("tenant"); t != "" && t != pr.Tenant {
-		writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.Tenant))
-		return "", false
-	}
-	return pr.Tenant, true
+	return scopeTenant(w, r, r.URL.Query().Get("tenant"), false)
 }
 
 // writeCatalogErr maps catalogue errors to status codes (same mapping as every resource).

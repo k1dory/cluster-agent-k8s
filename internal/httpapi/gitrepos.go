@@ -50,9 +50,9 @@ func (p *Platform) gitSyncRepo(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, syncBodyLimit))
+	raw, err := readBody(w, r, syncBodyLimit)
 	if err != nil {
-		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("body: at most %d bytes", syncBodyLimit))
+		writeBodyErr(w, err) // 413 over the cap; a body that breaks off (a client gone) is 400
 		return
 	}
 	commit, err := parseSyncBody(raw)
@@ -145,9 +145,9 @@ func (p *Platform) gitHook(w http.ResponseWriter, r *http.Request) {
 	if tenant == "-" {
 		tenant = ""
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, hookBodyLimit))
+	body, err := readBody(w, r, hookBodyLimit)
 	if err != nil {
-		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("body: at most %d bytes", hookBodyLimit))
+		writeBodyErr(w, err)
 		return
 	}
 	h, err := p.GitSync.Hook(r.Context(), tenant, r.PathValue("name"), r.Header, body)

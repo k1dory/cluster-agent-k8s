@@ -22,17 +22,7 @@ func (p *Platform) keyRoutes(mux *routeMux) {
 			writeErr(w, http.StatusServiceUnavailable, errors.New("api keys disabled"))
 			return "", false
 		}
-		pr := principalOf(r)
-		tenant := r.PathValue("tenant")
-		if tenant == "" {
-			writeErr(w, http.StatusBadRequest, errors.New("tenant is required"))
-			return "", false
-		}
-		if !pr.admin() && tenant != pr.Tenant {
-			writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.Tenant))
-			return "", false
-		}
-		return tenant, true
+		return scopeTenant(w, r, r.PathValue("tenant"), true)
 	}
 	// keyOf loads the key of the path and checks it belongs to the tenant of the path: another
 	// tenant's key is not found, never "forbidden" (ids are not enumerable either way).

@@ -15,6 +15,7 @@ import (
 	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/orchestrator"
+	"agent-sandbox/internal/store"
 	"github.com/k1dory/acpx"
 )
 
@@ -226,15 +227,20 @@ func (p *Platform) closeConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	run, err := p.Orch.Store.RunningRun(r.Context(), id)
-	if err != nil {
+	if errors.Is(err, store.ErrNotFound) {
 		writeErr(w, http.StatusConflict, errors.New("no conversation is open"))
 		return
 	}
-	if _, err := p.Orch.CloseRun(r.Context(), id, run.ID); err != nil {
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	closed, err := p.Orch.CloseRun(r.Context(), id, run.ID)
+	if err != nil {
 		writeOrchErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, run)
+	writeJSON(w, http.StatusOK, closed) // the run as it is now, not as it was before the close
 }
 
 func (p *Platform) closeRun(w http.ResponseWriter, r *http.Request) {
