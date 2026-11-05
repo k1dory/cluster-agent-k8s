@@ -113,7 +113,7 @@ DOCKERFILE
   out=$(docker run --rm --network none -e ACP_TEST_NETWORK=none --entrypoint /acp.test "$test_img" \
     -test.run "$pattern" -test.v 2>&1) || {
     # The verdicts and the tests' own messages first (an agent's log can be long), then the tail.
-    printf '%s\n' "$out" | grep -E -- '^(=== RUN|--- (FAIL|PASS|SKIP))|_test\.go:[0-9]+:' | cut -c1-2000
+    printf '%s\n' "$out" | grep -E -- '^(=== RUN|--- (FAIL|PASS|SKIP))|(_test|testing)\.go:[0-9]+:|^panic:' | cut -c1-2000
     printf '%s\n' "$out" | tail -40; ci_die "images: ACP smoke tests failed in $img"; }
   docker rmi -f "$test_img" >/dev/null 2>&1 || true
   for t in "$@"; do
