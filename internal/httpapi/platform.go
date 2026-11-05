@@ -410,7 +410,16 @@ func errOtherTenant(pr Principal) error { return errors.New("token is scoped to 
 
 // idempotent replays the stored response when the client repeats a request with the same
 // Idempotency-Key (per tenant and route, 24h). Only 2xx responses are stored.
-func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
+func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc { return p.keyed(false, next) }
+
+// idempotentUpload is idempotent for the one route that takes multipart (messages): its
+// multipart bodies are parsed and hashed by content. The route removes the parsed form's
+// temporary files (removeForm).
+func (p *Platform) idempotentUpload(next http.HandlerFunc) http.HandlerFunc {
+	return p.keyed(true, next)
+}
+
+func (p *Platform) keyed(uploads bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("Idempotency-Key")
 		if key == "" {
@@ -421,7 +430,7 @@ func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, errors.New("Idempotency-Key longer than 200 bytes"))
 			return
 		}
-		hash, err := requestHash(w, r)
+		hash, err := requestHash(w, r, uploads)
 		if err != nil {
 			writeBodyErr(w, err)
 			return
@@ -471,10 +480,12 @@ func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
 //
 // JSON is hashed as sent. A multipart body is hashed by what it carries, not by its bytes: the
 // boundary is random per request, so a client's retry of the same upload never has the same
-// bytes. The form is parsed here (files beyond multipartMemory spill to temporary files, which
-// the server removes after the request) and the handler reads the parsed form.
-func requestHash(w http.ResponseWriter, r *http.Request) (string, error) {
-	if !isMultipart(r) {
+// bytes. The form is parsed here only on the route that takes uploads (files beyond
+// multipartMemory spill to temporary files, which that route removes) and its handler reads
+// the parsed form. Every other route reads a multipart body as the JSON it is not, under the
+// JSON cap, and its handler refuses it: nothing is parsed or spilled there.
+func requestHash(w http.ResponseWriter, r *http.Request, uploads bool) (string, error) {
+	if !uploads || !isMultipart(r) {
 		body, err := readBody(w, r, jsonBodyLimit)
 		if err != nil {
 			return "", err

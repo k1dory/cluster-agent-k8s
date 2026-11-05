@@ -261,3 +261,32 @@ func TestReviewMultipartTemporaryFilesAreRemoved(t *testing.T) {
 		}
 	}
 }
+
+// Only the messages route reads multipart. The other idempotent routes take JSON: a keyed
+// multipart body there is held to the JSON cap and never parsed, so a large file part cannot
+// spill to disk on a route that would refuse it anyway.
+func TestReviewMultipartIsParsedOnlyOnTheMessagesRoute(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	s := newStack(t)
+	api := s.platform.URL
+	resp, body := call(t, "POST", api+"/v1/sandboxes", "t0k", map[string]any{"name": "nomp", "slug": "backend-dev", "owner": "alice"}, nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("create: %d %s", resp.StatusCode, body)
+	}
+	var sb struct{ ID string }
+	_ = json.Unmarshal(body, &sb)
+	big := strings.Repeat("s", multipartMemory+(1<<20))
+	for i, path := range []string{"/v1/sandboxes", "/v1/sandboxes/" + sb.ID + "/runs", "/v1/sandboxes/" + sb.ID + "/requests/q1"} {
+		for _, file := range []string{big, "small"} {
+			ct, b := multipartBody(t, "", "x", [2]string{"f.bin", file})
+			resp, body := postRaw(t, api+path, "t0k", ct, bytes.NewReader(b), map[string]string{"Idempotency-Key": fmt.Sprintf("mp-%d-%d", i, len(file))})
+			if resp.StatusCode != 413 && resp.StatusCode != 400 {
+				t.Fatalf("%s multipart: %d %s", path, resp.StatusCode, body)
+			}
+			if left, _ := filepath.Glob(filepath.Join(tmp, "multipart-*")); len(left) > 0 {
+				t.Fatalf("%s left temporary files: %v", path, left)
+			}
+		}
+	}
+}
