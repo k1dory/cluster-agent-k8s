@@ -430,7 +430,7 @@ func (p *Platform) keyed(uploads bool, next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, errors.New("Idempotency-Key longer than 200 bytes"))
 			return
 		}
-		hash, err := requestHash(w, r, uploads)
+		hash, legacy, err := requestHash(w, r, uploads)
 		if err != nil {
 			writeBodyErr(w, err)
 			return
@@ -445,7 +445,7 @@ func (p *Platform) keyed(uploads bool, next http.HandlerFunc) http.HandlerFunc {
 		}
 		if !reserved {
 			switch {
-			case existing.BodyHash != hash:
+			case existing.BodyHash != hash && (legacy == "" || existing.BodyHash != legacy):
 				writeErr(w, http.StatusUnprocessableEntity, errors.New("Idempotency-Key was already used with a different request body"))
 			case existing.InProgress():
 				w.Header().Set("Retry-After", "1")
@@ -484,22 +484,41 @@ func (p *Platform) keyed(uploads bool, next http.HandlerFunc) http.HandlerFunc {
 // multipartMemory spill to temporary files, which that route removes) and its handler reads
 // the parsed form. Every other route reads a multipart body as the JSON it is not, under the
 // JSON cap, and its handler refuses it: nothing is parsed or spilled there.
-func requestHash(w http.ResponseWriter, r *http.Request, uploads bool) (string, error) {
+func requestHash(w http.ResponseWriter, r *http.Request, uploads bool) (hash, legacy string, err error) {
 	if !uploads || !isMultipart(r) {
 		body, err := readBody(w, r, jsonBodyLimit)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		sum := sha256.Sum256(body)
-		return hex.EncodeToString(sum[:]), nil
+		return hex.EncodeToString(sum[:]), "", nil
 	}
+	// The raw bytes are hashed on the way through as well: records stored before the content
+	// hash hold the SHA-256 of the raw body (unprefixed), and the very retry of such a request
+	// has those same bytes. legacy matches them for as long as they live (24h).
 	capBody(w, r, multipartBodyLimit)
+	raw := sha256.New()
+	body := r.Body
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.TeeReader(body, raw), body}
 	if err := r.ParseMultipartForm(multipartMemory); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return multipartHash(r.MultipartForm)
+	if _, err := io.Copy(io.Discard, r.Body); err != nil { // the epilogue after the last part
+		return "", "", err
+	}
+	hash, err = multipartHash(r.MultipartForm)
+	if err != nil {
+		return "", "", err
+	}
+	return multipartHashVersion + hash, hex.EncodeToString(raw.Sum(nil)), nil
 }
+
+// multipartHashVersion prefixes a content hash, so it is never taken for a raw body's.
+const multipartHashVersion = "multipart-v1:"
 
 // multipartHash is sha256 over the form's parts in a canonical order: fields by name, each
 // field's values (and files) in the order they were sent, every name, file name and content
