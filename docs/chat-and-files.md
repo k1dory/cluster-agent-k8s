@@ -152,6 +152,23 @@ harness:
   off, `share` disabled and `OPENCODE_DISABLE_MODELS_FETCH` keep it from egress a pod has no use for.
   Its Anthropic provider's `baseURL` is the gateway bridge (below): OpenCode cannot present the
   pod's client certificate itself.
+- **Hermes Agent** (`command: hermes acp`, `examples/catalog/environment-hermes-acp.yaml`) runs
+  from its own image, `agent-hermes`: the official Hermes image pinned by digest
+  (`HERMES_IMAGE` in `hack/ci/versions.env`) with agent-init, agent-runner, the network lock and
+  user 1000 added (`images/agent-hermes/Dockerfile`). Hermes ships as that image, not as a
+  package the default agent image could install. The admin publishes it as a version of the
+  agent catalogue (`agent.versions.hermes: …/agent-hermes:sha-…@sha256:…`) and the profile names
+  `image: hermes`. `HERMES_HOME` is `~/.hermes` on the workspace volume (config, sessions,
+  memory, skills survive restarts); its configuration is a harness file, `.hermes/config.yaml`.
+  Hermes's own login is interactive and not used: the provider key is a placeholder in `env`,
+  and `ANTHROPIC_BASE_URL` is the gateway bridge (Hermes's httpx client cannot present the pod's
+  client certificate).
+- **Checked offline in CI.** `hack/ci/images.sh` runs the ACP smoke tests inside the built
+  images with no network: the shipped Codex, OpenCode and Hermes profiles open a session with
+  the real agent, and OpenCode's and Hermes's are loaded again by a second process (the next run).
+  Each also makes a real model call through the runner against a test gateway that requires the
+  pod's client certificate: OpenCode's and Hermes's answers come back into the transcript,
+  Codex's request arrives at `/v1/responses` with the certificate.
 - **Long lines.** For every harness, an output line over 1 MiB is replaced by a
   `[agent-runner] dropped an output line …` notice and reading goes on, so the harness never
   blocks on a reader that gave up.

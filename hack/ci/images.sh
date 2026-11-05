@@ -11,12 +11,13 @@ cd "$ci_root"
 ci_docker
 command -v python3 >/dev/null || ci_die "images: python3 is required (hack/test-netlock.py)"
 prefix=${IMAGE_PREFIX:-agent-sandbox} tag=${IMAGE_TAG:-ci}
-sandboxd=$prefix/sandboxd:$tag ctl=$prefix/sandboxctl:$tag agent=$prefix/agent:$tag
+sandboxd=$prefix/sandboxd:$tag ctl=$prefix/sandboxctl:$tag agent=$prefix/agent:$tag hermes=$prefix/agent-hermes:$tag
 
 echo "== build"
 docker build -f images/agent/Dockerfile $("$ci_dir/versions.sh" build-args) -t "$agent" .
 docker build -f images/sandboxd/Dockerfile -t "$sandboxd" .
 docker build -f images/sandboxd/Dockerfile --target sandboxctl -t "$ctl" .
+docker build -f images/agent-hermes/Dockerfile $("$ci_dir/versions.sh" hermes-build-args) -t "$hermes" .
 
 echo "== agent image: the harnesses of versions.env, installed and labelled"
 # The label is what an operator reads off a pulled image (docker inspect); the binary is what
@@ -110,7 +111,10 @@ WORKDIR /src/cmd/agent-runner
 DOCKERFILE
   pattern="^($(IFS='|'; echo "$*"))\$"
   out=$(docker run --rm --network none -e ACP_TEST_NETWORK=none --entrypoint /acp.test "$test_img" \
-    -test.run "$pattern" -test.v 2>&1) || { printf '%s\n' "$out" | tail -40; ci_die "images: ACP smoke tests failed in $img"; }
+    -test.run "$pattern" -test.v 2>&1) || {
+    # The verdicts and the tests' own messages first (an agent's log can be long), then the tail.
+    printf '%s\n' "$out" | grep -E -- '^(=== RUN|--- (FAIL|PASS|SKIP))|(_test|testing)\.go:[0-9]+:|^panic:' | cut -c1-2000
+    printf '%s\n' "$out" | tail -40; ci_die "images: ACP smoke tests failed in $img"; }
   docker rmi -f "$test_img" >/dev/null 2>&1 || true
   for t in "$@"; do
     case "$out" in *"--- PASS: $t "*) echo "$t: pass" ;; *) printf '%s\n' "$out" | tail -20; ci_die "images: $t did not pass in $img (skipped?)" ;; esac
@@ -120,6 +124,13 @@ DOCKERFILE
 echo "== agent image: the ACP agents open sessions from the shipped profiles, offline"
 acp_in_image "$agent" TestACPCodexExampleCreatesSession TestACPOpenCodeExampleCreatesAndLoadsASession \
   TestACPCodexExampleReachesTheModelThroughTheGateway TestACPOpenCodeExampleAnswersThroughTheGateway
+
+echo "== agent-hermes image: Hermes pinned and labelled, a sandbox agent image, its ACP session offline"
+label=$(docker inspect -f '{{ index .Config.Labels "io.agent-sandbox.harness.hermes.version" }}' "$hermes")
+[ "$label" = "$HERMES_VERSION" ] || ci_die "images: agent-hermes label says '$label', versions.env says $HERMES_VERSION"
+SMOKE_HARNESSES=hermes hack/smoke-image.sh "$hermes"
+python3 hack/test-netlock.py "$hermes"
+acp_in_image "$hermes" TestACPHermesExampleCreatesAndLoadsASession TestACPHermesExampleAnswersThroughTheGateway
 
 echo "== agent image: smoke test and network lock"
 hack/smoke-image.sh "$agent"

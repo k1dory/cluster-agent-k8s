@@ -96,9 +96,12 @@ func TestPublishSignsEveryDigestUnderTheCommitTag(t *testing.T) {
 			!strings.Contains(line, "OPENCODE_VERSION=")) {
 			t.Errorf("the agent built without the pinned harnesses: %s", line)
 		}
+		if strings.Contains(line, "/agent-hermes:") && (!strings.Contains(line, "HERMES_IMAGE=") || !strings.Contains(line, "HERMES_VERSION=")) {
+			t.Errorf("agent-hermes built without its pinned base: %s", line)
+		}
 	}
-	if builds != 3 {
-		t.Errorf("%d builds, want 3 (sandboxd, sandboxctl, agent)", builds)
+	if builds != 4 {
+		t.Errorf("%d builds, want 4 (sandboxd, sandboxctl, agent, agent-hermes)", builds)
 	}
 	var m struct {
 		Commit  string            `json:"commit"`
@@ -116,7 +119,7 @@ func TestPublishSignsEveryDigestUnderTheCommitTag(t *testing.T) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		t.Fatal(err)
 	}
-	if m.Commit != head || m.Tag != tag || !m.Signed || m.Harness["claude-code"] == "" || m.Harness["codex"] == "" || len(m.Images) != 3 {
+	if m.Commit != head || m.Tag != tag || !m.Signed || m.Harness["claude-code"] == "" || m.Harness["codex"] == "" || m.Harness["hermes"] == "" || len(m.Images) != 4 {
 		t.Fatalf("manifest: %s", b)
 	}
 	signs, _ := os.ReadFile(cosignLog)
