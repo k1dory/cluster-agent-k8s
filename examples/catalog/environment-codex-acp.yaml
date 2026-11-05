@@ -5,7 +5,10 @@
 # "ACP harnesses".
 #
 # Credentials: the pod holds a placeholder API key; the policy rule for api.openai.com injects
-# the tenant's key (docs/self-service.md). NO_BROWSER keeps the adapter from opening a login.
+# the tenant's key (docs/self-service.md). codex-acp refuses a session until it is told how to
+# authenticate: DEFAULT_AUTH_REQUEST selects its api-key method (the generic way for any ACP
+# agent is `harness.auth_method`, which the runner sends as ACP authenticate). NO_BROWSER keeps
+# the adapter from opening a login.
 # Apply:  sandboxctl apply -f examples/catalog/environment-codex-acp.yaml
 kind: EnvironmentProfile
 name: codex-acp
@@ -18,4 +21,5 @@ spec:
     permissions: allow
   env:
     OPENAI_API_KEY: placeholder-the-gateway-injects-the-real-key
+    DEFAULT_AUTH_REQUEST: '{"methodId":"api-key"}'
     NO_BROWSER: "1"

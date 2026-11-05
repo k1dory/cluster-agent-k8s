@@ -52,8 +52,10 @@ type Launch struct {
 	ChatIdle     int    `json:"chat_idle,omitempty"`
 	// HarnessPermissions answers an "acp" harness's permission requests: allow (default) or deny.
 	HarnessPermissions string `json:"harness_permissions,omitempty"`
-	Model              string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
-	Instructions       string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
+	// HarnessAuthMethod is the authentication method an "acp" harness is told to use.
+	HarnessAuthMethod string `json:"harness_auth_method,omitempty"`
+	Model             string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
+	Instructions      string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
 	// Env is the profile's own variables for the agent container. They never reach the init
 	// containers and never shadow a platform variable (see PlatformEnv).
 	Env map[string]string `json:"env,omitempty"`
@@ -88,7 +90,7 @@ func PlatformEnv(name string) bool {
 	}
 	switch name {
 	case "GATEWAY_IP", "GATEWAY_CA_FILE", "REGISTRAR_URL", "API_URL", "CERT_DIR", "HOME",
-		"HARNESS_CMD", "HARNESS_RESUME_CMD", "HARNESS_INPUT", "HARNESS_CHAT_IDLE", "HARNESS_PERMISSIONS":
+		"HARNESS_CMD", "HARNESS_RESUME_CMD", "HARNESS_INPUT", "HARNESS_CHAT_IDLE", "HARNESS_PERMISSIONS", "HARNESS_AUTH_METHOD":
 		return true
 	}
 	return false

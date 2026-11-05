@@ -38,10 +38,14 @@ type ACPLine struct {
 }
 
 // ACPDiff is a file change an ACP agent reported on a tool call. OldText is absent for a new file.
+// A change too large for the output keeps its path and sizes, without the texts (Truncated).
 type ACPDiff struct {
-	Path    string  `json:"path"`
-	OldText *string `json:"old_text,omitempty"`
-	NewText string  `json:"new_text"`
+	Path      string  `json:"path"`
+	OldText   *string `json:"old_text,omitempty"`
+	NewText   string  `json:"new_text"`
+	OldSize   int     `json:"old_size,omitempty"`
+	NewSize   int     `json:"new_size,omitempty"`
+	Truncated bool    `json:"truncated,omitempty"`
 }
 
 // String renders the line as the runner writes it.

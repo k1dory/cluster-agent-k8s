@@ -19,12 +19,14 @@ func TestACPProfileValidationAndLaunch(t *testing.T) {
 		`{"image":"stable","harness":{"command":"claude-agent-acp","input":"acp","permissions":"ask"}}`,
 		`{"image":"stable","harness":{"permissions":"deny"}}`,
 		`{"image":"stable","harness":{"input":"stream-json","permissions":"allow"}}`,
+		`{"image":"stable","harness":{"auth_method":"api-key"}}`,
+		`{"image":"stable","harness":{"command":"codex-acp","input":"acp","auth_method":"api key"}}`,
 	} {
 		if _, err := s.Put(ctx, model.KindEnvironment, "acme", doc(t, "acp", bad, nil), false, "alice"); !errors.Is(err, ErrInvalid) {
 			t.Errorf("must be invalid: %s → %v", bad, err)
 		}
 	}
-	spec := `{"image":"stable","harness":{"command":"codex-acp","input":"acp","permissions":"deny"}}`
+	spec := `{"image":"stable","harness":{"command":"codex-acp","input":"acp","permissions":"deny","auth_method":"api-key"}}`
 	if _, err := s.Put(ctx, model.KindEnvironment, "acme", doc(t, "acp", spec, nil), false, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +34,7 @@ func TestACPProfileValidationAndLaunch(t *testing.T) {
 		t.Fatal(err)
 	}
 	r, err := s.Resolve(ctx, "acme", "coder", false)
-	if err != nil || r.Launch.HarnessCommand != "codex-acp" || r.Launch.HarnessInput != "acp" || r.Launch.HarnessPermissions != "deny" {
+	if err != nil || r.Launch.HarnessCommand != "codex-acp" || r.Launch.HarnessInput != "acp" || r.Launch.HarnessPermissions != "deny" || r.Launch.HarnessAuthMethod != "api-key" {
 		t.Fatalf("resolve: %v %+v", err, r.Launch)
 	}
 }

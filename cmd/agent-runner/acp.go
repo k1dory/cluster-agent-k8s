@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -66,7 +67,14 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	chat := newChat(harness.InputACP, chatIdle())
 	var outputDone sync.WaitGroup
 	outputDone.Add(1)
-	go func() { defer outputDone.Done(); streamOutput(c, run.ID, outR, chat.sawLine) }()
+	// The conversation's idle clock is driven by driveACP itself (turn ended, next prompt sent),
+	// not by the output, which reaches streamOutput later than the next prompt may start. Once
+	// the reading ends the pipe is closed, so no write can wait on a reader that is gone.
+	go func() {
+		defer outputDone.Done()
+		streamOutput(c, run.ID, outR, nil)
+		_ = outR.CloseWithError(io.ErrClosedPipe)
+	}()
 	emit := func(line string) { _, _ = io.WriteString(outW, line+"\n") }
 
 	cl := &acpClient{emit: emit, permissions: os.Getenv("HARNESS_PERMISSIONS")}
@@ -101,6 +109,12 @@ type acpConn interface {
 	Cancel(ctx context.Context, params acp.CancelNotification) error
 }
 
+// acpAuthenticator is the authenticate method of a connection (the client-side connection has
+// it; a scripted one in a test need not).
+type acpAuthenticator interface {
+	Authenticate(ctx context.Context, params acp.AuthenticateRequest) (acp.AuthenticateResponse, error)
+}
+
 // driveACP holds the conversation: initialize, the session, then one prompt per message until
 // the input is closed (run.close, the idle period) or the run is cancelled. startInput starts
 // delivering the user's messages into the sink it is given. The result is the run's exit code.
@@ -115,6 +129,32 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 	if err != nil {
 		notice("acp initialize: %v", err)
 		return 1
+	}
+	// The profile names the agent's authentication method (spec.harness.auth_method): an API key
+	// in the environment, say. Without one the agent is not asked, and one that needs it refuses
+	// the session (authNeeded says which methods it offers).
+	if method := os.Getenv("HARNESS_AUTH_METHOD"); method != "" {
+		if ids := authMethodIDs(init.AuthMethods); !slices.Contains(ids, method) {
+			notice("acp authenticate: the agent offers %v, not %q (spec.harness.auth_method)", ids, method)
+			return 1
+		}
+		auth, ok := conn.(acpAuthenticator)
+		if !ok {
+			notice("acp authenticate: the connection cannot authenticate")
+			return 1
+		}
+		if _, err := auth.Authenticate(ctx, acp.AuthenticateRequest{MethodId: method}); err != nil {
+			notice("acp authenticate %s: %v", method, err)
+			return 1
+		}
+	}
+	authNeeded := func(op string, err error) {
+		var re *acp.RequestError
+		if errors.As(err, &re) && re.Code == acp.NewAuthRequired(nil).Code {
+			notice("acp %s: the agent requires authentication: set spec.harness.auth_method to one of %v", op, authMethodIDs(init.AuthMethods))
+			return
+		}
+		notice("acp %s: %v", op, err)
 	}
 	cwd := os.Getenv("PWD")
 	if _, err := os.Stat(filepath.Join(repoDir(), ".git")); err == nil {
@@ -139,7 +179,8 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 			if err == nil {
 				sessionID = acp.SessionId(run.Session)
 			} else {
-				notice("acp session/load %s: %v: starting a new session", run.Session, err)
+				authNeeded("session/load "+run.Session, err)
+				notice("starting a new session")
 			}
 		} else {
 			notice("the agent cannot load session %s (no loadSession capability): starting a new session", run.Session)
@@ -148,7 +189,7 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 	if sessionID == "" {
 		ns, err := conn.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: servers})
 		if err != nil {
-			notice("acp session/new: %v", err)
+			authNeeded("session/new", err)
 			return 1
 		}
 		sessionID, fresh = ns.SessionId, true
@@ -179,10 +220,13 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 		if resp.StopReason == acp.StopReasonCancelled {
 			return 1
 		}
+		chat.turnEnded()
 		next, ok := inputs.next(ctx)
 		if !ok {
 			return 0
 		}
+		// A message that waited for this turn is a new turn: the idle clock stops until it ends.
+		chat.sent()
 		prompt = next
 	}
 }
@@ -205,6 +249,22 @@ func firstPrompt(run *model.Run, fresh bool, instructions, resumePrompt string) 
 		return "<instructions>\n" + strings.TrimSpace(instructions) + "\n</instructions>\n\n" + task
 	}
 	return task
+}
+
+// authMethodIDs lists the ids of the authentication methods an agent advertises.
+func authMethodIDs(methods []acp.AuthMethod) []string {
+	ids := []string{}
+	for _, m := range methods {
+		switch {
+		case m.Agent != nil:
+			ids = append(ids, m.Agent.Id)
+		case m.EnvVar != nil:
+			ids = append(ids, m.EnvVar.Id)
+		case m.Terminal != nil:
+			ids = append(ids, m.Terminal.Id)
+		}
+	}
+	return ids
 }
 
 // acpMCPServers turns SANDBOX_MCP_SERVERS ([{name, url}]) into the session's MCP servers. They
@@ -380,12 +440,26 @@ func (a *acpClient) SessionUpdate(_ context.Context, n acp.SessionNotification) 
 	return nil
 }
 
+// maxACPDiffText caps the text of one diff on an ACP line: a larger change keeps its path and
+// sizes and is marked truncated (the file itself is in the workspace). The whole line stays
+// well under maxOutputLine and the control plane's batch limit.
+const maxACPDiffText = 128 << 10
+
 func acpDiffs(content []acp.ToolCallContent) []harness.ACPDiff {
 	var out []harness.ACPDiff
 	for _, c := range content {
-		if d := c.Diff; d != nil {
-			out = append(out, harness.ACPDiff{Path: d.Path, OldText: d.OldText, NewText: d.NewText})
+		d := c.Diff
+		if d == nil {
+			continue
 		}
+		diff := harness.ACPDiff{Path: d.Path, OldText: d.OldText, NewText: d.NewText, NewSize: len(d.NewText)}
+		if d.OldText != nil {
+			diff.OldSize = len(*d.OldText)
+		}
+		if diff.OldSize+diff.NewSize > maxACPDiffText {
+			diff.OldText, diff.NewText, diff.Truncated = nil, "", true
+		}
+		out = append(out, diff)
 	}
 	return out
 }

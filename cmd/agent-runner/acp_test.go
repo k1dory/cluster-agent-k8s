@@ -76,7 +76,9 @@ func (f *fakeAgent) Prompt(ctx context.Context, p acp.PromptRequest) (acp.Prompt
 		}
 	}
 	f.record("prompt", map[string]string{"session": string(p.SessionId), "text": text})
-	send := func(u acp.SessionUpdate) { _ = f.conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: u}) }
+	send := func(u acp.SessionUpdate) {
+		_ = f.conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: u})
+	}
 	send(acp.UpdateAgentMessageText("Hel"))
 	send(acp.UpdateAgentMessageText("lo"))
 	send(acp.StartToolCall("call_1", "Edit a.txt", acp.WithStartKind(acp.ToolKindEdit), acp.WithStartStatus(acp.ToolCallStatusPending),
@@ -386,6 +388,51 @@ func TestFirstPrompt(t *testing.T) {
 	} {
 		if got := firstPrompt(&tc.run, tc.fresh, "I", "carry on"); got != tc.want {
 			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A real ACP adapter (ACP_REAL_AGENT=<command>, e.g. the codex-acp of the agent image) opens a
+// session through the runner with the profile's authentication method (ACP_REAL_AUTH_METHOD,
+// sent as ACP authenticate). The run is stopped as soon as the session is reported; the model
+// endpoint points at a closed local port, so nothing leaves the machine. Skipped unless asked for.
+func TestACPRealAdapterOpensASession(t *testing.T) {
+	agent := os.Getenv("ACP_REAL_AGENT")
+	if agent == "" {
+		t.Skip("ACP_REAL_AGENT not set")
+	}
+	_, cp, cl := setupACP(t, "")
+	t.Setenv("ACP_FAKE_AGENT", "")
+	t.Setenv("HARNESS_CMD", agent)
+	t.Setenv("HARNESS_AUTH_METHOD", os.Getenv("ACP_REAL_AUTH_METHOD"))
+	t.Setenv("SANDBOX_MCP_SERVERS", "")
+	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:9/v1")
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() { done <- execute(ctx, cl, &model.Run{ID: "run_real", Task: "reply with the word ok"}) }()
+	deadline := time.After(30 * time.Second)
+	for {
+		cp.mu.Lock()
+		var session string
+		for _, l := range cp.lines {
+			if s, ok := harness.ParseSession(l); ok {
+				session = s
+			}
+		}
+		out := strings.Join(cp.lines, "\n")
+		cp.mu.Unlock()
+		if session != "" {
+			cancel()
+			<-done
+			return
+		}
+		select {
+		case <-done:
+			t.Fatalf("the run ended without a session; output:\n%s", out)
+		case <-deadline:
+			t.Fatalf("no session in 30s; output:\n%s", out)
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 }

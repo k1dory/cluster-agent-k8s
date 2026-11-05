@@ -96,6 +96,7 @@ harness:
   command: claude-agent-acp        # or codex-acp, or any agent that speaks ACP (gemini --experimental-acp…)
   input: acp
   permissions: allow               # allow (default) | deny
+  auth_method: api-key             # optional: the agent's authentication method (ACP authenticate)
 ```
 
 - **One session per conversation.** The run's task is the first `session/prompt` of a new
@@ -104,6 +105,11 @@ harness:
   the run finished, a rollout) loads the session it reported with `session/load` — the history
   the agent replays is not written again — so `resume_command` is not used. An agent without
   `loadSession` starts a new session and the runner says so in the output.
+- **Authentication.** An agent that refuses `session/new` with "Authentication required" names
+  its methods in `initialize` (`authMethods`); `auth_method` makes the runner `authenticate`
+  with one of them before the session (codex-acp: `api-key`, with the key in the environment).
+  Without it the runner reports the methods the agent offers. An adapter may also take the
+  choice from its own environment (codex-acp: `DEFAULT_AUTH_REQUEST`).
 - **MCP servers** of the agent's connections go into `session/new` as HTTP servers (the agent
   must announce `mcpCapabilities.http`; otherwise they are left out with a notice).
 - **Instructions.** ACP has no system prompt: a new session's first prompt carries the agent
@@ -118,13 +124,17 @@ harness:
   |-------------------|-----------------------------------------------------------|------------|
   | `acp.session`     | `session_id`                                              | — (the run's session) |
   | `acp.message`     | `text` (the agent's chunks of one message, joined)        | `assistant` |
-  | `acp.tool_call`   | `tool_call_id`, `title`, `kind`, `status`, `diffs[]` (`path`, `old_text`, `new_text`) | `tool` |
+  | `acp.tool_call`   | `tool_call_id`, `title`, `kind`, `status`, `diffs[]` (`path`, `old_text`, `new_text`, `old_size`, `new_size`, `truncated`) | `tool` |
   | `acp.tool_update` | `tool_call_id`, `status`, `diffs[]`                       | `log` |
   | `acp.permission`  | `tool_call_id`, `title`, `decision`                       | `log` |
   | `acp.turn_end`    | `stop_reason`                                             | ends the turn (`chat_idle` counts from here) |
 
-  A prompt's usage, when the agent reports it, is a `{"type":"usage",…}` line the run's
+  A diff whose texts exceed 128 KiB keeps its path and sizes and is marked `truncated` (the file
+  is in the workspace). A prompt's usage, when the agent reports it, is a `{"type":"usage",…}` line the run's
   accounting adds up. The agent's stderr is passed through as it is.
+- **Long lines.** For every harness, an output line over 1 MiB is replaced by a
+  `[agent-runner] dropped an output line …` notice and reading goes on, so the harness never
+  blocks on a reader that gave up.
 - **The runner offers no file system or terminal** to the agent (client capabilities are empty):
   the agent uses its own tools inside the pod, under the pod's network lock.
 

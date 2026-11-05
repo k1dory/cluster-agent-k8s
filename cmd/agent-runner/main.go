@@ -349,9 +349,48 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	return 0
 }
 
+// maxOutputLine is the longest output line the runner forwards. A longer one is dropped with a
+// notice and reading goes on: a reader that stopped would leave the harness (or the ACP bridge)
+// blocked on its next write for the rest of the run.
+const maxOutputLine = 1 << 20
+
+// readLines sends r's lines to out, each without its newline, until EOF or a read error; a line
+// longer than max is replaced by a notice.
+func readLines(r io.Reader, max int, out chan<- string) {
+	br := bufio.NewReaderSize(r, 64<<10)
+	var line []byte
+	dropped := 0
+	for {
+		chunk, err := br.ReadSlice('\n')
+		switch {
+		case dropped > 0:
+			dropped += len(chunk)
+		case len(line)+len(chunk) > max+1: // +1: the newline does not count
+			dropped = len(line) + len(chunk)
+			line = line[:0]
+		default:
+			line = append(line, chunk...)
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if dropped > 0 {
+			if err == nil {
+				dropped-- // the newline
+			}
+			out <- fmt.Sprintf("[agent-runner] dropped an output line of %d bytes (limit %d)", dropped, max)
+			dropped = 0
+		} else if len(line) > 0 || err == nil {
+			out <- strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
+		}
+		line = line[:0]
+		if err != nil {
+			return
+		}
+	}
+}
+
 func streamOutput(c *client, runID string, r io.Reader, onLine func(string)) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	var batch []string
 	flush := func() {
 		if len(batch) > 0 {
@@ -363,9 +402,7 @@ func streamOutput(c *client, runID string, r io.Reader, onLine func(string)) {
 	defer t.Stop()
 	lines := make(chan string)
 	go func() {
-		for sc.Scan() {
-			lines <- sc.Text()
-		}
+		readLines(r, maxOutputLine, lines)
 		close(lines)
 	}()
 	for {
@@ -486,12 +523,24 @@ func chatIdle() time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+// sawLine follows the harness's output: a turn end starts the idle countdown, and a turn (the
+// agent speaking or calling a tool) stops it again — the harness went on with a message that was
+// queued while the previous turn ran.
 func (s *chatState) sawLine(line string) {
-	if harness.IsTurnEnd(line) {
-		s.mu.Lock()
-		s.turnEnd = time.Now()
-		s.mu.Unlock()
+	switch {
+	case harness.IsTurnEnd(line):
+		s.turnEnded()
+	default:
+		if role, _ := harness.ParseMessage(line); role != "" {
+			s.sent()
+		}
 	}
+}
+
+func (s *chatState) turnEnded() {
+	s.mu.Lock()
+	s.turnEnd = time.Now()
+	s.mu.Unlock()
 }
 
 func (s *chatState) sent() {
