@@ -120,7 +120,10 @@ func TestACPHermesExampleAnswersThroughTheGateway(t *testing.T) {
 	if bin == "" {
 		t.Skip("set HERMES_TEST_BIN to run the Hermes model-call test (it runs by itself in the agent-hermes image's check)")
 	}
-	t.Setenv("HERMES_HOME", filepath.Join(os.Getenv("HOME"), ".hermes"))
-	lines, seen := modelCallThroughGateway(t, "environment-hermes-acp.yaml", "hermes", bin, "api.anthropic.com", anthropicAnswer("pong-from-the-gateway"))
+	// The image puts HERMES_HOME in the agent's home; here that home is the test's.
+	lines, seen := modelCallThroughGateway(t, "environment-hermes-acp.yaml", "hermes", bin, "api.anthropic.com", anthropicAnswer("pong-from-the-gateway"),
+		func(home string) map[string]string {
+			return map[string]string{"HERMES_HOME": filepath.Join(home, ".hermes")}
+		})
 	assertAnswered(t, lines, seen, "pong-from-the-gateway", "api.anthropic.com")
 }
