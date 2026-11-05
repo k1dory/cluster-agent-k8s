@@ -42,12 +42,14 @@ type limiter struct {
 	now       func() time.Time
 	buckets   sync.Map // key → *bucket
 	lastSweep atomic.Int64
+	lookedUp  func() // tests: runs between a bucket's lookup and its use
 }
 
 type bucket struct {
 	mu     sync.Mutex
 	tokens float64
 	at     time.Time
+	gone   bool // evicted by sweep: whoever holds it looks the key up again
 }
 
 func newLimiter(cfg RateLimit) *limiter {
@@ -60,44 +62,49 @@ func (l *limiter) refill(b *bucket, now time.Time) {
 	b.at = now
 }
 
-func (l *limiter) bucket(key string, now time.Time) *bucket {
-	l.sweep(now)
-	v, _ := l.buckets.LoadOrStore(key, &bucket{tokens: float64(l.cfg.Burst), at: now})
-	return v.(*bucket)
+// use runs fn on key's bucket, locked and refilled. A bucket the sweep evicted between the
+// lookup and the lock is gone: spending from it would let the next request start from a
+// fresh full bucket, so the lookup is repeated until it holds the bucket in the map.
+func (l *limiter) use(key string, fn func(b *bucket)) {
+	for {
+		now := l.now()
+		l.sweep(now)
+		v, _ := l.buckets.LoadOrStore(key, &bucket{tokens: float64(l.cfg.Burst), at: now})
+		if l.lookedUp != nil {
+			l.lookedUp()
+		}
+		b := v.(*bucket)
+		b.mu.Lock()
+		if b.gone {
+			b.mu.Unlock()
+			continue
+		}
+		l.refill(b, now)
+		fn(b)
+		b.mu.Unlock()
+		return
+	}
 }
 
 // wait is how long until key has an attempt left (0: it has one now); nothing is spent.
-func (l *limiter) wait(key string) time.Duration {
-	now := l.now()
-	b := l.bucket(key, now)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	l.refill(b, now)
-	return l.until(b)
+func (l *limiter) wait(key string) (d time.Duration) {
+	l.use(key, func(b *bucket) { d = l.until(b) })
+	return d
 }
 
 // take spends one attempt of key, or says how long until there is one.
-func (l *limiter) take(key string) time.Duration {
-	now := l.now()
-	b := l.bucket(key, now)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	l.refill(b, now)
-	if d := l.until(b); d > 0 {
-		return d
-	}
-	b.tokens--
-	return 0
+func (l *limiter) take(key string) (d time.Duration) {
+	l.use(key, func(b *bucket) {
+		if d = l.until(b); d == 0 {
+			b.tokens--
+		}
+	})
+	return d
 }
 
 // refund gives back an attempt take spent (an authentication that succeeded).
 func (l *limiter) refund(key string) {
-	now := l.now()
-	b := l.bucket(key, now)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	l.refill(b, now)
-	b.tokens = min(float64(l.cfg.Burst), b.tokens+1)
+	l.use(key, func(b *bucket) { b.tokens = min(float64(l.cfg.Burst), b.tokens+1) })
 }
 
 func (l *limiter) until(b *bucket) time.Duration {
@@ -108,7 +115,7 @@ func (l *limiter) until(b *bucket) time.Duration {
 }
 
 // sweep drops, at most once a minute, the buckets that have refilled completely: they are
-// what a new bucket would be.
+// what a new bucket would be. Each is marked gone under its own lock (see use).
 func (l *limiter) sweep(now time.Time) {
 	last := l.lastSweep.Load()
 	if now.UnixNano()-last < int64(time.Minute) || !l.lastSweep.CompareAndSwap(last, now.UnixNano()) {
@@ -118,8 +125,9 @@ func (l *limiter) sweep(now time.Time) {
 	l.buckets.Range(func(k, v any) bool {
 		b := v.(*bucket)
 		b.mu.Lock()
-		if now.Sub(b.at) >= full {
-			l.buckets.Delete(k)
+		if !b.gone && now.Sub(b.at) >= full {
+			b.gone = true // under b.mu: a take that already holds it sees this and looks again
+			l.buckets.CompareAndDelete(k, b)
 		}
 		b.mu.Unlock()
 		return true

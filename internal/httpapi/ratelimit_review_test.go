@@ -173,3 +173,27 @@ func TestReviewConcurrentGuessesCannotOutrunTheLimit(t *testing.T) {
 		}
 	}
 }
+
+// A take that found a bucket the sweep then evicts must not spend from the detached bucket:
+// the next take would get a fresh full one and the address would exceed its burst.
+func TestReviewSweepCannotDetachABucketATakeIsUsing(t *testing.T) {
+	now := time.Unix(1000, 0)
+	l := newLimiter(RateLimit{Burst: 1, Every: 10 * time.Second})
+	l.now = func() time.Time { return now }
+	l.wait("a") // the bucket exists, full, and is idle from here on
+	now = now.Add(time.Hour)
+	l.lastSweep.Store(now.UnixNano()) // no sweep before the lookup: it comes right after it
+	var once sync.Once
+	l.lookedUp = func() { // the sweep runs between the lookup and the take
+		once.Do(func() {
+			l.lastSweep.Store(0)
+			l.sweep(now)
+		})
+	}
+	if d := l.take("a"); d != 0 {
+		t.Fatalf("first attempt: %v", d)
+	}
+	if d := l.take("a"); d == 0 {
+		t.Fatal("a second attempt passed a burst of one: the first spent from an evicted bucket")
+	}
+}
