@@ -75,7 +75,7 @@ the subset a developer runs before pushing and says so in its last line.
 | `ci-vet` | `go vet`; `gofmt` over the module's Go files as `go list` names them (a module cache inside the tree is not formatted), with gofmt's own failure a failure | Go |
 | `ci-unit` | every test under the race detector, in-memory store | Go, python3 with PyYAML (the tests of the e2e script run its preflight, which reads the workflow) |
 | `ci-policy` | policies validate, expectations pass, the rendered gateway configuration passes `caddy validate` | Go; `CADDY_BIN`, else the newest supported Caddy is downloaded |
-| `ci-scan` | known vulnerabilities in the module's dependencies (`go.mod`, `go.sum`) with Trivy: HIGH and CRITICAL findings that have a fix fail, unfixed ones are reported; an accepted finding is listed in `.trivyignore.yaml` with an expiry and a statement | `TRIVY_BIN`, else the pinned Trivy is downloaded and checked against the release's checksums; network for the vulnerability database (cached under `.ci`) |
+| `ci-scan` | known vulnerabilities in the module's dependencies (`go.mod`, `go.sum`) with Trivy: every HIGH and CRITICAL finding is reported, those that have a fix fail; an accepted finding is listed in `.trivyignore.yaml` with an expiry and a statement | `TRIVY_BIN`, else the pinned Trivy is downloaded and checked against the release's checksums; network for the vulnerability database (cached under `.ci`) |
 | `ci-postgres` | store, Git job and record contracts, the database-taking tests of `internal/gitsync` and `internal/ciauth` | `SANDBOX_TEST_POSTGRES_URL` (required; the provider maps its service to it) |
 | `ci-caddy` | the gateway end to end on a real Caddy and `caddy validate`, per supported version | `CADDY_VERSION=x.y.z` for one version (a provider's matrix), `CADDY_BIN` for a binary of yours, else every version in `versions.env` is downloaded |
 | `ci-helm` | chart lint in both layouts; `deploy/k8s` is what the chart renders | `HELM`, else the pinned Helm is downloaded |
@@ -115,13 +115,18 @@ checksums, or `COSIGN_BIN`). The agent image's harnesses (`CLAUDE_CODE_VERSION`,
 npm is `NPM_VERSION` from the same file (the base image's copy lags and carries its own
 modules), checked the same way.
 
-Trivy is `TRIVY_VERSION` there (downloaded and checked against the release's checksums, or
-`TRIVY_BIN`). `ci-scan` and `ci-images` run it with one policy, `hack/ci/lib.sh`'s
-`ci_trivy_scan`: HIGH and CRITICAL findings with a fix fail, unfixed ones are reported, and a
-finding accepted on purpose is an entry in `.trivyignore.yaml` with a statement and an
-`expired_at`, after which it fails again. Both images upgrade their Debian packages at build
-time, so a security update in the base image's distribution needs no change here; a finding
-in a harness or in Hermes's image is a bump in `versions.env`.
+Trivy is `TRIVY_VERSION` there (downloaded, checked against the release's checksums and tried
+before it is kept, or `TRIVY_BIN`). `ci-scan` and `ci-images` run it with one policy,
+`hack/ci/lib.sh`'s `ci_trivy_scan`, in two passes: the report, every HIGH and CRITICAL finding
+whether or not a fix exists; then the verdict, in which only findings with a fix fail. A finding
+accepted on purpose is an entry in `.trivyignore.yaml` with a statement and an `expired_at`,
+after which it fails again. The scanner reads the repository's `hack/ci/trivy.yaml` and an
+environment emptied of `TRIVY_*`, so a runner's own Trivy settings cannot skip the scan or
+soften its filters. Images are scanned from the daemon by image id, the one just built. Both
+agent images upgrade their Debian packages at build time, so a security update in the base
+distribution needs no change here; a finding in a harness is a bump in `versions.env`.
+Hermes's own tree in its image (`/opt/hermes`, pinned by digest) is reported but is not part of
+the verdict: its fix is a `HERMES_VERSION` bump, which the report shows is due.
 
 A copy of the project publishes to its own registry with its own key: `IMAGE_REPO` and the two
 cosign secrets are its settings, and its `cosign.pub` replaces this one. To check an image by

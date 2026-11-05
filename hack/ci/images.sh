@@ -140,11 +140,18 @@ echo "== agent image: smoke test and network lock"
 hack/smoke-image.sh "$agent"
 python3 hack/test-netlock.py "$agent"
 
-echo "== every image: known vulnerabilities (trivy $TRIVY_VERSION, HIGH and CRITICAL with a fix)"
-# The same policy as ci-scan, on what the images carry: the base image's packages and the
-# harnesses' npm packages (the Go modules were scanned at the source). The images are read from
-# the daemon through the API (the scanner runs as a container when a remote daemon built them).
+echo "== every image: known vulnerabilities (trivy $TRIVY_VERSION; every HIGH and CRITICAL reported, those with a fix fail)"
+# The same policy as ci-scan, on what the images carry: the base image's packages, the
+# harnesses' npm packages, the Go binaries. Each image is read from this daemon by its id, the
+# image built above and no other copy of the tag. Hermes's own tree (/opt/hermes, the agent
+# and the tools its image bundles, pinned by digest) is reported but not part of the verdict:
+# its fix is a HERMES_VERSION bump, not a change here.
 for img in "$sandboxd" "$ctl" "$agent" "$hermes"; do
-  ci_trivy_scan image "$img" || ci_die "images: fixable HIGH or CRITICAL vulnerabilities in $img (bump the base image or a harness in hack/ci/versions.env, or accept the finding in .trivyignore.yaml with an expiry)"
+  id=$(docker image inspect -f '{{.Id}}' "$img") || ci_die "images: $img is not in the daemon"
+  skip=""
+  [ "$img" = "$hermes" ] && skip=opt/hermes
+  echo "-- $img ($id)"
+  CI_TRIVY_GATE_SKIP=$skip ci_trivy_scan image --image-src docker "$id" \
+    || ci_die "images: fixable HIGH or CRITICAL vulnerabilities in $img (upgrade the base image or a harness in hack/ci/versions.env, or accept the finding in .trivyignore.yaml with an expiry)"
 done
 ci_ok images

@@ -1,0 +1,4 @@
+# Trivy's configuration for ci-scan and ci-images, named explicitly by hack/ci/lib.sh
+# (ci_trivy_run) so that no trivy.yaml of a runner's is read. The policy (scanners, severity,
+# the fixed-only verdict, the ignore file) is on the command line there; this file stays empty
+# on purpose.

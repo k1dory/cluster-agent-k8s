@@ -65,36 +65,63 @@ ci_cosign() {
   echo "$dir/cosign"
 }
 
-# ci_trivy prints the path of Trivy: TRIVY_BIN when set, else TRIVY_VERSION downloaded once and
-# checked against the release's checksums, like cosign.
+# ci_trivy prints the path of Trivy: TRIVY_BIN when set, else TRIVY_VERSION downloaded once,
+# checked against the release's checksums (like cosign), extracted and tried in a scratch
+# directory and published whole: a failed download or extraction leaves nothing a later run
+# would take for a scanner.
 ci_trivy() {
   if [ -n "${TRIVY_BIN:-}" ]; then echo "$TRIVY_BIN"; return; fi
-  local dir="$CI_BIN/trivy-$TRIVY_VERSION" os arch name want got
+  local dir="$CI_BIN/trivy-$TRIVY_VERSION" os arch name want got tmp
   case "$(ci_os)" in linux) os=Linux ;; darwin) os=macOS ;; *) ci_die "trivy: no release for $(ci_os)" ;; esac
   case "$(ci_arch)" in amd64) arch=64bit ;; arm64) arch=ARM64 ;; esac
   name="trivy_${TRIVY_VERSION}_${os}-${arch}.tar.gz"
   if [ ! -x "$dir/trivy" ]; then
-    mkdir -p "$dir"
-    ci_fetch "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/$name" "$dir/$name"
-    ci_fetch "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_${TRIVY_VERSION}_checksums.txt" "$dir/checksums.txt"
-    want=$(awk -v n="$name" '$2 == n { print $1 }' "$dir/checksums.txt")
-    got=$(sha256sum "$dir/$name" 2>/dev/null | awk '{ print $1 }' || shasum -a 256 "$dir/$name" | awk '{ print $1 }')
-    [ -n "$want" ] && [ "$want" = "$got" ] || { rm -f "$dir/$name"; ci_die "trivy $TRIVY_VERSION: checksum mismatch for $name"; }
-    tar -C "$dir" -xzf "$dir/$name" trivy && rm -f "$dir/$name"
+    tmp=$(mktemp -d "$CI_BIN/trivy-download.XXXXXX") || ci_die "trivy: cannot create a scratch directory under $CI_BIN"
+    ci_fetch "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/$name" "$tmp/$name"
+    ci_fetch "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_${TRIVY_VERSION}_checksums.txt" "$tmp/checksums.txt"
+    want=$(awk -v n="$name" '$2 == n { print $1 }' "$tmp/checksums.txt")
+    got=$(sha256sum "$tmp/$name" 2>/dev/null | awk '{ print $1 }' || shasum -a 256 "$tmp/$name" | awk '{ print $1 }')
+    [ -n "$want" ] && [ "$want" = "$got" ] || { rm -rf "$tmp"; ci_die "trivy $TRIVY_VERSION: checksum mismatch for $name"; }
+    tar -C "$tmp" -xzf "$tmp/$name" trivy || { rm -rf "$tmp"; ci_die "trivy $TRIVY_VERSION: cannot extract trivy from $name"; }
+    "$tmp/trivy" --version >/dev/null 2>&1 || { rm -rf "$tmp"; ci_die "trivy $TRIVY_VERSION: the extracted binary does not run"; }
+    mkdir -p "$dir" && mv "$tmp/trivy" "$dir/trivy" && rm -rf "$tmp"
   fi
   echo "$dir/trivy"
 }
 
-# ci_trivy_scan TARGET-KIND TARGET... runs Trivy with the one vulnerability policy every scan
-# uses (ci-scan on the module, ci-images on the images): HIGH and CRITICAL findings that have a
-# fix fail the check; unfixed ones are reported and do not; accepted findings live in
-# .trivyignore.yaml with an expiry. The database is cached under .ci (TRIVY_CACHE_DIR).
-ci_trivy_scan() {
+# ci_trivy_run KIND ARGS... runs Trivy with the repository's configuration file and none of the
+# runner's: the environment is emptied of TRIVY_* (only the proxy and Docker settings a job
+# needs pass through) and the configuration file is named, so a trivy.yaml or a variable on a
+# runner cannot skip the scan or soften its filters. The policy is on the command line.
+ci_trivy_run() {
   local kind=$1 trivy
   shift
-  trivy=$(ci_trivy)
-  TRIVY_CACHE_DIR=${TRIVY_CACHE_DIR:-$CI_BIN/trivy-cache} "$trivy" "$kind" --quiet --scanners vuln \
-    --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --ignorefile "$ci_root/.trivyignore.yaml" "$@"
+  trivy=$(ci_trivy) || return 1
+  env -i PATH="$PATH" HOME="${HOME:-/tmp}" TMPDIR="${TMPDIR:-/tmp}" \
+    ${HTTP_PROXY:+HTTP_PROXY="$HTTP_PROXY"} ${HTTPS_PROXY:+HTTPS_PROXY="$HTTPS_PROXY"} ${NO_PROXY:+NO_PROXY="$NO_PROXY"} \
+    ${http_proxy:+http_proxy="$http_proxy"} ${https_proxy:+https_proxy="$https_proxy"} ${no_proxy:+no_proxy="$no_proxy"} \
+    ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} ${DOCKER_CERT_PATH:+DOCKER_CERT_PATH="$DOCKER_CERT_PATH"} \
+    ${DOCKER_TLS_VERIFY:+DOCKER_TLS_VERIFY="$DOCKER_TLS_VERIFY"} ${DOCKER_CONFIG:+DOCKER_CONFIG="$DOCKER_CONFIG"} \
+    TRIVY_CACHE_DIR="${TRIVY_CACHE_DIR:-$CI_BIN/trivy-cache}" \
+    "$trivy" "$kind" --config "$ci_dir/trivy.yaml" --quiet --scanners vuln --severity HIGH,CRITICAL \
+    --ignorefile "$ci_root/.trivyignore.yaml" "$@"
+}
+
+# ci_trivy_scan KIND TARGET... is the one vulnerability policy every scan uses (ci-scan on the
+# module, ci-images on the images). Two passes: the report, every HIGH and CRITICAL finding
+# whether or not a fix exists, so an unfixed one is seen and not hidden; then the verdict, in
+# which only findings with a fix fail (exit 1), because an unfixed one has nothing to bump
+# yet. A finding accepted on purpose lives in .trivyignore.yaml with an expiry.
+# CI_TRIVY_GATE_SKIP names directories the verdict leaves out (the report still shows them):
+# ci-images uses it for the tree of a third-party agent image whose fixes are its own release.
+ci_trivy_scan() {
+  local kind=$1 out
+  shift
+  ci_trivy_run "$kind" --exit-code 0 "$@" || return 1
+  out=$(ci_trivy_run "$kind" --ignore-unfixed --exit-code 1 ${CI_TRIVY_GATE_SKIP:+--skip-dirs "$CI_TRIVY_GATE_SKIP"} "$@" 2>&1) && return 0
+  echo "== fixable findings (the verdict)"
+  printf '%s\n' "$out" | grep -vE '^[[:space:]]*$|^Legend:|^- ' | tail -60
+  return 1
 }
 
 # ci_docker makes sure a docker CLI is on PATH (the static CLI is downloaded once when the

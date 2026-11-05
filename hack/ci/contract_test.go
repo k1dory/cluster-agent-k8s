@@ -199,27 +199,90 @@ func TestAcceptanceScriptsParseAndNameEveryPhase(t *testing.T) {
 }
 
 // The dependency scan is Trivy's verdict and nothing else: a scanner that finds a fixable
-// finding fails the group, named, and a clean scanner passes it, with the pinned policy on the
-// command line (severity, fixed only, the ignore file) so a provider cannot soften it.
+// finding fails the group, named, and a clean scanner passes it. The report pass shows every
+// finding and the verdict pass carries the pinned policy (severity, fixed only, the ignore
+// file, the repository's configuration file); the runner's TRIVY_* variables, which could skip
+// the scan or widen what is ignored, never reach the scanner.
 func TestScanPropagatesTrivyVerdict(t *testing.T) {
 	mod := module(t)
 	bin := t.TempDir()
-	stub(t, bin, "trivy", "echo \"$@\" > \"$STUB_ARGS\"; exit \"${STUB_EXIT:-0}\"\n")
-	args := filepath.Join(t.TempDir(), "args")
-	env := map[string]string{"CI_ROOT": mod, "TRIVY_BIN": filepath.Join(bin, "trivy"), "STUB_ARGS": args, "STUB_EXIT": "0"}
+	// The stub records each invocation's arguments and the TRIVY_* variables it sees, and
+	// exits with the code in the file next to it (the environment does not reach it).
+	stub(t, bin, "trivy", "d=$(dirname \"$0\"); echo \"$@\" >> \"$d/args\"; env | grep '^TRIVY_' >> \"$d/env\" || true; exit \"$(cat \"$d/exit\")\"\n")
+	setExit := func(code string) {
+		if err := os.WriteFile(filepath.Join(bin, "exit"), []byte(code), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setExit("0")
+	env := map[string]string{"CI_ROOT": mod, "TRIVY_BIN": filepath.Join(bin, "trivy"), "TRIVY_IGNORE_STATUS": "fixed", "TRIVY_DOWNLOAD_DB_ONLY": "true"}
 	out, err := runScript(t, "hack/ci/scan.sh", env, bin)
 	if err != nil || !strings.HasSuffix(strings.TrimSpace(out), "ci: scan: ok") {
 		t.Fatalf("a clean scan must pass: %v\n%s", err, out)
 	}
-	seen, _ := os.ReadFile(args)
-	for _, want := range []string{"fs ", "--severity HIGH,CRITICAL", "--ignore-unfixed", "--exit-code 1", "--ignorefile " + filepath.Join(mod, ".trivyignore.yaml")} {
-		if !strings.Contains(string(seen), want) {
-			t.Fatalf("the scan must run Trivy with %q; ran: %s", want, seen)
+	args, _ := os.ReadFile(filepath.Join(bin, "args"))
+	runs := strings.Split(strings.TrimSpace(string(args)), "\n")
+	if len(runs) != 2 {
+		t.Fatalf("the scan is a report and a verdict, two runs; ran %d:\n%s", len(runs), args)
+	}
+	for _, want := range []string{"fs ", "--severity HIGH,CRITICAL", "--exit-code 0", "--ignorefile " + filepath.Join(mod, ".trivyignore.yaml"), "--config "} {
+		if !strings.Contains(runs[0], want) {
+			t.Fatalf("the report must run Trivy with %q; ran: %s", want, runs[0])
 		}
 	}
-	env["STUB_EXIT"] = "1"
+	if strings.Contains(runs[0], "--ignore-unfixed") {
+		t.Fatalf("the report must show unfixed findings too; ran: %s", runs[0])
+	}
+	for _, want := range []string{"fs ", "--severity HIGH,CRITICAL", "--ignore-unfixed", "--exit-code 1", "--ignorefile " + filepath.Join(mod, ".trivyignore.yaml"), "--config "} {
+		if !strings.Contains(runs[1], want) {
+			t.Fatalf("the verdict must run Trivy with %q; ran: %s", want, runs[1])
+		}
+	}
+	seen, _ := os.ReadFile(filepath.Join(bin, "env"))
+	for _, leaked := range []string{"TRIVY_IGNORE_STATUS", "TRIVY_DOWNLOAD_DB_ONLY"} {
+		if strings.Contains(string(seen), leaked) {
+			t.Fatalf("the runner's %s must not reach the scanner; it saw:\n%s", leaked, seen)
+		}
+	}
+	if !strings.Contains(string(seen), "TRIVY_CACHE_DIR=") {
+		t.Fatalf("the scanner must get the cache directory from the script; it saw:\n%s", seen)
+	}
+	setExit("1")
 	out, err = runScript(t, "hack/ci/scan.sh", env, bin)
 	if err == nil || strings.Contains(out, "ci: scan: ok") || !strings.Contains(out, "vulnerabilities") {
 		t.Fatalf("a scanner that finds a fixable finding must fail the group, named: %v\n%s", err, out)
+	}
+}
+
+// A Trivy download whose archive does not extract (a truncated download that still matched
+// what the checksum file said, a full disk) fails the download, and leaves no file a later
+// run would take for the scanner.
+func TestTrivyDownloadRefusesAnArchiveThatDoesNotExtract(t *testing.T) {
+	bin := t.TempDir()
+	// A curl that serves garbage for the archive and a checksum file that vouches for it.
+	stub(t, bin, "curl", `out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2 ;; http*) url=$1; shift ;; *) shift ;; esac; done
+case "$url" in
+  *checksums.txt) name=$(basename "$(dirname "$out")"); printf 'not an archive' > "$out.tmp"
+    sum=$( (sha256sum "$out.tmp" 2>/dev/null || shasum -a 256 "$out.tmp") | awk '{print $1}'); rm -f "$out.tmp"
+    for n in $(ls "$(dirname "$out")" | grep '\.tar\.gz$'); do echo "$sum  $n"; done > "$out" ;;
+  *.tar.gz) printf 'not an archive' > "$out" ;;
+  *) exit 22 ;;
+esac
+`)
+	ciBin := t.TempDir()
+	cmd := exec.Command("bash", "-c", ". hack/ci/lib.sh && ci_trivy")
+	cmd.Dir = repoRoot(t)
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "CI_BIN="+ciBin, "TRIVY_BIN=")
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "cannot extract") {
+		t.Fatalf("an archive that does not extract must fail the download, named: %v\n%s", err, out)
+	}
+	matches, _ := filepath.Glob(filepath.Join(ciBin, "trivy-*", "trivy"))
+	if len(matches) != 0 {
+		t.Fatalf("a failed download must leave no scanner behind: %v", matches)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(ciBin, "trivy-download.*")); len(leftovers) != 0 {
+		t.Fatalf("a failed download must clean its scratch directory: %v", leftovers)
 	}
 }

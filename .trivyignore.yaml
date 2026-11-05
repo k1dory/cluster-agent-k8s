@@ -2,17 +2,10 @@
 # names the vulnerability, why it does not apply or is accepted, and when the acceptance
 # expires: after expired_at Trivy reports it again and the check fails, so an acceptance is
 # reviewed rather than forgotten. Keep it short; a bump in go.mod or versions.env is the fix.
-vulnerabilities:
-  - id: CVE-2026-53869
-    paths: ["opt/hermes/**"]
-    statement: >-
-      Hermes's package metadata in its image carries no version (Trivy reads 0.0.0 and names
-      0.16.0 as the fix); the image is HERMES_VERSION from versions.env, 0.22.7, past the fix.
-    expired_at: 2027-02-01
-  - id: CVE-2026-102276
-    paths: ["opt/hermes/tools/**"]
-    statement: >-
-      brace-expansion inside the npm that Hermes bundles under /opt/hermes/tools, which only
-      Hermes's own tool installs run; replaced when HERMES_VERSION moves to a release built on
-      npm 12.2 or later. The agent image's npm is NPM_VERSION and is not covered by this entry.
-    expired_at: 2027-02-01
+#
+# vulnerabilities:
+#   - id: CVE-2025-00000
+#     paths: ["usr/local/lib/node_modules/**"]   # optional
+#     statement: the vulnerable function is not reachable (why)
+#     expired_at: 2026-12-31
+vulnerabilities: []
