@@ -61,11 +61,16 @@ func (g *Gateway) bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := g.Registrar.Bootstrap(r.Context(), token, req)
-	if errors.Is(err, registrar.ErrUnauthorized) {
+	switch {
+	case errors.Is(err, registrar.ErrUnauthorized):
 		writeErr(w, http.StatusUnauthorized, err)
 		return
-	}
-	if err != nil {
+	case errors.Is(err, registrar.ErrUnavailable):
+		// The platform's side (the store, a lost race with the pod's own retry): agent-init
+		// retries a 503, and exits on a 400.
+		writeErr(w, http.StatusServiceUnavailable, err)
+		return
+	case err != nil:
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}

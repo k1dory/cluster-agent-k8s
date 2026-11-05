@@ -38,6 +38,7 @@ type stack struct {
 	rt                *orchestrator.FakeRuntime
 	orch              *orchestrator.Orchestrator
 	p                 *Platform
+	reg               *registrar.Registrar
 }
 
 func newStack(t *testing.T) *stack {
@@ -59,7 +60,7 @@ func newStack(t *testing.T) *stack {
 	ing := &ingress.Handler{Store: st, Waker: orch, TicketKey: []byte("k")}
 	p := &Platform{Orch: orch, Hub: hub, Policies: pols, Ingress: ing, Token: "t0k", Tenants: map[string]string{"alice-tok": "alice", "bob-tok": "bob"}}
 	g := &Gateway{Orch: orch, Registrar: reg, Authz: az}
-	s := &stack{platform: httptest.NewServer(p.Routes()), gateway: httptest.NewServer(g.Routes()), tokens: tokens, rt: rt, orch: orch, p: p}
+	s := &stack{platform: httptest.NewServer(p.Routes()), gateway: httptest.NewServer(g.Routes()), tokens: tokens, rt: rt, orch: orch, p: p, reg: reg}
 	t.Cleanup(s.platform.Close)
 	t.Cleanup(s.gateway.Close)
 	return s
