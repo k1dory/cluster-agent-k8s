@@ -183,6 +183,12 @@ func TestACPModeFromTheProfile(t *testing.T) {
 		t.Fatalf("the current mode is set again: %v", already.calls)
 	}
 
+	optAlready := &coreConn{newRes: acp.NewSessionResponse{ConfigOptions: []acp.SessionConfigOption{
+		selectOption("mode", acp.SessionConfigOptionCategoryMode, "agent-full-access", "agent", "agent-full-access")}}}
+	if _, _ = runCore(t, optAlready, nil, &model.Run{Task: "go"}); len(optAlready.calls) != 2 {
+		t.Fatalf("the current mode option is set again: %v", optAlready.calls)
+	}
+
 	t.Setenv("HARNESS_MODE", "yolo")
 	unknown := &coreConn{newRes: acp.NewSessionResponse{Modes: modes}}
 	code, lines := runCore(t, unknown, nil, &model.Run{Task: "go"})
