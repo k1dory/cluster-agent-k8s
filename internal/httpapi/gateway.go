@@ -32,8 +32,12 @@ type Gateway struct {
 
 // Routes builds the gateway mux.
 func (g *Gateway) Routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
+	return logRequests(g.Log, g.routes().ServeMux)
+}
+
+func (g *Gateway) routes() *routeMux {
+	mux := newRouteMux()
+	mux.HandleFunc("GET /healthz", healthz)
 	mux.Handle("GET /authz", g.Authz)
 	mux.Handle("POST /authz", g.Authz)
 	mux.HandleFunc("POST /bootstrap", g.bootstrap)
@@ -49,7 +53,7 @@ func (g *Gateway) Routes() http.Handler {
 	if g.MCP != nil {
 		mux.Handle("/", g.MCP) // everything else is an MCP host proxied by Caddy (see gateway template)
 	}
-	return logRequests(g.Log, mux)
+	return mux
 }
 
 func (g *Gateway) bootstrap(w http.ResponseWriter, r *http.Request) {

@@ -60,7 +60,7 @@ func (k kindService) Delete(ctx context.Context, tenant, name string) error {
 // resourceRoutes mounts one versioned resource under /v1/<path>. With adminWrites, only the
 // admin may PUT or DELETE (tenants still read their own scope). get is evaluated per request:
 // a platform without that service answers 503.
-func (p *Platform) resourceRoutes(mux *http.ServeMux, path string, get func() versioned, adminWrites bool) {
+func (p *Platform) resourceRoutes(mux *routeMux, path string, get func() versioned, adminWrites bool) {
 	scope := func(w http.ResponseWriter, r *http.Request) (versioned, string, bool) {
 		svc := get()
 		if svc == nil {
@@ -203,7 +203,7 @@ func revisionParam(w http.ResponseWriter, r *http.Request) (int, bool) {
 
 // tenantSettingsRoutes mounts /v1/tenants/{tenant}/settings: the admin writes, a tenant reads
 // its own. DELETE returns the tenant to the server defaults.
-func (p *Platform) tenantSettingsRoutes(mux *http.ServeMux) {
+func (p *Platform) tenantSettingsRoutes(mux *routeMux) {
 	svc := func() *tenants.Service { return p.TenantSettings }
 	own := func(w http.ResponseWriter, r *http.Request, write bool) (string, bool) {
 		if svc() == nil {
@@ -290,7 +290,7 @@ func (p *Platform) tenantSettingsRoutes(mux *http.ServeMux) {
 
 // configRoutes mounts every versioned resource; services the platform is not wired with
 // answer 503.
-func (p *Platform) configRoutes(mux *http.ServeMux) {
+func (p *Platform) configRoutes(mux *routeMux) {
 	kind := func(k string) func() versioned {
 		return func() versioned {
 			if p.Catalog == nil {

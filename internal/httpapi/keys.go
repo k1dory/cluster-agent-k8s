@@ -16,7 +16,7 @@ import (
 // a team adds a key for a new pipeline, rotates it on a schedule and revokes a leaked one
 // without anyone touching the server's configuration. The secret appears once, in the
 // response that creates or rotates it.
-func (p *Platform) keyRoutes(mux *http.ServeMux) {
+func (p *Platform) keyRoutes(mux *routeMux) {
 	own := func(w http.ResponseWriter, r *http.Request) (string, bool) {
 		if p.Keys == nil {
 			writeErr(w, http.StatusServiceUnavailable, errors.New("api keys disabled"))

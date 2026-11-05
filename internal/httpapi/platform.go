@@ -130,10 +130,36 @@ func principalOf(r *http.Request) Principal {
 	return pr
 }
 
+// routeMux is a ServeMux that remembers its patterns, so a test can hold the routes against
+// openapi.yaml.
+type routeMux struct {
+	*http.ServeMux
+	patterns []string
+}
+
+func newRouteMux() *routeMux { return &routeMux{ServeMux: http.NewServeMux()} }
+
+func (m *routeMux) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
+	m.patterns = append(m.patterns, pattern)
+	m.ServeMux.HandleFunc(pattern, h)
+}
+
+func (m *routeMux) Handle(pattern string, h http.Handler) {
+	m.patterns = append(m.patterns, pattern)
+	m.ServeMux.Handle(pattern, h)
+}
+
+// healthz is liveness, on both listeners.
+func healthz(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) }
+
 // Routes builds the platform mux.
 func (p *Platform) Routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
+	return logRequests(p.Log, jsonMuxErrors(p.routes().ServeMux))
+}
+
+func (p *Platform) routes() *routeMux {
+	mux := newRouteMux()
+	mux.HandleFunc("GET /healthz", healthz)
 	// Readiness: the store answers. A replica that lost its database stops taking traffic
 	// (the others, on the same database, keep it); liveness stays /healthz, so it is not
 	// restarted for an outage that is not its own.
@@ -185,7 +211,7 @@ func (p *Platform) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/whoami", p.auth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, principalOf(r))
 	}))
-	return logRequests(p.Log, jsonMuxErrors(mux))
+	return mux
 }
 
 // rollout answers POST /v1/rollouts: move agents to another version (see orchestrator.RolloutRequest).

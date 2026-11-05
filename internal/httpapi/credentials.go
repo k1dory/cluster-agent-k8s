@@ -12,7 +12,7 @@ import (
 // credentialRoutes: the secrets a tenant brings itself (BYOK). The scope is the catalogue's:
 // a tenant works in its own, the admin in a tenant's (?tenant=) or the shared one. The value
 // goes in once and never comes out: every response is metadata.
-func (p *Platform) credentialRoutes(mux *http.ServeMux) {
+func (p *Platform) credentialRoutes(mux *routeMux) {
 	scope := func(w http.ResponseWriter, r *http.Request) (string, bool) {
 		if p.Credentials == nil {
 			writeErr(w, http.StatusServiceUnavailable, credentials.ErrDisabled)
