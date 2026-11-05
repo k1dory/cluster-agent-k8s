@@ -19,6 +19,35 @@ import (
 	"agent-sandbox/internal/model"
 )
 
+// runOfflineInNetns keeps a model-call test's agent on the same loopback as the gateway bridge and
+// the test gateway. sandbox-exec (macOS) cuts the agent's network but not its loopback; unshare
+// -rn would give the agent a namespace, and a loopback, of its own. So on Linux the test runs
+// again, whole, in a new network namespace (TestMain brings lo up; ACP_TEST_NETWORK=none), and the
+// parent reports its verdict: true means the test ran there and the caller returns.
+func runOfflineInNetns(t *testing.T) bool {
+	t.Helper()
+	if os.Getenv("ACP_TEST_NETWORK") == "none" {
+		return false
+	}
+	if _, err := exec.LookPath("sandbox-exec"); err == nil {
+		return false
+	}
+	if err := exec.Command("unshare", "-rn", "true").Run(); err != nil {
+		t.Skip("no way to run the test without network here (sandbox-exec, unshare -rn)")
+	}
+	cmd := exec.Command("unshare", "-rn", os.Args[0], "-test.run", "^"+t.Name()+"$", "-test.v", "-test.count=1")
+	// Inside: lo brought up by TestMain (ACP_TEST_NETNS), and noNetwork knows the network is cut.
+	cmd.Env = append(os.Environ(), "ACP_TEST_NETWORK=none", "ACP_TEST_NETNS=1")
+	out, err := cmd.CombinedOutput()
+	switch {
+	case strings.Contains(string(out), "--- SKIP: "+t.Name()):
+		t.Skipf("skipped in the network namespace:\n%s", out)
+	case err != nil || !strings.Contains(string(out), "--- PASS: "+t.Name()):
+		t.Fatalf("in a new network namespace: %v\n%s", err, out)
+	}
+	return true
+}
+
 // gatewayRequest is what the test gateway saw of one request.
 type gatewayRequest struct {
 	ClientCN, SNI, Host, Method, Path, APIKey, Authorization, Upgrade string
@@ -190,6 +219,9 @@ func TestACPCodexExampleReachesTheModelThroughTheGateway(t *testing.T) {
 	}
 	if bin == "" {
 		t.Skip("set CODEX_ACP_TEST_BIN to run the Codex model-call test (it runs by itself in the agent image's check)")
+	}
+	if runOfflineInNetns(t) {
+		return
 	}
 	lines, seen := modelCallThroughGateway(t, "environment-codex-acp.yaml", "codex-acp", bin, "api.openai.com",
 		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
