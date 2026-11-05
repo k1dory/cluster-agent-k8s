@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1488,3 +1489,135 @@ func (m *Memory) GetGitJobByDelivery(_ context.Context, tenant, name, delivery s
 	}
 	return nil, ErrNotFound
 }
+
+// RotateAPIKey: see Atomics. Every check happens before the first change, under one lock.
+func (m *Memory) RotateAPIKey(_ context.Context, oldID string, next *model.APIKey, at time.Time, grace time.Duration) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old, ok := m.apiKeys[oldID]
+	if !ok {
+		return ErrNotFound
+	}
+	if !old.Active(at) {
+		return ErrKeyInactive
+	}
+	if _, dup := m.apiKeys[next.ID]; dup {
+		return fmt.Errorf("%w: api key %s exists", ErrConflict, next.ID)
+	}
+	var withdraw *model.APIKey
+	if prev, ok := m.apiKeys[old.RotatedTo]; ok && old.RotatedTo != "" && prev.Active(at) {
+		if prev.LastUsedAt != nil {
+			return &SuccessorInUseError{ID: prev.ID}
+		}
+		withdraw = prev
+	}
+	if withdraw != nil {
+		t := at
+		withdraw.RevokedAt = &t
+	}
+	if next.CreatedAt.IsZero() {
+		next.CreatedAt = at
+	}
+	m.apiKeys[next.ID] = cloneKey(next)
+	old.RotatedTo = next.ID
+	if grace <= 0 {
+		if old.RevokedAt == nil {
+			t := at
+			old.RevokedAt = &t
+		}
+		return nil
+	}
+	if end := at.Add(grace); old.ExpiresAt == nil || end.Before(*old.ExpiresAt) {
+		old.ExpiresAt = &end
+	}
+	return nil
+}
+
+// SwapBlob: see Atomics.
+func (m *Memory) SwapBlob(_ context.Context, name string, old, data []byte) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.blobs[name]
+	if !ok {
+		return false, ErrNotFound
+	}
+	if !bytes.Equal(cur, old) {
+		return false, nil
+	}
+	m.blobs[name] = append([]byte(nil), data...)
+	return true, nil
+}
+
+// BindInstance: see Atomics. issue runs under the store lock, as it runs inside the
+// transaction in Postgres.
+func (m *Memory) BindInstance(_ context.Context, b InstanceBinding, issue func(n int, existing *model.Instance) (*model.Instance, error)) (*BoundInstance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sb, ok := m.sandboxes[b.SandboxID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	var reuse *model.Instance
+	var others []*model.Instance
+	for _, in := range m.instances {
+		if in.SandboxID != b.SandboxID || in.PodName != b.PodName || in.RetiredAt != nil {
+			continue
+		}
+		if in.Serial == b.Serial && (reuse == nil || in.N > reuse.N) {
+			reuse = in
+		}
+	}
+	for _, in := range m.instances {
+		if in.SandboxID == b.SandboxID && in.PodName == b.PodName && in.RetiredAt == nil && in != reuse {
+			others = append(others, in)
+		}
+	}
+	n := 0
+	var existing *model.Instance
+	if reuse != nil {
+		n, existing = reuse.N, cloneInstance(reuse)
+	} else {
+		n = m.nextInst + 1
+	}
+	in, err := issue(n, existing)
+	if err != nil {
+		return nil, err
+	}
+	if reuse == nil {
+		for _, o := range m.instances {
+			if o.Serial == in.Serial {
+				return nil, fmt.Errorf("%w: serial %s is issued", ErrConflict, in.Serial)
+			}
+		}
+		m.nextInst = n
+		in.N = n
+		m.instances[n] = cloneInstance(in)
+	}
+	out := &BoundInstance{Reused: reuse != nil}
+	now := time.Now()
+	for _, o := range others {
+		t := now
+		o.RetiredAt = &t
+		out.Retired = append(out.Retired, o.N)
+	}
+	sort.Ints(out.Retired)
+	c := cloneSandbox(sb)
+	c.Instance = n
+	if c.PodName == "" {
+		c.PodName = b.PodName
+	}
+	c.Revision++
+	m.sandboxes[b.SandboxID] = c
+	out.Instance, out.Current = cloneInstance(m.instances[n]), c.PodName
+	return out, nil
+}
+
+func cloneInstance(in *model.Instance) *model.Instance {
+	c := *in
+	return &c
+}
+
+var (
+	_ Store = (*Memory)(nil)
+	_ Store = (*Postgres)(nil)
+)

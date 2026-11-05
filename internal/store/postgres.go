@@ -1629,3 +1629,165 @@ func qualified(table, cols string) string {
 	}
 	return strings.Join(parts, ", ")
 }
+
+// RotateAPIKey: see Atomics. The old key and its earlier successor are locked for the
+// transaction, so a concurrent use (TouchAPIKey) of that successor either lands first and is
+// seen, or waits until the withdrawal is decided.
+func (p *Postgres) RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, grace time.Duration) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	old, err := scanKey(tx.QueryRow(ctx, `SELECT `+keyCols+` FROM api_keys WHERE id=$1 FOR UPDATE`, oldID))
+	if err != nil {
+		return err
+	}
+	if !old.Active(at) {
+		return ErrKeyInactive
+	}
+	if old.RotatedTo != "" {
+		prev, err := scanKey(tx.QueryRow(ctx, `SELECT `+keyCols+` FROM api_keys WHERE id=$1 FOR UPDATE`, old.RotatedTo))
+		switch {
+		case errors.Is(err, ErrNotFound):
+		case err != nil:
+			return err
+		case prev.Active(at) && prev.LastUsedAt != nil:
+			return &SuccessorInUseError{ID: prev.ID}
+		case prev.Active(at):
+			if _, err := tx.Exec(ctx, `UPDATE api_keys SET revoked_at=COALESCE(revoked_at, $2) WHERE id=$1`, prev.ID, at); err != nil {
+				return err
+			}
+		}
+	}
+	if next.CreatedAt.IsZero() {
+		next.CreatedAt = at
+	}
+	tag, err := tx.Exec(ctx, `INSERT INTO api_keys (`+keyCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING`,
+		next.ID, next.Tenant, next.Name, next.Hash, next.CreatedBy, next.CreatedAt, next.ExpiresAt, next.RevokedAt, next.RotatedTo, next.LastUsedAt, next.Trust)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: api key %s exists", ErrConflict, next.ID)
+	}
+	if grace <= 0 {
+		_, err = tx.Exec(ctx, `UPDATE api_keys SET rotated_to=$2, revoked_at=COALESCE(revoked_at, $3) WHERE id=$1`, oldID, next.ID, at)
+	} else {
+		_, err = tx.Exec(ctx, `UPDATE api_keys SET rotated_to=$2, expires_at=LEAST(COALESCE(expires_at, $3::timestamptz), $3::timestamptz) WHERE id=$1`, oldID, next.ID, at.Add(grace))
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// SwapBlob: see Atomics.
+func (p *Postgres) SwapBlob(ctx context.Context, name string, old, data []byte) (bool, error) {
+	tag, err := p.pool.Exec(ctx, `UPDATE blobs SET data=$3 WHERE name=$1 AND data=$2`, name, old, data)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 1 {
+		return true, nil
+	}
+	var one int
+	if err := p.pool.QueryRow(ctx, `SELECT 1 FROM blobs WHERE name=$1`, name).Scan(&one); errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	} else if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// BindInstance: see Atomics. The sandbox row is locked first, so every bootstrap of the
+// sandbox, on any replica, runs one after the other.
+func (p *Postgres) BindInstance(ctx context.Context, b InstanceBinding, issue func(n int, existing *model.Instance) (*model.Instance, error)) (*BoundInstance, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	var current string
+	if err := tx.QueryRow(ctx, `SELECT pod_name FROM sandboxes WHERE id=$1 FOR UPDATE`, b.SandboxID).Scan(&current); errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	} else if err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx, `SELECT `+instCols+` FROM instances WHERE sandbox_id=$1 AND pod_name=$2 AND retired_at IS NULL ORDER BY n FOR UPDATE`, b.SandboxID, b.PodName)
+	if err != nil {
+		return nil, err
+	}
+	var live []*model.Instance
+	for rows.Next() {
+		in, err := scanInstance(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		live = append(live, in)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var reuse *model.Instance
+	for _, in := range live {
+		if in.Serial == b.Serial {
+			reuse = in // ORDER BY n: the newest wins
+		}
+	}
+	var n int
+	if reuse != nil {
+		n = reuse.N
+	} else {
+		var n64 int64
+		if err := tx.QueryRow(ctx, `SELECT nextval('instance_seq')`).Scan(&n64); err != nil {
+			return nil, err
+		}
+		n = int(n64)
+	}
+	var existing *model.Instance
+	if reuse != nil {
+		c := *reuse
+		existing = &c
+	}
+	in, err := issue(n, existing)
+	if err != nil {
+		return nil, err
+	}
+	out := &BoundInstance{Reused: reuse != nil}
+	if reuse == nil {
+		in.N = n
+		tag, err := tx.Exec(ctx, `INSERT INTO instances (n, sandbox_id, slug, tenant, pod_name, serial, issued_at, not_after, retired_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`,
+			in.N, in.SandboxID, in.Slug, in.Tenant, in.PodName, in.Serial, in.IssuedAt, in.NotAfter, in.RetiredAt)
+		if err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() == 0 {
+			return nil, fmt.Errorf("%w: instance %d or serial %s is issued", ErrConflict, in.N, in.Serial)
+		}
+		out.Instance = in
+	} else {
+		out.Instance = reuse
+	}
+	for _, o := range live {
+		if o.N != n {
+			out.Retired = append(out.Retired, o.N)
+		}
+	}
+	if len(out.Retired) > 0 {
+		if _, err := tx.Exec(ctx, `UPDATE instances SET retired_at=COALESCE(retired_at, now()) WHERE n = ANY($1)`, out.Retired); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.QueryRow(ctx, `UPDATE sandboxes SET instance=$2, pod_name=CASE WHEN pod_name='' THEN $3 ELSE pod_name END, revision=revision+1
+		WHERE id=$1 RETURNING pod_name`, b.SandboxID, n, b.PodName).Scan(&out.Current); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
