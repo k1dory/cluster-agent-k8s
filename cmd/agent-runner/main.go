@@ -111,7 +111,15 @@ func serveRuns(ctx context.Context, c *client) {
 			continue
 		}
 		exit := execute(ctx, c, &run)
-		c.finish(ctx, run.ID, exit)
+		// A result that was not acknowledged within the budget stays pending: the run is still
+		// `running` on the control plane, and while the pod is healthy nothing else settles it. No
+		// other run is taken before it is acknowledged; only SIGTERM gives it up.
+		for !c.finish(ctx, run.ID, exit) {
+			if ctx.Err() != nil {
+				return
+			}
+			fmt.Fprintf(os.Stderr, "agent-runner: the result of run %s is still pending: no new run is taken until it is acknowledged\n", run.ID)
+		}
 	}
 }
 
@@ -120,25 +128,26 @@ var finishBudget = 10 * time.Minute
 
 // finish reports the result and insists on an acknowledgement: the control plane's /finish is
 // idempotent, so a lost response is retried (capped exponential backoff with jitter) for
-// finishBudget rather than leaving the run `running`. 4xx means the run is gone or not ours:
-// stop. After SIGTERM (ctx) it goes on for shutdownGrace only: the pod is going away, and the
-// reconciler fails a run whose pod is gone.
-func (c *client) finish(ctx context.Context, runID string, exit int) {
+// finishBudget. settled is true once the result is settled: acknowledged, or refused with a 4xx
+// (the run is gone or not ours). false: the budget ran out, or SIGTERM (ctx) and the shutdown
+// grace did; the caller keeps the result pending (serveRuns). The reconciler fails a run whose
+// pod is gone, never one whose pod is healthy.
+func (c *client) finish(ctx context.Context, runID string, exit int) (settled bool) {
 	body, _ := json.Marshal(map[string]int{"exit_code": exit})
 	dctx, done := deliveryCtx(ctx, finishBudget)
 	defer done()
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 && !sleepCtx(dctx, backoff(attempt, time.Second, time.Minute)) {
-			fmt.Fprintf(os.Stderr, "agent-runner: finish of run %s not acknowledged, giving up: %v\n", runID, dctx.Err())
-			return
+			fmt.Fprintf(os.Stderr, "agent-runner: finish of run %s not acknowledged within the budget: %v\n", runID, dctx.Err())
+			return false
 		}
 		code, err := c.do(dctx, http.MethodPost, "/agent/runs/"+runID+"/finish", body, nil)
 		if err == nil {
-			return
+			return true
 		}
 		if code >= 400 && code < 500 {
 			fmt.Fprintln(os.Stderr, "agent-runner: finish refused:", err)
-			return
+			return true
 		}
 		fmt.Fprintln(os.Stderr, "agent-runner: finish (will retry):", err)
 	}
