@@ -91,9 +91,10 @@ answers and the run records.
    finishes with its exit code and usage. In `stream-json` mode the runner also closes the
    conversation by itself after `chat_idle` seconds without a message following a completed turn
    (default 10 minutes), so an idle chat does not hold a pod and a run open forever. The next
-   message resumes the session (point 2). Cancelling a run (`/cancel`) stops the harness: SIGINT
-   first (`claude -p` completes its turn and writes its result on it), SIGTERM 5 seconds later if it
-   is still running.
+   message resumes the session (point 2). Cancelling a run (`/cancel`) stops the harness and
+   everything it started (its process group): SIGINT first (`claude -p` completes its turn and
+   writes its result on it), SIGTERM 5 seconds later if it is still running. Whatever the harness
+   leaves running in its group when it exits gets SIGTERM, then SIGKILL 10 seconds later.
 
    The deployment's default harness is not `claude -p` but Claude over ACP (`claude-agent-acp`,
    `agent.harnessInput: acp` in the chart, `kube.harness_input` in sandboxd's configuration), and

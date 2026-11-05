@@ -329,18 +329,23 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "/bin/sh", "-lc", cmdline)
-	// A cancelled run is interrupted first: `claude -p` ends its turn and writes its result on
-	// SIGINT, while after SIGTERM alone the turn never completes. SIGTERM follows if the harness
-	// is still there, SIGKILL after WaitDelay.
+	// The harness and everything it starts are one process group, signalled as a whole, as the
+	// ACP path does: the shell of a compound HARNESS_CMD (or a harness's own helpers) would
+	// otherwise leave children running after the run, writing into the workspace. A cancelled run
+	// is interrupted first, as Ctrl-C at a terminal interrupts its foreground group: `claude -p`
+	// ends its turn and writes its result on SIGINT, while after SIGTERM alone the turn never
+	// completes. SIGTERM follows if the harness is still there, SIGKILL after WaitDelay, and what is
+	// left of the group once the harness exited is ended by endGroup.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	exited := make(chan struct{})
 	grace := interruptGrace
 	cmd.Cancel = func() error {
-		err := cmd.Process.Signal(syscall.SIGINT)
+		err := signalGroup(cmd, syscall.SIGINT)
 		go func() {
 			select {
 			case <-exited:
 			case <-time.After(grace):
-				_ = cmd.Process.Signal(syscall.SIGTERM)
+				_ = signalGroup(cmd, syscall.SIGTERM)
 			}
 		}()
 		return err
@@ -355,15 +360,22 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	if err != nil {
 		return 1
 	}
-	stdout, err := cmd.StdoutPipe()
+	// The output pipe is the runner's own, not StdoutPipe's, which Wait closes as soon as the
+	// harness exits (what it wrote last could still be unread). This one reads to EOF: until the
+	// harness and whatever it left holding the pipe are gone (endGroup).
+	stdout, out, err := os.Pipe()
 	if err != nil {
 		return 1
 	}
-	cmd.Stderr = cmd.Stdout
-	if err := cmd.Start(); err != nil {
+	cmd.Stdout, cmd.Stderr = out, out
+	err = cmd.Start()
+	_ = out.Close() // the harness has its copy
+	if err != nil {
+		_ = stdout.Close()
 		c.post(ctx, run.ID, []string{"[agent-runner] cannot start harness: " + err.Error()})
 		return 127
 	}
+	defer stdout.Close()
 	chat := newChat(os.Getenv("HARNESS_INPUT"), chatIdle())
 	// Harnesses that take the task on stdin get it first (in stream-json mode as the first user
 	// message); CLI-arg harnesses just ignore it. In text mode that is all stdin ever carries, so
@@ -386,7 +398,17 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	err = cmd.Wait()
 	close(exited)
 	cancel()
-	wg.Wait()
+	endGroup(cmd)
+	// The output ends when nothing of the group holds the pipe any more. A process that left the
+	// group (setsid) and kept it is not waited for past the group's kill: the pipe is closed.
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(groupKillDelay + 2*time.Second):
+		_ = stdout.Close()
+		<-done
+	}
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
 		return ee.ExitCode()
