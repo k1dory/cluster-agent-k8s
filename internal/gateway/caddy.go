@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -306,7 +307,7 @@ func render(cfg Config, hosts []policy.Host, agentCAPEM []byte) (string, []Skipp
 		hv := hostView{Name: h.Name, Upstream: h.Upstream, MCP: h.MCP, UpstreamHost: h.UpstreamHost}
 		// Upstream by IP but TLS for the real name: tell the transport which SNI/verification name
 		// to use (unless the upstream is addressed as itself).
-		if strings.HasPrefix(h.Upstream, "https://") && !h.UpstreamHost {
+		if u, err := url.Parse(h.Upstream); err == nil && u.Scheme == "https" && !h.UpstreamHost {
 			if up := policy.UpstreamHostname(h.Upstream); up != h.Name && isIP(up) {
 				hv.TLSServerName = h.Name
 			}

@@ -182,3 +182,17 @@ func TestReviewRevertingToTheAcceptedConfigClearsTheFailure(t *testing.T) {
 		t.Fatalf("restoring the accepted configuration must clear the failure and keep LastSync: %+v", st)
 	}
 }
+
+// A mixed-case scheme was accepted by the validator (url.Parse lower-cases it) while the
+// renderer matched the raw "https://" and left out tls_server_name: now refused, so the
+// host is left out rather than rendered without its TLS name.
+func TestReviewMixedCaseSchemeIsNotRenderedWithoutItsTLSName(t *testing.T) {
+	c, _ := ca.Generate("t", time.Hour)
+	out, skipped, err := render(reviewCfg(), []policy.Host{{Name: "n.example.com", Upstream: "HTTPS://10.0.0.5:8443"}}, c.PEM())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(skipped) != 1 || strings.Contains(out, "reverse_proxy HTTPS://") {
+		t.Fatalf("a non-canonical scheme must be left out: skipped=%+v", skipped)
+	}
+}

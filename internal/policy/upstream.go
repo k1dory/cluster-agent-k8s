@@ -30,6 +30,11 @@ func ValidateUpstream(s string) error {
 	if u.Scheme != "https" && u.Scheme != "http" {
 		return fmt.Errorf("upstream %q must start with http:// or https://", s)
 	}
+	// url.Parse lower-cases the scheme; the renderer, the MCP proxy and the conflict checks
+	// compare the string itself, so only one spelling is accepted.
+	if !strings.HasPrefix(s, u.Scheme+"://") {
+		return fmt.Errorf("upstream %q: write the scheme in lower case (%s://)", s, u.Scheme)
+	}
 	if u.Opaque != "" || u.Host == "" {
 		return fmt.Errorf("upstream %q has no host", s)
 	}
