@@ -499,7 +499,9 @@ pick:
 		}
 	}
 	a.mu.Lock()
-	a.flushLocked()
+	// Requests are dispatched independently of ordered session notifications.
+	// A permission callback may overtake text chunks, so only the notification
+	// stream and the prompt response may flush the pending assistant message.
 	a.emit(l.String())
 	a.mu.Unlock()
 	return out, nil
