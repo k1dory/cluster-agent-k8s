@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,7 +20,9 @@ import (
 // behavior. It runs automatically when codex-acp is on PATH (e.g. in the agent
 // image), or with CODEX_ACP_TEST_BIN=/absolute/path/to/codex-acp. An optional
 // CODEX_ACP_TEST_CODEX_PATH selects the exact Codex binary under test.
-// No prompt is sent and no real API key or existing login is used.
+// No prompt is sent and no real API key or existing login is used. The adapter
+// and its children run without outbound network access; if isolation is not
+// available, the test is skipped.
 func TestACPCodexExampleCreatesSession(t *testing.T) {
 	adapter := os.Getenv("CODEX_ACP_TEST_BIN")
 	if adapter == "" {
@@ -33,6 +36,7 @@ func TestACPCodexExampleCreatesSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	isolate := noNetwork(t)
 	raw, err := os.ReadFile("../../examples/catalog/environment-codex-acp.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -48,7 +52,9 @@ func TestACPCodexExampleCreatesSession(t *testing.T) {
 	home := t.TempDir()
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, adapter)
+	cmd := exec.CommandContext(ctx, isolate[0], append(isolate[1:], adapter)...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.Dir = home
 	// Deliberately exclude the developer's auth, provider overrides, and default
 	// auth request. Only the shipped profile may supply those settings.
@@ -78,14 +84,10 @@ func TestACPCodexExampleCreatesSession(t *testing.T) {
 	}
 	defer func() {
 		_ = stdin.Close()
-		done := make(chan error, 1)
-		go func() { done <- cmd.Wait() }()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			cancel()
-			<-done
-		}
+		// Kill the group before reaping its leader, even if the adapter already
+		// exited: app-server children must not outlive this test.
+		_ = cmd.Cancel()
+		_ = cmd.Wait()
 		if t.Failed() {
 			t.Logf("adapter stderr:\n%s", stderr.String())
 		}
