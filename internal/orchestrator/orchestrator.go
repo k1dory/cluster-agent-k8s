@@ -778,9 +778,16 @@ func (o *Orchestrator) stopPod(ctx context.Context, id string, final model.Sandb
 // stopped, put to sleep). Pod names are reused per sandbox, so between that observation and the
 // deletion another replica could wake the sandbox and create its replacement under the same
 // name. The deletion therefore runs under the tenant lock every wake takes, after checking the
-// record again: gone or deleting (nothing wakes it any more), or still stopping or sleeping at
-// the revision observed (no wake since). Anything else means the sandbox moved on and the name
-// may already be the replacement's: the pod is left to its new owner.
+// record again:
+//   - gone or deleting: nothing wakes it any more.
+//   - sleeping, at any revision: a sleeping sandbox has no pod, and none can start while the
+//     lock is held, so the name belongs to nobody but this pod. (A stop that was still running
+//     when the orphan was observed finishes as sleeping; skipping then left the pod forever,
+//     since nothing reconciles the pods of sleeping sandboxes.)
+//   - stopping at the observed revision: the stop that missed the pod, not yet finished.
+//
+// Anything else (waking, running, error, a newer stop) means the sandbox moved on and the name
+// may already be a replacement's: the pod is left to its new owner.
 func (o *Orchestrator) removeOrphan(ctx context.Context, tenant string, created *model.Sandbox, observed int64) {
 	err := o.Store.WithTenantLock(ctx, tenant, func(ctx context.Context) error {
 		cur, err := o.Store.GetSandbox(ctx, created.ID)
@@ -788,8 +795,8 @@ func (o *Orchestrator) removeOrphan(ctx context.Context, tenant string, created 
 		case errors.Is(err, store.ErrNotFound):
 		case err != nil:
 			return err
-		case cur.Status == model.StatusDeleting:
-		case (cur.Status == model.StatusStopping || cur.Status == model.StatusSleeping) && cur.Revision == observed:
+		case cur.Status == model.StatusDeleting, cur.Status == model.StatusSleeping:
+		case cur.Status == model.StatusStopping && cur.Revision == observed:
 		default:
 			o.Log.Info("sandbox moved on before its orphan pod was removed, leaving the pod", "id", created.ID, "pod", created.PodName, "status", cur.Status)
 			return nil

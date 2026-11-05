@@ -591,3 +591,57 @@ func TestReviewOrphanRemovalSparesTheReplacement(t *testing.T) {
 		t.Fatalf("the replacement pod was deleted as A's orphan: %v", err)
 	}
 }
+
+// parkDeleteRuntime removes the pod, then parks DeletePod until release: a stop between its
+// DeletePod and its final write.
+type parkDeleteRuntime struct {
+	*FakeRuntime
+	parked  chan struct{}
+	release chan struct{}
+}
+
+func (r *parkDeleteRuntime) DeletePod(ctx context.Context, sb *model.Sandbox) error {
+	err := r.FakeRuntime.DeletePod(ctx, sb)
+	close(r.parked)
+	<-r.release
+	return err
+}
+
+// Replica B starts a sleep while A creates the pod; B's DeletePod finds nothing. A observes
+// stopping (revision N) and judges its pod an orphan; before A takes the cleanup lock B
+// finishes the sleep, moving the revision on. No replacement started, yet the revision guard
+// skipped the deletion and the pod ran on forever behind a sleeping sandbox.
+func TestReviewOrphanRemovedAfterTheStopFinished(t *testing.T) {
+	ctx := context.Background()
+	fake := NewFakeRuntime()
+	mem := store.NewMemory()
+	now := time.Now()
+	sb := &model.Sandbox{ID: "sb_orphan2", Slug: "dev", Tenant: "acme", Name: "o", Owner: "alice", Status: model.StatusSleeping, CreatedAt: now, LastActivity: now}
+	_ = fake.EnsureVolume(ctx, sb)
+	if err := mem.CreateSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	bRT := &parkDeleteRuntime{FakeRuntime: fake, parked: make(chan struct{}), release: make(chan struct{})}
+	b := New(mem, bRT, nil, events.New(), Config{}, nil)
+	slept := make(chan error, 1)
+	pause := &pauseOnce{fn: func() {
+		close(bRT.release) // B finishes its sleep before A's locked re-read
+		if err := <-slept; err != nil {
+			t.Error(err)
+		}
+	}}
+	rt := &orphanRuntime{FakeRuntime: fake, pause: pause, whileCreate: func() {
+		go func() { _, err := b.Sleep(ctx, sb.ID, true); slept <- err }()
+		<-bRT.parked // B is stopping and found no pod
+	}}
+	a := New(lockPauseStore{Store: mem, pause: pause}, rt, nil, events.New(), Config{}, nil)
+	if _, err := a.Wake(ctx, sb.ID); err == nil {
+		t.Fatal("A's wake of a sandbox put to sleep meanwhile reported success")
+	}
+	if got, _ := mem.GetSandbox(ctx, sb.ID); got.Status != model.StatusSleeping {
+		t.Fatalf("sandbox after the race: %s", got.Status)
+	}
+	if _, _, err := fake.PodStatus(ctx, sb); err == nil {
+		t.Fatal("orphan pod left running behind a sleeping sandbox")
+	}
+}
