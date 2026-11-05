@@ -8,7 +8,10 @@ description: Python service work on Claude Code
 spec:
   image: stable
   harness:
-    command: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose'
+    command: claude-agent-acp
+    input: acp
+    permissions: allow
+    mode: default
   resources: {cpu_request: 500m, cpu_limit: "2", memory_request: 2Gi, memory_limit: 6Gi, volume_size: 20Gi}
   lifecycle: {idle_timeout: 1800}
 ---

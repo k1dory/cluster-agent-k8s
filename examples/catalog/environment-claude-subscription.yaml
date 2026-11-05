@@ -4,22 +4,24 @@
 # Authorization header (examples/policies/llm-subscriptions.yaml). docs/self-service.md,
 # "Subscriptions", has the whole path.
 #
-# Permissions: since 2.1.302 `claude -p` starts in manual mode, where an edit or a non-read-only
-# command is refused unless a rule, a hook or a permission prompt tool allows it, and nobody
-# answers in a pod. The sandbox (its policy and the gateway) is the boundary, so the run bypasses
-# Claude Code's own prompts; `--permission-prompts none` makes anything that would still prompt
-# fail at once instead of waiting. Refusals are listed in the result line (permission_denials).
-# For permission requests the runner answers and records, use an ACP profile (environment-claude-acp.yaml).
+# Claude runs over the Agent Client Protocol (claude-agent-acp, the same agent as
+# environment-claude-acp.yaml) with the subscription token instead of an API key: its permission
+# requests reach the runner as session/request_permission, are answered by `permissions` and
+# recorded. (`claude -p` in a pod refuses every edit and non-read-only command since 2.1.302:
+# nobody is there to approve them.) The Agent SDK's terms ask products built on it for an API
+# key, not a claude.ai login (https://code.claude.com/docs/en/agent-sdk/overview): use this
+# profile only where that subscription may be used this way.
 # Apply:  sandboxctl apply -f examples/catalog/environment-claude-subscription.yaml
 kind: EnvironmentProfile
 name: claude-subscription
-description: Claude Code on the tenant's Claude subscription, the token held by the gateway
+description: Claude over ACP on the tenant's Claude subscription, the token held by the gateway
 spec:
   image: stable
   harness:
-    command: 'claude -p --input-format stream-json --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
-    input: stream-json
-    resume_command: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
+    command: claude-agent-acp
+    input: acp
+    permissions: allow
+    mode: default
   model:
     name: claude-opus-5-5
     env:

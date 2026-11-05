@@ -43,6 +43,12 @@ Choosing the run that carries a message and recording it happen under one lock p
 shared by every replica (an advisory lock in PostgreSQL), so two messages sent at the same
 moment join the same conversation instead of starting two.
 
+The rest of this section is the fallback for harnesses without ACP (`claude -p`, `codex exec`, a
+script). Claude is not one of them: run it as `claude-agent-acp` with `input: acp`. `claude -p` in
+a pod refuses every edit and non-read-only command since Claude Code 2.1.302 (nobody is there to
+approve them), and permission flags are no substitute for requests the profile's `permissions`
+answers and the run records.
+
 1. **A message reaches a run in progress as input — in stream-json mode.** `POST /messages` on a
    sandbox whose run is running (or queued) appends an `input` event; the runner hands it to the
    harness's stdin. That needs a harness started in streaming-input mode:
@@ -90,9 +96,9 @@ moment join the same conversation instead of starting two.
    is still running.
 
    The deployment's default harness is not `claude -p` but Claude over ACP (`claude-agent-acp`,
-   `agent.harnessInput: acp` in the chart, `kube.harness_input` in sandboxd's configuration).
-   Where `claude -p` is used (claude-subscription), it runs with
-   `--permission-mode bypassPermissions --permission-prompts none`: since Claude Code 2.1.302 `-p` starts in a manual mode that refuses every
+   `agent.harnessInput: acp` in the chart, `kube.harness_input` in sandboxd's configuration), and
+   every shipped Claude profile is ACP. A deployment that still runs `claude -p` as a fallback
+   needs `--permission-mode bypassPermissions --permission-prompts none`: since Claude Code 2.1.302 `-p` starts in a manual mode that refuses every
    edit and non-read-only command nobody approves, and in a pod nobody does. The sandbox is the
    boundary; for recorded per-request decisions use ACP. Its MCP configuration names the servers
    by their gateway bridge URLs. `codex exec --json` gets its usage counted from each

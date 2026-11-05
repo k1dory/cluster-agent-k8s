@@ -74,8 +74,11 @@ The policy injects it as the bearer, and nothing else
     Authorization: "Bearer secret:claude-oauth"
 ```
 
-The environment profile gives Claude Code a placeholder token and no API key
-([examples/catalog/environment-claude-subscription.yaml](../examples/catalog/environment-claude-subscription.yaml)):
+The environment profile runs Claude over ACP (`claude-agent-acp`, `input: acp`) and gives it a
+placeholder token and no API key
+([examples/catalog/environment-claude-subscription.yaml](../examples/catalog/environment-claude-subscription.yaml));
+the adapter passes its environment to the Claude Code it starts unchanged (it rewrites credentials
+only for a client-configured provider, which the runner never sets):
 
 ```yaml
 env:

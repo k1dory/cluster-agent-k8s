@@ -2,8 +2,11 @@ package catalog
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"agent-sandbox/internal/model"
@@ -60,6 +63,45 @@ func TestShippedACPProfiles(t *testing.T) {
 		}
 		if _, err := s.Put(context.Background(), d.Kind, "acme", d, false, "ci"); err != nil {
 			t.Fatalf("%s: %v", f, err)
+		}
+	}
+}
+
+// Claude runs over ACP in every shipped profile: `claude -p` in a pod refuses every edit nobody
+// approves, and only ACP brings the requests to the runner. claude -p is a documented fallback.
+func TestShippedClaudeProfilesUseACP(t *testing.T) {
+	files, err := filepath.Glob("../../examples/catalog/*.yaml")
+	if err != nil || len(files) == 0 {
+		t.Fatal(files, err)
+	}
+	s := newService()
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		docs, err := ParseYAMLAll(raw)
+		if err != nil {
+			t.Fatalf("%s: %v", f, err)
+		}
+		for _, d := range docs {
+			if d.Kind != model.KindEnvironment {
+				continue
+			}
+			var spec EnvironmentSpec
+			if err := json.Unmarshal(d.Spec, &spec); err != nil {
+				t.Fatal(err)
+			}
+			cmd := spec.Harness.Command
+			if strings.Contains(cmd, "claude -p") || strings.HasPrefix(cmd, "claude ") {
+				t.Errorf("%s (%s): Claude must run as claude-agent-acp over ACP, not %q", f, d.Name, cmd)
+			}
+			if cmd == "claude-agent-acp" && spec.Harness.Input != "acp" {
+				t.Errorf("%s (%s): claude-agent-acp needs input acp", f, d.Name)
+			}
+			if _, err := s.Put(context.Background(), d.Kind, "acme", d, false, "ci"); err != nil {
+				t.Errorf("%s (%s): %v", f, d.Name, err)
+			}
 		}
 	}
 }
