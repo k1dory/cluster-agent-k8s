@@ -13,10 +13,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -251,9 +255,25 @@ type view struct {
 
 // Render produces the Caddyfile for the given policies and agent CA root (PEM).
 func Render(cfg Config, hosts []policy.Host, agentCAPEM []byte) (string, error) {
+	out, _, err := render(cfg, hosts, agentCAPEM)
+	return out, err
+}
+
+// Skipped is a host Render left out of the configuration, and why.
+type Skipped struct {
+	Host, Upstream string
+	Err            error
+}
+
+// render is Render that also reports the hosts it left out. A host whose upstream Caddy would
+// refuse is dropped rather than rendered: Caddy rejects the whole /load for one bad upstream,
+// so rendering it would freeze every other host on the last configuration that loaded. The
+// validators keep such upstreams out of policies and connections; this is the backstop for
+// what is already stored.
+func render(cfg Config, hosts []policy.Host, agentCAPEM []byte) (string, []Skipped, error) {
 	blk, _ := pem.Decode(agentCAPEM)
 	if blk == nil {
-		return "", errors.New("agent CA: no PEM certificate")
+		return "", nil, errors.New("agent CA: no PEM certificate")
 	}
 	admin := "off"
 	if cfg.CaddyAdmin != "" {
@@ -274,22 +294,20 @@ func Render(cfg Config, hosts []policy.Host, agentCAPEM []byte) (string, error) 
 	if v.RegistrarPort == 0 {
 		v.RegistrarPort = 8443
 	}
+	var skipped []Skipped
 	for _, h := range hosts {
 		if h.Name == cfg.APIHost || h.Name == cfg.RegistrarHost {
 			continue // served by the built-in blocks
+		}
+		if err := policy.ValidateUpstream(h.Upstream); err != nil {
+			skipped = append(skipped, Skipped{Host: h.Name, Upstream: h.Upstream, Err: err})
+			continue
 		}
 		hv := hostView{Name: h.Name, Upstream: h.Upstream, MCP: h.MCP, UpstreamHost: h.UpstreamHost}
 		// Upstream by IP but TLS for the real name: tell the transport which SNI/verification name
 		// to use (unless the upstream is addressed as itself).
 		if strings.HasPrefix(h.Upstream, "https://") && !h.UpstreamHost {
-			up := strings.TrimPrefix(h.Upstream, "https://")
-			if i := strings.Index(up, "/"); i >= 0 {
-				up = up[:i]
-			}
-			if i := strings.LastIndex(up, ":"); i >= 0 {
-				up = up[:i]
-			}
-			if up != h.Name && isIP(up) {
+			if up := policy.UpstreamHostname(h.Upstream); up != h.Name && isIP(up) {
 				hv.TLSServerName = h.Name
 			}
 		}
@@ -304,18 +322,44 @@ func Render(cfg Config, hosts []policy.Host, agentCAPEM []byte) (string, error) 
 	t := template.Must(template.New("caddyfile").Parse(caddyfileTmpl))
 	var buf bytes.Buffer
 	if err := t.Execute(&buf, v); err != nil {
-		return "", err
+		return "", skipped, err
 	}
-	return buf.String(), nil
+	return buf.String(), skipped, nil
 }
 
-func isIP(s string) bool {
-	for _, r := range s {
-		if (r < '0' || r > '9') && r != '.' {
-			return false
+// isIP: IPv4 or IPv6 literal (an IPv6 upstream needs tls_server_name as much as an IPv4 one).
+func isIP(s string) bool { return net.ParseIP(s) != nil }
+
+// hostAtLine names the policy host whose site block holds line n (1-based) of a rendered
+// Caddyfile, from the "# policy host:" comment each block starts with; "" outside them.
+func hostAtLine(caddyfile string, n int) string {
+	lines := strings.Split(caddyfile, "\n")
+	if n < 1 || n > len(lines) {
+		return ""
+	}
+	for i := n - 1; i >= 0; i-- {
+		l := lines[i]
+		if name, ok := strings.CutPrefix(l, "# policy host: "); ok {
+			return strings.TrimSpace(name)
+		}
+		// a top-level block other than a policy host (global options, snippets, API, registrar)
+		if i < n-1 && l == "}" {
+			return ""
 		}
 	}
-	return s != ""
+	return ""
+}
+
+var caddyfileLine = regexp.MustCompile(`Caddyfile:(\d+)`)
+
+// rejectedHost is the host a Caddy /load error points at, when the error names a line.
+func rejectedHost(caddyfile string, err error) string {
+	m := caddyfileLine.FindStringSubmatch(err.Error())
+	if m == nil {
+		return ""
+	}
+	n, _ := strconv.Atoi(m[1])
+	return hostAtLine(caddyfile, n)
 }
 
 // Push loads the Caddyfile into a running Caddy through its admin API.
@@ -386,6 +430,36 @@ type Syncer struct {
 	AgentCA  []byte
 	Log      *slog.Logger
 	last     string
+	tried    string // fingerprint of the last attempt, successful or not
+
+	mu     sync.Mutex
+	status SyncStatus
+	// lastSkipped: the hosts the previous render left out, so a host that keeps being skipped
+	// is logged when it starts and stops being, not on every tick.
+	lastSkipped string
+}
+
+// SyncStatus is what an operator or a readiness check needs to tell a gateway that applies
+// policy changes from one stuck on an old configuration (Caddy keeps the last one it loaded).
+type SyncStatus struct {
+	LastSync     time.Time // last configuration Caddy accepted (zero: none yet)
+	FailingSince time.Time // first failure of the current run of failures (zero: healthy)
+	Failures     int       // consecutive failures
+	LastError    string
+	Host         string   // the host the last Caddy rejection points at, when it names one
+	Skipped      []string // hosts left out of the configuration for an invalid upstream
+}
+
+// Healthy: the last attempt succeeded.
+func (st SyncStatus) Healthy() bool { return st.Failures == 0 }
+
+// Status reports the syncer's state; safe to call from any goroutine.
+func (s *Syncer) Status() SyncStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.status
+	st.Skipped = append([]string(nil), st.Skipped...)
+	return st
 }
 
 // hosts is the policy set's host list with the extra header names merged in.
@@ -420,10 +494,48 @@ func (s *Syncer) SyncOnce(ctx context.Context, force bool) error {
 	if !force && fp == s.last {
 		return nil
 	}
-	cf, err := Render(s.Cfg, hs, s.AgentCA)
+	s.tried = fp
+	err := s.syncOnce(ctx, hs, fp)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err == nil {
+		s.status.LastSync, s.status.FailingSince, s.status.Failures, s.status.LastError, s.status.Host = time.Now(), time.Time{}, 0, "", ""
+		return nil
+	}
+	if s.status.Failures == 0 {
+		s.status.FailingSince = time.Now()
+	}
+	s.status.Failures++
+	s.status.LastError = err.Error()
+	var rj *rejection
+	if errors.As(err, &rj) {
+		s.status.Host = rj.host
+	} else {
+		s.status.Host = ""
+	}
+	return err
+}
+
+// rejection is a /load Caddy refused, with the host its error points at.
+type rejection struct {
+	host, upstream string
+	err            error
+}
+
+func (r *rejection) Error() string {
+	if r.host == "" {
+		return r.err.Error()
+	}
+	return fmt.Sprintf("host %s (upstream %s): %v", r.host, r.upstream, r.err)
+}
+func (r *rejection) Unwrap() error { return r.err }
+
+func (s *Syncer) syncOnce(ctx context.Context, hs []policy.Host, fp string) error {
+	cf, skipped, err := render(s.Cfg, hs, s.AgentCA)
 	if err != nil {
 		return err
 	}
+	s.noteSkipped(skipped)
 	if s.Cfg.CaddyfileOut != "" {
 		if err := os.WriteFile(s.Cfg.CaddyfileOut, []byte(cf), 0o644); err != nil {
 			return err
@@ -431,40 +543,96 @@ func (s *Syncer) SyncOnce(ctx context.Context, force bool) error {
 	}
 	if s.Cfg.CaddyAdmin != "" {
 		if err := Push(ctx, s.Cfg.CaddyAdmin, cf); err != nil {
-			return err
+			rj := &rejection{host: rejectedHost(cf, err), err: err}
+			for _, h := range hs {
+				if h.Name == rj.host {
+					rj.upstream = h.Upstream
+				}
+			}
+			return rj
 		}
 	}
 	s.last = fp
 	if s.Log != nil {
-		s.Log.Info("gateway config synced", "hosts", len(s.Policies.Hosts()), "pushed", s.Cfg.CaddyAdmin != "")
+		s.Log.Info("gateway config synced", "hosts", len(hs)-len(skipped), "skipped", len(skipped), "pushed", s.Cfg.CaddyAdmin != "")
 	}
 	return nil
 }
 
-// Run syncs now, then re-syncs whenever policies change, until ctx ends.
-func (s *Syncer) Run(ctx context.Context, every time.Duration) {
-	for attempt := 1; ; attempt++ {
-		if err := s.SyncOnce(ctx, true); err == nil {
-			break
-		} else if s.Log != nil {
-			s.Log.Error("gateway sync", "attempt", attempt, "err", err)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(time.Duration(min(attempt, 12)) * 5 * time.Second):
-		}
+// noteSkipped records the hosts left out and logs when that list changes.
+func (s *Syncer) noteSkipped(skipped []Skipped) {
+	names := make([]string, 0, len(skipped))
+	for _, sk := range skipped {
+		names = append(names, sk.Host)
 	}
+	key := strings.Join(names, ",")
+	s.mu.Lock()
+	changed := key != s.lastSkipped
+	s.lastSkipped, s.status.Skipped = key, names
+	s.mu.Unlock()
+	if !changed || s.Log == nil {
+		return
+	}
+	for _, sk := range skipped {
+		s.Log.Error("gateway host left out of the configuration: its upstream is invalid; fix the policy or connection that names it",
+			"host", sk.Host, "upstream", sk.Upstream, "err", sk.Err)
+	}
+}
+
+// retryAfter is the wait before the next attempt after n consecutive failures: 5s doubling to
+// 5 minutes, so a configuration Caddy keeps refusing is neither hammered every tick nor
+// given up on.
+func retryAfter(n int) time.Duration {
+	d := 5 * time.Second
+	for i := 1; i < n && d < 5*time.Minute; i++ {
+		d *= 2
+	}
+	return min(d, 5*time.Minute)
+}
+
+// Run syncs now, then re-syncs whenever policies change, until ctx ends. A failure is retried
+// with backoff and logged on every attempt with how long the gateway has been stuck (Caddy
+// keeps serving its last good configuration meanwhile, so nothing else would show it); a
+// policy or connection change made meanwhile, the likely fix, is tried at the next tick.
+func (s *Syncer) Run(ctx context.Context, every time.Duration) {
+	retry := time.NewTimer(0) // the first attempt, then the backoff after a failure
+	defer retry.Stop()
 	t := time.NewTicker(every)
 	defer t.Stop()
+	failing := false
+	try := func(force bool) {
+		err := s.SyncOnce(ctx, force)
+		if err == nil {
+			if failing && s.Log != nil {
+				s.Log.Info("gateway sync recovered")
+			}
+			failing = false
+			retry.Stop()
+			return
+		}
+		failing = true
+		st := s.Status()
+		wait := retryAfter(st.Failures)
+		retry.Reset(wait)
+		if s.Log != nil {
+			s.Log.Error("gateway sync failed: caddy keeps its previous configuration, policy changes are not applied",
+				"host", st.Host, "failures", st.Failures, "failing_for", time.Since(st.FailingSince).Round(time.Second),
+				"retry_in", wait, "err", err)
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-retry.C:
+			try(true)
 		case <-t.C:
-			if err := s.SyncOnce(ctx, false); err != nil && s.Log != nil {
-				s.Log.Error("gateway sync", "err", err)
+			if failing {
+				if _, fp := s.hosts(); fp == s.tried {
+					continue // nothing changed: wait for the backoff
+				}
 			}
+			try(false)
 		}
 	}
 }

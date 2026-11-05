@@ -280,8 +280,10 @@ func (p *Policy) Validate() error {
 		if strings.ContainsAny(r.Host, "*/: ") {
 			return fmt.Errorf("allow[%d]: host %q must be a plain DNS name (the gateway issues one certificate per name)", i, r.Host)
 		}
-		if r.Upstream != "" && !strings.HasPrefix(r.Upstream, "https://") && !strings.HasPrefix(r.Upstream, "http://") {
-			return fmt.Errorf("allow[%d] (%s): upstream must start with http:// or https://", i, r.Host)
+		if r.Upstream != "" {
+			if err := ValidateUpstream(r.Upstream); err != nil {
+				return fmt.Errorf("allow[%d] (%s): %w", i, r.Host, err)
+			}
 		}
 		for _, m := range r.Methods {
 			if m != strings.ToUpper(m) {

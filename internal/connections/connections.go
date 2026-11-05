@@ -14,7 +14,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -171,9 +170,8 @@ func (s *Service) checkOwnHost(tenant, name string, sp *Spec) error {
 		return fmt.Errorf("%w: tenant %s may not reach %s: it is neither served by the policy repository nor listed under the tenant's hosts", res.ErrForbidden, tenant, sp.Host)
 	}
 	if sp.Upstream != "" {
-		u, err := url.Parse(sp.Upstream)
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-			return fmt.Errorf("%w: spec.upstream must be an http(s) URL with a host and nothing else", res.ErrInvalid)
+		if err := policy.ValidateUpstream(sp.Upstream); err != nil {
+			return fmt.Errorf("%w: spec.upstream: %v", res.ErrInvalid, err)
 		}
 	}
 	if sp.UpstreamHost && sp.Upstream == "" {
