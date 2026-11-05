@@ -100,25 +100,27 @@ ci_trivy_run() {
   env -i PATH="$PATH" HOME="${HOME:-/tmp}" TMPDIR="${TMPDIR:-/tmp}" \
     ${HTTP_PROXY:+HTTP_PROXY="$HTTP_PROXY"} ${HTTPS_PROXY:+HTTPS_PROXY="$HTTPS_PROXY"} ${NO_PROXY:+NO_PROXY="$NO_PROXY"} \
     ${http_proxy:+http_proxy="$http_proxy"} ${https_proxy:+https_proxy="$https_proxy"} ${no_proxy:+no_proxy="$no_proxy"} \
-    ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} ${DOCKER_CERT_PATH:+DOCKER_CERT_PATH="$DOCKER_CERT_PATH"} \
-    ${DOCKER_TLS_VERIFY:+DOCKER_TLS_VERIFY="$DOCKER_TLS_VERIFY"} ${DOCKER_CONFIG:+DOCKER_CONFIG="$DOCKER_CONFIG"} \
+    ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} ${DOCKER_CONTEXT:+DOCKER_CONTEXT="$DOCKER_CONTEXT"} \
+    ${DOCKER_CERT_PATH:+DOCKER_CERT_PATH="$DOCKER_CERT_PATH"} ${DOCKER_TLS_VERIFY:+DOCKER_TLS_VERIFY="$DOCKER_TLS_VERIFY"} \
+    ${DOCKER_CONFIG:+DOCKER_CONFIG="$DOCKER_CONFIG"} ${DOCKER_API_VERSION:+DOCKER_API_VERSION="$DOCKER_API_VERSION"} \
     TRIVY_CACHE_DIR="${TRIVY_CACHE_DIR:-$CI_BIN/trivy-cache}" \
     "$trivy" "$kind" --config "$ci_dir/trivy.yaml" --quiet --scanners vuln --severity HIGH,CRITICAL \
     --ignorefile "$ci_root/.trivyignore.yaml" "$@"
 }
 
-# ci_trivy_scan KIND TARGET... is the one vulnerability policy every scan uses (ci-scan on the
-# module, ci-images on the images). Two passes: the report, every HIGH and CRITICAL finding
-# whether or not a fix exists, so an unfixed one is seen and not hidden; then the verdict, in
-# which only findings with a fix fail (exit 1), because an unfixed one has nothing to bump
-# yet. A finding accepted on purpose lives in .trivyignore.yaml with an expiry.
-# CI_TRIVY_GATE_SKIP names directories the verdict leaves out (the report still shows them):
-# ci-images uses it for the tree of a third-party agent image whose fixes are its own release.
+# ci_trivy_scan KIND VERDICT-SKIP TARGET... is the one vulnerability policy every scan uses
+# (ci-scan on the module, ci-images on the images). Two passes: the report, every HIGH and
+# CRITICAL finding whether or not a fix exists, so an unfixed one is seen and not hidden; then
+# the verdict, in which only findings with a fix fail (exit 1), because an unfixed one has
+# nothing to bump yet. A finding accepted on purpose lives in .trivyignore.yaml with an expiry.
+# VERDICT-SKIP, usually empty, names a directory the verdict leaves out while the report still
+# shows it: ci-images passes the tree of a third-party agent image whose fixes are its own
+# release. It is an argument, not a variable, so nothing in a runner's environment sets it.
 ci_trivy_scan() {
-  local kind=$1 out
-  shift
+  local kind=$1 skip=$2 out
+  shift 2
   ci_trivy_run "$kind" --exit-code 0 "$@" || return 1
-  out=$(ci_trivy_run "$kind" --ignore-unfixed --exit-code 1 ${CI_TRIVY_GATE_SKIP:+--skip-dirs "$CI_TRIVY_GATE_SKIP"} "$@" 2>&1) && return 0
+  out=$(ci_trivy_run "$kind" --ignore-unfixed --exit-code 1 ${skip:+--skip-dirs "$skip"} "$@" 2>&1) && return 0
   echo "== fixable findings (the verdict)"
   printf '%s\n' "$out" | grep -vE '^[[:space:]]*$|^Legend:|^- ' | tail -60
   return 1

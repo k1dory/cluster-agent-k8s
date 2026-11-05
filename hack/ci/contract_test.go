@@ -206,24 +206,36 @@ func TestAcceptanceScriptsParseAndNameEveryPhase(t *testing.T) {
 func TestScanPropagatesTrivyVerdict(t *testing.T) {
 	mod := module(t)
 	bin := t.TempDir()
-	// The stub records each invocation's arguments and the TRIVY_* variables it sees, and
-	// exits with the code in the file next to it (the environment does not reach it).
-	stub(t, bin, "trivy", "d=$(dirname \"$0\"); echo \"$@\" >> \"$d/args\"; env | grep '^TRIVY_' >> \"$d/env\" || true; exit \"$(cat \"$d/exit\")\"\n")
+	// The stub records each invocation's arguments and the TRIVY_* variables it sees. The
+	// report pass (--exit-code 0) always succeeds, as Trivy's does; the verdict pass exits
+	// with the code in the file next to the stub (the environment does not reach it), so a
+	// failing verdict is what the test exercises, not a scanner that fails before it.
+	stub(t, bin, "trivy", "d=$(dirname \"$0\"); echo \"$@\" >> \"$d/args\"; env | grep '^TRIVY_' >> \"$d/env\" || true\n"+
+		"case \" $* \" in *' --exit-code 0 '*) exit 0 ;; esac; exit \"$(cat \"$d/exit\")\"\n")
 	setExit := func(code string) {
 		if err := os.WriteFile(filepath.Join(bin, "exit"), []byte(code), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
+	runsSeen := func() []string {
+		args, _ := os.ReadFile(filepath.Join(bin, "args"))
+		os.Remove(filepath.Join(bin, "args"))
+		return strings.Split(strings.TrimSpace(string(args)), "\n")
+	}
 	setExit("0")
-	env := map[string]string{"CI_ROOT": mod, "TRIVY_BIN": filepath.Join(bin, "trivy"), "TRIVY_IGNORE_STATUS": "fixed", "TRIVY_DOWNLOAD_DB_ONLY": "true"}
+	// A runner's environment that would skip the scan, widen what is ignored, or, through
+	// the verdict's skip list, empty the verdict: none of it may count.
+	env := map[string]string{"CI_ROOT": mod, "TRIVY_BIN": filepath.Join(bin, "trivy"), "TRIVY_IGNORE_STATUS": "fixed", "TRIVY_DOWNLOAD_DB_ONLY": "true", "CI_TRIVY_GATE_SKIP": "."}
 	out, err := runScript(t, "hack/ci/scan.sh", env, bin)
 	if err != nil || !strings.HasSuffix(strings.TrimSpace(out), "ci: scan: ok") {
 		t.Fatalf("a clean scan must pass: %v\n%s", err, out)
 	}
-	args, _ := os.ReadFile(filepath.Join(bin, "args"))
-	runs := strings.Split(strings.TrimSpace(string(args)), "\n")
+	runs := runsSeen()
 	if len(runs) != 2 {
-		t.Fatalf("the scan is a report and a verdict, two runs; ran %d:\n%s", len(runs), args)
+		t.Fatalf("the scan is a report and a verdict, two runs; ran %d:\n%s", len(runs), strings.Join(runs, "\n"))
+	}
+	if strings.Contains(" "+runs[1]+" ", " --skip-dirs . ") {
+		t.Fatalf("an inherited CI_TRIVY_GATE_SKIP must not reach the verdict; ran: %s", runs[1])
 	}
 	for _, want := range []string{"fs ", "--severity HIGH,CRITICAL", "--exit-code 0", "--ignorefile " + filepath.Join(mod, ".trivyignore.yaml"), "--config "} {
 		if !strings.Contains(runs[0], want) {
@@ -247,10 +259,20 @@ func TestScanPropagatesTrivyVerdict(t *testing.T) {
 	if !strings.Contains(string(seen), "TRIVY_CACHE_DIR=") {
 		t.Fatalf("the scanner must get the cache directory from the script; it saw:\n%s", seen)
 	}
+	// A failing verdict fails the group, named, after the report ran.
 	setExit("1")
 	out, err = runScript(t, "hack/ci/scan.sh", env, bin)
 	if err == nil || strings.Contains(out, "ci: scan: ok") || !strings.Contains(out, "vulnerabilities") {
 		t.Fatalf("a scanner that finds a fixable finding must fail the group, named: %v\n%s", err, out)
+	}
+	if runs = runsSeen(); len(runs) != 2 || !strings.Contains(runs[1], "--exit-code 1") {
+		t.Fatalf("the failing verdict must come from the second run; ran:\n%s", strings.Join(runs, "\n"))
+	}
+	// A scanner that cannot scan at all (the report pass itself fails) is a failure too.
+	stub(t, bin, "trivy", "echo 'FATAL no database' >&2; exit 2\n")
+	out, err = runScript(t, "hack/ci/scan.sh", env, bin)
+	if err == nil || strings.Contains(out, "ci: scan: ok") {
+		t.Fatalf("a scanner that fails to scan must fail the group: %v\n%s", err, out)
 	}
 }
 

@@ -122,7 +122,7 @@ whether or not a fix exists; then the verdict, in which only findings with a fix
 accepted on purpose is an entry in `.trivyignore.yaml` with a statement and an `expired_at`,
 after which it fails again. The scanner reads the repository's `hack/ci/trivy.yaml` and an
 environment emptied of `TRIVY_*`, so a runner's own Trivy settings cannot skip the scan or
-soften its filters. Images are scanned from the daemon by image id, the one just built. Both
+soften its filters. Images are scanned from the daemon by the id each build recorded (`--iidfile`), the one just built. Both
 agent images upgrade their Debian packages at build time, so a security update in the base
 distribution needs no change here; a finding in a harness is a bump in `versions.env`.
 Hermes's own tree in its image (`/opt/hermes`, pinned by digest) is reported but is not part of

@@ -13,5 +13,5 @@ cd "$ci_root"
 echo "== dependencies: trivy $TRIVY_VERSION, HIGH and CRITICAL with a fix"
 # .ci holds downloaded tools and the Trivy database itself; a module cache kept inside the
 # tree (GitLab's GOMODCACHE) is the dependencies' own code, scanned through go.sum already.
-ci_trivy_scan fs --skip-dirs .ci,.go-mod-cache,node_modules . || ci_die "scan: fixable HIGH or CRITICAL vulnerabilities in the dependencies (bump the module in go.mod, or accept the finding in .trivyignore.yaml with an expiry)"
+ci_trivy_scan fs "" --skip-dirs .ci,.go-mod-cache,node_modules . || ci_die "scan: fixable HIGH or CRITICAL vulnerabilities in the dependencies (bump the module in go.mod, or accept the finding in .trivyignore.yaml with an expiry)"
 ci_ok scan
