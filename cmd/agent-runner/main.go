@@ -671,7 +671,11 @@ func forwardInput(ctx context.Context, c *client, runID string, w inputSink, can
 			if err := w.Send(e.Data); err != nil {
 				return
 			}
-			chat.sent()
+			// An ACP conversation's activity is driveACP's: a message may join the turn in
+			// progress (steering) or wait for it, and driveACP knows which.
+			if chat.mode != harness.InputACP {
+				chat.sent()
+			}
 		}
 	}
 }

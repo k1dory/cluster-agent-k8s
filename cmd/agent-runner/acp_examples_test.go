@@ -228,10 +228,9 @@ func TestACPClaudeExampleTakesTheSystemPromptAndMode(t *testing.T) {
 	emit := func(l string) { notices = append(notices, l) }
 	// The runner's own wiring: notices and compaction updates asked for, the profile's session
 	// options in _meta (the adapter refuses options it cannot take).
-	cl := &acpClient{emit: emit}
-	conn := acpx.Dial(cl, stdin, stdout, acpx.WireOptions{Notices: true, Compaction: true, OnUpdate: cl.extraUpdate})
-	wire := conn.Wire
-	cl.systemPrompt = wire.SystemPrompt
+	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{Notices: true, Compaction: true})
+	cl := &acpClient{emit: emit, wire: wire, systemPrompt: wire.SystemPrompt}
+	conn := wire.Connect(cl)
 	meta, _ := json.Marshal(profile.Harness.SessionMeta)
 	t.Setenv("HARNESS_SESSION_META", string(meta))
 	s, ok := openACPSession(ctx, conn, cl, &model.Run{ID: "run_claude"}, emit)

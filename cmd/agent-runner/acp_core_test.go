@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -35,6 +38,8 @@ type coreConn struct {
 	onOpen func()
 	// steer answers Steer; nil: the connection has no steering (the method still exists).
 	steer func(text string) acpx.SteerOutcome
+	// configAfter is the agent's options after any change (nil: it answers none).
+	configAfter []acp.SessionConfigOption
 
 	mu       sync.Mutex
 	calls    []string
@@ -92,7 +97,7 @@ func (c *coreConn) SetSessionMode(_ context.Context, p acp.SetSessionModeRequest
 
 func (c *coreConn) SetSessionConfigOption(_ context.Context, p acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
 	c.call("set_config " + string(p.ValueId.ConfigId) + "=" + string(p.ValueId.Value))
-	return acp.SetSessionConfigOptionResponse{}, nil
+	return acp.SetSessionConfigOptionResponse{ConfigOptions: c.configAfter}, nil
 }
 
 func (c *coreConn) Prompt(_ context.Context, p acp.PromptRequest) (acp.PromptResponse, error) {
@@ -641,36 +646,227 @@ func TestACPSteeringJoinsTheTurnInProgress(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var sink inputSink
-			conn := &coreConn{steer: func(string) acpx.SteerOutcome { return tc.outcome }}
+			steered := make(chan struct{})
+			conn := &coreConn{steer: func(string) acpx.SteerOutcome { close(steered); return tc.outcome }}
 			conn.prompt = func(n int, _ string) (acp.PromptResponse, error) {
 				if n == 0 {
 					_ = sink.Send("more") // arrives during the turn
+					<-steered             // the turn lasts until the agent has answered the steering
 				}
 				return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 			}
-			var lines []string
-			emit := func(l string) { lines = append(lines, l) }
-			chat := newChat(harness.InputACP, chatIdle())
-			code := driveACP(t.Context(), conn, &acpClient{emit: emit}, &model.Run{Task: "task"}, emit, chat, func(s inputSink) {
-				sink = s
-				go func() {
-					// Close once the turns are over: the queue ends the conversation when drained.
-					for {
-						conn.mu.Lock()
-						done := len(conn.prompts) >= len(tc.prompts)
-						conn.mu.Unlock()
-						if done {
-							_ = s.Close()
-							return
-						}
-						time.Sleep(5 * time.Millisecond)
-					}
-				}()
-			})
+			code, lines := runSteering(t, conn, &sink, len(tc.prompts))
 			if code != 0 || !reflect.DeepEqual(conn.prompts, tc.prompts) || !hasCall(conn, "steer more") {
 				t.Fatalf("exit %d prompts %q calls %v\n%s", code, conn.prompts, conn.calls, notices(lines))
 			}
 		})
+	}
+}
+
+// runSteering drives a conversation whose messages the test sends through sink; the input closes
+// once want prompts have been sent.
+func runSteering(t *testing.T, conn *coreConn, sink *inputSink, want int) (int, []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var lines []string
+	emit := func(l string) { mu.Lock(); lines = append(lines, l); mu.Unlock() }
+	chat := newChat(harness.InputACP, chatIdle())
+	code := driveACP(t.Context(), conn, &acpClient{emit: emit}, &model.Run{Task: "task"}, emit, chat, func(s inputSink) {
+		*sink = s
+		go func() {
+			for {
+				conn.mu.Lock()
+				done := len(conn.prompts) >= want
+				conn.mu.Unlock()
+				if done {
+					_ = s.Close()
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}()
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	return code, lines
+}
+
+// The input never waits on steering: an agent that does not answer cannot hold up a cancel or a
+// close behind the message (the sender returns at once); messages keep their order, and the
+// conversation ends only once the steered ones are placed.
+func TestPromptQueueSteeringDoesNotBlockTheInput(t *testing.T) {
+	q := newPromptQueue()
+	release, started := make(chan struct{}), make(chan struct{})
+	var steered []string
+	var mu sync.Mutex
+	q.steer = func(text string) bool {
+		mu.Lock()
+		steered = append(steered, text)
+		mu.Unlock()
+		close(started)
+		<-release // a silent agent
+		return false
+	}
+	q.setTurn(true)
+	start := time.Now()
+	for _, m := range []string{"a", "b", "c"} {
+		if err := q.Send(m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.Close(); err != nil || time.Since(start) > time.Second {
+		t.Fatalf("the input waited on steering: %v", time.Since(start))
+	}
+	<-started
+	q.setTurn(false)
+	got := make(chan []string)
+	go func() {
+		var out []string
+		for {
+			m, ok := q.next(context.Background())
+			if !ok {
+				got <- out
+				return
+			}
+			out = append(out, m)
+		}
+	}()
+	select {
+	case <-got:
+		t.Fatal("the conversation ended before the steered message was placed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if out := <-got; !reflect.DeepEqual(out, []string{"a", "b", "c"}) {
+		t.Fatalf("order: %q", out)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !reflect.DeepEqual(steered, []string{"a"}) {
+		t.Fatalf("after a message the agent did not take, the rest wait without steering: %q", steered)
+	}
+}
+
+// A command the agent advertised is never steered: the agent runs commands from a prompt, steered
+// text would only be text.
+func TestACPSlashCommandsAreNotSteered(t *testing.T) {
+	clearACPEnv(t)
+	var sink inputSink
+	var cl *acpClient
+	conn := &coreConn{steer: func(string) acpx.SteerOutcome { return acpx.SteerInjected }}
+	conn.prompt = func(n int, _ string) (acp.PromptResponse, error) {
+		if n == 0 {
+			_ = cl.SessionUpdate(context.Background(), acp.SessionNotification{SessionId: "sess_new", Update: acp.SessionUpdate{
+				AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{SessionUpdate: "available_commands_update",
+					AvailableCommands: []acp.AvailableCommand{{Name: "compact"}}}}})
+			_ = sink.Send("/compact")
+			// The turn lasts while the worker decides: steered, the command would be gone from
+			// the prompts.
+			time.Sleep(200 * time.Millisecond)
+		}
+		return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+	}
+	emit := func(string) {}
+	cl = &acpClient{emit: emit}
+	chat := newChat(harness.InputACP, chatIdle())
+	code := driveACP(t.Context(), conn, cl, &model.Run{Task: "task"}, emit, chat, func(s inputSink) {
+		sink = s
+		go func() {
+			for {
+				conn.mu.Lock()
+				done := len(conn.prompts) >= 2
+				conn.mu.Unlock()
+				if done {
+					_ = s.Close()
+					return
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+		}()
+	})
+	if code != 0 || hasCall(conn, "steer /compact") || !reflect.DeepEqual(conn.prompts, []string{"task", "/compact"}) {
+		t.Fatalf("exit %d prompts %q calls %v", code, conn.prompts, conn.calls)
+	}
+}
+
+// The control plane's messages do not restart an ACP conversation's idle clock: driveACP owns it
+// (a message joined to a turn that has ended since must not keep the conversation open forever).
+func TestACPInputLeavesTheIdleClockToTheConversation(t *testing.T) {
+	sent := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var evs []model.Event
+		if !sent {
+			evs, sent = []model.Event{{ID: 1, Type: model.EventInput, Data: "late"}, {ID: 2, Type: model.EventRunClose}}, true
+		}
+		_ = json.NewEncoder(w).Encode(evs)
+	}))
+	defer srv.Close()
+	chat := newChat(harness.InputACP, time.Minute)
+	chat.turnEnded()
+	q := newPromptQueue()
+	forwardInput(t.Context(), &client{base: srv.URL, http: srv.Client()}, "r", q, func() {}, chat)
+	chat.mu.Lock()
+	defer chat.mu.Unlock()
+	if chat.turnEnd.IsZero() {
+		t.Fatal("an input event reset the ACP conversation's idle clock")
+	}
+}
+
+// One selection can change the agent's other options (codex-acp offers other reasoning levels
+// for another model): the reasoning level goes by the options after the model was set.
+func TestACPThoughtLevelFollowsTheModel(t *testing.T) {
+	clearACPEnv(t)
+	t.Setenv("SANDBOX_MODEL", "big")
+	t.Setenv("HARNESS_THOUGHT_LEVEL", "xhigh")
+	conn := &coreConn{newRes: acp.NewSessionResponse{ConfigOptions: []acp.SessionConfigOption{
+		selectOption("model", acp.SessionConfigOptionCategoryModel, "small", "small", "big"),
+		selectOption("effort", acp.SessionConfigOptionCategoryThoughtLevel, "low", "low")}},
+		configAfter: []acp.SessionConfigOption{
+			selectOption("model", acp.SessionConfigOptionCategoryModel, "big", "small", "big"),
+			selectOption("effort", acp.SessionConfigOptionCategoryThoughtLevel, "low", "low", "xhigh")}}
+	_, lines := runCore(t, conn, nil, &model.Run{Task: "go"})
+	if !hasCall(conn, "set_config model=big") || !hasCall(conn, "set_config effort=xhigh") {
+		t.Fatalf("calls %v\n%s", conn.calls, notices(lines))
+	}
+}
+
+// Through the real SDK connection and the wire: a notice between two chunks of a message is
+// written as a notice (not as a session title, which the SDK decodes it as), and the message
+// stays one message.
+func TestACPNoticeBetweenChunksKeepsTheMessageWhole(t *testing.T) {
+	lines := strings.Join([]string{
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hel"}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"notice","severity":"warning","title":"Context 90% full"}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"lo"}}}}`,
+		`{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"!"}}}}`,
+	}, "\n") + "\n"
+	var mu sync.Mutex
+	var out []string
+	wire := acpx.NewWire(io.Discard, strings.NewReader(lines), acpx.WireOptions{Notices: true})
+	cl := &acpClient{wire: wire, emit: func(l string) { mu.Lock(); out = append(out, l); mu.Unlock() }}
+	wire.Connect(cl)
+	for i := 0; ; i++ {
+		cl.mu.Lock()
+		n := cl.msg.Len()
+		cl.mu.Unlock()
+		if n == len("Hello!") {
+			break
+		}
+		if i == 200 {
+			t.Fatalf("message so far %d bytes", n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cl.flush()
+	mu.Lock()
+	defer mu.Unlock()
+	if len(out) != 2 || !strings.Contains(out[0], `"type":"acp.notice"`) || !strings.Contains(out[1], `"text":"Hello!"`) {
+		t.Fatalf("lines: %q", out)
+	}
+	for _, l := range out {
+		if strings.Contains(l, harness.ACPSessionInfo) {
+			t.Fatalf("the notice was taken for a session title: %q", out)
+		}
 	}
 }
 

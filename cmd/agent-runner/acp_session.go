@@ -53,9 +53,13 @@ func configureACPSession(ctx context.Context, conn acpConn, sid acp.SessionId, s
 		setting acpx.Setting
 		want    string
 	}{{modeSetting, s.mode}, {acpx.ModelSetting, s.model}, {thoughtLevelSetting, s.thoughtLevel}} {
-		if err := acpx.Configure(ctx, cf, sid, st, c.setting, c.want); err != nil {
+		// One selection can change the others (another model offers other reasoning levels):
+		// the next goes by the agent's answer.
+		next, err := acpx.Configure(ctx, cf, sid, st, c.setting, c.want)
+		if err != nil {
 			notice("%v", err)
 		}
+		st = next
 	}
 }
 

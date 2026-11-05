@@ -91,12 +91,13 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	}()
 	emit := func(line string) { _, _ = io.WriteString(outW, line+"\n") }
 
+	// The agent's notices and compaction updates are asked for by the wire (the SDK cannot) and
+	// told apart from the SDK's own updates in their place in the stream (Classify): the client
+	// has the wire before the connection delivers anything.
+	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{Notices: true, Compaction: true})
 	cl := &acpClient{emit: emit, permissions: os.Getenv("HARNESS_PERMISSIONS"), instructionsDelivered: delivered,
-		usageDir: filepath.Join(os.Getenv("HOME"), ".sandbox-acp-usage")}
-	// The agent's notices and compaction updates are asked for and read by the wire (the SDK
-	// cannot); everything else goes through the SDK's connection.
-	conn := acpx.Dial(cl, stdin, stdout, acpx.WireOptions{Notices: true, Compaction: true, OnUpdate: cl.extraUpdate})
-	cl.systemPrompt = conn.Wire.SystemPrompt
+		usageDir: filepath.Join(os.Getenv("HOME"), ".sandbox-acp-usage"), wire: wire, systemPrompt: wire.SystemPrompt}
+	conn := wire.Connect(cl)
 	exit := driveACP(runCtx, conn, cl, run, emit, chat, func(inputs inputSink) {
 		go forwardInput(runCtx, c, run.ID, inputs, cancel, chat)
 	})
@@ -355,10 +356,18 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 
 	inputs := newPromptQueue()
 	// A message sent while a turn runs joins it when the agent takes steering; otherwise, or when
-	// no turn is running after all, it waits for the turn to end and is the next prompt.
+	// no turn is running after all, it waits for the turn to end and is the next prompt. A slash
+	// command always waits: an agent runs its commands from a prompt, steered text is only text.
+	// Steering runs beside the input (promptQueue), bounded, so a silent agent cannot hold up a
+	// cancel or a close behind it.
 	if st, ok := conn.(acpSteerer); ok {
 		inputs.steer = func(text string) bool {
-			out, err := st.Steer(ctx, sessionID, escapeACPPrompt(text, cl.isCommand))
+			if escapeACPPrompt(text, cl.isCommand) == text && strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "/") {
+				return false // an advertised command
+			}
+			sctx, done := context.WithTimeout(ctx, steerTimeout)
+			defer done()
+			out, err := st.Steer(sctx, sessionID, escapeACPPrompt(text, cl.isCommand))
 			switch {
 			case err != nil:
 				notice("steering: %v: the message waits for the turn to end", err)
@@ -428,6 +437,10 @@ func closeACPSession(conn acpConn, sess acpOpened, notice func(string, ...any)) 
 		notice("acp session/close: %v", err)
 	}
 }
+
+// steerTimeout bounds how long the agent has to answer a steering request; a message it did not
+// take in that time waits for the turn to end.
+var steerTimeout = 30 * time.Second
 
 // promptACP sends one prompt. Hermes refuses every prompt of a session whose previous turn was
 // lost when its gateway restarted (unknown_execution) until the lost turn is discarded with
@@ -561,9 +574,14 @@ type promptQueue struct {
 	wake   chan struct{}
 	inTurn bool // a prompt is in flight
 	// steer, when set, offers a message that arrives during a turn to that turn; true: it was
-	// taken and does not wait.
-	steer func(text string) bool
+	// taken and does not wait. It runs on a worker of its own, never on the sender's goroutine:
+	// the sender (forwardInput) must stay free to take a cancel or a close.
+	steer     func(text string) bool
+	steering  []string // messages waiting for the worker, in order
+	steerBusy bool     // the worker is running
 }
+
+func newPromptQueue() *promptQueue { return &promptQueue{wake: make(chan struct{}, 1)} }
 
 // setTurn records whether a prompt is in flight.
 func (q *promptQueue) setTurn(v bool) {
@@ -572,25 +590,54 @@ func (q *promptQueue) setTurn(v bool) {
 	q.mu.Unlock()
 }
 
-func newPromptQueue() *promptQueue { return &promptQueue{wake: make(chan struct{}, 1)} }
-
+// Send takes a message and returns at once. During a turn (and behind messages still being
+// steered) it goes to the steering worker; otherwise, or when the worker cannot place it in the
+// turn, it waits for the next prompt. Order is kept either way.
 func (q *promptQueue) Send(text string) error {
-	q.mu.Lock()
-	steer := q.steer != nil && q.inTurn && !q.closed && len(q.queue) == 0
-	q.mu.Unlock()
-	// Steered outside the lock: the agent answers while the turn goes on. A message that queued
-	// behind another keeps its order and waits too.
-	if steer && q.steer(text) {
-		return nil
-	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
 		return errors.New("conversation closed")
 	}
+	if q.steer != nil && (q.steerBusy || q.inTurn && len(q.queue) == 0) {
+		q.steering = append(q.steering, text)
+		if !q.steerBusy {
+			q.steerBusy = true
+			go q.steerAll()
+		}
+		return nil
+	}
 	q.queue = append(q.queue, text)
 	q.signal()
 	return nil
+}
+
+// steerAll offers the waiting messages to the turn in progress, one by one; one not taken (no
+// turn any more, the agent declined or did not answer) goes to the prompt queue, and so does every
+// one after it, so they keep their order.
+func (q *promptQueue) steerAll() {
+	failed := false
+	for {
+		q.mu.Lock()
+		if len(q.steering) == 0 {
+			q.steerBusy = false
+			q.signal()
+			q.mu.Unlock()
+			return
+		}
+		text := q.steering[0]
+		q.steering = q.steering[1:]
+		inTurn := q.inTurn
+		q.mu.Unlock()
+		if !failed && inTurn && q.steer(text) {
+			continue
+		}
+		failed = true
+		q.mu.Lock()
+		q.queue = append(q.queue, text)
+		q.signal()
+		q.mu.Unlock()
+	}
 }
 
 func (q *promptQueue) Close() error {
@@ -608,8 +655,8 @@ func (q *promptQueue) signal() {
 	}
 }
 
-// next waits for the next message; ok is false once the input is closed and drained, or the
-// run is cancelled.
+// next waits for the next message; ok is false once the input is closed and drained (nothing
+// queued, nothing still being steered), or the run is cancelled.
 func (q *promptQueue) next(ctx context.Context) (string, bool) {
 	for {
 		q.mu.Lock()
@@ -619,9 +666,9 @@ func (q *promptQueue) next(ctx context.Context) (string, bool) {
 			q.mu.Unlock()
 			return t, true
 		}
-		closed := q.closed
+		done := q.closed && !q.steerBusy
 		q.mu.Unlock()
-		if closed {
+		if done {
 			return "", false
 		}
 		select {
@@ -644,6 +691,9 @@ type acpClient struct {
 	// instructionsDelivered: the instructions are in the agent's own configuration
 	// (harness.instructions), not to be sent again.
 	instructionsDelivered bool
+	// wire tells the SDK's updates from those it does not know (notices, compactions); nil: every
+	// update is the SDK's.
+	wire *acpx.Wire
 	// usageDir keeps the last cumulative usage of the sessions of an agent that reports one
 	// (acpUsage); "" keeps it in memory only.
 	usageDir string
@@ -699,12 +749,16 @@ func (a *acpClient) isCommand(name string) bool {
 func (a *acpClient) extraUpdate(u acpx.ExtraUpdate) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.extraUpdateLocked(u)
+}
+
+func (a *acpClient) extraUpdateLocked(u acpx.ExtraUpdate) {
 	if a.replaying {
 		return
 	}
 	switch {
 	case u.Notice != nil:
-		a.flushLocked()
+		// Not a break in the agent's message: one being streamed goes on and is written whole.
 		a.emit(harness.ACPLine{Type: harness.ACPNotice, Severity: u.Notice.Severity, Title: u.Notice.Title, Text: u.Notice.Description}.String())
 	case u.SummaryChunk != nil:
 		if a.summaries == nil {
@@ -727,7 +781,6 @@ func (a *acpClient) extraUpdate(u acpx.ExtraUpdate) {
 			}
 			delete(a.summaries, c.ID)
 		}
-		a.flushLocked()
 		a.emit(l.String())
 	}
 }
@@ -736,6 +789,16 @@ func (a *acpClient) SessionUpdate(_ context.Context, n acp.SessionNotification) 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	u := n.Update
+	// An update the SDK does not know reaches here as another kind's (a notice as a
+	// session_info_update): what it really is, the wire knows, in this same order.
+	if a.wire != nil {
+		if extra, sdk := a.wire.Classify(u); !sdk {
+			if extra != nil {
+				a.extraUpdateLocked(*extra)
+			}
+			return nil
+		}
+	}
 	// A cost reported while a load replays the history is the session's total so far: kept (the
 	// run's usage counts from it), not written.
 	if u.UsageUpdate != nil {
