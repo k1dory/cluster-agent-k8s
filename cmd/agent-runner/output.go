@@ -31,6 +31,12 @@ var (
 	spoolMaxLines     = 100_000
 	spoolReserveBytes = 1 << 20
 	spoolReserveLines = 4096
+	// spoolRequestBytes and spoolRequestLines are the reserve, above both, of what a person must
+	// see to answer the agent: its requests (permissions ask, a form, a sign-in link), their
+	// decisions and resolutions (interactiveLine). A question lost to a full spool would wait for
+	// an answer nobody can give.
+	spoolRequestBytes = 4 << 20
+	spoolRequestLines = 256
 	// spoolBatchLines, spoolBatchBytes and spoolBatchDelay shape a batch: a full one goes at
 	// once, a partial one after the delay. The bytes stay under the control plane's body limit
 	// (4 MiB); a batch over it is split on 413 anyway.
@@ -209,31 +215,46 @@ func (s *outputSpool) signal() {
 	}
 }
 
-// add queues a line and never blocks. A line that does not fit is dropped and counted; the next
-// one that fits is preceded by a single notice saying what was lost. A state line that does not
-// fit goes into the reserve above the bounds; past the reserve it is dropped too. The notice
-// itself is small and always goes in, so the spool never holds more than the bounds, the reserve
-// and one notice per drop announced.
-func (s *outputSpool) add(line string) {
+// interactiveLine reports whether a line is part of a question to a person: the request, the
+// decision on a permission, the resolution. The runner writes them (harness.ACPLine), type first.
+func interactiveLine(l string) bool {
+	for _, t := range []string{harness.ACPRequest, harness.ACPResolved, harness.ACPPermission} {
+		if strings.HasPrefix(l, `{"type":"`+t+`"`) {
+			return true
+		}
+	}
+	return false
+}
+
+// add queues a line and never blocks; ok is false when it was dropped. A line that does not fit
+// is dropped and counted; the next one that fits is preceded by a single notice saying what was
+// lost. A state line that does not fit goes into the reserve above the bounds, an interactive
+// line into the requests' reserve above that; past them they are dropped too. The notice itself
+// is small and always goes in, so the spool never holds more than the bounds, the reserves and
+// one notice per drop announced.
+func (s *outputSpool) add(line string) (ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return
+		return false
 	}
 	cost := len(line) + spoolLineOverhead
 	fits := func(maxBytes, maxLines int) bool {
 		return s.bytes+cost <= maxBytes && len(s.lines) < maxLines
 	}
+	reserveBytes, reserveLines := spoolMaxBytes+spoolReserveBytes, spoolMaxLines+spoolReserveLines
 	if !fits(spoolMaxBytes, spoolMaxLines) &&
-		!(fits(spoolMaxBytes+spoolReserveBytes, spoolMaxLines+spoolReserveLines) && stateLine(line)) {
+		!(fits(reserveBytes, reserveLines) && stateLine(line)) &&
+		!(fits(reserveBytes+spoolRequestBytes, reserveLines+spoolRequestLines) && interactiveLine(line)) {
 		s.dropped++
 		s.droppedBytes += len(line)
-		return
+		return false
 	}
 	s.noticeDropsLocked()
 	s.lines = append(s.lines, line)
 	s.bytes += cost
 	s.signal()
+	return true
 }
 
 // read spools r's lines until EOF or a read error (readLines: an oversized line becomes a
@@ -268,6 +289,13 @@ func (s *outputSpool) emit(text string) {
 		fmt.Println(l)
 		s.add(l)
 	}
+}
+
+// emitKept spools one line the runner writes (a request to a person) and says whether it was
+// kept: a request the person will never see is failed at once rather than waited on.
+func (s *outputSpool) emitKept(line string) bool {
+	fmt.Println(line)
+	return s.add(line)
 }
 
 func (s *outputSpool) noticeDropsLocked() {

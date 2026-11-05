@@ -101,7 +101,7 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	cl := &acpClient{emit: emit, permissions: os.Getenv("HARNESS_PERMISSIONS"), instructionsDelivered: delivered,
 		usageDir: filepath.Join(os.Getenv("HOME"), ".sandbox-acp-usage"), wire: wire, systemPrompt: wire.SystemPrompt,
 		pending: acpx.NewPending(), askTimeout: askTimeout(os.Getenv("HARNESS_ASK_TIMEOUT")),
-		resumePrompt: envValue(env, "SANDBOX_RESUME_PROMPT"),
+		resumePrompt: envValue(env, "SANDBOX_RESUME_PROMPT"), emitRequest: spool.emitKept,
 		abort: func() {
 			_ = signalGroup(cmd, syscall.SIGKILL)
 			_ = stdin.Close()
@@ -864,6 +864,9 @@ type acpClient struct {
 	lastCommands string
 	// resumePrompt is $SANDBOX_RESUME_PROMPT as execute set it for this run.
 	resumePrompt string
+	// emitRequest writes a request to a person and says whether it was kept (outputSpool.emitKept);
+	// nil: emit, always kept.
+	emitRequest func(string) bool
 	// abort ends the transport: the agent's group killed, its stdin closed (guard); nil: nothing to end.
 	abort     func()
 	abortOnce sync.Once
@@ -1184,10 +1187,10 @@ func (a *acpClient) askPermission(ctx context.Context, p acp.RequestPermissionRe
 	}
 	a.withDiffsLocked(&harness.ACPLine{ToolCallID: req.ToolCallID}, diffs)
 	rl.Diffs = snapshot
-	a.emit(boundRequestLine(rl))
+	delivered := a.emitRequestLocked(boundRequestLine(rl))
 	a.mu.Unlock()
 
-	reply, by := a.awaitReply(ctx, req.ID)
+	reply, by := a.awaitDelivered(ctx, req.ID, delivered)
 	resp := acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}}
 	outcome := "cancelled"
 	if by == "user" {
@@ -1234,6 +1237,30 @@ func boundRequestLine(l harness.ACPLine) string {
 	return l.String()
 }
 
+// emitRequestLocked writes a request line; false: it could not be kept for the person to see.
+// Called with a.mu held.
+func (a *acpClient) emitRequestLocked(line string) bool {
+	if a.emitRequest == nil {
+		a.emit(line)
+		return true
+	}
+	return a.emitRequest(line)
+}
+
+// awaitDelivered waits for the reply to a request the person was shown; one that could not be
+// shown (the output spool is full even in the requests' reserve) is given up at once, by
+// "undeliverable", instead of waiting out the ask timeout for an answer nobody can give.
+func (a *acpClient) awaitDelivered(ctx context.Context, id string, delivered bool) (acpx.Reply, string) {
+	if delivered {
+		return a.awaitReply(ctx, id)
+	}
+	gone, cancel := context.WithCancel(ctx)
+	cancel()
+	_, _ = a.pending.Wait(gone, id, 0) // closes the request
+	a.notice("request %s could not be shown (the output is not reaching the control plane): refused", id)
+	return acpx.Reply{}, "undeliverable"
+}
+
 // awaitReply waits for a person's reply to an open request; by is "user", or "timeout" / "cancelled"
 // when none came.
 func (a *acpClient) awaitReply(ctx context.Context, id string) (acpx.Reply, string) {
@@ -1264,10 +1291,10 @@ func (a *acpClient) UnstableCreateElicitation(ctx context.Context, p acp.Unstabl
 	req := a.pending.Open(r)
 	a.mu.Lock()
 	// Requests come apart from the ordered notifications: a message being streamed is not cut here.
-	a.emit(boundRequestLine(harness.ACPLine{Type: harness.ACPRequest, Request: &req}))
+	delivered := a.emitRequestLocked(boundRequestLine(harness.ACPLine{Type: harness.ACPRequest, Request: &req}))
 	a.mu.Unlock()
 
-	reply, by := a.awaitReply(ctx, req.ID)
+	reply, by := a.awaitDelivered(ctx, req.ID, delivered)
 	resp, outcome := acpx.CancelledElicitation(), "cancelled"
 	if by == "user" {
 		if resp, err = acpx.ElicitationResponse(req, reply); err != nil {
