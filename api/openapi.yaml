@@ -71,7 +71,9 @@ info:
     * **Idempotency**: `POST /v1/sandboxes` and `POST .../runs` honour `Idempotency-Key`. The key is
       reserved before the request runs: a concurrent repeat gets 409 with `Retry-After: 1`, a repeat
       with a different body gets 422, a repeat after success replays the stored response with
-      `Idempotency-Replayed: true` (24h, per tenant and route).
+      `Idempotency-Replayed: true` (24h, per tenant and route). A JSON body is compared as sent;
+      a multipart body by what it carries (fields, file names and contents in order), not by its
+      bytes, so a retry under a new boundary replays.
     * Unknown routes and methods answer the same JSON error shape (404 / 405 with `Allow`).
 servers:
   - url: http://localhost:8080

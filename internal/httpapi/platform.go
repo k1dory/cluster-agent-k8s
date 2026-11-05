@@ -14,8 +14,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -355,17 +358,11 @@ func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, errors.New("Idempotency-Key longer than 200 bytes"))
 			return
 		}
-		// The routes it wraps take JSON (or, for messages, multipart) under the body policy's
-		// cap: the hash is over the whole body, never a prefix of it, so two requests that differ
-		// past some offset are never taken for the same one. Over the cap is 413.
-		body, err := readBody(w, r, messageBodyLimit(r))
+		hash, err := requestHash(w, r)
 		if err != nil {
 			writeBodyErr(w, err)
 			return
 		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		sum := sha256.Sum256(body)
-		hash := hex.EncodeToString(sum[:])
 		full := principalOf(r).Tenant + "|" + r.Method + " " + r.URL.Path + "|" + key
 		// The reservation is the lock: concurrent repeats see it and wait, a repeat with another
 		// body is refused, and a finished request is replayed from the stored response.
@@ -402,6 +399,68 @@ func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
 			p.Log.Error("finish idempotent request", "key", key, "err", err)
 		}
 	}
+}
+
+// requestHash fingerprints the body of an idempotent request. The routes it wraps take JSON
+// (or, for messages, multipart) under the body policy's cap: the hash is over the whole body,
+// never a prefix of it, so two requests that differ past some offset are never taken for the
+// same one; over the cap is 413.
+//
+// JSON is hashed as sent. A multipart body is hashed by what it carries, not by its bytes: the
+// boundary is random per request, so a client's retry of the same upload never has the same
+// bytes. The form is parsed here (files beyond multipartMemory spill to temporary files, which
+// the server removes after the request) and the handler reads the parsed form.
+func requestHash(w http.ResponseWriter, r *http.Request) (string, error) {
+	if !isMultipart(r) {
+		body, err := readBody(w, r, jsonBodyLimit)
+		if err != nil {
+			return "", err
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		sum := sha256.Sum256(body)
+		return hex.EncodeToString(sum[:]), nil
+	}
+	capBody(w, r, multipartBodyLimit)
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
+		return "", err
+	}
+	return multipartHash(r.MultipartForm)
+}
+
+// multipartHash is sha256 over the form's parts in a canonical order: fields by name, each
+// field's values (and files) in the order they were sent, every name, file name and content
+// length-prefixed so no two different forms write the same stream.
+func multipartHash(form *multipart.Form) (string, error) {
+	h := sha256.New()
+	put := func(s string) { fmt.Fprintf(h, "%d:%s", len(s), s) }
+	h.Write([]byte("multipart/form-data\n"))
+	for _, name := range slices.Sorted(maps.Keys(form.Value)) {
+		put("value")
+		put(name)
+		fmt.Fprintf(h, "%d\n", len(form.Value[name]))
+		for _, v := range form.Value[name] {
+			put(v)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(form.File)) {
+		put("file")
+		put(name)
+		fmt.Fprintf(h, "%d\n", len(form.File[name]))
+		for _, fh := range form.File[name] {
+			put(fh.Filename)
+			f, err := fh.Open()
+			if err != nil {
+				return "", err
+			}
+			fmt.Fprintf(h, "%d:", fh.Size)
+			_, err = io.Copy(h, f)
+			f.Close()
+			if err != nil {
+				return "", err
+			}
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 type recorder struct {

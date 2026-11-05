@@ -180,3 +180,39 @@ func TestReviewMultipartMessagesHaveTheirOwnCap(t *testing.T) {
 	pr.Close()
 	wantErr(t, "multipart over the total cap", resp, body, 413, CodeTooLarge)
 }
+
+// A retried multipart upload has a new random boundary; the idempotency hash is over what the
+// form carries, so the retry replays instead of answering 422, and other content still is 422.
+func TestReviewMultipartRetryWithAnotherBoundaryReplays(t *testing.T) {
+	s := newStack(t)
+	api, gw := s.platform.URL, s.gateway.URL
+	sb, hdr := agentOf(t, s, "retry")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go fakeRunner(ctx, t, gw, hdr, map[string]string{})
+
+	key := map[string]string{"Idempotency-Key": "same-upload"}
+	ct1, b1 := multipartBody(t, "boundary-one-1111", "see attached", [2]string{"a.txt", "alpha"}, [2]string{"b.txt", "beta"})
+	resp1, body1 := postRaw(t, api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", ct1, bytes.NewReader(b1), key)
+	if resp1.StatusCode != 202 {
+		t.Fatalf("first upload: %d %s", resp1.StatusCode, body1)
+	}
+	ct2, b2 := multipartBody(t, "boundary-two-2222", "see attached", [2]string{"a.txt", "alpha"}, [2]string{"b.txt", "beta"})
+	if bytes.Equal(b1, b2) {
+		t.Fatal("the two bodies must differ in their bytes")
+	}
+	resp2, body2 := postRaw(t, api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", ct2, bytes.NewReader(b2), key)
+	if resp2.StatusCode != 202 || resp2.Header.Get("Idempotency-Replayed") != "true" || !bytes.Equal(body1, body2) {
+		t.Fatalf("retry with another boundary: %d replayed=%q %s", resp2.StatusCode, resp2.Header.Get("Idempotency-Replayed"), body2)
+	}
+	// The files in another order, another content or another name are another request.
+	for _, files := range [][][2]string{
+		{{"b.txt", "beta"}, {"a.txt", "alpha"}},
+		{{"a.txt", "alpha!"}, {"b.txt", "beta"}},
+		{{"a2.txt", "alpha"}, {"b.txt", "beta"}},
+	} {
+		ct, b := multipartBody(t, "", "see attached", files...)
+		resp, body := postRaw(t, api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", ct, bytes.NewReader(b), key)
+		wantErr(t, fmt.Sprintf("other upload %v under the key", files), resp, body, 422, CodeInvalid)
+	}
+}
