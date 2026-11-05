@@ -124,7 +124,7 @@ DOCKERFILE
 echo "== agent image: the ACP agents open sessions from the shipped profiles, offline"
 acp_in_image "$agent" TestACPCodexExampleCreatesSession TestACPOpenCodeExampleCreatesAndLoadsASession \
   TestACPCodexExampleReachesTheModelThroughTheGateway TestACPOpenCodeExampleAnswersThroughTheGateway \
-  TestACPClaudeExampleTakesTheSystemPromptAndMode
+  TestACPClaudeExampleTakesTheSystemPromptAndMode TestACPCodexChatGPTExampleReachesTheModelThroughTheGateway
 
 echo "== agent-hermes image: Hermes pinned and labelled, a sandbox agent image, its ACP session offline"
 label=$(docker inspect -f '{{ index .Config.Labels "io.agent-sandbox.harness.hermes.version" }}' "$hermes")

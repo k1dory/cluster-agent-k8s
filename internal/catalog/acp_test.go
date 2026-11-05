@@ -67,9 +67,10 @@ func TestShippedACPProfiles(t *testing.T) {
 	}
 }
 
-// Claude runs over ACP in every shipped profile: `claude -p` in a pod refuses every edit nobody
-// approves, and only ACP brings the requests to the runner. claude -p is a documented fallback.
-func TestShippedClaudeProfilesUseACP(t *testing.T) {
+// Every shipped profile runs its agent over ACP: `claude -p` in a pod refuses every edit nobody
+// approves, `codex exec` keeps no conversation open and records no approvals; only ACP brings the
+// requests to the runner. text and stream-json are a documented fallback.
+func TestShippedProfilesUseACP(t *testing.T) {
 	files, err := filepath.Glob("../../examples/catalog/*.yaml")
 	if err != nil || len(files) == 0 {
 		t.Fatal(files, err)
@@ -93,11 +94,11 @@ func TestShippedClaudeProfilesUseACP(t *testing.T) {
 				t.Fatal(err)
 			}
 			cmd := spec.Harness.Command
-			if strings.Contains(cmd, "claude -p") || strings.HasPrefix(cmd, "claude ") {
-				t.Errorf("%s (%s): Claude must run as claude-agent-acp over ACP, not %q", f, d.Name, cmd)
+			if strings.Contains(cmd, "claude -p") || strings.HasPrefix(cmd, "claude ") || strings.Contains(cmd, "codex exec") {
+				t.Errorf("%s (%s): agents run over ACP (claude-agent-acp, codex-acp), not %q", f, d.Name, cmd)
 			}
-			if cmd == "claude-agent-acp" && spec.Harness.Input != "acp" {
-				t.Errorf("%s (%s): claude-agent-acp needs input acp", f, d.Name)
+			if cmd != "" && (spec.Harness.Input != "acp" || spec.Harness.ResumeCommand != "") {
+				t.Errorf("%s (%s): a shipped harness is ACP (input acp, no resume command): %+v", f, d.Name, spec.Harness)
 			}
 			if _, err := s.Put(context.Background(), d.Kind, "acme", d, false, "ci"); err != nil {
 				t.Errorf("%s (%s): %v", f, d.Name, err)

@@ -238,3 +238,31 @@ func TestACPCodexExampleReachesTheModelThroughTheGateway(t *testing.T) {
 	}
 	t.Fatalf("no Codex model call reached the gateway with the pod's certificate and the profile's key: %+v; output:\n%s", seen, strings.Join(lines, "\n"))
 }
+
+// The ChatGPT-subscription profile's model calls go through the bridge to chatgpt.com's Codex
+// backend with the pod's certificate and the provider's placeholder as the bearer (the gateway
+// swaps it for the tenant's token), not the placeholder of the login codex-acp needs. Runs in the
+// agent image's check or with CODEX_ACP_TEST_BIN.
+func TestACPCodexChatGPTExampleReachesTheModelThroughTheGateway(t *testing.T) {
+	bin := os.Getenv("CODEX_ACP_TEST_BIN")
+	if bin == "" && os.Getenv("ACP_TEST_NETWORK") == "none" {
+		bin, _ = exec.LookPath("codex-acp")
+	}
+	if bin == "" {
+		t.Skip("set CODEX_ACP_TEST_BIN to run the Codex ChatGPT model-call test (it runs by itself in the agent image's check)")
+	}
+	if runOfflineInNetns(t) {
+		return
+	}
+	lines, seen := modelCallThroughGateway(t, "environment-codex-chatgpt.yaml", "codex-acp", bin, "chatgpt.com",
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"error":{"message":"test gateway"}}`, http.StatusServiceUnavailable)
+		}))
+	for _, r := range seen {
+		if strings.HasPrefix(r.Path, "/backend-api/codex/") && r.ClientCN == "sandbox-test/1" && r.SNI == "chatgpt.com" &&
+			r.Authorization == "Bearer placeholder-the-gateway-injects-the-real-token" {
+			return
+		}
+	}
+	t.Fatalf("no Codex model call reached chatgpt.com through the gateway with the pod's certificate and the provider's placeholder: %+v; output:\n%s", seen, strings.Join(lines, "\n"))
+}

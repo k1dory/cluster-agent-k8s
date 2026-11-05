@@ -37,8 +37,15 @@ func TestACPCodexExampleCreatesSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Both shipped Codex profiles (API key, ChatGPT subscription) run codex-acp.
+	for _, file := range []string{"environment-codex-acp.yaml", "environment-codex-chatgpt.yaml"} {
+		t.Run(file, func(t *testing.T) { codexExampleSession(t, adapter, file) })
+	}
+}
+
+func codexExampleSession(t *testing.T, adapter, file string) {
 	isolate := noNetwork(t)
-	raw, err := os.ReadFile("../../examples/catalog/environment-codex-acp.yaml")
+	raw, err := os.ReadFile("../../examples/catalog/" + file)
 	if err != nil {
 		t.Fatal(err)
 	}

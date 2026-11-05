@@ -130,10 +130,13 @@ from the ID token, so the policy injects both
     ChatGPT-Account-ID: "secret:chatgpt.account_id"
 ```
 
-Codex in the pod uses a provider pointed at the ChatGPT backend whose key is a placeholder
+Codex runs over ACP (`codex-acp`, mode `agent-full-access`) with a provider pointed at the
+ChatGPT backend through the gateway bridge, whose key is a placeholder
 ([examples/catalog/environment-codex-chatgpt.yaml](../examples/catalog/environment-codex-chatgpt.yaml),
 which writes `~/.codex/config.toml` through the harness files below), so neither the refresh
-token nor the access token is ever in the pod. A sign-in nobody approves within fifteen minutes,
+token nor the access token is ever in the pod. codex-acp wants an account before it opens a
+session: `DEFAULT_AUTH_REQUEST` logs it in with a placeholder API key, which is never sent to
+chatgpt.com (the requests carry the provider's placeholder, which the gateway replaces). A sign-in nobody approves within fifteen minutes,
 a denied one, and a refresh token the provider revokes, expires or finds reused end as `failed`
 with the reason: the gateway then answers 502 with it, and `oauth login` again is the fix. A
 provider outage keeps the sign-in and retries. The tokens are encrypted under

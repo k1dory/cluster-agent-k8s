@@ -100,11 +100,10 @@ func TestShippedCodexProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := spec.Harness.Files[".codex/config.toml"]
-	// The provider goes through the gateway bridge (Codex presents no client certificate), with
-	// full access and no git check: the pod is the sandbox, the workspace need not be a checkout.
+	// Codex over ACP in full access (the pod is the sandbox); the provider goes through the
+	// gateway bridge (Codex presents no client certificate).
 	if !strings.Contains(cfg, `env_key = "CODEX_GATEWAY_PLACEHOLDER"`) || !strings.Contains(cfg, "http://127.0.0.1:4480/https/chatgpt.com/backend-api/codex") ||
-		!strings.Contains(cfg, `sandbox_mode = "danger-full-access"`) || !strings.Contains(spec.Harness.Command, "--skip-git-repo-check") ||
-		!strings.Contains(spec.Harness.ResumeCommand, "codex exec resume") ||
+		spec.Harness.Command != "codex-acp" || spec.Harness.Input != "acp" || spec.Harness.Mode != "agent-full-access" || spec.Harness.ResumeCommand != "" ||
 		spec.Env["CODEX_GATEWAY_PLACEHOLDER"] == "" || spec.Env["OPENAI_API_KEY"] != "" {
 		t.Fatalf("codex profile: %+v", spec)
 	}

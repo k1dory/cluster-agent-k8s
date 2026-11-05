@@ -101,8 +101,10 @@ answers and the run records.
    needs `--permission-mode bypassPermissions --permission-prompts none`: since Claude Code 2.1.302 `-p` starts in a manual mode that refuses every
    edit and non-read-only command nobody approves, and in a pod nobody does. The sandbox is the
    boundary; for recorded per-request decisions use ACP. Its MCP configuration names the servers
-   by their gateway bridge URLs. `codex exec --json` gets its usage counted from each
-   `turn.completed` (`examples/catalog/environment-codex-chatgpt.yaml` has the flags it needs in a pod).
+   by their gateway bridge URLs. A fallback `codex exec --json` gets its usage counted from each
+   `turn.completed`; in a pod it needs full access (`sandbox_mode = "danger-full-access"`,
+   `approval_policy = "never"`) and `--skip-git-repo-check`. Every shipped profile, Codex's
+   included, runs over ACP.
 
 Forced rollouts keep working on the same mechanism: the interrupted run is re-queued with
 `mode: resume` and the harness is told to continue where it left off.

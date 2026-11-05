@@ -5,29 +5,32 @@
 # placeholder; nothing it could leak is a credential. docs/self-service.md, "Subscriptions".
 # A generic example: a deployment keeps its real profile (model, flags) in its own repository.
 #
+# Codex runs over the Agent Client Protocol (codex-acp, the same adapter as
+# environment-codex-acp.yaml): a conversation stays open (messages are prompts of one session,
+# the next run resumes it), file changes come with their diffs, approvals reach `permissions`
+# and are recorded, usage is counted per turn. Mode `agent-full-access`: the pod is the sandbox
+# (codex-acp's default mode needs Codex's bubblewrap sandbox, which does not start in a pod, and
+# lets a reviewer model decide escalations).
+#
 # Codex cannot present the pod's client certificate to the gateway: its provider points at
 # agent-runner's gateway bridge on loopback (docs/chat-and-files.md, "Gateway bridge"), which
-# forwards to chatgpt.com with the certificate. `codex exec` defaults to a read-only sandbox and
-# refuses to run outside a trusted git checkout: the pod is the sandbox (full access, approvals
-# never) and the workspace need not be a repository. The task is an argument only (stdin is
-# closed, or exec would take the runner's copy of it as more input). A conversation continues
-# as `codex exec resume` of the thread the run reported.
-# For a conversation that stays open, diffs and recorded approvals, use codex-acp over ACP.
+# forwards to chatgpt.com with the certificate. `codex exec` is the fallback for a harness
+# without ACP only.
 # Apply:  sandboxctl apply -f examples/catalog/environment-codex-chatgpt.yaml
 kind: EnvironmentProfile
 name: codex-chatgpt
-description: Codex CLI on the tenant's ChatGPT subscription, the tokens held by sandboxd and the gateway
+description: Codex over ACP on the tenant's ChatGPT subscription, the tokens held by sandboxd and the gateway
 spec:
   image: stable
   harness:
-    command: 'codex exec --json --skip-git-repo-check "$SANDBOX_TASK" </dev/null'
-    resume_command: 'codex exec resume --json --skip-git-repo-check "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" </dev/null'
+    command: codex-acp
+    input: acp
+    permissions: allow
+    mode: agent-full-access
     files:
       # Written to $HOME/.codex/config.toml before every run (CODEX_HOME defaults to ~/.codex).
       .codex/config.toml: |
         model_provider = "chatgpt-gateway"
-        sandbox_mode = "danger-full-access"
-        approval_policy = "never"
 
         [model_providers.chatgpt-gateway]
         name = "ChatGPT subscription through the sandbox gateway"
@@ -47,3 +50,8 @@ spec:
         exporter = "none"
   env:
     CODEX_GATEWAY_PLACEHOLDER: placeholder-the-gateway-injects-the-real-token
+    # codex-acp refuses a session until Codex has an account, even with a provider of its own:
+    # an api-key login with a placeholder (in the request, not OPENAI_API_KEY) satisfies it. The
+    # requests to chatgpt.com carry the provider's env_key, which the gateway replaces.
+    DEFAULT_AUTH_REQUEST: '{"methodId":"api-key","_meta":{"api-key":{"apiKey":"placeholder-the-gateway-injects-the-real-token"}}}'
+    NO_BROWSER: "1"
