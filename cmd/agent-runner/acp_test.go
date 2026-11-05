@@ -474,7 +474,7 @@ func openRealACP(t *testing.T, isolate []string, agent, home string, env []strin
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = stdin.Close(); cancel(); _ = cmd.Wait() }()
+	defer stopAdapter(stdin, cancel, cmd)
 	emit := func(l string) { notices = append(notices, l) }
 	cl := &acpClient{emit: emit}
 	conn := &loggedInit{ClientSideConnection: acp.NewClientSideConnection(cl, stdin, stdout), t: t}
@@ -502,4 +502,19 @@ func noNetwork(t *testing.T) []string {
 	}
 	t.Skip("no way to run the adapter without network here (sandbox-exec, unshare -rn)")
 	return nil
+}
+
+// stopAdapter ends an agent process as the runner does (executeACP): end of input, a grace period
+// to exit on its own, then the process group. An agent killed at once can leave helpers that
+// keep writing into its home (hermes), which then outlives the test's temporary directory.
+func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd) {
+	_ = stdin.Close()
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	select {
+	case <-exited:
+	case <-time.After(5 * time.Second):
+		cancel()
+		<-exited
+	}
 }
