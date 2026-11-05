@@ -1,3 +1,12 @@
+-- The schema, in ordered steps. Each step runs once, in its own transaction, and is recorded
+-- in schema_migrations; a database already at the latest step runs nothing at startup (the
+-- ALTER TABLE ... IF NOT EXISTS of a step take ACCESS EXCLUSIVE even when they change nothing).
+--
+-- Steps 1-7 are the schema as it stood when the version table came in. They stay idempotent:
+-- a database migrated before then has no schema_migrations row yet and runs them all again.
+-- A change is a new step appended at the end, never an edit of an applied one.
+
+-- step 1: sandboxes, runs, events, instances, idempotency
 CREATE TABLE IF NOT EXISTS sandboxes (
     id              text PRIMARY KEY,
     name            text NOT NULL,
@@ -104,6 +113,7 @@ CREATE TABLE IF NOT EXISTS idempotency (
 ALTER TABLE idempotency ADD COLUMN IF NOT EXISTS body_hash text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency (created_at);
 
+-- step 2: agent versions, conversation mode, blobs, admin grant
 -- Agent versioning and optimistic locking (see model.Sandbox).
 ALTER TABLE sandboxes
     ADD COLUMN IF NOT EXISTS agent_version text NOT NULL DEFAULT '',
@@ -127,6 +137,7 @@ CREATE TABLE IF NOT EXISTS blobs (
 
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS admin_grant boolean NOT NULL DEFAULT false;
 
+-- step 3: catalogue
 -- Catalogue: AgentDefinition / EnvironmentProfile revisions (append-only, latest = current).
 CREATE TABLE IF NOT EXISTS catalog_items (
     kind        text NOT NULL,
@@ -157,6 +168,7 @@ ALTER TABLE runs
     ADD COLUMN IF NOT EXISTS environment_ref text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS environment_revision integer NOT NULL DEFAULT 0;
 
+-- step 4: applies, API keys, token uses
 -- Applies: one application of a bundle, continued by key, a step written with its item in
 -- one transaction (see store.Applies).
 CREATE TABLE IF NOT EXISTS applies (
@@ -195,6 +207,7 @@ CREATE TABLE IF NOT EXISTS token_uses (
 -- key_id: the key the token was exchanged for, written in the same transaction as the key.
 ALTER TABLE token_uses ADD COLUMN IF NOT EXISTS key_id text NOT NULL DEFAULT '';
 
+-- step 5: credentials, OAuth sign-ins
 -- Tenant-brought credentials (BYOK): ciphertext only; the server key never touches the database.
 CREATE TABLE IF NOT EXISTS credentials (
     tenant      text NOT NULL DEFAULT '',
@@ -236,6 +249,7 @@ CREATE TABLE IF NOT EXISTS oauth_credentials (
 );
 CREATE INDEX IF NOT EXISTS oauth_credentials_due ON oauth_credentials (next_at) WHERE status <> 'failed';
 
+-- step 6: git syncs
 -- Git repositories: the last check and the last sync of each GitRepository (model.GitSync);
 -- the applies and the revisions carry the history.
 CREATE TABLE IF NOT EXISTS git_syncs (
@@ -246,17 +260,7 @@ CREATE TABLE IF NOT EXISTS git_syncs (
     PRIMARY KEY (tenant, name)
 );
 
--- Records written before the record had two halves kept check and sync fields at the root.
--- Each half missing in the new form is built from those fields (a half already written in the
--- new form wins), then the root fields go. Idempotent: a converted record has no root field.
-UPDATE git_syncs SET doc =
-    (doc - 'tenant' - 'name' - 'head' - 'checked_at' - 'check_error' - 'commit' - 'bundles' - 'status' - 'error' - 'synced_at' - 'updated_at')
-    || CASE WHEN doc ? 'check' OR NOT (doc ? 'checked_at') THEN '{}'::jsonb
-            ELSE jsonb_build_object('check', jsonb_strip_nulls(jsonb_build_object('head', doc->'head', 'at', doc->'checked_at', 'error', doc->'check_error'))) END
-    || CASE WHEN doc ? 'sync' OR NOT (doc ? 'synced_at') THEN '{}'::jsonb
-            ELSE jsonb_build_object('sync', jsonb_strip_nulls(jsonb_build_object('commit', doc->'commit', 'bundles', doc->'bundles', 'status', doc->'status', 'error', doc->'error', 'at', doc->'synced_at'))) END
-WHERE doc ?| array['checked_at', 'synced_at', 'head', 'commit', 'status', 'bundles', 'check_error', 'tenant', 'name', 'updated_at'];
-
+-- step 7: git webhook jobs
 -- Webhook jobs (model.GitJob): an accepted delivery survives the replica that accepted it; one
 -- job per delivery; claimed under a lease by one replica at a time (store.GitJobs).
 CREATE TABLE IF NOT EXISTS git_jobs (
@@ -278,7 +282,24 @@ CREATE TABLE IF NOT EXISTS git_jobs (
 );
 CREATE INDEX IF NOT EXISTS git_jobs_waiting ON git_jobs (status, lease_until, created_at);
 -- run counts a job's executions for good (attempts starts over when a redelivery requeues
--- the job): the identity an execution's writes are fenced by. Rows from before carry their
--- attempts as the executions so far.
+-- the job): the identity an execution's writes are fenced by.
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS run integer NOT NULL DEFAULT 0;
+
+-- every start: repairs of rows a replica of an older release may still write
+-- No DDL here: these run on every start, after the steps, because during a rolling update an
+-- older replica keeps writing the old form after the step that introduced the new one ran.
+
+-- Records written before the record had two halves kept check and sync fields at the root.
+-- Each half missing in the new form is built from those fields (a half already written in the
+-- new form wins), then the root fields go. Idempotent: a converted record has no root field.
+UPDATE git_syncs SET doc =
+    (doc - 'tenant' - 'name' - 'head' - 'checked_at' - 'check_error' - 'commit' - 'bundles' - 'status' - 'error' - 'synced_at' - 'updated_at')
+    || CASE WHEN doc ? 'check' OR NOT (doc ? 'checked_at') THEN '{}'::jsonb
+            ELSE jsonb_build_object('check', jsonb_strip_nulls(jsonb_build_object('head', doc->'head', 'at', doc->'checked_at', 'error', doc->'check_error'))) END
+    || CASE WHEN doc ? 'sync' OR NOT (doc ? 'synced_at') THEN '{}'::jsonb
+            ELSE jsonb_build_object('sync', jsonb_strip_nulls(jsonb_build_object('commit', doc->'commit', 'bundles', doc->'bundles', 'status', doc->'status', 'error', doc->'error', 'at', doc->'synced_at'))) END
+WHERE doc ?| array['checked_at', 'synced_at', 'head', 'commit', 'status', 'bundles', 'check_error', 'tenant', 'name', 'updated_at'];
+
+-- Rows from before git_jobs.run (or written by a replica that does not know it) carry their
+-- attempts as the executions so far.
 UPDATE git_jobs SET run = attempts WHERE run = 0 AND attempts > 0;

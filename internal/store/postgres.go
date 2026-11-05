@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,11 +51,57 @@ func OpenPostgres(ctx context.Context, url string) (*Postgres, error) {
 	return &Postgres{pool: pool, lockers: make(chan struct{}, max(1, int(cfg.MaxConns)/2))}, nil
 }
 
-// migrate applies the schema under an advisory lock: replicas start together (a rollout
-// recreates them at once), and CREATE ... IF NOT EXISTS is not safe against itself on a fresh
-// database (two creators of one type collide on pg_type's unique index). One replica
-// migrates, the others wait and find everything in place.
+// migration is one step of migrations.sql.
+type migration struct {
+	version int
+	name    string
+	sql     string
+}
+
+var (
+	stepRe   = regexp.MustCompile(`(?m)^-- step (\d+): (.+)$`)
+	alwaysRe = regexp.MustCompile(`(?m)^-- every start: .+$`)
+)
+
+// parseMigrations splits the schema file at its "-- step N: name" lines, and returns the
+// "-- every start:" section that follows the last step separately. Steps must be numbered
+// 1, 2, 3... in order: a gap or a duplicate is a mistake in the file, not something to skip.
+func parseMigrations(src string) (steps []migration, always string, err error) {
+	if loc := alwaysRe.FindStringIndex(src); loc != nil {
+		src, always = src[:loc[0]], src[loc[1]:]
+		if stepRe.MatchString(always) {
+			return nil, "", fmt.Errorf("migrations: a step after the every-start section")
+		}
+	}
+	locs := stepRe.FindAllStringSubmatchIndex(src, -1)
+	if len(locs) == 0 {
+		return nil, "", fmt.Errorf("migrations: no step markers")
+	}
+	for i, l := range locs {
+		v, _ := strconv.Atoi(src[l[2]:l[3]])
+		if v != i+1 {
+			return nil, "", fmt.Errorf("migrations: step %d where step %d was expected", v, i+1)
+		}
+		end := len(src)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		steps = append(steps, migration{version: v, name: strings.TrimSpace(src[l[4]:l[5]]), sql: src[l[1]:end]})
+	}
+	return steps, always, nil
+}
+
+// migrate applies the steps a database has not recorded yet, under an advisory lock: replicas
+// start together (a rollout recreates them at once), and CREATE ... IF NOT EXISTS is not safe
+// against itself on a fresh database (two creators of one type collide on pg_type's unique
+// index). One replica migrates, the others wait and find the steps recorded. A database at the
+// latest step runs no DDL at all (only the every-start row repairs); one written by a newer release (a step this binary does not
+// know) is left alone, so an older replica still starts during a rolling update.
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	steps, always, err := parseMigrations(migrations)
+	if err != nil {
+		return err
+	}
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return err
@@ -62,11 +110,58 @@ func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('agent-sandbox:migrations'))`); err != nil {
 		return err
 	}
-	_, merr := conn.Exec(ctx, migrations)
+	merr := applySteps(ctx, conn.Conn(), steps)
+	if merr == nil && strings.TrimSpace(always) != "" {
+		if _, err := conn.Exec(ctx, always); err != nil {
+			merr = fmt.Errorf("migrations, every-start repairs: %w", err)
+		}
+	}
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext('agent-sandbox:migrations'))`); err != nil && merr == nil {
 		return err
 	}
 	return merr
+}
+
+func applySteps(ctx context.Context, conn *pgx.Conn, steps []migration) error {
+	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version    integer PRIMARY KEY,
+		name       text NOT NULL,
+		applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+		return err
+	}
+	applied := map[int]bool{}
+	rows, err := conn.Query(ctx, `SELECT version FROM schema_migrations`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return err
+		}
+		applied[v] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, st := range steps {
+		if applied[st.version] {
+			continue
+		}
+		err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, st.sql); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`, st.version, st.name)
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("migration %d (%s): %w", st.version, st.name, err)
+		}
+	}
+	return nil
 }
 
 // dedicated opens a connection outside the pool for long-held session state (locks, LISTEN).
