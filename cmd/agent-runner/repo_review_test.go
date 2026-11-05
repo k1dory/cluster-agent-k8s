@@ -206,3 +206,54 @@ func TestCloneLeavesAFileAtTheCheckoutPath(t *testing.T) {
 		t.Fatalf("an empty directory at the checkout path: %v", err)
 	}
 }
+
+// A run cancelled while the clone runs stops the clone and never starts its harness.
+func TestCancelDuringTheCloneStopsTheRun(t *testing.T) {
+	isolatedGit(t)
+	workspaceRepo = repoSync{}
+	t.Cleanup(func() { workspaceRepo = repoSync{} })
+	hang := make(chan struct{})
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-hang:
+		case <-r.Context().Done():
+		}
+	}))
+	defer remote.Close()
+	defer close(hang)
+	old := cloneTimeout
+	cloneTimeout = 30 * time.Second
+	defer func() { cloneTimeout = old }()
+	_, cp, _ := setupACP(t, "")
+	t.Setenv("HARNESS_INPUT", "")
+	t.Setenv("ACP_FAKE_AGENT", "")
+	t.Setenv("SANDBOX_MCP_SERVERS", "")
+	marker := filepath.Join(t.TempDir(), "started")
+	t.Setenv("HARNESS_CMD", `touch "`+marker+`"`)
+	t.Setenv("SANDBOX_REPO_DIR", filepath.Join(t.TempDir(), "repo"))
+	t.Setenv("SANDBOX_REPO", remote.URL+"/slow.git")
+	// The control plane: the run is cancelled as soon as anyone looks.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/input") {
+			time.Sleep(300 * time.Millisecond) // the clone is under way
+			_, _ = w.Write([]byte(`[{"id":1,"type":"run.cancel"}]`))
+			return
+		}
+		cp.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	start := time.Now()
+	code := execute(t.Context(), &client{base: srv.URL, http: srv.Client()}, &model.Run{ID: "run_cancel_setup", Task: "x"})
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("the run went on for %s after its cancel", d)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the harness of a cancelled run was started")
+	}
+	cp.mu.Lock()
+	out := strings.Join(cp.lines, "\n")
+	cp.mu.Unlock()
+	if code == 0 || !strings.Contains(out, "run cancelled before the harness started") {
+		t.Fatalf("exit %d, output:\n%s", code, out)
+	}
+}

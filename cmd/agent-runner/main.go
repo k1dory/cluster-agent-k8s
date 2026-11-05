@@ -412,7 +412,16 @@ func harnessOf(cmdline, input string) (string, string) {
 // user input events are written to the harness stdin.
 func execute(ctx context.Context, c *client, run *model.Run) int {
 	cmdline, input := harnessOf(os.Getenv("HARNESS_CMD"), os.Getenv("HARNESS_INPUT"))
-	if notice := workspaceRepo.ensure(ctx); notice != "" {
+	// The setup (a clone can take minutes) runs under a watch for the run's cancel: forwardInput,
+	// which acts on it during the run, only starts with the harness.
+	setup, stopWatch := watchCancel(ctx, c, run.ID)
+	notice := workspaceRepo.ensure(setup)
+	stopWatch()
+	if errors.Is(context.Cause(setup), errRunCancelled) {
+		c.post(ctx, run.ID, []string{"[agent-runner] run cancelled before the harness started"})
+		return 1
+	}
+	if notice != "" {
 		c.post(ctx, run.ID, []string{notice})
 	}
 	env := append(os.Environ(), "SANDBOX_TASK="+run.Task, "SANDBOX_RUN_ID="+run.ID)
@@ -558,6 +567,41 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 		return 1
 	}
 	return 0
+}
+
+// errRunCancelled is the cause of a setup context ended by the run's cancel (watchCancel).
+var errRunCancelled = errors.New("run cancelled")
+
+// watchCancel follows the run's input for a run.cancel until stop is called; the context it
+// returns ends (cause errRunCancelled) when one comes. Reading the input consumes nothing:
+// forwardInput reads the same events from the start once the harness runs.
+func watchCancel(ctx context.Context, c *client, runID string) (context.Context, func()) {
+	setup, cancel := context.WithCancelCause(ctx)
+	watch, endWatch := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var after int64
+		for watch.Err() == nil {
+			var evs []model.Event
+			_, err := c.do(watch, http.MethodGet, fmt.Sprintf("/agent/runs/%s/input?after=%d&wait=30s", runID, after), nil, &evs)
+			if err != nil {
+				if !sleepCtx(watch, 2*time.Second) {
+					return
+				}
+				continue
+			}
+			for _, e := range evs {
+				after = e.ID
+				if e.Type == model.EventRunCancel {
+					fmt.Println("agent-runner: run cancelled by the control plane while it was being set up")
+					cancel(errRunCancelled)
+					return
+				}
+			}
+		}
+	}()
+	return setup, func() { endWatch(); <-done }
 }
 
 // interruptGrace is how long a cancelled harness has after SIGINT before SIGTERM.
