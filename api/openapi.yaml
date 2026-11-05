@@ -2587,8 +2587,8 @@ components:
         tenant: { type: string }
         slug: { type: string }
         run_id: { type: string }
-        type: { type: string, enum: [status, run.queued, run.started, run.output, run.finished, run.cancel, input, egress.allow, egress.deny, rollout] }
-        data: { type: string, description: "status: new status; run.started: agent version; run.finished: final run status; egress.*: Egress JSON; rollout: {from, to, mode, run_id, resume_id}" }
+        type: { type: string, enum: [status, run.queued, run.started, run.output, run.finished, run.cancel, run.close, input, reply, fs.request, fs.result, egress.allow, egress.deny, rollout] }
+        data: { type: string, description: "status: new status; run.started: agent version; run.finished: final run status; reply: the answer to a request of the agent (JSON); fs.request: FSRequest JSON; fs.result: FSResult JSON; egress.*: Egress JSON; rollout: {from, to, mode, run_id, resume_id}" }
         at: { type: string, format: date-time }
     UsageTotals:
       type: object
