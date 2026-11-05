@@ -47,6 +47,11 @@ func ValidateUpstream(s string) error {
 		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
 			return fmt.Errorf("upstream %q: port %q is not a port number", s, port)
 		}
+		// Caddy refuses a scheme that contradicts the well-known port (reverseproxy
+		// addresses.go): http on 443 or https on 80 fails the whole configuration.
+		if u.Scheme == "http" && port == "443" || u.Scheme == "https" && port == "80" {
+			return fmt.Errorf("upstream %q: scheme %s conflicts with port %s", s, u.Scheme, port)
+		}
 	}
 	if strings.HasPrefix(u.Host, "[") {
 		// A bracketed literal must be an IPv6 address (the zone form is meaningless here).

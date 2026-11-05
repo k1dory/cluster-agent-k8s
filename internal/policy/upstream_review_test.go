@@ -19,7 +19,7 @@ func TestReviewValidateUpstream(t *testing.T) {
 		"https://user:pw@h.example.com", "ftp://h.example.com", "https://", "https://{env.X}", "https://h.example.com {",
 		"https://h}.example.com", "https://h.example.com:0", "https://h.example.com:99999", "https://h.example.com:",
 		"https://[10.0.0.5]", "https://-bad.example.com", "10.0.0.5:8443", "https:h.example.com", "https://h .com",
-		"https://h.example.com\n}", "",
+		"https://h.example.com\n}", "", "http://h.example.com:443", "https://h.example.com:80", "http://[fd00::1]:443",
 	} {
 		if err := ValidateUpstream(bad); err == nil {
 			t.Errorf("%q must be refused", bad)

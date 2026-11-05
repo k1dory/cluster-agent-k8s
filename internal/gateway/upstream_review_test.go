@@ -34,16 +34,18 @@ func TestReviewRenderLeavesOutAHostWithAnInvalidUpstream(t *testing.T) {
 	c, _ := ca.Generate("t", time.Hour)
 	hs := []policy.Host{
 		{Name: "bad.example.com", Upstream: "https://10.0.0.5:8443/api"},
+		{Name: "badport.example.com", Upstream: "http://10.0.0.5:443"},
+		{Name: "badport2.example.com", Upstream: "https://10.0.0.5:80"},
 		{Name: "good.example.com", Upstream: "https://good.example.com"},
 	}
 	out, skipped, err := render(reviewCfg(), hs, c.PEM())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(out, "bad.example.com") || !strings.Contains(out, "good.example.com {") {
+	if strings.Contains(out, "bad.example.com") || strings.Contains(out, "badport") || !strings.Contains(out, "good.example.com {") {
 		t.Fatalf("the bad host must be left out and the good one kept:\n%s", out)
 	}
-	if len(skipped) != 1 || skipped[0].Host != "bad.example.com" {
+	if len(skipped) != 3 || skipped[0].Host != "bad.example.com" {
 		t.Fatalf("skipped: %+v", skipped)
 	}
 }
