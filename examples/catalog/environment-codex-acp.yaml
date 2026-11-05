@@ -19,6 +19,18 @@ spec:
     command: codex-acp
     input: acp
     permissions: allow
+    files:
+      # Codex cannot present the pod's client certificate to the gateway (and ignores
+      # OPENAI_BASE_URL): its provider points at agent-runner's gateway bridge on loopback
+      # (docs/chat-and-files.md, "Gateway bridge"). Written to $HOME/.codex/config.toml.
+      .codex/config.toml: |
+        model_provider = "openai-gateway"
+
+        [model_providers.openai-gateway]
+        name = "OpenAI through the sandbox gateway"
+        base_url = "http://127.0.0.1:4480/https/api.openai.com/v1"
+        env_key = "OPENAI_API_KEY"
+        wire_api = "responses"
   env:
     OPENAI_API_KEY: placeholder-the-gateway-injects-the-real-key
     DEFAULT_AUTH_REQUEST: '{"methodId":"api-key"}'

@@ -132,6 +132,17 @@ harness:
   A diff whose texts exceed 128 KiB keeps its path and sizes and is marked `truncated` (the file
   is in the workspace). A prompt's usage, when the agent reports it, is a `{"type":"usage",…}` line the run's
   accounting adds up. The agent's stderr is passed through as it is.
+- **Gateway bridge.** Every connection out of the pod ends at the gateway, which requires the
+  pod's client certificate (mTLS). Claude Code, git and curl present it from what agent-init
+  writes; most other harnesses cannot (OpenCode on Bun, Hermes on Python's httpx, Codex on Rust
+  read no client certificate from the environment). agent-runner therefore serves a bridge on
+  the pod's loopback, `http://127.0.0.1:4480/https/<host>/<path>` (`$SANDBOX_GATEWAY_BRIDGE`),
+  that forwards to `https://<host>/<path>` through the gateway with the certificate: headers and
+  bodies unchanged (the gateway still swaps placeholder credentials and applies the policy),
+  answers streamed, WebSocket upgrades carried. A profile points its harness's provider at it
+  (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, a config file's `baseURL`), and the MCP servers an ACP
+  agent gets in `session/new` are already bridge URLs. It reaches nothing the pod could not:
+  the certificate is the pod's own and the network lock still admits only the gateway.
 - **Long lines.** For every harness, an output line over 1 MiB is replaced by a
   `[agent-runner] dropped an output line …` notice and reading goes on, so the harness never
   blocks on a reader that gave up.
