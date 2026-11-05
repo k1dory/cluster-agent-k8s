@@ -107,7 +107,7 @@ kube:
   # harness needs no resume command.
   harness_command: claude-agent-acp
   harness_input: acp                 # text | stream-json | acp
-  harness_permissions: allow         # acp: allow | deny
+  harness_permissions: allow         # acp: allow | deny | ask (a person answers, POST /requests/{id})
   harness_mode: default              # acp: the agent's session mode
   # harness_mcp: always              # acp: pass MCP servers to an agent that does not declare HTTP
   # harness_auth_method: api-key     # acp: the agent's authentication method

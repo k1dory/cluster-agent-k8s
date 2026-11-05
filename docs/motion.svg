@@ -107,7 +107,7 @@
     <rect x="900" y="250" width="260" height="100" class="card" stroke="#22c55e"/>
     <text x="916" y="276" class="h">pod · backend-dev / n=7</text>
     <text x="916" y="298" class="mut">one interface: 10.77.77.10 → gateway</text>
-    <text x="916" y="318" class="mut">agent-runner → claude -p "$TASK"</text>
+    <text x="916" y="318" class="mut">agent-runner ⇄ agent (ACP)</text>
     <g id="think" class="kf">
       <circle cx="1100" cy="336" r="4" fill="#fbbf24"/><circle cx="1114" cy="336" r="4" fill="#fbbf24"/><circle cx="1128" cy="336" r="4" fill="#fbbf24"/>
     </g>
