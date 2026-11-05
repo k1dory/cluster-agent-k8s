@@ -1691,6 +1691,8 @@ paths:
                   description: Optional harness total; overrides what was parsed from the output stream
       responses:
         "204": { description: Recorded }
+        "400": { description: "The body is not one JSON object with these fields (nothing is recorded)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { $ref: "#/components/responses/Error" }
 
   /bootstrap:
     post:

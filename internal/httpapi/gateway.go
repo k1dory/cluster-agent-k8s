@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"bufio"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -250,7 +249,12 @@ func (g *Gateway) finish(w http.ResponseWriter, r *http.Request, id *identity.Id
 		ExitCode int          `json:"exit_code"`
 		Usage    *model.Usage `json:"usage,omitempty"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	// A body that does not decode is refused, never read as exit 0 without usage: that would
+	// record a failed run as a success. The runner retries finish until it is acknowledged.
+	if err := decodeStrict(w, r, &req, smallBodyLimit); err != nil {
+		writeBodyErr(w, err)
+		return
+	}
 	if err := g.Orch.FinishRun(r.Context(), id.SandboxID, run.ID, req.ExitCode, req.Usage); err != nil {
 		writeOrchErr(w, err)
 		return
