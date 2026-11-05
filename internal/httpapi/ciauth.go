@@ -18,6 +18,14 @@ func (p *Platform) ciAuthRoutes(mux *routeMux) {
 			writeErr(w, http.StatusServiceUnavailable, ciauth.ErrDisabled)
 			return
 		}
+		// Every exchange counts against its source address, refused or not: the route takes
+		// no bearer, so it is where a guess costs nothing else.
+		if lim := p.authLimiter(); lim != nil {
+			if d := lim.take("ci|" + sourceOf(r)); d > 0 {
+				writeRateLimited(w, d)
+				return
+			}
+		}
 		var body struct {
 			Token string `json:"token"`
 		}

@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"agent-sandbox/api"
@@ -78,9 +79,15 @@ type Platform struct {
 	// TTLFromToken caps the lifetime of sandboxes created with a short-lived token (and so
 	// their agent certificates) at the token's expiry.
 	TTLFromToken bool
-	Build        string // control-plane version reported by GET /v1/version
-	Replica      string // this replica's name (the pod), reported by GET /v1/version
-	Log          *slog.Logger
+	// AuthLimit bounds, per source address, POST /v1/auth/ci and failed bearer authentication
+	// (see RateLimit); the zero value is on with the defaults.
+	AuthLimit RateLimit
+	limitOnce sync.Once
+	limiter   *limiter
+
+	Build   string // control-plane version reported by GET /v1/version
+	Replica string // this replica's name (the pod), reported by GET /v1/version
+	Log     *slog.Logger
 }
 
 // SetServices installs the configuration services (see internal/app).
@@ -307,6 +314,21 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		got := []byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		// Failed attempts are counted per source address; once its bucket is empty, every token
+		// from there is refused unchecked (a check would still tell a guess that is right), until
+		// the bucket refills. Requests without a token are not counted.
+		lim, src := p.authLimiter(), "auth|"+sourceOf(r)
+		if lim != nil && len(got) > 0 {
+			if d := lim.wait(src); d > 0 {
+				writeRateLimited(w, d)
+				return
+			}
+		}
+		failed := func() {
+			if lim != nil && len(got) > 0 {
+				lim.take(src)
+			}
+		}
 		var pr *Principal
 		if p.Token != "" && subtle.ConstantTimeCompare(got, []byte(p.Token)) == 1 {
 			pr = &Principal{Admin: true, Subject: "admin-token"}
@@ -320,6 +342,7 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 			k, err := p.Keys.Authenticate(r.Context(), string(got))
 			if err != nil {
 				if errors.Is(err, apikeys.ErrBadKey) {
+					failed()
 					writeErr(w, http.StatusUnauthorized, errors.New("bad token"))
 				} else {
 					writeErr(w, http.StatusInternalServerError, fmt.Errorf("api key: %w", err))
@@ -331,12 +354,14 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 		if pr == nil && p.Verifier != nil && strings.Count(string(got), ".") == 2 {
 			v, err := p.Verifier.Verify(r.Context(), string(got))
 			if err != nil {
+				failed()
 				writeErr(w, http.StatusUnauthorized, fmt.Errorf("token: %w", err))
 				return
 			}
 			pr = &v
 		}
 		if pr == nil {
+			failed()
 			writeErr(w, http.StatusUnauthorized, errors.New("bad token"))
 			return
 		}

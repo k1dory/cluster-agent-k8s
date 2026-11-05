@@ -89,6 +89,10 @@ the `SANDBOXD_URL` variable, are then all the repository needs.
   a signature the held keys do not verify (a key rotated under the same id, or a token naming
   none) fetches the set again, at most once a minute, so a rotation never needs a restart.
   Each issuer is fetched under its own lock: a slow issuer delays its own tokens and no other.
+- Exchanges are rate limited per source address, as are failed bearer tokens on every route:
+  30 at once, then one per second, per replica; over that is 429 with `Retry-After`. The
+  address is the connection's, so behind a proxy that hides it every job shares one budget:
+  keep the client address at the listener or limit at the proxy.
 
 ## Server configuration
 
