@@ -280,12 +280,15 @@ func (s *Service) tokenOwner(ctx context.Context, use string) (string, error) {
 	return "", err
 }
 
-// unavailable reports an issuer whose keys could not be fetched (503).
+// unavailable reports an issuer whose keys could not be fetched (503). The cause stays in the
+// server log: POST /v1/auth/ci is unauthenticated and the issuer is tenant-defined, so a
+// connect, TLS or HTTP error handed back would make the platform an oracle for whatever
+// host the issuer names.
 func (s *Service) unavailable(issuer string, err error) error {
 	if s.Log != nil {
 		s.Log.Warn("ci auth: issuer unavailable", "issuer", issuer, "err", err)
 	}
-	return fmt.Errorf("%w: %v", ErrIssuer, err)
+	return ErrIssuer
 }
 
 func (s *Service) refuse(reason string, cause error) error {

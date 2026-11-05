@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"testing"
 	"time"
 
 	"agent-sandbox/internal/model"
@@ -159,8 +160,14 @@ func Decode(it *model.CatalogItem) (Spec, error) {
 	return sp, err
 }
 
-// CheckIssuer accepts an https URL without user information, query or fragment (http for a
-// loopback host only, for tests), as an issuer names itself.
+// allowLoopbackHTTP lets an http issuer on a loopback host through. Only test binaries set it
+// (their issuers are httptest servers): in sandboxd a tenant-defined http://127.0.0.1:<port>
+// issuer would have the platform fetch from its own loopback services on an unauthenticated
+// request.
+var allowLoopbackHTTP = testing.Testing()
+
+// CheckIssuer accepts an https URL without user information, query or fragment, as an issuer
+// names itself (and, in tests only, http for a loopback host).
 func CheckIssuer(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -173,8 +180,8 @@ func CheckIssuer(raw string) error {
 	case "https":
 	case "http":
 		host := u.Hostname()
-		if ip := net.ParseIP(host); host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-			return fmt.Errorf("http is accepted for a loopback host only; use https")
+		if ip := net.ParseIP(host); !allowLoopbackHTTP || host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			return fmt.Errorf("scheme %q is not https", u.Scheme)
 		}
 	default:
 		return fmt.Errorf("scheme %q is not https", u.Scheme)
