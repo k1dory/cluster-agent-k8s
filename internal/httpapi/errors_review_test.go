@@ -118,6 +118,7 @@ func TestReviewStoreFailuresAre500AndLogged(t *testing.T) {
 	}
 	var sb model.Sandbox
 	_ = json.Unmarshal(body, &sb)
+	waitRunning(t, s.platform.URL, "t0k", sb.ID) // the start runs in the background and reads the store
 	var logs bytes.Buffer
 	broken := failingStore{s.orch.Store}
 	s.orch.Store = broken
