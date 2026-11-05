@@ -109,19 +109,47 @@ type cachedSpec struct {
 
 // specOf decodes a snapshot item's spec once per revision. The result is shared: read only.
 func (s *Service) specOf(it *model.CatalogItem) (*Spec, error) {
-	key := it.Tenant + "|" + it.Name
 	s.specMu.Lock()
 	defer s.specMu.Unlock()
-	if c, ok := s.specs[key]; ok && c.revision == it.Revision && bytes.Equal(c.raw, it.Spec) {
-		return c.spec, c.err
-	}
-	var sp Spec
-	err := res.DecodeStrict(it.Spec, &sp)
+	c := s.cachedSpecLocked(s.specs, it)
 	if s.specs == nil {
 		s.specs = map[string]cachedSpec{}
 	}
-	s.specs[key] = cachedSpec{revision: it.Revision, raw: it.Spec, spec: &sp, err: err}
-	return &sp, err
+	s.specs[it.Tenant+"|"+it.Name] = c
+	return c.spec, c.err
+}
+
+func (s *Service) cachedSpecLocked(from map[string]cachedSpec, it *model.CatalogItem) cachedSpec {
+	if c, ok := from[it.Tenant+"|"+it.Name]; ok && c.revision == it.Revision && bytes.Equal(c.raw, it.Spec) {
+		return c
+	}
+	var sp Spec
+	err := res.DecodeStrict(it.Spec, &sp)
+	return cachedSpec{revision: it.Revision, raw: it.Spec, spec: &sp, err: err}
+}
+
+// liveSpecs decodes every live connection (through the cache) and keeps in the cache only
+// those: a deleted connection leaves it at the next sweep, so create/delete churn does not
+// grow it. The sweeps run on every DNS query and gateway sync.
+func (s *Service) liveSpecs() []liveSpec {
+	items := s.snap.All()
+	out := make([]liveSpec, 0, len(items))
+	s.specMu.Lock()
+	defer s.specMu.Unlock()
+	next := make(map[string]cachedSpec, len(items))
+	for _, it := range items {
+		c := s.cachedSpecLocked(s.specs, it)
+		next[it.Tenant+"|"+it.Name] = c
+		out = append(out, liveSpec{item: it, spec: c.spec, err: c.err})
+	}
+	s.specs = next
+	return out
+}
+
+type liveSpec struct {
+	item *model.CatalogItem
+	spec *Spec
+	err  error
 }
 
 // New returns a service over st; call Refresh (and Watch) so the gateway knows the header names.
@@ -251,8 +279,8 @@ func upstreamOf(sp *Spec) string {
 // them into the policy hosts the gateway, the DNS and the MCP proxy work from.
 func (s *Service) OwnHosts() ([]policy.Host, string) {
 	byName := map[string]*policy.Host{}
-	for _, it := range s.snap.All() {
-		sp, err := s.specOf(it)
+	for _, ls := range s.liveSpecs() {
+		it, sp, err := ls.item, ls.spec, ls.err
 		if err != nil {
 			continue
 		}
@@ -396,8 +424,8 @@ func (s *Service) Watch(ctx context.Context, log *slog.Logger) {
 // copies them from the decision, so an agent can neither pre-set nor keep one.
 func (s *Service) HostHeaders() (map[string][]string, string) {
 	out := map[string][]string{}
-	for _, it := range s.snap.All() {
-		sp, err := s.specOf(it)
+	for _, ls := range s.liveSpecs() {
+		sp, err := ls.spec, ls.err
 		if err != nil {
 			continue
 		}
