@@ -10,9 +10,12 @@ package registrar
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/big"
 	"sync"
 	"time"
 
@@ -105,8 +108,10 @@ func (r *Registrar) Bootstrap(ctx context.Context, token string, req BootstrapRe
 		return nil, fmt.Errorf("pod %s/%s lacks sandbox labels", pod.Namespace, pod.Name)
 	}
 	sb, err := r.Store.GetSandbox(ctx, pod.SandboxID)
-	if err != nil {
+	if errors.Is(err, store.ErrNotFound) {
 		return nil, fmt.Errorf("sandbox %s: %w", pod.SandboxID, err)
+	} else if err != nil {
+		return nil, unavailable(err)
 	}
 	if sb.Slug != pod.Slug {
 		return nil, fmt.Errorf("pod slug %q does not match sandbox slug %q", pod.Slug, sb.Slug)
@@ -120,94 +125,92 @@ func (r *Registrar) Bootstrap(ctx context.Context, token string, req BootstrapRe
 	if err != nil {
 		return nil, fmt.Errorf("csr: %w", err)
 	}
-	n, err := r.Store.NextInstance(ctx)
-	if err != nil {
-		return nil, err
+	if err := csr.CheckSignature(); err != nil {
+		return nil, fmt.Errorf("csr signature: %w", err)
 	}
-	id := identity.Identity{Slug: pod.Slug, Instance: n, SandboxID: pod.SandboxID, Tenant: pod.Tenant, AdminGrant: sb.AdminGrant}
+	// One identity per pod and key: agent-init sends the same CSR on every attempt, so a retry
+	// after a lost response, or one racing the attempt it gave up on, gets the same instance
+	// and the same serial and validity, and whichever certificate the pod keeps is valid. The
+	// store serialises the bootstraps of a sandbox across replicas (BindInstance); a pod
+	// with a new key (its init container restarted) replaces its earlier identity.
+	serial, err := serialFor(pod.SandboxID, pod.Name, csr)
+	if err != nil {
+		return nil, fmt.Errorf("csr: %w", err)
+	}
 	// The identity never outlives the sandbox: a TTL set on the sandbox (explicitly, or from the
 	// OIDC token that created it) caps the certificate too.
 	var cap time.Time
 	if sb.ExpiresAt != nil {
 		cap = *sb.ExpiresAt
 	}
-	cert, certPEM, err := r.CA.Sign(ca.SignRequest{CSR: csr, CN: pod.Slug, URIs: id.URIs(), TTL: r.TTL, NotAfter: cap})
+	var certPEM []byte
+	var cert *x509.Certificate
+	bound, err := r.Store.BindInstance(ctx, store.InstanceBinding{SandboxID: pod.SandboxID, PodName: pod.Name, Serial: serial.Text(16)},
+		func(n int, existing *model.Instance) (*model.Instance, error) {
+			id := identity.Identity{Slug: pod.Slug, Instance: n, SandboxID: pod.SandboxID, Tenant: pod.Tenant, AdminGrant: sb.AdminGrant}
+			sr := ca.SignRequest{CSR: csr, CN: pod.Slug, URIs: id.URIs(), TTL: r.TTL, NotAfter: cap, Serial: serial}
+			if existing != nil {
+				sr.NotBefore, sr.NotAfter = existing.IssuedAt, existing.NotAfter
+			}
+			var err error
+			if cert, certPEM, err = r.CA.Sign(sr); err != nil {
+				return nil, err
+			}
+			if existing != nil {
+				return existing, nil
+			}
+			return &model.Instance{
+				SandboxID: pod.SandboxID, Slug: pod.Slug, Tenant: pod.Tenant, PodName: pod.Name,
+				Serial: serial.Text(16), IssuedAt: cert.NotBefore, NotAfter: cert.NotAfter,
+			}, nil
+		})
 	if err != nil {
-		return nil, err
-	}
-	in := &model.Instance{
-		N: n, SandboxID: pod.SandboxID, Slug: pod.Slug, Tenant: pod.Tenant, PodName: pod.Name,
-		Serial: cert.SerialNumber.Text(16), IssuedAt: time.Now(), NotAfter: cert.NotAfter,
-	}
-	if err := r.Store.CreateInstance(ctx, in); err != nil {
-		return nil, err
-	}
-	// A repeated bootstrap from the same pod (the init container retrying after a lost
-	// response) replaces the identity it got before rather than adding one: the earlier
-	// certificate's key never reached the pod's disk, yet it would stay valid until the pod
-	// goes. The newest instance stands, so racing bootstraps do not retire each other.
-	if err := r.retireEarlier(ctx, pod, n); err != nil {
-		return nil, err
-	}
-	// The orchestrator may be writing the same row (pod name, status): reload and retry on conflict.
-	for attempt := 0; ; attempt++ {
-		sb.Instance = n
-		if sb.PodName != "" && sb.PodName != pod.Name {
-			// The orchestrator already named a newer pod (a rollout replaced this one while it was
-			// still starting): keep its name, the identity we issue is retired with the old pod anyway.
-			r.log().Warn("bootstrap from a pod that is no longer current", "pod", pod.Name, "current", sb.PodName, "sandbox", sb.ID)
-		} else {
-			sb.PodName = pod.Name
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, fmt.Errorf("sandbox %s: %w", pod.SandboxID, err)
 		}
-		err := r.Store.UpdateSandbox(ctx, sb)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, store.ErrConflict) || attempt >= 10 {
-			return nil, err
-		}
-		if sb, err = r.Store.GetSandbox(ctx, pod.SandboxID); err != nil {
-			return nil, err
-		}
+		return nil, unavailable(err)
 	}
-	r.log().Info("identity issued", "slug", pod.Slug, "instance", n, "sandbox", pod.SandboxID, "tenant", pod.Tenant, "pod", pod.Name, "serial", in.Serial)
+	in := bound.Instance
+	if bound.Current != pod.Name {
+		// The orchestrator already named a newer pod (a rollout replaced this one while it was
+		// still starting): the identity we issue is retired with the old pod anyway.
+		r.log().Warn("bootstrap from a pod that is no longer current", "pod", pod.Name, "current", bound.Current, "sandbox", sb.ID)
+	}
+	for _, old := range bound.Retired {
+		r.log().Warn("bootstrap with a new key from the same pod: earlier identity retired", "pod", pod.Name, "sandbox", pod.SandboxID, "retired", old, "instance", in.N)
+	}
+	r.log().Info("identity issued", "slug", pod.Slug, "instance", in.N, "sandbox", pod.SandboxID, "tenant", pod.Tenant, "pod", pod.Name, "serial", in.Serial, "repeated", bound.Reused)
 	return &BootstrapResponse{
-		Instance: n, Slug: pod.Slug, SandboxID: pod.SandboxID, Tenant: pod.Tenant,
+		Instance: in.N, Slug: pod.Slug, SandboxID: pod.SandboxID, Tenant: pod.Tenant,
 		Cert: string(certPEM), CA: string(r.CA.PEM()), GatewayCA: string(r.gatewayCA()), NotAfter: cert.NotAfter,
 	}, nil
 }
 
-// errSuperseded: a bootstrap from the same pod allocated a later instance while this one ran.
-var errSuperseded = errors.New("bootstrap superseded by a later one from the same pod")
+// ErrUnavailable: the bootstrap could not be completed for a reason on the platform's side
+// (the store did not answer, a write conflicted); the same request may succeed when retried.
+// The HTTP layer answers it with 503 so agent-init retries instead of giving up.
+var ErrUnavailable = errors.New("identity issuance temporarily unavailable, retry")
 
-// retireEarlier keeps only the newest live instance issued to this pod and retires the rest.
-// Every bootstrap does it after storing its own instance, so whichever looks last sees them
-// all; one that finds a newer instance than its own retires itself and fails (the caller
-// retries, and the newest stands).
-func (r *Registrar) retireEarlier(ctx context.Context, pod *PodInfo, n int) error {
-	ins, err := r.Store.ListInstances(ctx, pod.SandboxID)
+func unavailable(err error) error { return fmt.Errorf("%w: %v", ErrUnavailable, err) }
+
+// serialFor derives the certificate serial from the sandbox, the pod and the CSR's public
+// key: the same pod presenting the same key gets the same serial on every attempt. 127 bits
+// of SHA-256, positive and non-zero as RFC 5280 asks.
+func serialFor(sandboxID, pod string, csr *x509.CertificateRequest) (*big.Int, error) {
+	spki, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	newest := n
-	for _, in := range ins {
-		if in.RetiredAt == nil && in.PodName == pod.Name && in.N > newest {
-			newest = in.N
-		}
+	h := sha256.New()
+	fmt.Fprintf(h, "agent-sandbox serial\x00%s\x00%s\x00", sandboxID, pod)
+	h.Write(spki)
+	sum := h.Sum(nil)[:16]
+	sum[0] &= 0x7f
+	n := new(big.Int).SetBytes(sum)
+	if n.Sign() == 0 {
+		n.SetInt64(1)
 	}
-	for _, in := range ins {
-		if in.RetiredAt != nil || in.PodName != pod.Name || in.N >= newest {
-			continue
-		}
-		if err := r.Store.RetireInstance(ctx, in.N); err != nil {
-			return err
-		}
-		r.log().Warn("repeated bootstrap from the same pod: earlier identity retired", "pod", pod.Name, "sandbox", pod.SandboxID, "retired", in.N, "live", newest)
-	}
-	if newest != n {
-		return errSuperseded
-	}
-	return nil
+	return n, nil
 }
 
 // RetireSandbox retires every live instance of a sandbox (called when its pod is deleted).

@@ -2,13 +2,34 @@ package registrar
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"agent-sandbox/internal/ca"
+	"agent-sandbox/internal/identity"
 	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/store"
 )
+
+// checkCert runs the certificate a bootstrap returned through Registrar.Check, as authz does.
+func checkCert(t *testing.T, r *Registrar, res *BootstrapResponse) error {
+	t.Helper()
+	b, _ := pem.Decode([]byte(res.Cert))
+	cert, err := x509.ParseCertificate(b.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := identity.FromCert(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.Check(context.Background(), id)
+	return err
+}
 
 func liveInstances(t *testing.T, r *Registrar, sandbox string) []int {
 	t.Helper()
@@ -25,57 +46,93 @@ func liveInstances(t *testing.T, r *Registrar, sandbox string) []int {
 	return live
 }
 
-// A retry after a lost response used to leave two live identities for one pod until the pod
-// was deleted; the earlier one is retired now.
-func TestReviewRepeatedBootstrapFromThePodRetiresTheEarlierIdentity(t *testing.T) {
+// A retry after a lost response (same pod, same CSR) used to add a second live identity; now
+// it gets the same identity, and both certificates pass.
+func TestReviewRepeatedBootstrapGetsTheSameIdentity(t *testing.T) {
 	r, _ := newTestRegistrar(t)
 	ctx := context.Background()
 	_, csr, _ := ca.NewCSR("backend-dev")
-	if _, err := r.Bootstrap(ctx, "tok-pod-a", BootstrapRequest{CSR: string(csr)}); err != nil {
+	first, err := r.Bootstrap(ctx, "tok-pod-a", BootstrapRequest{CSR: string(csr)})
+	if err != nil {
 		t.Fatal(err)
 	}
 	second, err := r.Bootstrap(ctx, "tok-pod-a", BootstrapRequest{CSR: string(csr)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if live := liveInstances(t, r, "sb1"); len(live) != 1 || live[0] != second.Instance {
-		t.Fatalf("one live identity per pod, the latest: %v (latest %d)", live, second.Instance)
+	if first.Instance != second.Instance || !first.NotAfter.Equal(second.NotAfter) {
+		t.Fatalf("same pod and key, same identity: %d/%v vs %d/%v", first.Instance, first.NotAfter, second.Instance, second.NotAfter)
 	}
-}
-
-// Racing bootstraps from one pod must not retire each other.
-func TestReviewConcurrentBootstrapsLeaveOneIdentityLive(t *testing.T) {
-	r, _ := newTestRegistrar(t)
-	ctx := context.Background()
-	_, csr, _ := ca.NewCSR("backend-dev")
-	var wg sync.WaitGroup
-	for range 4 {
-		wg.Go(func() { _, _ = r.Bootstrap(ctx, "tok-pod-a", BootstrapRequest{CSR: string(csr)}) })
+	for _, res := range []*BootstrapResponse{first, second} {
+		if err := checkCert(t, r, res); err != nil {
+			t.Fatalf("every certificate returned must be valid: %v", err)
+		}
 	}
-	wg.Wait()
 	if live := liveInstances(t, r, "sb1"); len(live) != 1 {
-		t.Fatalf("racing bootstraps from one pod must leave exactly one live identity: %v", live)
+		t.Fatalf("one live identity: %v", live)
 	}
-}
-
-// Another pod of the same sandbox (a rollout) keeps its identity: only the same pod's earlier
-// ones are replaced, and the "no longer current" path still issues.
-func TestReviewBootstrapLeavesOtherPodsIdentities(t *testing.T) {
-	r, _ := newTestRegistrar(t)
-	ctx := context.Background()
-	r.Resolver = StaticResolver{
-		"tok-pod-a": {Name: "pod-a", SandboxID: "sb1", Slug: "backend-dev", Tenant: "u1"},
-		"tok-pod-b": {Name: "pod-b", SandboxID: "sb1", Slug: "backend-dev", Tenant: "u1"},
+	// A new key from the same pod replaces the identity: the earlier certificate stops.
+	_, csr2, _ := ca.NewCSR("backend-dev")
+	third, err := r.Bootstrap(ctx, "tok-pod-a", BootstrapRequest{CSR: string(csr2)})
+	if err != nil || third.Instance == first.Instance {
+		t.Fatalf("new key: %v %+v", err, third)
 	}
-	_, csr, _ := ca.NewCSR("backend-dev")
-	if _, err := r.Bootstrap(ctx, "tok-pod-b", BootstrapRequest{CSR: string(csr)}); err != nil {
+	if err := checkCert(t, r, first); err == nil {
+		t.Fatal("the identity of the replaced key must be retired")
+	}
+	if err := checkCert(t, r, third); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Bootstrap(ctx, "tok-pod-a", BootstrapRequest{CSR: string(csr)}); err != nil {
-		t.Fatalf("a pod that is no longer current still bootstraps: %v", err)
+}
+
+// Racing bootstraps from one pod with its one key: every one succeeds and every certificate
+// it returns passes Check (the old code could hand back a certificate it had just retired,
+// or fail with a "superseded" error agent-init treats as fatal).
+func TestReviewConcurrentBootstrapsAllReturnValidCertificates(t *testing.T) {
+	r, _ := newTestRegistrar(t)
+	ctx := context.Background()
+	_, csr, _ := ca.NewCSR("backend-dev")
+	const n = 8
+	res := make([]*BootstrapResponse, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() { res[i], errs[i] = r.Bootstrap(ctx, "tok-pod-a", BootstrapRequest{CSR: string(csr)}) })
 	}
-	if live := liveInstances(t, r, "sb1"); len(live) != 2 {
-		t.Fatalf("different pods keep their own identities: %v", live)
+	wg.Wait()
+	for i := range n {
+		if errs[i] != nil {
+			t.Fatalf("bootstrap %d: %v", i, errs[i])
+		}
+		if err := checkCert(t, r, res[i]); err != nil {
+			t.Fatalf("bootstrap %d returned a certificate that fails Check: %v", i, err)
+		}
+		if res[i].Instance != res[0].Instance {
+			t.Fatalf("one identity for one pod and key: %d vs %d", res[i].Instance, res[0].Instance)
+		}
+	}
+	if live := liveInstances(t, r, "sb1"); len(live) != 1 {
+		t.Fatalf("one live identity: %v", live)
+	}
+}
+
+// A store failure is the platform's, not the request's: it comes back as ErrUnavailable,
+// which the HTTP layer answers with a status agent-init retries.
+type failingBind struct{ store.Store }
+
+func (failingBind) BindInstance(context.Context, store.InstanceBinding, func(int, *model.Instance) (*model.Instance, error)) (*store.BoundInstance, error) {
+	return nil, errors.New("connection reset")
+}
+
+func TestReviewBootstrapStoreFailureIsRetryable(t *testing.T) {
+	r, st := newTestRegistrar(t)
+	r.Store = failingBind{st}
+	_, csr, _ := ca.NewCSR("backend-dev")
+	if _, err := r.Bootstrap(context.Background(), "tok-pod-a", BootstrapRequest{CSR: string(csr)}); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("a store failure must be retryable: %v", err)
+	}
+	if _, err := r.Bootstrap(context.Background(), "tok-pod-a", BootstrapRequest{CSR: "junk"}); err == nil || errors.Is(err, ErrUnavailable) {
+		t.Fatalf("a bad request stays a bad request: %v", err)
 	}
 }
 

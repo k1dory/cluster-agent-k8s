@@ -145,6 +145,12 @@ type SignRequest struct {
 	URIs     []*url.URL
 	TTL      time.Duration
 	NotAfter time.Time // optional hard cap
+	// Serial and NotBefore, when set, are used as given: a certificate issued again for the
+	// same identity and key (a repeated bootstrap) carries the same serial and validity as
+	// the first, so either copy is the same certificate to whoever checks it. NotAfter is then
+	// taken as is too.
+	Serial    *big.Int
+	NotBefore time.Time
 }
 
 // Sign issues a client certificate. The CSR's own names are ignored: identity comes
@@ -153,14 +159,21 @@ func (c *CA) Sign(req SignRequest) (*x509.Certificate, []byte, error) {
 	if err := req.CSR.CheckSignature(); err != nil {
 		return nil, nil, fmt.Errorf("csr signature: %w", err)
 	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))
-	if err != nil {
-		return nil, nil, err
+	serial := req.Serial
+	if serial == nil {
+		var err error
+		if serial, err = rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127)); err != nil {
+			return nil, nil, err
+		}
 	}
 	now := time.Now()
+	notBefore := now.Add(-5 * time.Minute)
 	notAfter := now.Add(req.TTL)
 	if !req.NotAfter.IsZero() && req.NotAfter.Before(notAfter) {
 		notAfter = req.NotAfter
+	}
+	if !req.NotBefore.IsZero() {
+		notBefore, notAfter = req.NotBefore, req.NotAfter
 	}
 	if notAfter.After(c.Cert.NotAfter) {
 		notAfter = c.Cert.NotAfter
@@ -169,7 +182,7 @@ func (c *CA) Sign(req SignRequest) (*x509.Certificate, []byte, error) {
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: req.CN},
 		URIs:         req.URIs,
-		NotBefore:    now.Add(-5 * time.Minute),
+		NotBefore:    notBefore,
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
