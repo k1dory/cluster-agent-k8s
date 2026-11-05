@@ -105,6 +105,10 @@ type Config struct {
 	// DefaultHarnessInput is the input mode of the deployment's default harness (kube.harness_input):
 	// a sandbox whose profile names no harness of its own runs it.
 	DefaultHarnessInput string
+	// StopTimeout bounds a pod stop: the cluster calls a stop makes once it has moved the sandbox
+	// to stopping, and how long the reconciler lets a sandbox sit in stopping with its pod alive
+	// before it takes the stop over (the replica that began it died). 0 → 2m.
+	StopTimeout time.Duration
 }
 
 // SlugQuota: the static configuration has no per-slug limits.
@@ -153,9 +157,11 @@ type Orchestrator struct {
 	ListenerPublishes bool
 
 	mu       sync.Mutex
-	waking   map[string]bool   // sandboxes this replica is watching to readiness
-	meta     map[string]sbMeta // sandbox id → tenant/slug, for stamping events
-	sessions map[string]string // run id → last harness session id stored, to skip repeated writes
+	waking   map[string]bool      // sandboxes this replica is watching to readiness
+	meta     map[string]sbMeta    // sandbox id → tenant/slug, for stamping events
+	sessions map[string]string    // run id → last harness session id stored, to skip repeated writes
+	stopping map[string]bool      // sandboxes this replica is taking down right now
+	stopSeen map[string]time.Time // when the reconciler first saw a sandbox stopping with its pod alive
 	leading  atomic.Bool
 }
 
@@ -175,11 +181,15 @@ func New(st store.Store, rt Runtime, ret Retirer, hub *events.Hub, cfg Config, l
 	if cfg.IdleCheckEvery == 0 {
 		cfg.IdleCheckEvery = time.Minute
 	}
+	if cfg.StopTimeout == 0 {
+		cfg.StopTimeout = 2 * time.Minute
+	}
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Orchestrator{Store: st, Runtime: rt, Retirer: ret, Hub: hub, Cfg: cfg, Log: log,
-		waking: map[string]bool{}, meta: map[string]sbMeta{}, sessions: map[string]string{}}
+		waking: map[string]bool{}, meta: map[string]sbMeta{}, sessions: map[string]string{},
+		stopping: map[string]bool{}, stopSeen: map[string]time.Time{}}
 }
 
 // Errors surfaced to the API.
@@ -427,6 +437,10 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 	if from != "" && from != sb.AgentVersion {
 		o.Log.Info("agent version switch", "id", sb.ID, "from", from, "to", sb.AgentVersion)
 	}
+	// The sandbox is waking now: creating the pod and recording it (or the failure) must not stop
+	// because the client went away, or the record stays waking with nothing behind it.
+	ctx, cancel := o.detached(ctx)
+	defer cancel()
 	pod, err := o.Runtime.CreatePod(ctx, sb)
 	if err != nil {
 		o.fail(ctx, id, "pod: "+err.Error())
@@ -673,6 +687,14 @@ func (o *Orchestrator) stopPod(ctx context.Context, id string, final model.Sandb
 	if err != nil {
 		return nil, err
 	}
+	o.mu.Lock()
+	o.stopping[id] = true
+	o.mu.Unlock()
+	defer func() { o.mu.Lock(); delete(o.stopping, id); o.mu.Unlock() }()
+	// The sandbox is stopping now: the rest no longer depends on the caller. A client that hangs
+	// up must not leave the pod running behind a record that says stopping.
+	ctx, cancel := o.detached(ctx)
+	defer cancel()
 	if err := o.Runtime.DeletePod(ctx, sb); err != nil {
 		o.fail(ctx, id, "delete pod: "+err.Error())
 		return nil, fmt.Errorf("%w: delete pod: %v", ErrRuntime, err)
@@ -687,6 +709,13 @@ func (o *Orchestrator) stopPod(ctx context.Context, id string, final model.Sandb
 		return o.startPod(ctx, id)
 	}
 	return o.setStatus(ctx, id, final, func(s *model.Sandbox) { s.PodName, s.IP = "", "" })
+}
+
+// detached returns a context that outlives the caller's (a request whose client went away) but
+// not forever: work that must finish once a state transition is written, and the bookkeeping of
+// its failure.
+func (o *Orchestrator) detached(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), o.Cfg.StopTimeout)
 }
 
 // cancelRunning settles the run that was executing in a sandbox whose pod is going away. Only
@@ -753,6 +782,7 @@ func (o *Orchestrator) Delete(ctx context.Context, id string) error {
 	err = o.Store.DeleteSandbox(ctx, id)
 	o.mu.Lock()
 	delete(o.meta, id)
+	delete(o.stopSeen, id)
 	o.mu.Unlock()
 	return err
 }
@@ -1322,6 +1352,64 @@ func (o *Orchestrator) lead(ctx context.Context, lease store.Lease) {
 	}
 }
 
+// reconcileStopping finishes a stop that was interrupted (the replica died, or its DeletePod
+// failed after the record said stopping). Once the runtime no longer knows the pod, the sandbox
+// settles as sleeping so it can be woken again. A pod still there after StopTimeout is deleted
+// again, in the background so a slow termination does not hold up the pass.
+func (o *Orchestrator) reconcileStopping(ctx context.Context, sb *model.Sandbox, now time.Time) {
+	_, _, err := o.Runtime.PodStatus(ctx, sb)
+	if errors.Is(err, ErrPodNotFound) {
+		o.forgetStop(sb.ID)
+		o.settleStopped(ctx, sb.ID)
+		return
+	}
+	if err != nil && !errors.Is(err, ErrPodTerminated) {
+		o.Log.Warn("cannot observe pod of a stopping sandbox", "id", sb.ID, "pod", sb.PodName, "err", err)
+		return
+	}
+	o.mu.Lock()
+	first, seen := o.stopSeen[sb.ID]
+	if !seen {
+		o.stopSeen[sb.ID], first = now, now
+	}
+	if o.stopping[sb.ID] || now.Sub(first) < o.Cfg.StopTimeout {
+		o.mu.Unlock()
+		return // a stop in progress, here or (for all we know) on another replica
+	}
+	o.stopping[sb.ID] = true
+	o.mu.Unlock()
+	o.Log.Warn("sandbox stuck stopping with its pod alive, deleting the pod again", "id", sb.ID, "pod", sb.PodName)
+	go func() {
+		defer func() { o.mu.Lock(); delete(o.stopping, sb.ID); o.mu.Unlock() }()
+		ctx, cancel := o.detached(context.Background())
+		defer cancel()
+		if err := o.Runtime.DeletePod(ctx, sb); err != nil {
+			o.Log.Error("delete pod of a stopping sandbox", "id", sb.ID, "err", err)
+			return // the next pass tries again
+		}
+		o.forgetStop(sb.ID)
+		if o.Retirer != nil {
+			if err := o.Retirer.RetireSandbox(ctx, sb.ID); err != nil {
+				o.Log.Error("retire identities", "id", sb.ID, "err", err)
+			}
+		}
+		o.cancelRunning(ctx, sb.ID)
+		o.settleStopped(ctx, sb.ID)
+	}()
+}
+
+// settleStopped moves a sandbox whose pod is gone from stopping to sleeping.
+func (o *Orchestrator) settleStopped(ctx context.Context, id string) {
+	_, _ = o.setStatusFrom(ctx, id, []model.SandboxStatus{model.StatusStopping}, model.StatusSleeping, func(s *model.Sandbox) { s.PodName, s.IP = "", "" })
+}
+
+// forgetStop drops what the reconciler remembered about a stuck stop.
+func (o *Orchestrator) forgetStop(id string) {
+	o.mu.Lock()
+	delete(o.stopSeen, id)
+	o.mu.Unlock()
+}
+
 // failRun settles a run whose executor is gone: status failed, the reason in the output, the
 // usual run.finished event. Clients watching the run see it end instead of hanging forever.
 func (o *Orchestrator) failRun(ctx context.Context, sandboxID string, r *model.Run, reason string) {
@@ -1361,6 +1449,9 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 	o.purgeFSBlobs(ctx)
 	now := time.Now()
 	for _, sb := range sbs {
+		if sb.Status != model.StatusStopping {
+			o.forgetStop(sb.ID)
+		}
 		switch {
 		case sb.Status == model.StatusDeleting:
 			// A delete the cluster refused earlier: try again.
@@ -1382,11 +1473,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			o.fail(ctx, sb.ID, "creation did not complete (control plane restarted?); wake to retry")
 			continue
 		case sb.Status == model.StatusStopping:
-			// A stop interrupted by a replica restart: once the runtime no longer knows the pod,
-			// settle as sleeping so the sandbox can be woken again.
-			if _, _, err := o.Runtime.PodStatus(ctx, sb); errors.Is(err, ErrPodNotFound) {
-				_, _ = o.setStatusFrom(ctx, sb.ID, []model.SandboxStatus{model.StatusStopping}, model.StatusSleeping, func(s *model.Sandbox) { s.PodName, s.IP = "", "" })
-			}
+			o.reconcileStopping(ctx, sb, now)
 			continue
 		}
 		if sb.Status != model.StatusRunning {
