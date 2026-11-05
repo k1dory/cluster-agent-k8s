@@ -20,11 +20,11 @@ case "${1:-plain}" in
     echo "helm: $HELM_VERSION"
     echo "postgres: $POSTGRES_IMAGE"
     echo "docker cli (when the runner has none): $DOCKER_CLI_VERSION"
-    echo "agent image harnesses: claude-code $CLAUDE_CODE_VERSION, codex $CODEX_VERSION"
+    echo "agent image harnesses: claude-code $CLAUDE_CODE_VERSION, codex $CODEX_VERSION, claude-agent-acp $CLAUDE_AGENT_ACP_VERSION, codex-acp $CODEX_ACP_VERSION"
     echo "cosign: $COSIGN_VERSION"
     ;;
   build-args)
-    echo "--build-arg CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION --build-arg CODEX_VERSION=$CODEX_VERSION"
+    echo "--build-arg CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION --build-arg CODEX_VERSION=$CODEX_VERSION --build-arg CLAUDE_AGENT_ACP_VERSION=$CLAUDE_AGENT_ACP_VERSION --build-arg CODEX_ACP_VERSION=$CODEX_ACP_VERSION"
     ;;
   verify)
     # Where a provider file cannot read versions.env (GitLab's service and job images are

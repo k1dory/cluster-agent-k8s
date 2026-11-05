@@ -1,0 +1,25 @@
+# EnvironmentProfile: Codex over the Agent Client Protocol. The command is the ACP adapter
+# (@agentclientprotocol/codex-acp, built on Codex's app-server, pinned in the agent image).
+# Unlike `codex exec`, a conversation stays open (messages are prompts of one session), file
+# changes come with their diffs and approvals reach `permissions`. docs/chat-and-files.md,
+# "ACP harnesses".
+#
+# Credentials: the pod holds a placeholder API key; the policy rule for api.openai.com injects
+# the tenant's key (docs/self-service.md). codex-acp refuses a session until it is told how to
+# authenticate: DEFAULT_AUTH_REQUEST selects its api-key method (the generic way for any ACP
+# agent is `harness.auth_method`, which the runner sends as ACP authenticate). NO_BROWSER keeps
+# the adapter from opening a login.
+# Apply:  sandboxctl apply -f examples/catalog/environment-codex-acp.yaml
+kind: EnvironmentProfile
+name: codex-acp
+description: Codex over ACP, the API key held by the gateway
+spec:
+  image: stable
+  harness:
+    command: codex-acp
+    input: acp
+    permissions: allow
+  env:
+    OPENAI_API_KEY: placeholder-the-gateway-injects-the-real-key
+    DEFAULT_AUTH_REQUEST: '{"methodId":"api-key"}'
+    NO_BROWSER: "1"

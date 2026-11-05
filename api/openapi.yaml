@@ -1883,6 +1883,10 @@ components:
         harness_command: { type: string }
         harness_resume_command: { type: string }
         resume_prompt: { type: string }
+        harness_input: { type: string, enum: [text, stream-json, acp], description: "How the runner hands messages to the harness (the profile's harness.input); exported as HARNESS_INPUT" }
+        chat_idle: { type: integer, description: "stream-json and acp: seconds without a message after a turn before the conversation is closed (0 = 600); exported as HARNESS_CHAT_IDLE" }
+        harness_permissions: { type: string, enum: [allow, deny], description: "acp: how the agent's permission requests are answered (absent = allow); exported as HARNESS_PERMISSIONS" }
+        harness_auth_method: { type: string, description: "acp: the authentication method the agent is told to use; exported as HARNESS_AUTH_METHOD" }
         model: { type: string, description: "Exported as SANDBOX_MODEL and ANTHROPIC_MODEL" }
         instructions: { type: string, description: "Exported as SANDBOX_INSTRUCTIONS" }
         env: { type: object, additionalProperties: { type: string } }
@@ -2128,8 +2132,10 @@ components:
             command: { type: string }
             resume_command: { type: string, description: "Continues a session: $SANDBOX_SESSION, the message (or the rollout prompt) in $SANDBOX_RESUME_PROMPT" }
             resume_prompt: { type: string, description: "What a rollout resume tells the harness (default: continue the task)" }
-            input: { type: string, enum: [text, stream-json], description: "How messages reach the harness: a line on stdin, or Claude Code's streaming JSON input (keeps the conversation open)" }
-            chat_idle: { type: integer, minimum: 0, description: "stream-json: seconds without a message after a turn before the runner closes the conversation (0 = 600)" }
+            input: { type: string, enum: [text, stream-json, acp], description: "How messages reach the harness: a line on stdin, Claude Code's streaming JSON input (keeps the conversation open), or the Agent Client Protocol (the command is an ACP agent; every message is a prompt of the same session)" }
+            permissions: { type: string, enum: [allow, deny], description: "input acp only: how the runner answers the agent's permission requests (default allow); every request and decision is recorded in the run's output" }
+            auth_method: { type: string, pattern: "^[A-Za-z0-9._:-]{1,64}$", description: "input acp only: the id of the authentication method the runner asks the agent to use (ACP authenticate; one of the agent's authMethods, e.g. codex-acp's api-key)" }
+            chat_idle: { type: integer, minimum: 0, description: "stream-json and acp: seconds without a message after a turn before the runner closes the conversation (0 = 600)" }
             files:
               type: object
               maxProperties: 16

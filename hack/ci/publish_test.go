@@ -91,7 +91,8 @@ func TestPublishSignsEveryDigestUnderTheCommitTag(t *testing.T) {
 		if !strings.Contains(line, "org.opencontainers.image.revision="+head) {
 			t.Errorf("a build without its revision label: %s", line)
 		}
-		if strings.Contains(line, "/agent:") && (!strings.Contains(line, "CLAUDE_CODE_VERSION=") || !strings.Contains(line, "CODEX_VERSION=")) {
+		if strings.Contains(line, "/agent:") && (!strings.Contains(line, "CLAUDE_CODE_VERSION=") || !strings.Contains(line, "CODEX_VERSION=") ||
+			!strings.Contains(line, "CLAUDE_AGENT_ACP_VERSION=") || !strings.Contains(line, "CODEX_ACP_VERSION=")) {
 			t.Errorf("the agent built without the pinned harnesses: %s", line)
 		}
 	}

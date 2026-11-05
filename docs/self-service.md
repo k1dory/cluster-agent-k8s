@@ -244,6 +244,10 @@ default harness command loads it with `--mcp-config`. A custom `harness.command`
 `"$SANDBOX_MCP_CONFIG"` itself where it wants it. The gateway decides what each call may do; the
 configuration only tells the harness where the servers are.
 
+An ACP agent (`harness.input: acp`, e.g. `command: claude-agent-acp` or `codex-acp`) gets the
+same servers in its `session/new` instead of a configuration file, and the definition's
+instructions ahead of its first prompt; see docs/chat-and-files.md, "ACP harnesses".
+
 ## What stays with the operator
 
 - The policy repository: the slugs and the network rules reviewed as code, their `tenants:`

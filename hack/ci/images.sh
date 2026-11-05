@@ -30,6 +30,17 @@ harness() { # harness LABEL-NAME COMMAND WANT
 }
 harness claude-code claude "$CLAUDE_CODE_VERSION"
 harness codex codex "$CODEX_VERSION"
+# The ACP adapters speak JSON-RPC on stdio and have no --version: the label and the installed
+# package are what pin them.
+acp_adapter() { # acp_adapter LABEL-NAME PACKAGE WANT
+  local label seen
+  label=$(docker inspect -f "{{ index .Config.Labels \"io.agent-sandbox.harness.$1.version\" }}" "$agent")
+  [ "$label" = "$3" ] || ci_die "images: label io.agent-sandbox.harness.$1.version is '$label', versions.env says $3"
+  seen=$(docker run --rm --entrypoint /bin/sh "$agent" -lc "npm ls -g --depth=0 $2 2>/dev/null; command -v $1" 2>&1 || true)
+  case "$seen" in *"$2@$3"*/"$1"*) echo "$1 $3" ;; *) ci_die "images: $2@$3 or the $1 command is missing from the agent image: '$seen'" ;; esac
+}
+acp_adapter claude-agent-acp @agentclientprotocol/claude-agent-acp "$CLAUDE_AGENT_ACP_VERSION"
+acp_adapter codex-acp @agentclientprotocol/codex-acp "$CODEX_ACP_VERSION"
 
 echo "== control plane: git present, nonroot"
 docker run --rm --entrypoint git "$sandboxd" --version

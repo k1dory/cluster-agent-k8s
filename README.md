@@ -230,7 +230,8 @@ sandbox and its runs record `agent_ref` / `environment_ref` the same way.
 A profile's `env` (and `model.env`) is the agent container's only: it never reaches the init
 containers that lock the network and bootstrap the identity, and it cannot set a platform name
 (`SANDBOX_*`, `GATEWAY_IP`, `REGISTRAR_URL`, `API_URL`, `CERT_DIR`, `HOME`, `HARNESS_CMD`,
-`HARNESS_RESUME_CMD`, `GATEWAY_CA_FILE`: refused with 422) or shadow the operator's `agent.env`.
+`HARNESS_RESUME_CMD`, `HARNESS_INPUT`, `HARNESS_CHAT_IDLE`, `HARNESS_PERMISSIONS`, `HARNESS_AUTH_METHOD`,
+`GATEWAY_CA_FILE`: refused with 422) or shadow the operator's `agent.env`.
 The model name and the instructions are exported by the platform (`SANDBOX_MODEL`,
 `ANTHROPIC_MODEL`, `SANDBOX_INSTRUCTIONS`). Resources are Kubernetes quantities, positive, with
 requests within limits. See `examples/catalog/` for a working pair of documents.

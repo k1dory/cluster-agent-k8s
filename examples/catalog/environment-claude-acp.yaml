@@ -1,0 +1,23 @@
+# EnvironmentProfile: Claude over the Agent Client Protocol. The command is the ACP adapter
+# (@agentclientprotocol/claude-agent-acp, built on the Claude Agent SDK, pinned in the agent
+# image); agent-runner is its client: every message of the conversation is a prompt of one ACP
+# session, the agent's tool calls arrive with their diffs, its permission requests are answered
+# by `permissions` and recorded. docs/chat-and-files.md, "ACP harnesses".
+#
+# Credentials: the Agent SDK's terms ask for an API key, not a claude.ai login, in products built
+# on it (https://code.claude.com/docs/en/agent-sdk/overview). The pod holds a placeholder; the
+# policy rule for api.anthropic.com injects `x-api-key: secret:anthropic` (docs/self-service.md).
+# Apply:  sandboxctl apply -f examples/catalog/environment-claude-acp.yaml
+kind: EnvironmentProfile
+name: claude-acp
+description: Claude Agent SDK over ACP, the API key held by the gateway
+spec:
+  image: stable
+  harness:
+    command: claude-agent-acp
+    input: acp
+    permissions: allow
+  model:
+    name: claude-opus-5-5
+  env:
+    ANTHROPIC_API_KEY: placeholder-the-gateway-injects-the-real-key

@@ -273,6 +273,13 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 		case os.Getenv("SANDBOX_RESUME_PROMPT") == "":
 			env = append(env, "SANDBOX_RESUME_PROMPT=The sandbox was restarted to update the agent. Continue the task where you left off.")
 		}
+	}
+	// An ACP harness is one program for the whole conversation: a resume is session/load of the
+	// same agent, MCP servers go into session/new, the runner is its client (acp.go).
+	if os.Getenv("HARNESS_INPUT") == harness.InputACP {
+		return executeACP(ctx, c, run, cmdline, env)
+	}
+	if run.ResumeOf != "" {
 		switch resume := os.Getenv("HARNESS_RESUME_CMD"); {
 		case run.Session != "" && resume != "":
 			cmdline = resume
@@ -327,7 +334,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); streamOutput(c, run.ID, stdout, chat.sawLine) }()
-	go func() { defer wg.Done(); forwardInput(runCtx, c, run.ID, stdin, cancel, chat) }()
+	go func() { defer wg.Done(); forwardInput(runCtx, c, run.ID, stdinSink{stdin, chat.mode}, cancel, chat) }()
 
 	err = cmd.Wait()
 	cancel()
@@ -342,9 +349,48 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	return 0
 }
 
+// maxOutputLine is the longest output line the runner forwards. A longer one is dropped with a
+// notice and reading goes on: a reader that stopped would leave the harness (or the ACP bridge)
+// blocked on its next write for the rest of the run.
+const maxOutputLine = 1 << 20
+
+// readLines sends r's lines to out, each without its newline, until EOF or a read error; a line
+// longer than max is replaced by a notice.
+func readLines(r io.Reader, max int, out chan<- string) {
+	br := bufio.NewReaderSize(r, 64<<10)
+	var line []byte
+	dropped := 0
+	for {
+		chunk, err := br.ReadSlice('\n')
+		switch {
+		case dropped > 0:
+			dropped += len(chunk)
+		case len(line)+len(chunk) > max+1: // +1: the newline does not count
+			dropped = len(line) + len(chunk)
+			line = line[:0]
+		default:
+			line = append(line, chunk...)
+		}
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		if dropped > 0 {
+			if err == nil {
+				dropped-- // the newline
+			}
+			out <- fmt.Sprintf("[agent-runner] dropped an output line of %d bytes (limit %d)", dropped, max)
+			dropped = 0
+		} else if len(line) > 0 || err == nil {
+			out <- strings.TrimSuffix(strings.TrimSuffix(string(line), "\n"), "\r")
+		}
+		line = line[:0]
+		if err != nil {
+			return
+		}
+	}
+}
+
 func streamOutput(c *client, runID string, r io.Reader, onLine func(string)) {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	var batch []string
 	flush := func() {
 		if len(batch) > 0 {
@@ -356,9 +402,7 @@ func streamOutput(c *client, runID string, r io.Reader, onLine func(string)) {
 	defer t.Stop()
 	lines := make(chan string)
 	go func() {
-		for sc.Scan() {
-			lines <- sc.Text()
-		}
+		readLines(r, maxOutputLine, lines)
 		close(lines)
 	}()
 	for {
@@ -479,12 +523,24 @@ func chatIdle() time.Duration {
 	return time.Duration(n) * time.Second
 }
 
+// sawLine follows the harness's output: a turn end starts the idle countdown, and a turn (the
+// agent speaking or calling a tool) stops it again — the harness went on with a message that was
+// queued while the previous turn ran.
 func (s *chatState) sawLine(line string) {
-	if harness.IsTurnEnd(line) {
-		s.mu.Lock()
-		s.turnEnd = time.Now()
-		s.mu.Unlock()
+	switch {
+	case harness.IsTurnEnd(line):
+		s.turnEnded()
+	default:
+		if role, _ := harness.ParseMessage(line); role != "" {
+			s.sent()
+		}
 	}
+}
+
+func (s *chatState) turnEnded() {
+	s.mu.Lock()
+	s.turnEnd = time.Now()
+	s.mu.Unlock()
 }
 
 func (s *chatState) sent() {
@@ -503,15 +559,42 @@ func (s *chatState) idleFor() time.Duration {
 	return time.Since(s.turnEnd)
 }
 
+// inputSink is where forwardInput hands the user's messages: the harness's stdin, or the
+// prompts of an ACP session. Close ends the conversation.
+type inputSink interface {
+	Send(text string) error
+	Close() error
+}
+
+// stdinSink writes each message to the harness's stdin in its input mode.
+type stdinSink struct {
+	w    io.WriteCloser
+	mode string
+}
+
+func (s stdinSink) Send(text string) error {
+	_, err := io.WriteString(s.w, harness.FormatInput(s.mode, text))
+	return err
+}
+
+func (s stdinSink) Close() error { return s.w.Close() }
+
+// streams says whether the harness takes messages during a run: stream-json on stdin, or the
+// next prompt of an ACP session.
+func (s *chatState) streams() bool {
+	return s.mode == harness.InputStreamJSON || s.mode == harness.InputACP
+}
+
 // forwardInput delivers the user's messages to the harness: input events as lines (or
-// stream-json user messages), run.cancel as a kill, run.close as end of input. In stream-json
-// mode the conversation is also closed after the idle period following a completed turn.
-func forwardInput(ctx context.Context, c *client, runID string, w io.WriteCloser, cancelRun context.CancelFunc, chat *chatState) {
+// stream-json user messages, or ACP prompts), run.cancel as a kill, run.close as end of input.
+// In a streaming mode the conversation is also closed after the idle period following a
+// completed turn.
+func forwardInput(ctx context.Context, c *client, runID string, w inputSink, cancelRun context.CancelFunc, chat *chatState) {
 	defer w.Close()
 	var after int64
 	for ctx.Err() == nil {
 		wait := 30 * time.Second
-		if chat.mode == harness.InputStreamJSON {
+		if chat.streams() {
 			if idle := chat.idleFor(); idle > 0 {
 				if idle >= chat.idle {
 					fmt.Printf("agent-runner: no message for %s after the last turn, closing the conversation\n", chat.idle)
@@ -540,14 +623,14 @@ func forwardInput(ctx context.Context, c *client, runID string, w io.WriteCloser
 				fmt.Println("agent-runner: conversation closed by the control plane")
 				return
 			}
-			if chat.mode != harness.InputStreamJSON {
+			if !chat.streams() {
 				// stdin is closed (see execute). The control plane turns a message for a
 				// text-mode harness into the next run and refuses input, so this is an event
 				// from before the sandbox's mode changed; cancel and close above still apply.
 				fmt.Println("agent-runner: input event ignored: a text-mode harness reads only its task")
 				continue
 			}
-			if _, err := io.WriteString(w, harness.FormatInput(chat.mode, e.Data)); err != nil {
+			if err := w.Send(e.Data); err != nil {
 				return
 			}
 			chat.sent()
