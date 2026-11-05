@@ -135,7 +135,25 @@ func TestReviewFinishRacingCancelKeepsUsage(t *testing.T) {
 	}
 }
 
-// The claim stamps what executes the run in the same write; Output never rewrites it.
+// claimHookStore runs hook once, right after the store claimed a run and before NextRun
+// resumes: another writer acting on the freshly claimed run.
+type claimHookStore struct {
+	store.Store
+	hook func(r *model.Run)
+}
+
+func (s *claimHookStore) ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string, stamp store.RunStamp) (*model.Run, error) {
+	r, err := s.Store.ClaimRun(ctx, runID, startedAt, session, stamp)
+	if h := s.hook; h != nil && err == nil {
+		s.hook = nil
+		h(r)
+	}
+	return r, err
+}
+
+// The claim stamps what executes the run in the same write. NextRun used to stamp it with a
+// second, full-row write from its copy afterwards: a usage line or a cancel landing between
+// the claim and that write was overwritten (the run back to running with no usage).
 func TestReviewClaimStampsAgentVersion(t *testing.T) {
 	o, _, sb := reviewRunningSandbox(t)
 	ctx := context.Background()
@@ -145,6 +163,16 @@ func TestReviewClaimStampsAgentVersion(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	hs := &claimHookStore{Store: o.Store}
+	o.Store = hs
+	hs.hook = func(r *model.Run) {
+		if err := o.Output(ctx, sb.ID, r.ID, `{"type":"usage","output_tokens":3}`); err != nil {
+			t.Error(err)
+		}
+		if _, err := o.CancelRun(ctx, sb.ID, r.ID); err != nil {
+			t.Error(err)
+		}
+	}
 	if _, err := o.CreateRun(ctx, sb.ID, "task"); err != nil {
 		t.Fatal(err)
 	}
@@ -152,9 +180,11 @@ func TestReviewClaimStampsAgentVersion(t *testing.T) {
 	if err != nil || run.AgentVersion != "img:7" || run.AgentRevision != 2 || run.EnvironmentRevision != 5 {
 		t.Fatalf("claimed run: %v %+v", err, run)
 	}
-	_ = o.Output(ctx, sb.ID, run.ID, `{"type":"system","session_id":"s-9"}`)
 	got, _ := o.Store.GetRun(ctx, run.ID)
-	if got.AgentVersion != "img:7" || got.AgentRef != "worker" || got.EnvironmentRef != "base" || got.Session != "s-9" {
-		t.Fatalf("run after output: %+v", got)
+	if got.Status != model.RunCancelled || got.FinishedAt == nil || got.Usage.OutputTokens != 3 {
+		t.Fatalf("cancel and usage recorded between the claim and NextRun's return were lost: %+v", got)
+	}
+	if got.AgentVersion != "img:7" || got.AgentRef != "worker" || got.EnvironmentRef != "base" {
+		t.Fatalf("stamp: %+v", got)
 	}
 }
