@@ -138,6 +138,18 @@ harness:
   configuration is a harness file, `.config/opencode/opencode.json`: with its `permission` rules
   at `ask`, every edit and shell command reaches `permissions` and the run's output; `autoupdate`
   off, `share` disabled and `OPENCODE_DISABLE_MODELS_FETCH` keep it from egress a pod has no use for.
+- **Hermes Agent** (`command: hermes acp`, `examples/catalog/environment-hermes-acp.yaml`) runs
+  from its own image, `agent-hermes`: the official Hermes image pinned by digest
+  (`HERMES_IMAGE` in `hack/ci/versions.env`) with agent-init, agent-runner, the network lock and
+  user 1000 added (`images/agent-hermes/Dockerfile`). Hermes ships as that image, not as a
+  package the default agent image could install. The admin publishes it as a version of the
+  agent catalogue (`agent.versions.hermes: …/agent-hermes:sha-…@sha256:…`) and the profile names
+  `image: hermes`. `HERMES_HOME` is `~/.hermes` on the workspace volume (config, sessions,
+  memory, skills survive restarts); its configuration is a harness file, `.hermes/config.yaml`.
+  Hermes's own login is interactive and not used: the provider key is a placeholder in `env`.
+- **Checked offline in CI.** `hack/ci/images.sh` runs the ACP smoke tests inside the built
+  images with no network: the shipped Codex, OpenCode and Hermes profiles open a session with
+  the real agent, and OpenCode's and Hermes's are loaded again by a second process (the next run).
 - **Long lines.** For every harness, an output line over 1 MiB is replaced by a
   `[agent-runner] dropped an output line …` notice and reading goes on, so the harness never
   blocks on a reader that gave up.

@@ -95,6 +95,7 @@ images:
 	docker build -f images/sandboxd/Dockerfile -t $(REGISTRY)/sandboxd:$(TAG) .
 	docker build -f images/sandboxd/Dockerfile --target sandboxctl -t $(REGISTRY)/sandboxctl:$(TAG) .
 	docker build -f images/agent/Dockerfile $$(hack/ci/versions.sh build-args) -t $(REGISTRY)/agent:$(TAG) .
+	docker build -f images/agent-hermes/Dockerfile $$(hack/ci/versions.sh hermes-build-args) -t $(REGISTRY)/agent-hermes:$(TAG) .
 
 # Publishing is a separate, explicitly configured action (docs/ci-contract.md, rule 5), not a
 # check: linux/amd64 images of sandboxd, sandboxctl and the agent pushed to IMAGE_REPO under the
