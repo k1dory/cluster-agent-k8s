@@ -27,12 +27,19 @@ func TestReviewKeyUsageCannotUndoRevocation(t *testing.T) {
 	ctx := t.Context()
 	mem := store.NewMemory()
 	st := &reviewKeyTouchStore{Store: mem}
-	s := &Service{Store: st}
-	admin := &Service{Store: mem}
+	clock := time.Now()
+	s := &Service{Store: st, Now: func() time.Time { return clock }}
+	admin := &Service{Store: mem, Now: func() time.Time { return clock }}
 	k, secret, err := s.Create(ctx, "acme", "review", 0, "operator")
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A later use (the first is recorded atomically, see FirstUseAPIKey): its best-effort
+	// timestamp write is what races the revocation.
+	if _, err := s.Authenticate(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(2 * time.Minute)
 	// Another request revokes the key after authentication read it, before its usage
 	// timestamp is saved. Bookkeeping must leave the completed revocation intact.
 	st.beforeTouch = func() {

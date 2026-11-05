@@ -435,6 +435,11 @@ type Atomics interface {
 	// LockedAPIKey reads a key under its row lock: it waits for a transaction holding the row
 	// (a rotation whose COMMIT is still completing) and returns what that left.
 	LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error)
+	// FirstUseAPIKey records a key's first use, only while it is still active at `at`:
+	// ErrKeyInactive otherwise (a rotation withdrew it meanwhile; the write waits for that
+	// rotation's row lock). Rotation treats a key without a recorded use as unused, so a
+	// first use must be durable before it is let through.
+	FirstUseAPIKey(ctx context.Context, id string, at time.Time) error
 	// SwapBlob replaces the blob under name with data only if it still holds old, and reports
 	// whether it did (false: another writer got there first). ErrNotFound when absent.
 	SwapBlob(ctx context.Context, name string, old, data []byte) (bool, error)

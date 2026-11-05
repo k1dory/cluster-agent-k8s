@@ -42,6 +42,7 @@ type Store interface {
 	store.APIKeys
 	RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, opts store.RotateOptions) error
 	LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error)
+	FirstUseAPIKey(ctx context.Context, id string, at time.Time) error
 }
 
 // MaxTTL caps a key's lifetime when the caller names one longer; 0 = no cap.
@@ -220,9 +221,24 @@ func (s *Service) Authenticate(ctx context.Context, token string) (*model.APIKey
 	if every == 0 {
 		every = time.Minute
 	}
-	if k.LastUsedAt == nil || now.Sub(*k.LastUsedAt) >= every {
+	if k.LastUsedAt == nil {
+		// The first use is recorded before it is let through: a rotation repeated on the
+		// parent key withdraws a successor with no recorded use, so an unrecorded use would
+		// have its working key revoked. The write succeeds only while the key is still active
+		// (it waits for such a rotation); a failure fails the request.
+		switch err := s.Store.FirstUseAPIKey(ctx, k.ID, now); {
+		case errors.Is(err, store.ErrKeyInactive), errors.Is(err, store.ErrNotFound):
+			return nil, ErrBadKey
+		case err != nil:
+			return nil, fmt.Errorf("recording the key's first use: %w", err)
+		}
+		k.LastUsedAt = &now
+		return k, nil
+	}
+	if now.Sub(*k.LastUsedAt) >= every {
 		// Only the use is recorded, never the record we read: a revocation that landed between
-		// our read and this write is not undone. A lost touch is not an authentication failure.
+		// our read and this write is not undone. A lost later touch is not an authentication
+		// failure.
 		if err := s.Store.TouchAPIKey(ctx, k.ID, now); err == nil {
 			k.LastUsedAt = &now
 		}

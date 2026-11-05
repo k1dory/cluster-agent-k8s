@@ -27,6 +27,7 @@ type Memory struct {
 	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
 	applies   map[string]*model.Apply
 	apiKeys   map[string]*model.APIKey
+	keyOrigin map[string]*time.Time // api key id → its original_expires_at (Postgres: a column)
 	tokenUses map[string]tokenUse
 	gitSyncs  map[string]*model.GitSync
 	gitJobs   map[string]*model.GitJob
@@ -1051,6 +1052,7 @@ func (m *Memory) DeleteAPIKey(_ context.Context, id string) error {
 		return ErrNotFound
 	}
 	delete(m.apiKeys, id)
+	delete(m.keyOrigin, id)
 	return nil
 }
 
@@ -1061,6 +1063,7 @@ func (m *Memory) PruneTrustedAPIKeys(_ context.Context, before time.Time) (int, 
 	for id, k := range m.apiKeys {
 		if k.Trust != "" && k.ExpiresAt != nil && k.ExpiresAt.Before(before) {
 			delete(m.apiKeys, id)
+			delete(m.keyOrigin, id)
 			n++
 		}
 	}
@@ -1568,27 +1571,35 @@ func earliest(a, b *time.Time) *time.Time {
 	return &t
 }
 
-// memKeyOrigins holds each Memory's original_expires_at column (Postgres: a column of
-// api_keys): kept beside the struct so the store's other code is untouched.
-var (
-	memKeyOriginsMu sync.Mutex
-	memKeyOrigins   = map[*Memory]map[string]*time.Time{}
-)
-
+// memKeyOrigin and setMemKeyOrigin read and write the original_expires_at a rotation kept;
+// m.mu held. The entry goes with the key (DeleteAPIKey, PruneTrustedAPIKeys), as the column
+// goes with the row.
 func memKeyOrigin(m *Memory, id string) (*time.Time, bool) {
-	memKeyOriginsMu.Lock()
-	defer memKeyOriginsMu.Unlock()
-	t, ok := memKeyOrigins[m][id]
+	t, ok := m.keyOrigin[id]
 	return t, ok
 }
 
 func setMemKeyOrigin(m *Memory, id string, t *time.Time) {
-	memKeyOriginsMu.Lock()
-	defer memKeyOriginsMu.Unlock()
-	if memKeyOrigins[m] == nil {
-		memKeyOrigins[m] = map[string]*time.Time{}
+	if m.keyOrigin == nil {
+		m.keyOrigin = map[string]*time.Time{}
 	}
-	memKeyOrigins[m][id] = t
+	m.keyOrigin[id] = t
+}
+
+// FirstUseAPIKey: see Atomics.
+func (m *Memory) FirstUseAPIKey(_ context.Context, id string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.apiKeys[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if k.RevokedAt != nil || !k.Active(at) {
+		return ErrKeyInactive
+	}
+	t := at
+	k.LastUsedAt = &t
+	return nil
 }
 
 // SwapBlob: see Atomics.

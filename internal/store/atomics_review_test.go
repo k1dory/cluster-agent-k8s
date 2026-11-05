@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -327,4 +328,64 @@ func TestReviewPostgresLockedAPIKeyWaitsForTheCommit(t *testing.T) {
 	if k := <-got; k == nil || k.RotatedTo != "lk-next" {
 		t.Fatalf("the locked read returns what committed: %+v", k)
 	}
+}
+
+// A first use racing the withdrawal of its key: never both a recorded (successful) first use
+// and a withdrawal; a revoked key's first use fails.
+func TestReviewFirstUseIsSerialisedWithWithdrawal(t *testing.T) {
+	bothStores(t, func(t *testing.T, st Store) {
+		ctx := t.Context()
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		for i := range 20 {
+			id := func(s string) string { return fmt.Sprintf("fu-%s-%d", s, i) }
+			if err := st.CreateAPIKey(ctx, &model.APIKey{ID: id("old"), Tenant: "acme", Name: "ci", Hash: id("h"), CreatedAt: now}); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.RotateAPIKey(ctx, id("old"), &model.APIKey{ID: id("s1"), Tenant: "acme", Name: "ci", Hash: id("h1")}, now, RotateOptions{Grace: time.Hour}); err != nil {
+				t.Fatal(err)
+			}
+			var wg sync.WaitGroup
+			var useErr, rotErr error
+			wg.Go(func() { useErr = st.FirstUseAPIKey(ctx, id("s1"), now) })
+			wg.Go(func() {
+				rotErr = st.RotateAPIKey(ctx, id("old"), &model.APIKey{ID: id("s2"), Tenant: "acme", Name: "ci", Hash: id("h2")}, now, RotateOptions{Grace: time.Hour})
+			})
+			wg.Wait()
+			if useErr == nil && rotErr == nil {
+				t.Fatalf("round %d: a recorded first use and a withdrawal of the same key", i)
+			}
+			if useErr != nil && !errors.Is(useErr, ErrKeyInactive) {
+				t.Fatalf("round %d: %v", i, useErr)
+			}
+		}
+	})
+}
+
+// Deleting a rotated key and creating its id again must not inherit the deleted key's
+// original expiry (Postgres drops it with the row; Memory kept it in a global map).
+func TestReviewOriginalExpiryGoesWithTheKey(t *testing.T) {
+	bothStores(t, func(t *testing.T, st Store) {
+		ctx := t.Context()
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		hour, ten := now.Add(time.Hour), now.Add(10*time.Hour)
+		if err := st.CreateAPIKey(ctx, &model.APIKey{ID: "re", Tenant: "acme", Name: "ci", Hash: "h", CreatedAt: now, ExpiresAt: &hour}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RotateAPIKey(ctx, "re", &model.APIKey{ID: "re-1", Tenant: "acme", Name: "ci", Hash: "h1"}, now, RotateOptions{Grace: time.Minute, InheritExpiry: true}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.DeleteAPIKey(ctx, "re"); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.CreateAPIKey(ctx, &model.APIKey{ID: "re", Tenant: "acme", Name: "ci", Hash: "h", CreatedAt: now, ExpiresAt: &ten}); err != nil {
+			t.Fatal(err)
+		}
+		next := &model.APIKey{ID: "re-2", Tenant: "acme", Name: "ci", Hash: "h2"}
+		if err := st.RotateAPIKey(ctx, "re", next, now, RotateOptions{Grace: time.Minute, InheritExpiry: true}); err != nil {
+			t.Fatal(err)
+		}
+		if next.ExpiresAt == nil || !next.ExpiresAt.Equal(ten) {
+			t.Fatalf("the recreated key's own expiry %v must be inherited, got %v", ten, next.ExpiresAt)
+		}
+	})
 }

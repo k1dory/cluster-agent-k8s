@@ -1833,3 +1833,23 @@ func (p *Postgres) BindInstance(ctx context.Context, b InstanceBinding, issue fu
 	}
 	return out, nil
 }
+
+// FirstUseAPIKey: see Atomics. The UPDATE waits for a rotation holding the row and then
+// re-checks its WHERE on what that rotation committed.
+func (p *Postgres) FirstUseAPIKey(ctx context.Context, id string, at time.Time) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE api_keys SET last_used_at=$2
+		WHERE id=$1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > $2)`, id, at)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	var one int
+	if err := p.pool.QueryRow(ctx, `SELECT 1 FROM api_keys WHERE id=$1`, id).Scan(&one); errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return err
+	}
+	return ErrKeyInactive
+}

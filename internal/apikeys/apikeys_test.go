@@ -145,8 +145,13 @@ func TestAUseOrARotationNeverUndoesARevocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Use: the key is read as active, revoked by someone else, then its use is recorded. The
-	// next request must be refused: the touch wrote only last_used_at.
+	// A later use (the first is recorded only while the key is active, see FirstUseAPIKey):
+	// the key is read as active, revoked by someone else, then its use is recorded. The next
+	// request must be refused: the touch wrote only last_used_at.
+	if _, err := s.Authenticate(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Minute)
 	r.revokeOnGet = k.ID
 	if _, err := s.Authenticate(ctx, secret); err != nil {
 		t.Fatalf("the racing use itself: %v", err)

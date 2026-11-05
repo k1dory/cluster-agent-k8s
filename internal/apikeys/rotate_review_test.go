@@ -223,3 +223,57 @@ func TestReviewOmittedTTLRetryUsesTheOriginalLifetime(t *testing.T) {
 		t.Fatalf("stored: %+v", got)
 	}
 }
+
+// touchFails loses every usage write; firstUseFails also fails the durable first-use record.
+type touchFails struct {
+	Store
+	firstUseFails bool
+}
+
+func (touchFails) TouchAPIKey(context.Context, string, time.Time) error {
+	return errors.New("usage write lost")
+}
+
+func (f touchFails) FirstUseAPIKey(ctx context.Context, id string, at time.Time) error {
+	if f.firstUseFails {
+		return errors.New("usage write lost")
+	}
+	return f.Store.FirstUseAPIKey(ctx, id, at)
+}
+
+// A successor served a request although its usage write failed (Authenticate ignored the
+// error), so a retried rotation of its parent took it for unused and revoked a working key.
+// The first use is now recorded before it is let through: the retry is refused, and a first
+// use that cannot be recorded fails the request instead.
+func TestReviewAWorkingSuccessorIsNeverWithdrawn(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	mem := store.NewMemory()
+	s := &Service{Store: touchFails{Store: mem}, Now: func() time.Time { return now }}
+	old, _, err := s.Create(ctx, "acme", "ci", 0, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, secret, err := s.Rotate(ctx, old.ID, 0, time.Hour, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Authenticate(ctx, secret); err != nil {
+		t.Fatalf("the successor authenticates: %v", err)
+	}
+	if _, _, err := s.Rotate(ctx, old.ID, 0, time.Hour, "admin"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("a successor that served a request must not be withdrawn: %v", err)
+	}
+	if k, _ := mem.GetAPIKey(ctx, next.ID); !k.Active(now) {
+		t.Fatal("the working successor was revoked")
+	}
+	// Where even the first use cannot be recorded, the request fails rather than pass unseen.
+	s2 := &Service{Store: touchFails{Store: mem, firstUseFails: true}, Now: func() time.Time { return now }}
+	_, secret2, err := s2.Create(ctx, "acme", "deploy", 0, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.Authenticate(ctx, secret2); err == nil {
+		t.Fatal("an unrecorded first use must not authenticate")
+	}
+}
