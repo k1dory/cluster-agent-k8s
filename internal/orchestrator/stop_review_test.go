@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -410,5 +411,86 @@ func TestReviewWakeKeepsAPodThatBecameReadyFirst(t *testing.T) {
 	}
 	if _, _, err := fake.PodStatus(ctx, sb); err != nil {
 		t.Fatalf("the healthy pod was deleted: %v", err)
+	}
+}
+
+// ctxStore refuses sandbox reads and writes on a done context, as Postgres does (the memory
+// store ignores cancellation, which hid this).
+type ctxStore struct{ store.Store }
+
+func (s ctxStore) GetSandbox(ctx context.Context, id string) (*model.Sandbox, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.Store.GetSandbox(ctx, id)
+}
+
+func (s ctxStore) UpdateSandbox(ctx context.Context, sb *model.Sandbox) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.Store.UpdateSandbox(ctx, sb)
+}
+
+// hangRuntime's cluster calls never answer: they return when their context ends.
+type hangRuntime struct {
+	*FakeRuntime
+	beforeCreate func()
+}
+
+func (r *hangRuntime) DeletePod(ctx context.Context, _ *model.Sandbox) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (r *hangRuntime) CreatePod(ctx context.Context, _ *model.Sandbox) (string, error) {
+	if h := r.beforeCreate; h != nil {
+		r.beforeCreate = nil
+		h()
+	}
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+// A cluster call that ran out its StopTimeout handed the expired context to fail, so on
+// Postgres the error was never recorded and the sandbox sat in stopping or waking. The failure
+// is now written on a fresh context, and only over the status the failed operation set.
+func TestReviewFailureRecordedAfterTheDeadline(t *testing.T) {
+	ctx := context.Background()
+	fake := NewFakeRuntime()
+	mem := store.NewMemory()
+	now := time.Now()
+	sb := &model.Sandbox{ID: "sb_deadline", Slug: "dev", Tenant: "acme", Name: "d", Owner: "alice", Status: model.StatusRunning, CreatedAt: now, LastActivity: now}
+	_ = fake.EnsureVolume(ctx, sb)
+	sb.PodName, _ = fake.CreatePod(ctx, sb)
+	if err := mem.CreateSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	rt := &hangRuntime{FakeRuntime: fake}
+	o := New(ctxStore{mem}, rt, nil, events.New(), Config{StopTimeout: 20 * time.Millisecond}, nil)
+
+	if _, err := o.Sleep(ctx, sb.ID, false); err == nil {
+		t.Fatal("sleep whose DeletePod timed out reported success")
+	}
+	if got, _ := mem.GetSandbox(ctx, sb.ID); got.Status != model.StatusError || !strings.Contains(got.Error, "delete pod") {
+		t.Fatalf("after DeletePod ran out its deadline: %s %q", got.Status, got.Error)
+	}
+	if _, err := o.Wake(ctx, sb.ID); err == nil {
+		t.Fatal("wake whose CreatePod timed out reported success")
+	}
+	if got, _ := mem.GetSandbox(ctx, sb.ID); got.Status != model.StatusError || !strings.Contains(got.Error, "pod: ") {
+		t.Fatalf("after CreatePod ran out its deadline: %s %q", got.Status, got.Error)
+	}
+
+	// A delete the cluster refuses lands while the create hangs: the create's failure must not
+	// write error over deleting (the delete's retry depends on it).
+	fake.SetFailDelete(errFakeRefused)
+	o2 := New(ctxStore{mem}, fake, nil, events.New(), Config{}, nil)
+	rt.beforeCreate = func() { _ = o2.Delete(ctx, sb.ID) }
+	if _, err := o.Wake(ctx, sb.ID); err == nil {
+		t.Fatal("wake of a sandbox being deleted reported success")
+	}
+	if got, _ := mem.GetSandbox(ctx, sb.ID); got.Status != model.StatusDeleting {
+		t.Fatalf("a failed create overwrote the delete: %s %q", got.Status, got.Error)
 	}
 }

@@ -351,7 +351,7 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 	}
 	o.remember(sb)
 	if err := o.Runtime.EnsureVolume(ctx, sb); err != nil {
-		o.fail(ctx, sb.ID, "volume: "+err.Error())
+		o.fail(ctx, sb.ID, model.StatusCreating, "volume: "+err.Error())
 		sb, _ = o.Store.GetSandbox(ctx, sb.ID)
 		return sb, fmt.Errorf("%w: volume: %v", ErrRuntime, err)
 	}
@@ -451,7 +451,7 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 	defer cancel()
 	pod, err := o.Runtime.CreatePod(ctx, sb)
 	if err != nil {
-		o.fail(ctx, id, "pod: "+err.Error())
+		o.fail(ctx, id, model.StatusWaking, "pod: "+err.Error())
 		return nil, fmt.Errorf("%w: pod: %v", ErrRuntime, err)
 	}
 	// The lock was released before CreatePod, so the record may have moved meanwhile:
@@ -530,7 +530,7 @@ func (o *Orchestrator) waitReady(id string) {
 			switch {
 			case errors.Is(err, ErrPodTerminated):
 				// Crashed init container, evicted: no point waiting for the deadline.
-				o.fail(context.Background(), id, "pod status: "+err.Error())
+				o.fail(context.Background(), id, model.StatusWaking, "pod status: "+err.Error())
 				return
 			case err != nil:
 				// Not visible yet (another replica is still creating it) or the API is unreachable:
@@ -551,7 +551,7 @@ func (o *Orchestrator) waitReady(id string) {
 			if lastErr != nil {
 				msg += ": " + lastErr.Error()
 			}
-			o.fail(context.Background(), id, msg)
+			o.fail(context.Background(), id, model.StatusWaking, msg)
 			return
 		case <-t.C:
 		}
@@ -598,9 +598,21 @@ func (o *Orchestrator) setStatusFrom(ctx context.Context, id string, from []mode
 	return sb, nil
 }
 
-func (o *Orchestrator) fail(ctx context.Context, id, msg string) {
+// failTimeout bounds the write of a failure, on a context of its own.
+const failTimeout = 10 * time.Second
+
+// fail records that the operation which moved the sandbox to from went wrong: status error
+// with the reason, only while the sandbox is still in from (a writer that moved it on since,
+// a delete or a newer start, keeps its state). The write gets a fresh context: the caller's
+// is often the reason it failed (its deadline ran out in the cluster call, the client left),
+// and a cancelled context would keep Postgres from recording anything.
+func (o *Orchestrator) fail(ctx context.Context, id string, from model.SandboxStatus, msg string) {
 	o.Log.Error("sandbox error", "id", id, "err", msg)
-	_, _ = o.setStatus(ctx, id, model.StatusError, func(s *model.Sandbox) { s.Error = msg })
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), failTimeout)
+	defer cancel()
+	if _, err := o.setStatusFrom(ctx, id, []model.SandboxStatus{from}, model.StatusError, func(s *model.Sandbox) { s.Error = msg }); err != nil && !errors.Is(err, ErrConflict) {
+		o.Log.Error("record sandbox error", "id", id, "err", err)
+	}
 }
 
 func (o *Orchestrator) remember(sb *model.Sandbox) {
@@ -740,7 +752,7 @@ func (o *Orchestrator) stopPod(ctx context.Context, id string, final model.Sandb
 	ctx, cancel := o.detached(ctx)
 	defer cancel()
 	if err := o.Runtime.DeletePod(ctx, sb); err != nil {
-		o.fail(ctx, id, "delete pod: "+err.Error())
+		o.fail(ctx, id, model.StatusStopping, "delete pod: "+err.Error())
 		return nil, fmt.Errorf("%w: delete pod: %v", ErrRuntime, err)
 	}
 	if o.Retirer != nil {
@@ -1580,7 +1592,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			go o.waitReady(sb.ID)
 			continue
 		case sb.Status == model.StatusCreating && now.Sub(sb.CreatedAt) > o.Cfg.ReadyTimeout:
-			o.fail(ctx, sb.ID, "creation did not complete (control plane restarted?); wake to retry")
+			o.fail(ctx, sb.ID, model.StatusCreating, "creation did not complete (control plane restarted?); wake to retry")
 			continue
 		case sb.Status == model.StatusStopping:
 			o.reconcileStopping(ctx, sb, now)
