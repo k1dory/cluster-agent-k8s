@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"context"
 	"encoding/json"
 	"os"
@@ -102,6 +103,13 @@ func TestACPCodexExampleCreatesSession(t *testing.T) {
 	}
 	if session.SessionId == "" {
 		t.Fatal("session/new returned an empty session id")
+	}
+	// The profile's mode is one codex-acp offers and accepts.
+	var notices []string
+	configureACPSession(ctx, conn, session.SessionId, acpSessionState{modes: session.Modes, options: session.ConfigOptions},
+		profile.Harness.Mode, "", func(f string, a ...any) { notices = append(notices, fmt.Sprintf(f, a...)) })
+	if profile.Harness.Mode == "" || len(notices) != 0 {
+		t.Fatalf("mode %q: %q", profile.Harness.Mode, notices)
 	}
 }
 

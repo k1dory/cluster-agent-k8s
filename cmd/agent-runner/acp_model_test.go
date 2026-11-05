@@ -111,6 +111,9 @@ func modelCallThroughGateway(t *testing.T, example, name, bin string, host strin
 	}
 	t.Setenv("HARNESS_PERMISSIONS", profile.Harness.Permissions)
 	t.Setenv("HARNESS_AUTH_METHOD", profile.Harness.AuthMethod)
+	t.Setenv("HARNESS_MODE", profile.Harness.Mode)
+	t.Setenv("HARNESS_MCP", profile.Harness.MCP)
+	t.Setenv("SANDBOX_MODEL", profile.Model.Name)
 	quoted := make([]string, len(isolate))
 	for i, a := range isolate {
 		quoted[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"

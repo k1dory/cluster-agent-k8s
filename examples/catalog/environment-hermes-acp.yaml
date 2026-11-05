@@ -9,10 +9,19 @@
 # Hermes is not in the default agent image: it ships as its own image (Python 3.14, a pinned
 # SQLite, its package manager), which agent-hermes builds on (images/agent-hermes/Dockerfile).
 #
-# Configuration is a harness file, $HERMES_HOME/config.yaml: the Anthropic provider, telemetry
-# and update checks off (the gateway would deny them anyway). Hermes's own login (`--setup`) is
-# interactive and not used: the key comes from the environment as a placeholder the policy rule
-# for api.anthropic.com replaces (`x-api-key: secret:anthropic`, docs/self-service.md).
+# Configuration is a harness file, $HERMES_HOME/config.yaml: the Anthropic provider, telemetry,
+# update checks, the remote model catalogue and lazy package installs off (the gateway would
+# deny them anyway), the web and browser toolsets off (they would leave the pod past the bridge).
+# approvals.mode is `off` for `permissions: allow`: by default (`smart`) a model decides which
+# commands need approval, and a `deny` profile would not be obeyed. A deny profile sets
+# `manual`, so every approval reaches the runner. Hermes's own login (`--setup`) is interactive
+# and not used: the key comes from the environment as a placeholder the policy rule for
+# api.anthropic.com replaces (`x-api-key: secret:anthropic`, docs/self-service.md).
+#
+# Hermes takes the sandbox's MCP servers (over HTTP) without declaring it: `mcp: always` passes
+# them. A turn lost when Hermes's gateway restarts is discarded by the runner, which then sends
+# the prompt again; Hermes reports the session's running token total, which the runner turns
+# into each turn's share.
 # Apply:  sandboxctl apply -f examples/catalog/environment-hermes-acp.yaml
 kind: EnvironmentProfile
 name: hermes-acp
@@ -23,11 +32,20 @@ spec:
     command: hermes acp
     input: acp
     permissions: allow
+    mcp: always
     files:
       .hermes/config.yaml: |
         model:
           provider: anthropic
           default: claude-sonnet-5-5
+        approvals:
+          mode: "off"
+        agent:
+          disabled_toolsets: [web, search, x_search, browser]
+        model_catalog:
+          enabled: false
+        security:
+          allow_lazy_installs: false
         telemetry:
           shared_metrics:
             enabled: false
@@ -38,5 +56,6 @@ spec:
     ANTHROPIC_API_KEY: placeholder-the-gateway-injects-the-real-key
     # Hermes's Anthropic client (httpx) cannot present the pod's client certificate to the
     # gateway: it goes through agent-runner's gateway bridge on loopback (docs/chat-and-files.md,
-    # "Gateway bridge"). The Anthropic SDK adds /v1 itself.
+    # "Gateway bridge"). The Anthropic SDK adds /v1 itself. Hermes reads the base URL from the
+    # environment only, not from config.yaml.
     ANTHROPIC_BASE_URL: http://127.0.0.1:4480/https/api.anthropic.com

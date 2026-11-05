@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
+	"time"
+
+	acp "github.com/coder/acp-go-sdk"
 
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/model"
@@ -72,6 +78,12 @@ func exampleSmoke(t *testing.T, file, binEnv, program string, extraEnv func(home
 		env = append(env, extraEnv(home)...)
 	}
 	t.Setenv("HARNESS_AUTH_METHOD", profile.Harness.AuthMethod)
+	// The profile's mode and model are applied to the real agent: a notice would say it does
+	// not offer them (the first run must have none).
+	t.Setenv("HARNESS_MODE", profile.Harness.Mode)
+	t.Setenv("HARNESS_MCP", profile.Harness.MCP)
+	t.Setenv("SANDBOX_MODEL", profile.Model.Name)
+	t.Setenv("SANDBOX_INSTRUCTIONS", "")
 	t.Setenv("SANDBOX_MCP_SERVERS", "")
 	t.Setenv("PWD", home)
 	t.Setenv("SANDBOX_REPO_DIR", home+"/no-repo")
@@ -132,4 +144,78 @@ func TestACPHermesExampleAnswersThroughTheGateway(t *testing.T) {
 			return map[string]string{"HERMES_HOME": filepath.Join(home, ".hermes")}
 		})
 	assertAnswered(t, lines, seen, "pong-from-the-gateway", "api.anthropic.com")
+}
+
+// The shipped claude-acp profile against the real adapter: it declares the client system prompt,
+// takes the instructions as one in session/new (the request is refused if the field is wrong),
+// and accepts the profile's mode. Nothing is prompted. Runs in the agent image's check or with
+// CLAUDE_AGENT_ACP_TEST_BIN.
+func TestACPClaudeExampleTakesTheSystemPromptAndMode(t *testing.T) {
+	bin := os.Getenv("CLAUDE_AGENT_ACP_TEST_BIN")
+	if bin == "" && os.Getenv("ACP_TEST_NETWORK") == "none" {
+		bin, _ = exec.LookPath("claude-agent-acp")
+	}
+	if bin == "" {
+		t.Skip("set CLAUDE_AGENT_ACP_TEST_BIN to run the claude-acp profile check (it runs by itself in the agent images' check)")
+	}
+	isolate := noNetwork(t)
+	raw, err := os.ReadFile("../../examples/catalog/environment-claude-acp.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc, err := catalog.ParseYAML(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile catalog.EnvironmentSpec
+	if err := json.Unmarshal(doc.Spec, &profile); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	files, _ := json.Marshal(profile.Harness.Files)
+	if _, err := writeHarnessFiles(string(files), home); err != nil {
+		t.Fatal(err)
+	}
+	var env []string
+	for k, v := range profile.Env {
+		env = append(env, k+"="+v)
+	}
+	t.Setenv("HARNESS_AUTH_METHOD", profile.Harness.AuthMethod)
+	t.Setenv("HARNESS_MODE", profile.Harness.Mode)
+	t.Setenv("HARNESS_MCP", "")
+	t.Setenv("SANDBOX_MODEL", "") // the adapter's model aliases are not the profile's names; ANTHROPIC_MODEL selects it
+	t.Setenv("SANDBOX_INSTRUCTIONS", "Answer in one word.")
+	t.Setenv("SANDBOX_MCP_SERVERS", "")
+	t.Setenv("PWD", home)
+	t.Setenv("SANDBOX_REPO_DIR", home+"/no-repo")
+
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, isolate[0], append(isolate[1:], bin)...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.Dir = home
+	cmd.Env = append(append(os.Environ(), "HOME="+home), env...)
+	cmd.WaitDelay = 2 * time.Second
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer stopAdapter(stdin, cancel, cmd)
+	var notices []string
+	emit := func(l string) { notices = append(notices, l) }
+	wire := newACPWire(stdin, stdout)
+	cl := &acpClient{emit: emit, systemPrompt: wire.SystemPrompt}
+	s, ok := openACPSession(ctx, acp.NewClientSideConnection(cl, wire, wire), cl, &model.Run{ID: "run_claude"}, emit)
+	switch {
+	case !ok:
+		t.Fatalf("no session: %q\nadapter stderr:\n%s", notices, stderr.String())
+	case !wire.SystemPrompt() || !s.instructions:
+		t.Fatalf("the adapter's system prompt was not used (capability %v)", wire.SystemPrompt())
+	case len(notices) != 0:
+		t.Fatalf("notices: %q", notices)
+	}
 }

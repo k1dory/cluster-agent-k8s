@@ -502,8 +502,10 @@ func openRealACP(t *testing.T, isolate []string, agent, home string, env []strin
 	}
 	defer stopAdapter(stdin, cancel, cmd)
 	emit := func(l string) { notices = append(notices, l) }
-	cl := &acpClient{emit: emit}
-	conn := &loggedInit{ClientSideConnection: acp.NewClientSideConnection(cl, stdin, stdout), t: t}
+	// The runner's own wiring (executeACP): the wire carries the system prompt.
+	wire := newACPWire(stdin, stdout)
+	cl := &acpClient{emit: emit, systemPrompt: wire.SystemPrompt}
+	conn := &loggedInit{ClientSideConnection: acp.NewClientSideConnection(cl, wire, wire), t: t}
 	s, ok := openACPSession(ctx, conn, cl, run, emit)
 	if !ok || s.id == "" {
 		t.Fatalf("no session: %q\nadapter stderr:\n%s", notices, stderr.String())
