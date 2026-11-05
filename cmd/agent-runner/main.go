@@ -207,6 +207,13 @@ func ensureRepo(ctx context.Context) error {
 			return fmt.Errorf("workspace at %s belongs to another repository (%s) and could not be moved: %w", dir, origin, err)
 		}
 	}
+	// An empty directory is git's to create (or a restored checkout's place). Anything else at
+	// the path, a file or a directory with content, is left exactly as it is: the clone refuses it.
+	if fi, err := os.Lstat(dir); err == nil && fi.IsDir() {
+		if entries, err := os.ReadDir(dir); err == nil && len(entries) == 0 {
+			_ = os.Remove(dir)
+		}
+	}
 	// A checkout of this repository moved aside earlier (the repository changed and changed back)
 	// comes back as it was, with its work: switching back and forth neither clones again nor
 	// leaves one more copy each time.
@@ -218,8 +225,6 @@ func ensureRepo(ctx context.Context) error {
 			}
 		}
 	}
-	// An empty directory is git's to create; one with content is not touched (the clone refuses it).
-	_ = os.Remove(dir)
 	_, statErr := os.Stat(dir)
 	created := os.IsNotExist(statErr)
 	fmt.Println("agent-runner: cloning", repo, "into", dir)

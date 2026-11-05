@@ -172,3 +172,37 @@ func TestRepositorySwitchKeepsTheWork(t *testing.T) {
 	has(b, "work-b")
 	has(a, "work-a")
 }
+
+// A file where the checkout should be is not the runner's to remove: the clone fails, the file
+// stays as it was, and the run is told.
+func TestCloneLeavesAFileAtTheCheckoutPath(t *testing.T) {
+	isolatedGit(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	repo, checkout := filepath.Join(root, "a"), filepath.Join(root, "repo")
+	if out, err := exec.Command("git", "init", "--bare", repo).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	if err := os.WriteFile(checkout, []byte("notes nobody pushed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SANDBOX_REPO_DIR", checkout)
+	t.Setenv("SANDBOX_REPO", repo)
+	if err := ensureRepo(ctx); err == nil {
+		t.Fatal("the clone replaced a file at the checkout path")
+	}
+	if b, err := os.ReadFile(checkout); err != nil || string(b) != "notes nobody pushed\n" {
+		t.Fatalf("the file at the checkout path changed: %q %v", b, err)
+	}
+	// An empty directory there is fine: git creates it.
+	if err := os.Remove(checkout); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(checkout, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureRepo(ctx); err != nil {
+		t.Fatalf("an empty directory at the checkout path: %v", err)
+	}
+}
