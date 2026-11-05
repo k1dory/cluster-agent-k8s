@@ -10,7 +10,7 @@ import (
 )
 
 type reviewKeyTouchStore struct {
-	store.APIKeys
+	Store
 	beforeTouch func()
 }
 
@@ -20,13 +20,13 @@ func (s *reviewKeyTouchStore) TouchAPIKey(ctx context.Context, id string, at tim
 		s.beforeTouch = nil
 		f()
 	}
-	return s.APIKeys.TouchAPIKey(ctx, id, at)
+	return s.Store.TouchAPIKey(ctx, id, at)
 }
 
 func TestReviewKeyUsageCannotUndoRevocation(t *testing.T) {
 	ctx := t.Context()
 	mem := store.NewMemory()
-	st := &reviewKeyTouchStore{APIKeys: mem}
+	st := &reviewKeyTouchStore{Store: mem}
 	s := &Service{Store: st}
 	admin := &Service{Store: mem}
 	k, secret, err := s.Create(ctx, "acme", "review", 0, "operator")

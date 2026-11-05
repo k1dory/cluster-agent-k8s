@@ -37,9 +37,15 @@ const MaxNameLen = 64
 
 var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$`)
 
+// Store is what the service needs: the key table and its atomic rotation.
+type Store interface {
+	store.APIKeys
+	RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, grace time.Duration) error
+}
+
 // MaxTTL caps a key's lifetime when the caller names one longer; 0 = no cap.
 type Service struct {
-	Store  store.APIKeys
+	Store  Store
 	MaxTTL time.Duration
 	Now    func() time.Time
 	// TouchEvery bounds how often a use is recorded (last_used_at): one write per key per
@@ -111,13 +117,12 @@ func (s *Service) build(tenant, name string, ttl time.Duration, by, trust string
 // keeps the old key's remaining lifetime) and retires the old one: at once when grace is 0,
 // else after grace, so a pipeline can switch over without a gap.
 //
-// The store has no transaction spanning the two writes, so Rotate makes each failure leave a
-// state a retry can start from. The successor is created first and withdrawn again if the
-// old key cannot be retired: the old key is then exactly as it was, and no key nobody holds
-// the secret of stays live. A rotate repeated on a key already rotated (the response with the
-// secret was lost) withdraws the earlier successor if it was never used and issues a new one;
-// the earlier secret cannot be returned, only its hash is stored. A successor already in use
-// is not touched: rotate that one instead.
+// The replacement, the old key's retirement and, for a key rotated before, the withdrawal of
+// its earlier successor are one store transaction (store.RotateAPIKey): on an error nothing
+// changed. A rotate repeated on a key already rotated (the response with the secret was lost)
+// withdraws the earlier successor if it was never used and issues a new one; the earlier
+// secret cannot be returned, only its hash is stored. A successor already in use is not
+// touched and the rotation is refused: rotate that one instead.
 func (s *Service) Rotate(ctx context.Context, id string, ttl, grace time.Duration, by string) (*model.APIKey, string, error) {
 	old, err := s.Store.GetAPIKey(ctx, id)
 	if err != nil {
@@ -130,47 +135,50 @@ func (s *Service) Rotate(ctx context.Context, id string, ttl, grace time.Duratio
 	if grace < 0 || ttl < 0 {
 		return nil, "", fmt.Errorf("%w: ttl and grace must not be negative", ErrInvalid)
 	}
-	// The old key's lifetime before an earlier rotation shortened it to the grace period.
-	remaining := old.ExpiresAt
-	if old.RotatedTo != "" {
-		prev, err := s.Store.GetAPIKey(ctx, old.RotatedTo)
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			// withdrawn, or never stored: nothing to undo
-		case err != nil:
-			return nil, "", err
-		case prev.Active(now) && prev.LastUsedAt != nil:
-			return nil, "", fmt.Errorf("%w: key %s was already rotated to %s, which is in use: rotate %s instead", ErrInvalid, id, prev.ID, prev.ID)
-		default:
-			if prev.Active(now) {
-				if err := s.Store.RevokeAPIKey(ctx, prev.ID, now); err != nil {
-					return nil, "", fmt.Errorf("withdrawing the unused successor %s of an earlier rotation: %w", prev.ID, err)
-				}
+	if ttl == 0 {
+		// The old key's lifetime before an earlier rotation shortened it to the grace period.
+		// Read outside the transaction: it decides only the new key's lifetime.
+		remaining := old.ExpiresAt
+		if old.RotatedTo != "" {
+			if prev, err := s.Store.GetAPIKey(ctx, old.RotatedTo); err == nil {
+				remaining = prev.ExpiresAt
+			} else if !errors.Is(err, store.ErrNotFound) {
+				return nil, "", err
 			}
-			remaining = prev.ExpiresAt
+		}
+		if remaining != nil {
+			if ttl = remaining.Sub(now); ttl <= 0 {
+				return nil, "", fmt.Errorf("%w: key %s expires now; create a new one", ErrInvalid, id)
+			}
 		}
 	}
-	if ttl == 0 && remaining != nil {
-		if ttl = remaining.Sub(now); ttl <= 0 {
-			return nil, "", fmt.Errorf("%w: key %s expires now; create a new one", ErrInvalid, id)
-		}
-	}
-	next, secret, err := s.Create(ctx, old.Tenant, old.Name, ttl, by)
+	next, secret, err := s.build(old.Tenant, old.Name, ttl, by, "")
 	if err != nil {
 		return nil, "", err
 	}
-	// One atomic store operation; a revocation that landed meanwhile stands.
-	if err := s.Store.RetireAPIKey(ctx, old.ID, next.ID, now, grace); err != nil {
-		// The secret never leaves this function: take the successor back so the old key is the
-		// only one, as before, and a retry starts clean.
-		if derr := s.Store.DeleteAPIKey(ctx, next.ID); derr != nil {
-			if rerr := s.Store.RevokeAPIKey(ctx, next.ID, now); rerr != nil {
-				return nil, "", fmt.Errorf("retiring key %s: %w (and the unused successor %s could not be withdrawn: %v; revoke it)", old.ID, err, next.ID, rerr)
-			}
-		}
-		return nil, "", fmt.Errorf("retiring key %s: %w (nothing changed; retry)", old.ID, err)
+	err = s.Store.RotateAPIKey(ctx, old.ID, next, now, grace)
+	var inUse *store.SuccessorInUseError
+	switch {
+	case err == nil:
+		return next, secret, nil
+	case errors.As(err, &inUse):
+		return nil, "", fmt.Errorf("%w: key %s was already rotated to %s, which is in use: rotate %s instead", ErrInvalid, id, inUse.ID, inUse.ID)
+	case errors.Is(err, store.ErrKeyInactive):
+		return nil, "", fmt.Errorf("%w: key %s is revoked or expired; create a new one", ErrInvalid, id)
+	case errors.Is(err, store.ErrNotFound):
+		return nil, "", err
 	}
-	return next, secret, nil
+	// The transaction may have committed with the acknowledgement lost. Ask, on a context of
+	// its own (the request's may be what failed): the old key names its successor only if it
+	// did. Nothing is ever deleted: the transaction left either everything or nothing.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if cur, gerr := s.Store.GetAPIKey(rctx, old.ID); gerr == nil && cur.RotatedTo == next.ID {
+		return next, secret, nil
+	} else if gerr != nil {
+		return nil, "", fmt.Errorf("rotating key %s: %w (whether it took effect is unknown: %v; GET the key: rotated_to says)", old.ID, err, gerr)
+	}
+	return nil, "", fmt.Errorf("rotating key %s: %w (nothing changed; retry)", old.ID, err)
 }
 
 // Revoke ends a key now. Revoking an already revoked key is fine (the earlier time stands).

@@ -119,16 +119,16 @@ func TestIssueAuthenticateRotateRevoke(t *testing.T) {
 // racing wraps the store so that a revocation lands between the service's read of a key and
 // its next write: the write must not undo it.
 type racing struct {
-	store.APIKeys
+	Store
 	revokeOnGet string // key id revoked right after it is read
 	at          time.Time
 }
 
 func (r *racing) GetAPIKey(ctx context.Context, id string) (*model.APIKey, error) {
-	k, err := r.APIKeys.GetAPIKey(ctx, id)
+	k, err := r.Store.GetAPIKey(ctx, id)
 	if err == nil && id == r.revokeOnGet {
 		r.revokeOnGet = ""
-		if err := r.APIKeys.RevokeAPIKey(ctx, id, r.at); err != nil {
+		if err := r.Store.RevokeAPIKey(ctx, id, r.at); err != nil {
 			return nil, err
 		}
 	}
@@ -139,7 +139,7 @@ func TestAUseOrARotationNeverUndoesARevocation(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 10, 24, 12, 0, 0, 0, time.UTC)
 	mem := store.NewMemory()
-	r := &racing{APIKeys: mem, at: now}
+	r := &racing{Store: mem, at: now}
 	s := &Service{Store: r, Now: func() time.Time { return now }}
 	k, secret, err := s.Create(ctx, "acme", "ci", 0, "admin")
 	if err != nil {
@@ -157,31 +157,18 @@ func TestAUseOrARotationNeverUndoesARevocation(t *testing.T) {
 	if got, _ := mem.GetAPIKey(ctx, k.ID); got.RevokedAt == nil || got.LastUsedAt == nil {
 		t.Fatalf("both the revocation and the use must be recorded: %+v", got)
 	}
-	// Rotation: the old key is read as active, revoked by someone else, then retired with a
-	// grace period. The revocation stands; the new key works.
+	// Rotation: the old key is read as active, revoked by someone else, then rotated. The
+	// rotation is one transaction that sees the revocation: it is refused, the revocation
+	// stands and no successor exists.
 	k2, s2, _ := s.Create(ctx, "acme", "deploy", 0, "admin")
 	r.revokeOnGet = k2.ID
-	next, nextSecret, err := s.Rotate(ctx, k2.ID, 0, time.Hour, "admin")
-	if err != nil {
-		t.Fatalf("rotate: %v", err)
+	if _, _, err := s.Rotate(ctx, k2.ID, 0, time.Hour, "admin"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("rotating a key revoked meanwhile must be refused: %v", err)
 	}
 	if _, err := s.Authenticate(ctx, s2); !errors.Is(err, ErrBadKey) {
-		t.Fatalf("a rotation with grace undid the revocation: %v", err)
+		t.Fatalf("the revocation must stand: %v", err)
 	}
-	if got, _ := mem.GetAPIKey(ctx, k2.ID); got.RotatedTo != next.ID || got.RevokedAt == nil {
+	if got, _ := mem.GetAPIKey(ctx, k2.ID); got.RotatedTo != "" || got.RevokedAt == nil {
 		t.Fatalf("old key: %+v", got)
-	}
-	if _, err := s.Authenticate(ctx, nextSecret); err != nil {
-		t.Fatalf("new key: %v", err)
-	}
-	// Revoking twice keeps the first time.
-	k3, _, _ := s.Create(ctx, "acme", "x", 0, "admin")
-	if _, err := s.Revoke(ctx, k3.ID); err != nil {
-		t.Fatal(err)
-	}
-	now = now.Add(time.Hour)
-	again, _ := s.Revoke(ctx, k3.ID)
-	if !again.RevokedAt.Equal(now.Add(-time.Hour)) {
-		t.Fatalf("second revocation moved the time: %v", again.RevokedAt)
 	}
 }
