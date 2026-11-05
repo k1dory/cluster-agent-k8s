@@ -8,8 +8,10 @@
 # run's output. The config also turns off what a pod has no use for: self-update, sharing
 # sessions to opencode.ai, the remote model catalogue (each would be an egress the policy denies).
 #
-# Credentials: the pod holds a placeholder API key; the policy rule for api.anthropic.com injects
-# `x-api-key: secret:anthropic` (docs/self-service.md).
+# OpenCode (Bun) cannot present the pod's client certificate to the gateway: its Anthropic
+# provider points at agent-runner's gateway bridge on loopback (docs/chat-and-files.md,
+# "Gateway bridge"). Credentials: the pod holds a placeholder API key; the policy rule for
+# api.anthropic.com injects `x-api-key: secret:anthropic` (docs/self-service.md).
 # Apply:  sandboxctl apply -f examples/catalog/environment-opencode-acp.yaml
 kind: EnvironmentProfile
 name: opencode-acp
@@ -28,7 +30,10 @@ spec:
           "model": "anthropic/claude-sonnet-5-5",
           "autoupdate": false,
           "share": "disabled",
-          "permission": { "edit": "ask", "bash": "ask" }
+          "permission": { "edit": "ask", "bash": "ask" },
+          "provider": {
+            "anthropic": { "options": { "baseURL": "http://127.0.0.1:4480/https/api.anthropic.com/v1" } }
+          }
         }
   env:
     ANTHROPIC_API_KEY: placeholder-the-gateway-injects-the-real-key

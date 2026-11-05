@@ -118,7 +118,8 @@ DOCKERFILE
 }
 
 echo "== agent image: the ACP agents open sessions from the shipped profiles, offline"
-acp_in_image "$agent" TestACPCodexExampleCreatesSession TestACPOpenCodeExampleCreatesAndLoadsASession
+acp_in_image "$agent" TestACPCodexExampleCreatesSession TestACPOpenCodeExampleCreatesAndLoadsASession \
+  TestACPCodexExampleReachesTheModelThroughTheGateway TestACPOpenCodeExampleAnswersThroughTheGateway
 
 echo "== agent image: smoke test and network lock"
 hack/smoke-image.sh "$agent"

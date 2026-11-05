@@ -269,7 +269,7 @@ func TestACPConversation(t *testing.T) {
 			t.Fatal("a new conversation must not load a session")
 		}
 	}
-	if len(newSession.McpServers) != 1 || newSession.McpServers[0].Http == nil || newSession.McpServers[0].Http.Url != "https://argus-mcp.asb.internal/" {
+	if len(newSession.McpServers) != 1 || newSession.McpServers[0].Http == nil || newSession.McpServers[0].Http.Url != "http://127.0.0.1:4480/https/argus-mcp.asb.internal/" {
 		t.Fatalf("session/new MCP servers: %+v", newSession.McpServers)
 	}
 	if len(prompts) != 2 {
