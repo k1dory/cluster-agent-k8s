@@ -17,6 +17,7 @@ import (
 
 	acp "github.com/coder/acp-go-sdk"
 
+	"agent-sandbox/internal/acpx"
 	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 )
@@ -414,7 +415,7 @@ func TestFirstPrompt(t *testing.T) {
 		{"rollout, loaded", model.Run{Task: "t", ResumeOf: "r", Mode: model.RunResume}, false, "carry on"},
 		{"rollout, session lost", model.Run{Task: "t", ResumeOf: "r", Mode: model.RunResume}, true, "<instructions>\nI\n</instructions>\n\nt"},
 	} {
-		if got := firstPrompt(&tc.run, tc.fresh, "I", "carry on"); got != tc.want {
+		if got := firstPrompt(&tc.run, tc.fresh, "I", "carry on", nil); got != tc.want {
 			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
 		}
 	}
@@ -503,7 +504,7 @@ func openRealACP(t *testing.T, isolate []string, agent, home string, env []strin
 	defer stopAdapter(stdin, cancel, cmd)
 	emit := func(l string) { notices = append(notices, l) }
 	// The runner's own wiring (executeACP): the wire carries the system prompt.
-	wire := newACPWire(stdin, stdout)
+	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{})
 	cl := &acpClient{emit: emit, systemPrompt: wire.SystemPrompt}
 	conn := &loggedInit{ClientSideConnection: acp.NewClientSideConnection(cl, wire, wire), t: t}
 	s, ok := openACPSession(ctx, conn, cl, run, emit)

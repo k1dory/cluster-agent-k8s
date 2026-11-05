@@ -13,6 +13,7 @@ import (
 
 	acp "github.com/coder/acp-go-sdk"
 
+	"agent-sandbox/internal/acpx"
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/model"
 )
@@ -207,7 +208,7 @@ func TestACPClaudeExampleTakesTheSystemPromptAndMode(t *testing.T) {
 	defer stopAdapter(stdin, cancel, cmd)
 	var notices []string
 	emit := func(l string) { notices = append(notices, l) }
-	wire := newACPWire(stdin, stdout)
+	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{})
 	cl := &acpClient{emit: emit, systemPrompt: wire.SystemPrompt}
 	s, ok := openACPSession(ctx, acp.NewClientSideConnection(cl, wire, wire), cl, &model.Run{ID: "run_claude"}, emit)
 	switch {

@@ -29,12 +29,21 @@ func TestACPProfileValidationAndLaunch(t *testing.T) {
 		`{"image":"stable","harness":{"command":"codex-acp","input":"acp","mode":"full access"}}`,
 		`{"image":"stable","harness":{"command":"hermes acp","input":"acp","mcp":"never"}}`,
 		`{"image":"stable","harness":{"input":"text","mcp":"always"}}`,
+		`{"image":"stable","harness":{"thought_level":"high"}}`,
+		`{"image":"stable","harness":{"command":"codex-acp","input":"acp","thought_level":"very high"}}`,
+		`{"image":"stable","harness":{"session_meta":{"a":1}}}`,
+		`{"image":"stable","harness":{"command":"x","input":"acp","session_meta":{"pad":"`+strings.Repeat("x", 17<<10)+`"}}}`,
+		`{"image":"stable","harness":{"instructions":"file"}}`,
+		`{"image":"stable","harness":{"command":"x","input":"acp","instructions":"prompt"}}`,
+		`{"image":"stable","harness":{"command":"x","input":"acp","instructions":"env:SANDBOX_INSTRUCTIONS"}}`,
+		`{"image":"stable","harness":{"command":"x","input":"acp","instructions":"env:HARNESS_CMD"}}`,
+		`{"image":"stable","harness":{"command":"x","input":"acp","instructions":"env:1BAD"}}`,
 	} {
 		if _, err := s.Put(ctx, model.KindEnvironment, "acme", doc(t, "acp", bad, nil), false, "alice"); !errors.Is(err, ErrInvalid) {
 			t.Errorf("must be invalid: %s → %v", bad, err)
 		}
 	}
-	spec := `{"image":"stable","harness":{"command":"codex-acp","input":"acp","permissions":"deny","auth_method":"api-key","mode":"agent-full-access","mcp":"always"}}`
+	spec := `{"image":"stable","harness":{"command":"codex-acp","input":"acp","permissions":"deny","auth_method":"api-key","mode":"agent-full-access","mcp":"always","thought_level":"high","session_meta":{"claudeCode":{"options":{"maxTurns":40}}},"instructions":"env:HERMES_ENVIRONMENT_HINT"}}`
 	if _, err := s.Put(ctx, model.KindEnvironment, "acme", doc(t, "acp", spec, nil), false, "alice"); err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +52,8 @@ func TestACPProfileValidationAndLaunch(t *testing.T) {
 	}
 	r, err := s.Resolve(ctx, "acme", "coder", false)
 	if err != nil || r.Launch.HarnessCommand != "codex-acp" || r.Launch.HarnessInput != "acp" || r.Launch.HarnessPermissions != "deny" || r.Launch.HarnessAuthMethod != "api-key" ||
-		r.Launch.HarnessMode != "agent-full-access" || r.Launch.HarnessMCP != "always" {
+		r.Launch.HarnessMode != "agent-full-access" || r.Launch.HarnessMCP != "always" || r.Launch.HarnessThoughtLevel != "high" ||
+		r.Launch.HarnessSessionMeta != `{"claudeCode":{"options":{"maxTurns":40}}}` || r.Launch.HarnessInstructions != "env:HERMES_ENVIRONMENT_HINT" {
 		t.Fatalf("resolve: %v %+v", err, r.Launch)
 	}
 }

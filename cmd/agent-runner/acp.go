@@ -19,6 +19,7 @@ import (
 
 	acp "github.com/coder/acp-go-sdk"
 
+	"agent-sandbox/internal/acpx"
 	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 )
@@ -40,8 +41,19 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	// run still gets its session/cancel first.
 	procCtx, stopProc := context.WithCancel(context.Background())
 	defer stopProc()
+	// The instructions an agent reads from its own configuration (harness.instructions: file or
+	// env:NAME) are in place before it starts.
+	env, delivered, err := deliverInstructions(env, os.Getenv("HARNESS_INSTRUCTIONS"), os.Getenv("SANDBOX_INSTRUCTIONS"), os.Getenv("HOME"))
+	if err != nil {
+		c.post(run.ID, []string{"[agent-runner] instructions: " + err.Error()})
+		return 1
+	}
 	cmd := exec.CommandContext(procCtx, "/bin/sh", "-lc", cmdline)
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	// The agent and everything it starts are one process group, ended as a whole: an agent may
+	// leave helpers running after it exits (Hermes's gateway daemon, a server of its own), which
+	// would outlive the run with the run's configuration and keep writing into the workspace.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return signalGroup(cmd, syscall.SIGTERM) }
 	cmd.WaitDelay = 20 * time.Second
 	cmd.Env = env
 	cmd.Dir = os.Getenv("PWD")
@@ -79,16 +91,18 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	}()
 	emit := func(line string) { _, _ = io.WriteString(outW, line+"\n") }
 
-	wire := newACPWire(stdin, stdout)
-	cl := &acpClient{emit: emit, permissions: os.Getenv("HARNESS_PERMISSIONS"), systemPrompt: wire.SystemPrompt,
+	cl := &acpClient{emit: emit, permissions: os.Getenv("HARNESS_PERMISSIONS"), instructionsDelivered: delivered,
 		usageDir: filepath.Join(os.Getenv("HOME"), ".sandbox-acp-usage")}
-	conn := acp.NewClientSideConnection(cl, wire, wire)
+	// The agent's notices and compaction updates are asked for and read by the wire (the SDK
+	// cannot); everything else goes through the SDK's connection.
+	conn := acpx.Dial(cl, stdin, stdout, acpx.WireOptions{Notices: true, Compaction: true, OnUpdate: cl.extraUpdate})
+	cl.systemPrompt = conn.Wire.SystemPrompt
 	exit := driveACP(runCtx, conn, cl, run, emit, chat, func(inputs inputSink) {
 		go forwardInput(runCtx, c, run.ID, inputs, cancel, chat)
 	})
 
 	// The conversation is over: end of input, a grace period for the agent to exit on its own,
-	// then SIGTERM (and SIGKILL after WaitDelay).
+	// then SIGTERM to its process group (and SIGKILL after WaitDelay).
 	_ = stdin.Close()
 	exited := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(exited) }()
@@ -98,9 +112,67 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 		stopProc()
 		<-exited
 	}
+	// What the agent left running in its group is stopped too: SIGTERM (a daemon drains on it),
+	// SIGKILL a moment later for what did not exit.
+	endGroup(cmd)
 	_ = outW.Close()
 	outputDone.Wait()
 	return exit
+}
+
+// signalGroup sends sig to the process group the command leads.
+func signalGroup(cmd *exec.Cmd, sig syscall.Signal) error {
+	if cmd.Process == nil {
+		return nil
+	}
+	return syscall.Kill(-cmd.Process.Pid, sig)
+}
+
+// groupKillDelay is how long what is left of an agent's process group has between SIGTERM and SIGKILL.
+var groupKillDelay = 10 * time.Second
+
+// endGroup stops whatever is left of the agent's process group once the agent has exited.
+func endGroup(cmd *exec.Cmd) {
+	if signalGroup(cmd, syscall.SIGTERM) != nil {
+		return // nothing left
+	}
+	delay := groupKillDelay
+	go func() {
+		time.Sleep(delay)
+		_ = signalGroup(cmd, syscall.SIGKILL)
+	}()
+}
+
+// deliverInstructions puts the agent definition's instructions where the profile says the agent
+// reads them (harness.instructions): "file" writes them to $HOME/.sandbox/instructions.md
+// (SANDBOX_INSTRUCTIONS_FILE; OpenCode's `instructions` names it), "env:NAME" exports them as NAME
+// (Hermes's HERMES_ENVIRONMENT_HINT). delivered is true when they were: the first prompt then
+// carries no copy. Empty (the default): the session's system prompt when the agent takes one,
+// else a prefix of the first prompt.
+func deliverInstructions(env []string, mode, instructions, home string) (out []string, delivered bool, err error) {
+	instructions = strings.TrimSpace(instructions)
+	switch {
+	case mode == "":
+		return env, false, nil
+	case mode == "file":
+		dir := filepath.Join(home, ".sandbox")
+		path := filepath.Join(dir, "instructions.md")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return env, false, err
+		}
+		// Written even when empty: a configuration that names the file must find it.
+		if err := os.WriteFile(path, []byte(instructions+"\n"), 0o600); err != nil {
+			return env, false, err
+		}
+		return append(env, "SANDBOX_INSTRUCTIONS_FILE="+path), true, nil
+	case strings.HasPrefix(mode, "env:"):
+		name := strings.TrimPrefix(mode, "env:")
+		if name == "" || model.PlatformEnv(name) {
+			return env, false, fmt.Errorf("harness.instructions %q: not a variable the profile may set", mode)
+		}
+		return append(env, name+"="+instructions), true, nil
+	}
+	return env, false, fmt.Errorf("harness.instructions %q: file or env:NAME", mode)
 }
 
 // acpConn is what driveACP needs of the client-side connection (an interface, so the conversation
@@ -111,6 +183,16 @@ type acpConn interface {
 	LoadSession(ctx context.Context, params acp.LoadSessionRequest) (acp.LoadSessionResponse, error)
 	Prompt(ctx context.Context, params acp.PromptRequest) (acp.PromptResponse, error)
 	Cancel(ctx context.Context, params acp.CancelNotification) error
+}
+
+// acpSteerer sends a message into the turn in progress (acpx.Conn.Steer).
+type acpSteerer interface {
+	Steer(ctx context.Context, sessionID acp.SessionId, text string) (acpx.SteerOutcome, error)
+}
+
+// acpCloser ends a session on the agent's side (session/close).
+type acpCloser interface {
+	CloseSession(ctx context.Context, params acp.CloseSessionRequest) (acp.CloseSessionResponse, error)
 }
 
 // acpAuthenticator is the authenticate method of a connection (the client-side connection has
@@ -124,8 +206,9 @@ type acpAuthenticator interface {
 type acpOpened struct {
 	id           acp.SessionId
 	fresh        bool
-	instructions bool   // given as the session's system prompt: no prefix on the first prompt
+	instructions bool   // given natively (system prompt, file, env): no prefix on the first prompt
 	agent        string // initialize agentInfo.name
+	canClose     bool   // the agent declares sessionCapabilities.close
 }
 
 // openACPSession initializes the agent, authenticates it when the profile names a method, and
@@ -147,6 +230,7 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 	if init.AgentInfo != nil {
 		s.agent = init.AgentInfo.Name
 	}
+	s.canClose = init.AgentCapabilities.SessionCapabilities.Close != nil
 	// The profile names the agent's authentication method (spec.harness.auth_method): an API key
 	// in the environment, say. Without one the agent is not asked, and one that needs it refuses
 	// the session (authNeeded says which methods it offers).
@@ -187,17 +271,27 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 	if skipped > 0 {
 		notice("%d mcp server(s) not passed: the agent does not declare MCP servers over HTTP (spec.harness.mcp: always passes them anyway)", skipped)
 	}
-	// The instructions are the session's system prompt when the agent takes one: they then
-	// survive the agent compacting its context, which a prefix of the first prompt may not.
-	// A system prompt is not part of the session's history, so a loaded or resumed session gets
-	// it again.
+	// The instructions reach the agent natively when they can: already in its configuration
+	// (harness.instructions), else as the session's system prompt when the agent takes one. They
+	// then survive the agent compacting its context, which a prefix of the first prompt may not. A
+	// system prompt is not part of the session's history, so a loaded or resumed session gets it
+	// again.
 	instructions := strings.TrimSpace(os.Getenv("SANDBOX_INSTRUCTIONS"))
-	if instructions != "" && cl.systemPrompt != nil && cl.systemPrompt() {
+	switch {
+	case instructions == "":
+	case cl.instructionsDelivered:
+		s.instructions, instructions = true, ""
+	case cl.systemPrompt != nil && cl.systemPrompt():
 		s.instructions = true
-	} else {
+	default:
 		instructions = ""
 	}
-	meta := sessionMeta(instructions)
+	// harness.session_meta goes with every session request (claude-agent-acp: claudeCode.options).
+	profileMeta, err := profileSessionMeta(os.Getenv("HARNESS_SESSION_META"))
+	if err != nil {
+		notice("%v: not passed", err)
+	}
+	meta := acpx.SessionMeta(profileMeta, instructions)
 
 	var st acpSessionState
 	if run.Session != "" && run.ResumeOf != "" {
@@ -208,7 +302,7 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 			// session/resume continues without replaying the history.
 			r, err := resumer.ResumeSession(ctx, acp.ResumeSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
 			if err == nil {
-				s.id, st = prev, acpSessionState{modes: r.Modes, options: r.ConfigOptions}
+				s.id, st = prev, acpSessionState{Modes: r.Modes, Options: r.ConfigOptions}
 			} else {
 				authNeeded("session/resume "+run.Session, err)
 			}
@@ -219,7 +313,7 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 			r, err := conn.LoadSession(ctx, acp.LoadSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
 			cl.setReplaying(false)
 			if err == nil {
-				s.id, st = prev, acpSessionState{modes: r.Modes, options: r.ConfigOptions}
+				s.id, st = prev, acpSessionState{Modes: r.Modes, Options: r.ConfigOptions}
 			} else {
 				authNeeded("session/load "+run.Session, err)
 			}
@@ -238,9 +332,10 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 			authNeeded("session/new", err)
 			return s, false
 		}
-		s.id, s.fresh, st = ns.SessionId, true, acpSessionState{modes: ns.Modes, options: ns.ConfigOptions}
+		s.id, s.fresh, st = ns.SessionId, true, acpSessionState{Modes: ns.Modes, Options: ns.ConfigOptions}
 	}
-	configureACPSession(ctx, conn, s.id, st, os.Getenv("HARNESS_MODE"), os.Getenv("SANDBOX_MODEL"), notice)
+	configureACPSession(ctx, conn, s.id, st, acpSettings{mode: os.Getenv("HARNESS_MODE"), model: os.Getenv("SANDBOX_MODEL"),
+		thoughtLevel: os.Getenv("HARNESS_THOUGHT_LEVEL")}, notice)
 	return s, true
 }
 
@@ -259,14 +354,35 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 	usage := newACPUsage(sess.agent, string(sessionID), cl)
 
 	inputs := newPromptQueue()
+	// A message sent while a turn runs joins it when the agent takes steering; otherwise, or when
+	// no turn is running after all, it waits for the turn to end and is the next prompt.
+	if st, ok := conn.(acpSteerer); ok {
+		inputs.steer = func(text string) bool {
+			out, err := st.Steer(ctx, sessionID, escapeACPPrompt(text, cl.isCommand))
+			switch {
+			case err != nil:
+				notice("steering: %v: the message waits for the turn to end", err)
+				return false
+			case out == acpx.SteerInjected:
+				notice("the message joined the turn in progress (steering)")
+				return true
+			case out == acpx.SteerStartedNewTurn:
+				notice("the agent started a turn with the message itself (steering)")
+				return true
+			}
+			return false
+		}
+	}
 	startInput(inputs)
 	instructions := os.Getenv("SANDBOX_INSTRUCTIONS")
 	if sess.instructions {
 		instructions = "" // the session's system prompt has them
 	}
-	prompt := firstPrompt(run, sess.fresh, instructions, os.Getenv("SANDBOX_RESUME_PROMPT"))
+	prompt := firstPrompt(run, sess.fresh, instructions, os.Getenv("SANDBOX_RESUME_PROMPT"), cl.isCommand)
 	for {
+		inputs.setTurn(true)
 		resp, err := promptACP(ctx, conn, cl, sessionID, prompt, notice)
+		inputs.setTurn(false)
 		cl.flush()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -289,11 +405,27 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 		chat.turnEnded()
 		next, ok := inputs.next(ctx)
 		if !ok {
+			closeACPSession(conn, sess, notice)
 			return 0
 		}
 		// A message that waited for this turn is a new turn: the idle clock stops until it ends.
 		chat.sent()
-		prompt = escapeACPPrompt(next)
+		prompt = escapeACPPrompt(next, cl.isCommand)
+	}
+}
+
+// closeACPSession ends the conversation's session on the agent's side when it declares
+// session/close: the agent frees what it holds for it and writes its state before the process
+// ends. The session stays continuable (resume, load).
+func closeACPSession(conn acpConn, sess acpOpened, notice func(string, ...any)) {
+	cl, ok := conn.(acpCloser)
+	if !sess.canClose || !ok {
+		return
+	}
+	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
+	defer done()
+	if _, err := cl.CloseSession(ctx, acp.CloseSessionRequest{SessionId: sess.id}); err != nil {
+		notice("acp session/close: %v", err)
 	}
 }
 
@@ -337,21 +469,26 @@ func lostTurns(msg string) []string {
 	return ids
 }
 
-// escapeACPPrompt keeps a message that starts with "/" from being taken for one of the agent's
-// slash commands (OpenCode runs a known command and ends the turn empty on an unknown one;
-// claude-agent-acp has its own). The agents trim whitespace before they look, so the escape is
-// a zero-width space, which they do not trim and the model reads past.
-func escapeACPPrompt(text string) string {
-	if strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "/") {
-		return "\u200b" + text
+// escapeACPPrompt keeps a message that starts with "/" from being taken for a slash command the
+// agent does not have (OpenCode ends the turn empty on an unknown one). A command the agent
+// advertised (available_commands_update: /compact, /review…) passes as it is. The agents trim
+// whitespace before they look, so the escape is a zero-width space, which they do not trim and
+// the model reads past.
+func escapeACPPrompt(text string, isCommand func(string) bool) string {
+	t := strings.TrimLeft(text, " \t\r\n")
+	if !strings.HasPrefix(t, "/") {
+		return text
 	}
-	return text
+	if name, _, _ := strings.Cut(strings.TrimPrefix(t, "/"), " "); isCommand != nil && name != "" && isCommand(strings.TrimSpace(name)) {
+		return text
+	}
+	return "\u200b" + text
 }
 
 // firstPrompt is the text of the run's first prompt. For an agent that takes no system prompt
 // (sessionCapabilities.systemPrompt), a new session starts with the agent definition's
 // instructions ahead of the task; a loaded one already has them. A run that resumes an interrupted one (a rollout) continues it.
-func firstPrompt(run *model.Run, fresh bool, instructions, resumePrompt string) string {
+func firstPrompt(run *model.Run, fresh bool, instructions, resumePrompt string, isCommand func(string) bool) string {
 	task := run.Task
 	if run.ResumeOf != "" && run.Mode != model.RunMessage {
 		task = resumePrompt
@@ -362,7 +499,7 @@ func firstPrompt(run *model.Run, fresh bool, instructions, resumePrompt string) 
 			task = run.Task // nothing to continue: do the task again
 		}
 	}
-	task = escapeACPPrompt(task)
+	task = escapeACPPrompt(task, isCommand)
 	if fresh && strings.TrimSpace(instructions) != "" {
 		return "<instructions>\n" + strings.TrimSpace(instructions) + "\n</instructions>\n\n" + task
 	}
@@ -422,11 +559,30 @@ type promptQueue struct {
 	queue  []string
 	closed bool
 	wake   chan struct{}
+	inTurn bool // a prompt is in flight
+	// steer, when set, offers a message that arrives during a turn to that turn; true: it was
+	// taken and does not wait.
+	steer func(text string) bool
+}
+
+// setTurn records whether a prompt is in flight.
+func (q *promptQueue) setTurn(v bool) {
+	q.mu.Lock()
+	q.inTurn = v
+	q.mu.Unlock()
 }
 
 func newPromptQueue() *promptQueue { return &promptQueue{wake: make(chan struct{}, 1)} }
 
 func (q *promptQueue) Send(text string) error {
+	q.mu.Lock()
+	steer := q.steer != nil && q.inTurn && !q.closed && len(q.queue) == 0
+	q.mu.Unlock()
+	// Steered outside the lock: the agent answers while the turn goes on. A message that queued
+	// behind another keeps its order and waits too.
+	if steer && q.steer(text) {
+		return nil
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if q.closed {
@@ -482,16 +638,22 @@ func (q *promptQueue) next(ctx context.Context) (string, bool) {
 type acpClient struct {
 	emit        func(string)
 	permissions string // harness.PermissionsAllow (default) or PermissionsDeny
-	// systemPrompt reports whether the agent takes the client's system prompt (acpWire); nil:
+	// systemPrompt reports whether the agent takes the client's system prompt (acpx.Wire); nil:
 	// it does not.
 	systemPrompt func() bool
+	// instructionsDelivered: the instructions are in the agent's own configuration
+	// (harness.instructions), not to be sent again.
+	instructionsDelivered bool
 	// usageDir keeps the last cumulative usage of the sessions of an agent that reports one
 	// (acpUsage); "" keeps it in memory only.
 	usageDir string
 
 	mu        sync.Mutex
-	msg       strings.Builder // the agent message being streamed in chunks
-	replaying bool            // session/load: history the transcript already has
+	msg       strings.Builder             // the agent message being streamed in chunks
+	thought   strings.Builder             // the agent's reasoning being streamed in chunks
+	replaying bool                        // session/load: history the transcript already has
+	commands  map[string]bool             // the slash commands the agent advertised
+	summaries map[string]*strings.Builder // compaction summaries being streamed, by compaction id
 	// diffs are the diffs last written for each tool call: a later line with the same ones
 	// leaves them out, one with others replaces them (harness.ACPLine.DiffsReplace).
 	diffs map[string][]harness.ACPDiff
@@ -516,10 +678,58 @@ func (a *acpClient) flush() {
 }
 
 func (a *acpClient) flushLocked() {
+	if strings.TrimSpace(a.thought.String()) != "" {
+		a.emit(harness.ACPLine{Type: harness.ACPThought, Text: a.thought.String()}.String())
+	}
+	a.thought.Reset()
 	if strings.TrimSpace(a.msg.String()) != "" {
 		a.emit(harness.ACPLine{Type: harness.ACPMessage, Text: a.msg.String()}.String())
 	}
 	a.msg.Reset()
+}
+
+// isCommand reports whether the agent advertised the slash command name.
+func (a *acpClient) isCommand(name string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.commands[name]
+}
+
+// extraUpdate writes the updates the SDK cannot decode (acpx.Wire): notices and compactions.
+func (a *acpClient) extraUpdate(u acpx.ExtraUpdate) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.replaying {
+		return
+	}
+	switch {
+	case u.Notice != nil:
+		a.flushLocked()
+		a.emit(harness.ACPLine{Type: harness.ACPNotice, Severity: u.Notice.Severity, Title: u.Notice.Title, Text: u.Notice.Description}.String())
+	case u.SummaryChunk != nil:
+		if a.summaries == nil {
+			a.summaries = map[string]*strings.Builder{}
+		}
+		b := a.summaries[u.SummaryChunk.ID]
+		if b == nil {
+			b = &strings.Builder{}
+			a.summaries[u.SummaryChunk.ID] = b
+		}
+		if b.Len() < maxACPDiffText {
+			b.WriteString(u.SummaryChunk.Text)
+		}
+	case u.Compaction != nil:
+		c := u.Compaction
+		l := harness.ACPLine{Type: harness.ACPCompaction, CompactionID: c.ID, Status: c.Status, Error: c.Error, Text: c.Summary}
+		if c.Status != "in_progress" {
+			if b := a.summaries[c.ID]; b != nil && l.Text == "" {
+				l.Text = b.String()
+			}
+			delete(a.summaries, c.ID)
+		}
+		a.flushLocked()
+		a.emit(l.String())
+	}
 }
 
 func (a *acpClient) SessionUpdate(_ context.Context, n acp.SessionNotification) error {
@@ -534,14 +744,44 @@ func (a *acpClient) SessionUpdate(_ context.Context, n acp.SessionNotification) 
 		}
 		return nil
 	}
+	// The agent's commands are state, whenever they come (a load announces them too).
+	if u.AvailableCommandsUpdate != nil {
+		a.commands = map[string]bool{}
+		for _, c := range u.AvailableCommandsUpdate.AvailableCommands {
+			a.commands[c.Name] = true
+		}
+		return nil
+	}
 	if a.replaying {
 		return nil
 	}
 	switch {
 	case u.AgentMessageChunk != nil:
+		if a.thought.Len() > 0 {
+			a.flushLocked() // the reasoning before this message is complete
+		}
 		if t := u.AgentMessageChunk.Content.Text; t != nil {
 			a.msg.WriteString(t.Text)
 		}
+	case u.AgentThoughtChunk != nil:
+		if a.msg.Len() > 0 {
+			a.flushLocked()
+		}
+		if t := u.AgentThoughtChunk.Content.Text; t != nil {
+			a.thought.WriteString(t.Text)
+		}
+	case u.Plan != nil:
+		a.flushLocked()
+		l := harness.ACPLine{Type: harness.ACPPlan, Entries: []harness.ACPPlanEntry{}}
+		for _, e := range u.Plan.Entries {
+			l.Entries = append(l.Entries, harness.ACPPlanEntry{Content: e.Content, Status: string(e.Status), Priority: string(e.Priority)})
+		}
+		a.emit(l.String())
+	case u.SessionInfoUpdate != nil:
+		if t := u.SessionInfoUpdate.Title; t != nil && *t != "" {
+			a.emit(harness.ACPLine{Type: harness.ACPSessionInfo, Title: *t}.String())
+		}
+
 	case u.ToolCall != nil:
 		a.flushLocked()
 		tc := u.ToolCall

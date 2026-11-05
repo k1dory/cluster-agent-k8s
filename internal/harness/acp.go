@@ -20,6 +20,12 @@ const (
 	ACPToolUpdate = "acp.tool_update" // progress of a tool call: status, diffs
 	ACPPermission = "acp.permission"  // a permission the agent asked for and the runner's decision
 	ACPTurnEnd    = "acp.turn_end"    // stop_reason: the prompt turn is over
+	// What the agent reports besides its messages and tool calls.
+	ACPThought     = "acp.thought"      // text: the agent's reasoning before a message (its chunks joined)
+	ACPPlan        = "acp.plan"         // entries: the agent's plan, whole, each time it changes
+	ACPNotice      = "acp.notice"       // severity, title, text: a notice for the user (a limit, an error it recovered from)
+	ACPCompaction  = "acp.compaction"   // compaction_id, status, error, text (its summary): the agent compacted its context
+	ACPSessionInfo = "acp.session_info" // title: the session's title as the agent names it
 )
 
 // ACPLine is one line of an ACP harness's output as the runner writes it.
@@ -40,6 +46,20 @@ type ACPLine struct {
 	// Permission: the option the runner chose (its kind: allow_once, reject_once…) and why.
 	Decision   string `json:"decision,omitempty"`
 	StopReason string `json:"stop_reason,omitempty"`
+	// Notice: info, warning, error or the agent's own.
+	Severity string `json:"severity,omitempty"`
+	// Plan: the entries, in order.
+	Entries []ACPPlanEntry `json:"entries,omitempty"`
+	// Compaction: its id and, when it failed, why.
+	CompactionID string `json:"compaction_id,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+// ACPPlanEntry is one step of an agent's plan: pending, in_progress or completed.
+type ACPPlanEntry struct {
+	Content  string `json:"content"`
+	Status   string `json:"status"`
+	Priority string `json:"priority,omitempty"`
 }
 
 // ACPDiff is a file change an ACP agent reported on a tool call. OldText is absent for a new file.

@@ -57,9 +57,15 @@ type Launch struct {
 	// HarnessMode is the session mode an "acp" harness is put in (session/set_mode).
 	HarnessMode string `json:"harness_mode,omitempty"`
 	// HarnessMCP is when an "acp" harness gets the MCP servers: auto (default) or always.
-	HarnessMCP   string `json:"harness_mcp,omitempty"`
-	Model        string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
-	Instructions string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
+	HarnessMCP string `json:"harness_mcp,omitempty"`
+	// HarnessThoughtLevel is the reasoning level an "acp" harness is put on.
+	HarnessThoughtLevel string `json:"harness_thought_level,omitempty"`
+	// HarnessSessionMeta is the _meta (a JSON object) every session request of an "acp" harness carries.
+	HarnessSessionMeta string `json:"harness_session_meta,omitempty"`
+	// HarnessInstructions is how an "acp" harness gets the instructions: "", file or env:NAME.
+	HarnessInstructions string `json:"harness_instructions,omitempty"`
+	Model               string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
+	Instructions        string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
 	// Env is the profile's own variables for the agent container. They never reach the init
 	// containers and never shadow a platform variable (see PlatformEnv).
 	Env map[string]string `json:"env,omitempty"`
@@ -95,7 +101,7 @@ func PlatformEnv(name string) bool {
 	switch name {
 	case "GATEWAY_IP", "GATEWAY_CA_FILE", "REGISTRAR_URL", "API_URL", "CERT_DIR", "HOME",
 		"HARNESS_CMD", "HARNESS_RESUME_CMD", "HARNESS_INPUT", "HARNESS_CHAT_IDLE", "HARNESS_PERMISSIONS", "HARNESS_AUTH_METHOD",
-		"HARNESS_MODE", "HARNESS_MCP":
+		"HARNESS_MODE", "HARNESS_MCP", "HARNESS_THOUGHT_LEVEL", "HARNESS_SESSION_META", "HARNESS_INSTRUCTIONS":
 		return true
 	}
 	return false
