@@ -831,7 +831,7 @@ paths:
   /hooks/git/{tenant}/{name}:
     post:
       tags: [git]
-      summary: A GitHub or GitLab webhook delivery for a registered GitRepository (no bearer token)
+      summary: A GitHub, GitLab or Forgejo (Gitea) webhook delivery for a registered GitRepository (no bearer token)
       description: |
         The provider tells the platform what happened and the platform does what the CI templates
         would, with nothing installed in the repository but the webhook: a push to the followed
@@ -839,7 +839,7 @@ paths:
         gets the plan of its head as one comment (updated per push, found by the marker line) and
         a commit status `agent-sandbox/plan` (`action: plan`); anything else is recorded as
         ignored with the reason. The delivery is authenticated by its signature against the
-        repository's `webhook_secret` (GitHub `X-Hub-Signature-256`, GitLab `X-Gitlab-Token`) and
+        repository's `webhook_secret` (GitHub `X-Hub-Signature-256`, GitLab `X-Gitlab-Token`, Forgejo `X-Forgejo-Signature`, Gitea `X-Gitea-Signature`) and
         must name the registered repository. The action is a persisted job: one per delivery (a
         redelivery names the same job), claimed by one replica at a time under a lease and taken
         over by another when that replica dies; it runs with the repository's authority, under the
@@ -1999,7 +1999,7 @@ components:
       type: object
       description: The last webhook delivery handled for the repository
       properties:
-        provider: { type: string, enum: [github, gitlab] }
+        provider: { type: string, enum: [github, gitlab, forgejo], description: "forgejo: Forgejo and Gitea alike" }
         event: { type: string, description: "push, pull_request, merge_request, or the provider's name of an event the platform ignores" }
         action: { type: string, enum: [sync, plan, ignored] }
         reason: { type: string, description: "Why the delivery was ignored, how a redelivery was treated, or a note on how the action went (the head the ref or the request has moved to, the attempt that failed and when the next runs)" }

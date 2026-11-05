@@ -190,8 +190,10 @@ with its own, empty Git configuration.
 Add `webhook_secret: config-hook` to the registration (the name of a credential holding the
 secret the provider will sign with) and point the repository's webhook at
 `POST https://<platform>/hooks/git/<tenant>/config` (`-` as the tenant for a shared
-repository), content type JSON, events *push* and *pull request* (GitHub) or *push* and
-*merge request* (GitLab), the same secret on the provider's side. From then on:
+repository), content type JSON, events *push* and *pull request* (GitHub, Forgejo, Gitea) or
+*push* and *merge request* (GitLab), the same secret on the provider's side. On Forgejo and
+Gitea the webhook is of type *Forgejo* / *Gitea* (Settings → Webhooks), with *Pull request
+events* including *synchronized* (new commits on the head). From then on:
 
 - a push to the followed ref syncs its head, exactly as `sandboxctl gitrepo sync` would
   (one apply per bundle under the stable key, `source.commit` on every revision, nothing
@@ -202,14 +204,19 @@ repository), content type JSON, events *push* and *pull request* (GitHub) or *pu
   failure when one is not, error when the repository could not be read. The head is fetched
   from the request's own ref (`refs/pull/N/head`, `refs/merge-requests/N/head`), the comment
   and the status are posted with the repository's `credential` to the API of the registered
-  repository's host, never to an address the delivery names;
+  repository's host, never to an address the delivery names (GitHub's API or `/api/v3`,
+  GitLab's `/api/v4`, Forgejo's and Gitea's `/api/v1`: the credential is an access token with
+  write access to the repository's issues and statuses);
 - everything else (another branch, a deleted ref, a closed request, an event the platform
   does not act on, a delivery naming another repository) is recorded as ignored with the
   reason.
 
 A delivery is accepted only when its signature matches the secret (GitHub's
-`X-Hub-Signature-256`, GitLab's `X-Gitlab-Token`); a repository without `webhook_secret`
-accepts none. An accepted delivery becomes a persisted job (one per delivery: a redelivery
+`X-Hub-Signature-256`, GitLab's `X-Gitlab-Token`, Forgejo's `X-Forgejo-Signature` and Gitea's
+`X-Gitea-Signature`); a repository without `webhook_secret` accepts none. Forgejo and Gitea
+also send GitHub's headers for tools that only know GitHub; the platform recognises them by
+their own headers first, so their pull requests are planned on their own actions (`opened`,
+`synchronized`, `reopened`) and answered through their own API. An accepted delivery becomes a persisted job (one per delivery: a redelivery
 names the same job), which one replica at a time claims under a lease and runs with the
 repository's authority (a tenant's repository does what the tenant may), under the tenant's
 cross-replica lock, syncs and pull request plans alike; a replica that dies mid-way leaves a
