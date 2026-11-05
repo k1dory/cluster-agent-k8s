@@ -769,7 +769,7 @@ func limitClause(n, def int) string {
 
 func (p *Postgres) QueryRuns(ctx context.Context, f Filter) ([]*model.Run, error) {
 	w, args := f.where("id", "created_at", false)
-	return p.queryRuns(ctx, `SELECT `+runCols+` FROM runs`+w+` ORDER BY created_at, id`+limitClause(f.Limit, 100000), args...)
+	return p.queryRuns(ctx, `SELECT `+runCols+` FROM runs`+w+` ORDER BY created_at, id`+limitClause(min(f.Limit, MaxRunsPerQuery), MaxRunsPerQuery), args...)
 }
 
 func (p *Postgres) QueryEvents(ctx context.Context, f Filter) ([]*model.Event, error) {

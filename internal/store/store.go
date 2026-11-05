@@ -370,7 +370,9 @@ type Store interface {
 	// run is no longer in one of from (another writer settled it first), ErrNotFound when absent.
 	SettleRun(ctx context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error)
 	ListRuns(ctx context.Context, sandboxID string) ([]*model.Run, error)
-	// QueryRuns returns runs matching f across sandboxes, oldest first.
+	// QueryRuns returns runs matching f across sandboxes, oldest first: at most f.Limit, or
+	// MaxRunsPerQuery when f.Limit is 0 or larger. A caller that needs them all pages with
+	// f.Cursor.
 	QueryRuns(ctx context.Context, f Filter) ([]*model.Run, error)
 	// ClaimQueuedRun atomically moves the oldest queued run of the sandbox to running and
 	// returns it; concurrent callers never get the same run. ErrNotFound when none is queued.
@@ -426,6 +428,9 @@ type Store interface {
 
 	Close() error
 }
+
+// MaxRunsPerQuery caps one QueryRuns, on every store alike.
+const MaxRunsPerQuery = 100000
 
 // RunStamp is what a run records at its claim about what executes it: the agent image and the
 // catalogue revisions of the sandbox at that moment. It never changes afterwards.

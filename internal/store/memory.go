@@ -808,6 +808,10 @@ func (m *Memory) QueryRuns(_ context.Context, f Filter) ([]*model.Run, error) {
 		}
 		return all[i].CreatedAt.Before(all[j].CreatedAt)
 	})
+	limit := f.Limit
+	if limit <= 0 || limit > MaxRunsPerQuery {
+		limit = MaxRunsPerQuery // as Postgres does
+	}
 	var out []*model.Run
 	for _, r := range all {
 		if !f.Cursor.after(r.CreatedAt, r.ID) {
@@ -815,7 +819,7 @@ func (m *Memory) QueryRuns(_ context.Context, f Filter) ([]*model.Run, error) {
 		}
 		c := *r
 		out = append(out, &c)
-		if f.Limit > 0 && len(out) >= f.Limit {
+		if len(out) >= limit {
 			break
 		}
 	}
