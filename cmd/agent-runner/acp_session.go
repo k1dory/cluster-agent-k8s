@@ -8,7 +8,7 @@ import (
 
 	acp "github.com/coder/acp-go-sdk"
 
-	"agent-sandbox/internal/acpx"
+	"github.com/k1dory/acpx"
 )
 
 // acpSessionState is what the agent said about a session when it opened.
@@ -26,6 +26,17 @@ type acpSettings struct {
 	mode, model, thoughtLevel string
 }
 
+// The settings under the profile's names, for the run's notices.
+var (
+	modeSetting         = named(acpx.ModeSetting, "harness.mode")
+	thoughtLevelSetting = named(acpx.ThoughtLevelSetting, "harness.thought_level")
+)
+
+func named(s acpx.Setting, name string) acpx.Setting {
+	s.Name = name
+	return s
+}
+
 // configureACPSession puts a freshly opened, loaded or resumed session in the profile's mode, on
 // its model and its reasoning level, through what the agent advertised (acpx.Configure). What
 // cannot be applied is reported, never fatal: the agent runs with its own default.
@@ -41,7 +52,7 @@ func configureACPSession(ctx context.Context, conn acpConn, sid acp.SessionId, s
 	for _, c := range []struct {
 		setting acpx.Setting
 		want    string
-	}{{acpx.ModeSetting, s.mode}, {acpx.ModelSetting, s.model}, {acpx.ThoughtLevelSetting, s.thoughtLevel}} {
+	}{{modeSetting, s.mode}, {acpx.ModelSetting, s.model}, {thoughtLevelSetting, s.thoughtLevel}} {
 		if err := acpx.Configure(ctx, cf, sid, st, c.setting, c.want); err != nil {
 			notice("%v", err)
 		}

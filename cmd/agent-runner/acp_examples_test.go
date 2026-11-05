@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"agent-sandbox/internal/acpx"
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/model"
+	"github.com/k1dory/acpx"
 )
 
 // The shipped OpenCode profile, as the runner applies it (its harness files written to a clean

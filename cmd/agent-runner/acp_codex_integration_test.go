@@ -14,8 +14,8 @@ import (
 
 	acp "github.com/coder/acp-go-sdk"
 
-	"agent-sandbox/internal/acpx"
 	"agent-sandbox/internal/catalog"
+	"github.com/k1dory/acpx"
 )
 
 // This smoke test needs the real adapter, not a mock of its authentication

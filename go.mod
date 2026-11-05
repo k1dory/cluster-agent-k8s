@@ -3,9 +3,11 @@ module agent-sandbox
 go 1.26.6
 
 require (
+	github.com/coder/acp-go-sdk v0.13.5
 	github.com/coreos/go-oidc/v3 v3.11.0
 	github.com/go-jose/go-jose/v4 v4.0.2
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/k1dory/acpx v0.1.0
 	github.com/miekg/dns v1.1.73
 	golang.org/x/sys v0.47.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -16,7 +18,6 @@ require (
 )
 
 require (
-	github.com/coder/acp-go-sdk v0.13.5 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/emicklei/go-restful/v3 v3.13.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.1 // indirect

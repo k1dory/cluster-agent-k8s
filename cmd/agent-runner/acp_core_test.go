@@ -16,9 +16,9 @@ import (
 
 	acp "github.com/coder/acp-go-sdk"
 
-	"agent-sandbox/internal/acpx"
 	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
+	"github.com/k1dory/acpx"
 )
 
 // coreConn is a scripted ACP agent in process: it declares what a test gives it (modes,

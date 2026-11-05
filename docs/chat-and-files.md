@@ -129,7 +129,7 @@ harness:
   auth_method: api-key             # optional: the agent's authentication method (ACP authenticate)
 ```
 
-The ACP side of agent-runner is `internal/acpx`, the platform's client layer over acp-go-sdk
+The ACP side of agent-runner is [`github.com/k1dory/acpx`](https://github.com/k1dory/acpx), the platform's client layer over acp-go-sdk
 v0.13.5: what the SDK does not type (the client system prompt, steering, notices, compaction
 updates, the client's session capabilities) is carried there at the JSON-RPC level, with ready
 calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
@@ -173,7 +173,7 @@ calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
   (`$SANDBOX_INSTRUCTIONS_FILE`) before the agent starts, which OpenCode's `instructions` names;
   `env:NAME` exports them as `NAME` (Hermes's `HERMES_ENVIRONMENT_HINT`). Either way they are part
   of the agent's system prompt and the first prompt carries no copy. (acp-go-sdk v0.13.5 has no
-  systemPrompt field: `internal/acpx` adds it at the JSON-RPC level.)
+  systemPrompt field: [`github.com/k1dory/acpx`](https://github.com/k1dory/acpx) adds it at the JSON-RPC level.)
 - **Reasoning level.** `thought_level` (`HARNESS_THOUGHT_LEVEL`) is selected like the model,
   through the agent's configuration option of category `thought_level` (codex-acp
   `reasoning_effort`, OpenCode `effort`, Hermes `reasoning_effort`), by value or display name.
@@ -215,7 +215,7 @@ calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
 
   Notices and compaction updates come only to a client that advertises
   `clientCapabilities.session.notices` / `.compaction`, which the runner does (the SDK cannot
-  express them; `internal/acpx` adds and decodes them).
+  express them; [`github.com/k1dory/acpx`](https://github.com/k1dory/acpx) adds and decodes them).
 
   **The diffs of a tool call are those of its last line that has any.** A line repeats no diff
   the call's previous line already carried; one with different diffs says `diffs_replace`

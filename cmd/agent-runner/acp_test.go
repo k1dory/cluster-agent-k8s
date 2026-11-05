@@ -17,9 +17,9 @@ import (
 
 	acp "github.com/coder/acp-go-sdk"
 
-	"agent-sandbox/internal/acpx"
 	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
+	"github.com/k1dory/acpx"
 )
 
 // The test binary doubles as a scripted ACP agent: run with ACP_FAKE_AGENT=1 it speaks ACP on

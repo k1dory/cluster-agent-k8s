@@ -19,9 +19,9 @@ import (
 
 	acp "github.com/coder/acp-go-sdk"
 
-	"agent-sandbox/internal/acpx"
 	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
+	"github.com/k1dory/acpx"
 )
 
 // executeACP runs one run of an Agent Client Protocol harness: the command is an ACP agent
