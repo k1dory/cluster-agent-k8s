@@ -45,6 +45,7 @@ type Config struct {
 	// Credentials: secrets tenants bring through the API (PUT /v1/credentials/{name}), encrypted
 	// at rest under key (64 hex characters or the base64 of 32 bytes; `openssl rand -hex 32`).
 	// Empty disables the API; `secret:NAME` then resolves from the secrets provider alone.
+	// With ca.source db the key also encrypts the CA private keys in the database.
 	//
 	// OAuth: the providers a tenant may sign in to with the device flow (POST
 	// /v1/oauth-credentials/{name}/login), sandboxd then keeping the access token fresh.

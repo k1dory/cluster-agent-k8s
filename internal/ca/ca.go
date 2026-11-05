@@ -3,6 +3,7 @@
 package ca
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -13,6 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/url"
 	"os"
@@ -266,9 +268,72 @@ func ParseBundle(b []byte) (*CA, error) {
 	return Parse(certPEM, keyPEM)
 }
 
-// Blobs is where a shared CA lives (the store's GetOrCreateBlob).
+// Blobs is where a shared CA lives (the store's GetOrCreateBlob and PutBlob).
 type Blobs interface {
 	GetOrCreateBlob(ctx context.Context, name string, create func() ([]byte, error)) ([]byte, error)
+	PutBlob(ctx context.Context, name string, data []byte) error
+}
+
+// KeySealer encrypts the CA key before it reaches the database (credentials.Sealer, under
+// credentials.key). The aad binds the ciphertext to the blob it is stored under.
+type KeySealer interface {
+	Seal(aad string, plain []byte) []byte
+	Open(aad string, sealed []byte) ([]byte, error)
+}
+
+// sealedKeyType is the PEM type of a CA key encrypted with a KeySealer: the block's bytes are
+// the sealed DER of the EC key. Not a standard type on purpose: nothing should mistake it for
+// a usable key.
+const sealedKeyType = "AGENT-SANDBOX SEALED EC PRIVATE KEY"
+
+func sealAAD(name string) string { return "ca:" + name }
+
+// SealedBundle is Bundle with the key encrypted by sl under aad sealAAD(name).
+func (c *CA) SealedBundle(sl KeySealer, name string) ([]byte, error) {
+	keyDER, err := x509.MarshalECPrivateKey(c.key.(*ecdsa.PrivateKey))
+	if err != nil {
+		return nil, err
+	}
+	return append(append([]byte{}, c.pem...), pem.EncodeToMemory(&pem.Block{Type: sealedKeyType, Bytes: sl.Seal(sealAAD(name), keyDER)})...), nil
+}
+
+// BundleSealed reports whether a stored bundle holds an encrypted key.
+func BundleSealed(b []byte) bool {
+	return bytes.Contains(b, []byte("-----BEGIN "+sealedKeyType+"-----"))
+}
+
+// ParseSealedBundle reads a bundle stored under name: a sealed one with sl, a legacy plaintext
+// one as is.
+func ParseSealedBundle(b []byte, sl KeySealer, name string) (*CA, error) {
+	if !BundleSealed(b) {
+		return ParseBundle(b)
+	}
+	if sl == nil {
+		return nil, fmt.Errorf("ca %s: the key in the database is encrypted and credentials.key is not set", name)
+	}
+	var certPEM []byte
+	var sealed []byte
+	for rest := b; ; {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		switch blk.Type {
+		case "CERTIFICATE":
+			certPEM = pem.EncodeToMemory(blk)
+		case sealedKeyType:
+			sealed = blk.Bytes
+		}
+	}
+	if certPEM == nil || sealed == nil {
+		return nil, errors.New("ca bundle: certificate or key missing")
+	}
+	keyDER, err := sl.Open(sealAAD(name), sealed)
+	if err != nil {
+		return nil, fmt.Errorf("ca %s: key: %w", name, err)
+	}
+	return Parse(certPEM, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
 }
 
 // BlobName is the store key of the shared agent CA.
@@ -276,23 +341,47 @@ const BlobName = "agent-ca"
 
 // LoadOrCreateShared returns the agent CA every replica shares: generated once by whoever gets
 // to the store first, read by everyone else.
-func LoadOrCreateShared(ctx context.Context, st Blobs) (*CA, error) {
-	return LoadOrCreateSharedNamed(ctx, st, BlobName, "agent-sandbox agent CA")
+func LoadOrCreateShared(ctx context.Context, st Blobs, sl KeySealer, log *slog.Logger) (*CA, error) {
+	return LoadOrCreateSharedNamed(ctx, st, BlobName, "agent-sandbox agent CA", sl, log)
 }
 
 // LoadOrCreateSharedNamed is LoadOrCreateShared for any CA kept under blob name with cn.
-func LoadOrCreateSharedNamed(ctx context.Context, st Blobs, name, cn string) (*CA, error) {
+//
+// With a sealer (credentials.key set) the key is stored encrypted: a new CA is only ever
+// created sealed, and a legacy plaintext bundle is read, stored again sealed and logged once.
+// Without one the key is stored in clear as before (sandboxd warns at startup), and a sealed
+// bundle is refused rather than replaced.
+func LoadOrCreateSharedNamed(ctx context.Context, st Blobs, name, cn string, sl KeySealer, log *slog.Logger) (*CA, error) {
 	data, err := st.GetOrCreateBlob(ctx, name, func() ([]byte, error) {
 		c, err := Generate(cn, 10*365*24*time.Hour)
 		if err != nil {
 			return nil, err
+		}
+		if sl != nil {
+			return c.SealedBundle(sl, name)
 		}
 		return c.Bundle()
 	})
 	if err != nil {
 		return nil, err
 	}
-	return ParseBundle(data)
+	c, err := ParseSealedBundle(data, sl, name)
+	if err != nil {
+		return nil, err
+	}
+	if sl != nil && !BundleSealed(data) {
+		sealed, err := c.SealedBundle(sl, name)
+		if err != nil {
+			return nil, err
+		}
+		if err := st.PutBlob(ctx, name, sealed); err != nil {
+			return nil, fmt.Errorf("ca %s: storing the key encrypted: %w", name, err)
+		}
+		if log != nil {
+			log.Warn("CA key found in clear in the database: stored it again encrypted under credentials.key", "blob", name)
+		}
+	}
+	return c, nil
 }
 
 // WriteTo stores the CA as <dir>/<base>.crt and <dir>/<base>.key for a program that reads

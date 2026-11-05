@@ -107,8 +107,9 @@ DNS the moment the address moves to it.
   are safe to run from several replicas. Nothing on the gateway nodes' disks matters with
   `ca.source: db`.
 - **Backup.** With `ca.source: db` the database holds everything the control plane needs:
-  catalogue, sandboxes, runs, keys, applies, the agent CA and the gateway root. `pg_dump` is the
-  backup; restore with the control plane stopped (`kubectl scale deploy/<release>-sandboxd
+  catalogue, sandboxes, runs, keys, applies, the agent CA and the gateway root (their keys
+  encrypted under `credentials.key` when it is set: keep the key with the dump, a restore
+  without it cannot load the CA). `pg_dump` is the backup; restore with the control plane stopped (`kubectl scale deploy/<release>-sandboxd
   --replicas=0`), then start it. Workspace volumes (`ws-<sandbox>`, one PVC per sandbox) are
   outside the database: back them up with your volume tooling if the agents' files matter; a
   restored database with a missing volume gives that sandbox a fresh workspace on its next
