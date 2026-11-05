@@ -101,7 +101,11 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	cl := &acpClient{emit: emit, permissions: os.Getenv("HARNESS_PERMISSIONS"), instructionsDelivered: delivered,
 		usageDir: filepath.Join(os.Getenv("HOME"), ".sandbox-acp-usage"), wire: wire, systemPrompt: wire.SystemPrompt,
 		pending: acpx.NewPending(), askTimeout: askTimeout(os.Getenv("HARNESS_ASK_TIMEOUT")),
-		resumePrompt: envValue(env, "SANDBOX_RESUME_PROMPT")}
+		resumePrompt: envValue(env, "SANDBOX_RESUME_PROMPT"),
+		abort: func() {
+			_ = signalGroup(cmd, syscall.SIGKILL)
+			_ = stdin.Close()
+		}}
 	conn := wire.Connect(cl)
 	exit := driveACP(runCtx, conn, cl, run, emit, chat, func(inputs inputSink) {
 		go forwardInput(runCtx, c, run.ID, inputs, cancel, chat)
@@ -151,6 +155,46 @@ func secondsOr(v string, def time.Duration) time.Duration {
 		return time.Duration(n) * time.Second
 	}
 	return def
+}
+
+// abortGrace is how long a call has to return once its context ended (a deadline, the run's
+// cancel) before the transport is ended under it.
+var abortGrace = 5 * time.Second
+
+// guard ends the transport (abort) when a call outlives its context by abortGrace. A context only
+// bounds the wait for an answer: the SDK writes the request first, synchronously, and a write to an
+// agent that stopped reading its stdin blocks once the pipe is full, deadline or not. release is
+// called when the call returned.
+func (a *acpClient) guard(ctx context.Context) (release func()) {
+	if a.abort == nil {
+		return func() {}
+	}
+	var mu sync.Mutex
+	var t *time.Timer
+	released := false
+	unregister := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if released {
+			return
+		}
+		t = time.AfterFunc(abortGrace, func() {
+			a.abortOnce.Do(func() {
+				fmt.Fprintf(os.Stderr, "agent-runner: an ACP call did not return %s after its deadline: stopping the agent\n", abortGrace)
+				a.notice("the agent did not let go of a call %s after its deadline (it stopped reading its input): the agent is stopped", abortGrace)
+				a.abort()
+			})
+		})
+	})
+	return func() {
+		unregister()
+		mu.Lock()
+		defer mu.Unlock()
+		released = true
+		if t != nil {
+			t.Stop()
+		}
+	}
 }
 
 // signalGroup sends sig to the process group the command leads.
@@ -265,7 +309,11 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 	notice := noticeFunc(emit)
 	// Every call has its own deadline (a load that timed out still leaves session/new its own).
 	setup := acpSetupTimeout()
-	call := func(d time.Duration) (context.Context, context.CancelFunc) { return context.WithTimeout(ctx, d) }
+	call := func(d time.Duration) (context.Context, context.CancelFunc) {
+		cctx, cancel := context.WithTimeout(ctx, d)
+		release := cl.guard(cctx)
+		return cctx, func() { release(); cancel() }
+	}
 	// failed reports a call that failed; one that ran out of time says which limit it met.
 	failed := func(op string, cctx context.Context, err error) {
 		if errors.Is(cctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
@@ -471,7 +519,9 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 	for {
 		inputs.setTurn(true)
 		turnCtx, endTurn := context.WithTimeout(ctx, turnTimeout)
+		release := cl.guard(turnCtx)
 		resp, err := promptACP(turnCtx, conn, cl, sessionID, prompt, notice)
+		release()
 		overran := errors.Is(turnCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
 		endTurn()
 		inputs.setTurn(false)
@@ -814,6 +864,9 @@ type acpClient struct {
 	lastCommands string
 	// resumePrompt is $SANDBOX_RESUME_PROMPT as execute set it for this run.
 	resumePrompt string
+	// abort ends the transport: the agent's group killed, its stdin closed (guard); nil: nothing to end.
+	abort     func()
+	abortOnce sync.Once
 	// usageDir keeps the last cumulative usage of the sessions of an agent that reports one
 	// (acpUsage); "" keeps it in memory only.
 	usageDir string
