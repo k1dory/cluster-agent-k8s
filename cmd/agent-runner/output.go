@@ -43,10 +43,60 @@ var (
 	// outputDrainBudget is how long the output still queued when the harness is done may take to
 	// be delivered before it is given up, and how long a lone notice is retried.
 	outputDrainBudget = 5 * time.Minute
-	// shutdownGrace is how long delivery goes on after SIGTERM: the pod has 30 seconds by default,
-	// and the result of the run (finish) still has to go after the output.
-	shutdownGrace = 15 * time.Second
+	// shutdownBudget is the time from SIGTERM to the run's result being sent: the pod has 30
+	// seconds by default. One clock orders the way out (shutdownDeadline): the harness gets until
+	// shutdownBudget less drainReserve and finishReserve to end (then its group is killed, see
+	// stopAtShutdown), its output until shutdownBudget less finishReserve to be delivered, and
+	// finish the rest.
+	shutdownBudget = 25 * time.Second
+	drainReserve   = 4 * time.Second
+	finishReserve  = 3 * time.Second
 )
+
+// stopTimes records when each signal context ended (by its Done channel): every part of the way
+// out counts from the same SIGTERM, whenever it starts.
+var stopTimes sync.Map
+
+// shutdownDeadline is the moment, reserve before the end of the shutdown budget, by which a part
+// of the way out must be done. Called once ctx has ended.
+func shutdownDeadline(ctx context.Context, reserve time.Duration) time.Time {
+	at, _ := stopTimes.LoadOrStore(ctx.Done(), time.Now())
+	return at.(time.Time).Add(shutdownBudget - reserve)
+}
+
+// atShutdown runs f at the shutdown deadline (reserve before the budget's end) once parent ends;
+// stop cancels it.
+func atShutdown(parent context.Context, reserve time.Duration, f func()) (stop func()) {
+	var mu sync.Mutex
+	var t *time.Timer
+	stopped := false
+	unregister := context.AfterFunc(parent, func() {
+		d := time.Until(shutdownDeadline(parent, reserve))
+		mu.Lock()
+		defer mu.Unlock()
+		if !stopped {
+			t = time.AfterFunc(d, f)
+		}
+	})
+	return func() {
+		unregister()
+		mu.Lock()
+		defer mu.Unlock()
+		stopped = true
+		if t != nil {
+			t.Stop()
+		}
+	}
+}
+
+// stopAtShutdown ends a harness that is still running when the time left after SIGTERM is only
+// enough to deliver its output and the result: kill is its group's SIGKILL.
+func stopAtShutdown(parent context.Context, kill func()) (stop func()) {
+	return atShutdown(parent, drainReserve+finishReserve, func() {
+		fmt.Fprintln(os.Stderr, "agent-runner: the harness did not end within the shutdown budget: killing it")
+		kill()
+	})
+}
 
 // spoolLineOverhead is what a queued line costs besides its text (its slice entry, its string
 // header, the newline of the batch).
@@ -107,30 +157,21 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 // deliveryCtx is the lifetime of a delivery the runner insists on: until budget (0: no limit)
-// has passed, or shutdownGrace after parent (the process's signal context) ended.
-func deliveryCtx(parent context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+// has passed, or, once parent (the process's signal context) ended, until the shutdown deadline
+// reserve before the budget's end. It does not end at SIGTERM itself: what the harness says
+// while it stops is the run's result, and is delivered.
+func deliveryCtx(parent context.Context, budget, reserve time.Duration) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var timer *time.Timer
 	if budget > 0 {
 		timer = time.AfterFunc(budget, cancel)
 	}
-	var mu sync.Mutex
-	var grace *time.Timer
-	stop := context.AfterFunc(parent, func() {
-		mu.Lock()
-		grace = time.AfterFunc(shutdownGrace, cancel)
-		mu.Unlock()
-	})
+	stop := atShutdown(parent, reserve, cancel)
 	return ctx, func() {
 		stop()
 		if timer != nil {
 			timer.Stop()
 		}
-		mu.Lock()
-		if grace != nil {
-			grace.Stop()
-		}
-		mu.Unlock()
 		cancel()
 	}
 }
@@ -153,9 +194,9 @@ type outputSpool struct {
 }
 
 // newOutputSpool starts the sender. parent is the process's signal context: after SIGTERM the
-// output is delivered for shutdownGrace more, then given up.
+// output is delivered until the shutdown deadline that leaves finish its reserve.
 func newOutputSpool(parent context.Context, c *client, runID string) *outputSpool {
-	ctx, stop := deliveryCtx(parent, 0)
+	ctx, stop := deliveryCtx(parent, 0, finishReserve)
 	s := &outputSpool{c: c, runID: runID, ctx: ctx, stop: stop, wake: make(chan struct{}, 1), done: make(chan struct{})}
 	go s.send()
 	return s
@@ -328,7 +369,7 @@ func (s *outputSpool) send() {
 // post delivers a few lines outside a run's output stream (a notice before the harness starts),
 // retried within outputDrainBudget.
 func (c *client) post(ctx context.Context, runID string, lines []string) {
-	dctx, done := deliveryCtx(ctx, outputDrainBudget)
+	dctx, done := deliveryCtx(ctx, outputDrainBudget, finishReserve)
 	defer done()
 	if err := c.postBatch(dctx, runID, lines); err != nil {
 		fmt.Fprintf(os.Stderr, "agent-runner: run %s: %d output line(s) not delivered: %v\n", runID, len(lines), err)

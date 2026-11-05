@@ -75,6 +75,12 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 		return 127
 	}
 	spool := newOutputSpool(ctx, c, run.ID)
+	// After SIGTERM the agent has until the shutdown budget leaves only enough time for its output
+	// and the result: then its group is killed and its stdin closed, which ends the connection.
+	defer stopAtShutdown(ctx, func() {
+		_ = signalGroup(cmd, syscall.SIGKILL)
+		_ = stdin.Close()
+	})()
 	chat := newChat(harness.InputACP, chatIdle())
 	var outputDone sync.WaitGroup
 	outputDone.Add(1)

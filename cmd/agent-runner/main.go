@@ -76,6 +76,8 @@ func (c *client) do(ctx context.Context, method, path string, body []byte, out a
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// The shutdown budget counts from the signal, whichever part of the way out looks first.
+	context.AfterFunc(ctx, func() { shutdownDeadline(ctx, 0) })
 	c, err := newClient()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "agent-runner:", err)
@@ -130,11 +132,11 @@ var finishBudget = 10 * time.Minute
 // idempotent, so a lost response is retried (capped exponential backoff with jitter) for
 // finishBudget. settled is true once the result is settled: acknowledged, or refused with a 4xx
 // (the run is gone or not ours). false: the budget ran out, or SIGTERM (ctx) and the shutdown
-// grace did; the caller keeps the result pending (serveRuns). The reconciler fails a run whose
+// budget did; the caller keeps the result pending (serveRuns). The reconciler fails a run whose
 // pod is gone, never one whose pod is healthy.
 func (c *client) finish(ctx context.Context, runID string, exit int) (settled bool) {
 	body, _ := json.Marshal(map[string]int{"exit_code": exit})
-	dctx, done := deliveryCtx(ctx, finishBudget)
+	dctx, done := deliveryCtx(ctx, finishBudget, 0)
 	defer done()
 	for attempt := 0; ; attempt++ {
 		if attempt > 0 && !sleepCtx(dctx, backoff(attempt, time.Second, time.Minute)) {
@@ -526,6 +528,13 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 		return 127
 	}
 	defer stdout.Close()
+	// After SIGTERM the harness has until the shutdown budget leaves only enough time for its
+	// output and the result: then its group is killed, and the output pipe closed shortly after
+	// (what still holds it left the group).
+	defer stopAtShutdown(ctx, func() {
+		_ = signalGroup(cmd, syscall.SIGKILL)
+		time.AfterFunc(500*time.Millisecond, func() { _ = stdout.Close() })
+	})()
 	chat := newChat(os.Getenv("HARNESS_INPUT"), chatIdle())
 	// Harnesses that take the task on stdin get it first (in stream-json mode as the first user
 	// message); CLI-arg harnesses just ignore it. In text mode that is all stdin ever carries, so

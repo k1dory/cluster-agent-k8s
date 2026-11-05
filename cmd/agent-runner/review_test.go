@@ -153,17 +153,17 @@ func TestReviewFinishIsBoundedAndStopsAfterSIGTERM(t *testing.T) {
 	}))
 	defer server.Close()
 	c := &client{base: server.URL, http: server.Client()}
-	oldBudget, oldGrace := finishBudget, shutdownGrace
-	defer func() { finishBudget, shutdownGrace = oldBudget, oldGrace }()
+	oldBudget, oldShutdown := finishBudget, shutdownBudget
+	defer func() { finishBudget, shutdownBudget = oldBudget, oldShutdown }()
 
-	finishBudget, shutdownGrace = 1500*time.Millisecond, time.Hour
+	finishBudget, shutdownBudget = 1500*time.Millisecond, time.Hour
 	start := time.Now()
 	c.finish(t.Context(), "run-down", 1)
 	if d := time.Since(start); d > 5*time.Second || calls.Load() < 2 {
 		t.Fatalf("budget: returned after %s with %d attempts", d, calls.Load())
 	}
 
-	finishBudget, shutdownGrace = time.Hour, 300*time.Millisecond
+	finishBudget, shutdownBudget = time.Hour, 300*time.Millisecond
 	ctx, sigterm := context.WithCancel(t.Context())
 	sigterm()
 	start = time.Now()
