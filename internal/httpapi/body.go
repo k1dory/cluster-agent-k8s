@@ -115,3 +115,18 @@ func decodeStrict(w http.ResponseWriter, r *http.Request, v any, limit int64) er
 	}
 	return nil
 }
+
+// removeForm deletes the temporary files of a parsed multipart form once the route is done,
+// whatever way it ends (an answer, a replay, a refusal). net/http removes them only for the
+// request it created, and auth hands the handlers a copy (WithContext), so its cleanup never
+// sees the form parsed here.
+func removeForm(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if r.MultipartForm != nil {
+				_ = r.MultipartForm.RemoveAll()
+			}
+		}()
+		next(w, r)
+	}
+}

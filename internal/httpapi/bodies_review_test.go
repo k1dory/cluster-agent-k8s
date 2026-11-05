@@ -8,6 +8,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -214,5 +215,49 @@ func TestReviewMultipartRetryWithAnotherBoundaryReplays(t *testing.T) {
 		ct, b := multipartBody(t, "", "see attached", files...)
 		resp, body := postRaw(t, api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", ct, bytes.NewReader(b), key)
 		wantErr(t, fmt.Sprintf("other upload %v under the key", files), resp, body, 422, CodeInvalid)
+	}
+}
+
+// Uploads that spill to temporary files leave none behind: auth hands the handlers a copy of
+// the request, so net/http's own cleanup never sees the parsed form. Covered: a keyed upload,
+// its replay, an unkeyed upload and a rejected one (too many files).
+func TestReviewMultipartTemporaryFilesAreRemoved(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	s := newStack(t)
+	api, gw := s.platform.URL, s.gateway.URL
+	sb, hdr := agentOf(t, s, "spill")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go fakeRunner(ctx, t, gw, hdr, map[string]string{})
+
+	big := strings.Repeat("s", multipartMemory+(1<<20)) // over what is kept in memory
+	url := api + "/v1/sandboxes/" + sb.ID + "/messages"
+	key := map[string]string{"Idempotency-Key": "spill-1"}
+	var many [][2]string
+	for i := 0; i <= MaxUploadFiles; i++ {
+		many = append(many, [2]string{fmt.Sprintf("f%d.bin", i), big[:1<<20]})
+	}
+	many[0][1] = big
+	for _, c := range []struct {
+		what  string
+		hdr   map[string]string
+		files [][2]string
+		want  int
+	}{
+		{"keyed upload", key, [][2]string{{"big.bin", big}}, 202},
+		{"replay", key, [][2]string{{"big.bin", big}}, 202},
+		{"unkeyed upload", nil, [][2]string{{"big.bin", big}}, 202},
+		{"rejected upload", map[string]string{"Idempotency-Key": "spill-2"}, many, 413},
+	} {
+		ct, b := multipartBody(t, "", "upload", c.files...)
+		resp, body := postRaw(t, url, "alice-tok", ct, bytes.NewReader(b), c.hdr)
+		if resp.StatusCode != c.want {
+			t.Fatalf("%s: %d %s", c.what, resp.StatusCode, body)
+		}
+		left, _ := filepath.Glob(filepath.Join(tmp, "multipart-*"))
+		if len(left) > 0 {
+			t.Fatalf("%s left temporary files: %v", c.what, left)
+		}
 	}
 }

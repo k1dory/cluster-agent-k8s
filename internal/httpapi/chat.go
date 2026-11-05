@@ -30,7 +30,7 @@ import (
 //	GET  /v1/sandboxes/{id}/files/content?path= read a file
 //	PUT  /v1/sandboxes/{id}/files/content?path= write a file (the body)
 func (p *Platform) chatRoutes(mux *routeMux) {
-	mux.HandleFunc("POST /v1/sandboxes/{id}/messages", p.auth(p.idempotent(p.sendMessage)))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/messages", p.auth(removeForm(p.idempotent(p.sendMessage))))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/messages", p.auth(p.listMessages))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/messages/stream", p.auth(p.streamMessages))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/messages/close", p.auth(p.closeConversation))
