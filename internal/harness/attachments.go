@@ -1,6 +1,10 @@
 package harness
 
-import "strings"
+import (
+	"path"
+	"strings"
+	"unicode"
+)
 
 // attachmentsHeader opens the list of files a message has attached, after its text. It is the
 // contract between the control plane, which writes it (every harness reads it as text), and the
@@ -28,10 +32,19 @@ func SplitAttachments(s string) (text string, paths []string) {
 	}
 	for _, l := range strings.Split(s[i+len(attachmentsHeader):], "\n- ") {
 		l = strings.TrimSpace(l)
-		if !strings.HasPrefix(l, "/") || strings.Contains(l, "\n") {
-			return s, nil // not the list the control plane writes
+		if !AttachmentPath(l) {
+			return s, nil // not the list the control plane writes: text
 		}
 		paths = append(paths, l)
 	}
 	return s[:i], paths
+}
+
+// AttachmentPath is a path the attachment list may hold: in the workspace, clean, no control
+// characters (which could start a line of the list).
+func AttachmentPath(p string) bool {
+	if !strings.HasPrefix(p, "/workspace/") || path.Clean(p) != p || strings.ContainsFunc(p, unicode.IsControl) {
+		return false
+	}
+	return true
 }

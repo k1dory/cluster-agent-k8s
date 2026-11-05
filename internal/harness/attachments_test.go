@@ -17,7 +17,8 @@ func TestAttachmentsRoundTrip(t *testing.T) {
 	if s := WithAttachments("", []string{"/workspace/a"}); s != "See the attached files.\n\nAttached files:\n- /workspace/a" {
 		t.Fatalf("empty text: %q", s)
 	}
-	for _, plain := range []string{"just text", "text\n\nAttached files:\n- not a path", ""} {
+	for _, plain := range []string{"just text", "text\n\nAttached files:\n- not a path", "", "text\n\nAttached files:\n- /etc/passwd",
+		"text\n\nAttached files:\n- /workspace/../etc/passwd", "text\n\nAttached files:\n- /workspace/a\x00b"} {
 		if text, paths := SplitAttachments(plain); text != plain || paths != nil {
 			t.Fatalf("%q: %q %q", plain, text, paths)
 		}

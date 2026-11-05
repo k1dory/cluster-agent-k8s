@@ -22,12 +22,18 @@ import (
 // from the stream: this one is the reference.
 type chatState struct {
 	mu       sync.Mutex
-	open     map[string]acpx.Request
+	open     map[string]openRequest
 	order    []string // open requests, oldest first
 	commands []harness.ACPCommand
 }
 
-func newChatState() *chatState { return &chatState{open: map[string]acpx.Request{}} }
+// openRequest is a request and the run that asked it (the answer goes to that run).
+type openRequest struct {
+	acpx.Request
+	RunID string
+}
+
+func newChatState() *chatState { return &chatState{open: map[string]openRequest{}} }
 
 // observe takes in one turn of the conversation.
 func (s *chatState) observe(m model.Message) {
@@ -42,7 +48,7 @@ func (s *chatState) observe(m model.Message) {
 	defer s.mu.Unlock()
 	switch {
 	case m.Role == model.RoleRequest && l.Request != nil:
-		s.open[l.Request.ID] = *l.Request
+		s.open[l.Request.ID] = openRequest{Request: *l.Request, RunID: m.RunID}
 		s.order = append(s.order, l.Request.ID)
 	case m.Role == model.RoleResolved:
 		delete(s.open, l.RequestID)
@@ -58,17 +64,17 @@ func (s *chatState) observe(m model.Message) {
 }
 
 // request is the open request a reply means: the one named, else the latest.
-func (s *chatState) request(id string) (acpx.Request, error) {
+func (s *chatState) request(id string) (openRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if id != "" {
 		if r, ok := s.open[id]; ok {
 			return r, nil
 		}
-		return acpx.Request{}, fmt.Errorf("no open request %s", id)
+		return openRequest{}, fmt.Errorf("no open request %s", id)
 	}
 	if len(s.order) == 0 {
-		return acpx.Request{}, errors.New("the agent is not waiting for an answer")
+		return openRequest{}, errors.New("the agent is not waiting for an answer")
 	}
 	return s.open[s.order[len(s.order)-1]], nil
 }
@@ -104,6 +110,12 @@ func renderRequest(r acpx.Request) string {
 	switch r.Kind {
 	case acpx.RequestPermission:
 		fmt.Fprintf(&b, "? the agent asks permission: %s  [%s]\n", r.Title, r.ID)
+		if r.Text != "" {
+			b.WriteString("    " + strings.ReplaceAll(truncateText(r.Text, 2000), "\n", "\n    ") + "\n")
+		}
+		if len(r.RawInput) > 0 && string(r.RawInput) != "{}" {
+			fmt.Fprintf(&b, "    input: %s\n", truncateText(string(r.RawInput), 500))
+		}
 		for i, o := range r.Options {
 			fmt.Fprintf(&b, "    %d. %s (%s)\n", i+1, o.Name, o.Kind)
 		}
@@ -123,21 +135,40 @@ func renderRequest(r acpx.Request) string {
 	return b.String()
 }
 
-// formFields describes a form's fields: name, title, choices, required.
+// formFields describes a form's fields: name, title, the question (description), choices
+// (oneOf/anyOf/enum, or a multi-select's items), required.
 func formFields(schema json.RawMessage) []string {
+	type choices struct {
+		Type  string `json:"type"`
+		OneOf []struct {
+			Const any `json:"const"`
+		} `json:"oneOf"`
+		AnyOf []struct {
+			Const any `json:"const"`
+		} `json:"anyOf"`
+		Enum []any `json:"enum"`
+	}
 	var s struct {
 		Properties map[string]struct {
-			Type  string `json:"type"`
-			Title string `json:"title"`
-			OneOf []struct {
-				Const any `json:"const"`
-			} `json:"oneOf"`
-			Enum []any `json:"enum"`
+			choices
+			Title       string   `json:"title"`
+			Description string   `json:"description"`
+			Items       *choices `json:"items"`
 		} `json:"properties"`
 		Required []string `json:"required"`
 	}
 	if json.Unmarshal(schema, &s) != nil {
 		return nil
+	}
+	list := func(c choices) []string {
+		var out []string
+		for _, o := range append(c.OneOf, c.AnyOf...) {
+			out = append(out, fmt.Sprint(o.Const))
+		}
+		for _, e := range c.Enum {
+			out = append(out, fmt.Sprint(e))
+		}
+		return out
 	}
 	required := map[string]bool{}
 	for _, r := range s.Required {
@@ -155,16 +186,15 @@ func formFields(schema json.RawMessage) []string {
 		if p.Title != "" {
 			line += " (" + p.Title + ")"
 		}
-		var choices []string
-		for _, o := range p.OneOf {
-			choices = append(choices, fmt.Sprint(o.Const))
+		if p.Description != "" {
+			line += " — " + p.Description
 		}
-		for _, e := range p.Enum {
-			choices = append(choices, fmt.Sprint(e))
-		}
-		if len(choices) > 0 {
-			line += ": " + strings.Join(choices, " | ")
-		} else if p.Type != "" {
+		switch {
+		case p.Items != nil && len(list(*p.Items)) > 0:
+			line += ": any of " + strings.Join(list(*p.Items), " | ") + "  (field='[\"a\",\"b\"]')"
+		case len(list(p.choices)) > 0:
+			line += ": " + strings.Join(list(p.choices), " | ")
+		case p.Type != "":
 			line += ": " + p.Type
 		}
 		if required[n] {
@@ -173,6 +203,13 @@ func formFields(schema json.RawMessage) []string {
 		out = append(out, line)
 	}
 	return out
+}
+
+func truncateText(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
 }
 
 // buildReply turns what was typed after /reply into the answer to r: an option's number or id

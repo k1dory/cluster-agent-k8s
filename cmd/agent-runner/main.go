@@ -630,13 +630,24 @@ func (s *chatState) streams() bool {
 func forwardInput(ctx context.Context, c *client, runID string, w inputSink, cancelRun context.CancelFunc, chat *chatState) {
 	defer w.Close()
 	var after int64
+	// Once the conversation is closed (run.close, the idle period) the input is closed, and what
+	// waits on a person is given up (promptQueue.Close); polling goes on for a cancel until the
+	// run ends (ctx), so a harness still finishing its turn can always be stopped.
+	closed := false
+	closeInput := func(why string) {
+		if !closed {
+			closed = true
+			fmt.Println("agent-runner: " + why)
+			_ = w.Close()
+		}
+	}
 	for ctx.Err() == nil {
 		wait := 30 * time.Second
-		if chat.streams() {
+		if chat.streams() && !closed {
 			if idle := chat.idleFor(); idle > 0 {
 				if idle >= chat.idle {
-					fmt.Printf("agent-runner: no message for %s after the last turn, closing the conversation\n", chat.idle)
-					return
+					closeInput(fmt.Sprintf("no message for %s after the last turn, closing the conversation", chat.idle))
+					continue
 				}
 				wait = min(wait, chat.idle-idle)
 			}
@@ -658,9 +669,13 @@ func forwardInput(ctx context.Context, c *client, runID string, w inputSink, can
 				cancelRun()
 				return
 			case model.EventRunClose:
-				fmt.Println("agent-runner: conversation closed by the control plane")
-				return
-			case model.EventReply:
+				closeInput("conversation closed by the control plane")
+				continue
+			}
+			if closed {
+				continue // after the close: only a cancel matters
+			}
+			if e.Type == model.EventReply {
 				// A person's answer to a request of the agent: to the conversation that holds it.
 				if r, ok := w.(interface{ Reply(string) error }); ok {
 					_ = r.Reply(e.Data)
@@ -675,7 +690,8 @@ func forwardInput(ctx context.Context, c *client, runID string, w inputSink, can
 				continue
 			}
 			if err := w.Send(e.Data); err != nil {
-				return
+				closeInput("input closed")
+				continue
 			}
 			// An ACP conversation's activity is driveACP's: a message may join the turn in
 			// progress (steering) or wait for it, and driveACP knows which.

@@ -138,7 +138,7 @@ func (o *Orchestrator) harnessInput(sb *model.Sandbox) string {
 // to the run that waits for it. The runner checks the answer against the request it holds and
 // writes how the request was resolved (acp.request_resolved); a reply to a request no longer
 // waiting is resolved as such there.
-func (o *Orchestrator) Reply(ctx context.Context, sandboxID string, reply acpx.Reply) (*model.Run, error) {
+func (o *Orchestrator) Reply(ctx context.Context, sandboxID, runID string, reply acpx.Reply) (*model.Run, error) {
 	if !requestIDRe.MatchString(reply.RequestID) {
 		return nil, fmt.Errorf("%w: request_id must be a request id (req_…)", ErrBadRequest)
 	}
@@ -163,9 +163,17 @@ func (o *Orchestrator) Reply(ctx context.Context, sandboxID string, reply acpx.R
 	if o.harnessInput(sb) != harness.InputACP {
 		return nil, fmt.Errorf("%w: the sandbox's harness asks nothing (input %q, not acp)", ErrConflict, o.harnessInput(sb))
 	}
-	r, err := o.Store.RunningRun(ctx, sandboxID)
-	if err != nil {
-		return nil, fmt.Errorf("%w: no run is waiting for an answer", ErrConflict)
+	// The answer goes to the run that asked (the request turn's run_id), never to another one
+	// that happens to run now.
+	if runID == "" {
+		return nil, fmt.Errorf("%w: run_id is required: the run that asked (the request's run_id)", ErrBadRequest)
+	}
+	r, err := o.Store.GetRun(ctx, runID)
+	if err != nil || r.SandboxID != sandboxID {
+		return nil, fmt.Errorf("run %s: %w", runID, store.ErrNotFound)
+	}
+	if r.Status != model.RunRunning {
+		return nil, fmt.Errorf("%w: run %s is %s: the request is no longer waiting", ErrConflict, runID, r.Status)
 	}
 	o.Touch(ctx, sandboxID)
 	return r, o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventReply, Data: string(data)})

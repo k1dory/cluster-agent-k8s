@@ -794,11 +794,15 @@ func TestACPSlashCommandsAreNotSteered(t *testing.T) {
 // The control plane's messages do not restart an ACP conversation's idle clock: driveACP owns it
 // (a message joined to a turn that has ended since must not keep the conversation open forever).
 func TestACPInputLeavesTheIdleClockToTheConversation(t *testing.T) {
-	sent := false
+	polls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		polls++
 		var evs []model.Event
-		if !sent {
-			evs, sent = []model.Event{{ID: 1, Type: model.EventInput, Data: "late"}, {ID: 2, Type: model.EventRunClose}}, true
+		switch polls {
+		case 1:
+			evs = []model.Event{{ID: 1, Type: model.EventInput, Data: "late"}, {ID: 2, Type: model.EventRunClose}}
+		case 2:
+			evs = []model.Event{{ID: 3, Type: model.EventRunCancel}}
 		}
 		_ = json.NewEncoder(w).Encode(evs)
 	}))

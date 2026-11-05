@@ -356,6 +356,15 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 // starts delivering the user's messages into the sink it is given. The result is the run's exit
 // code.
 func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, emit func(string), chat *chatState, startInput func(inputSink)) int {
+	// The input runs from the start: what the agent asks a person while the session opens (a
+	// sign-in link during authentication) is answered, and a cancel reaches it; messages wait in
+	// the queue for the first turn to end.
+	inputs := newPromptQueue()
+	inputs.onReply = cl.reply
+	if cl.pending != nil {
+		inputs.onClose = cl.pending.Close
+	}
+	startInput(inputs)
 	sess, ok := openACPSession(ctx, conn, cl, run, emit)
 	if !ok {
 		return 1
@@ -365,15 +374,13 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 	notice := noticeFunc(emit)
 	usage := newACPUsage(sess.agent, string(sessionID), cl)
 
-	inputs := newPromptQueue()
-	inputs.onReply = cl.reply
 	// A message sent while a turn runs joins it when the agent takes steering; otherwise, or when
 	// no turn is running after all, it waits for the turn to end and is the next prompt. A slash
 	// command always waits: an agent runs its commands from a prompt, steered text is only text.
 	// Steering runs beside the input (promptQueue), bounded, so a silent agent cannot hold up a
 	// cancel or a close behind it.
 	if st, ok := conn.(acpSteerer); ok {
-		inputs.steer = func(text string) bool {
+		inputs.setSteer(func(text string) bool {
 			if escapeACPPrompt(text, cl.isCommand) == text && strings.HasPrefix(strings.TrimLeft(text, " \t\r\n"), "/") {
 				return false // an advertised command
 			}
@@ -395,9 +402,8 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 				return true
 			}
 			return false
-		}
+		})
 	}
-	startInput(inputs)
 	instructions := os.Getenv("SANDBOX_INSTRUCTIONS")
 	if sess.instructions {
 		instructions = "" // the session's system prompt has them
@@ -506,6 +512,10 @@ func lostTurns(msg string) []string {
 // whitespace before they look, so the escape is a zero-width space, which they do not trim and
 // the model reads past.
 func escapeACPPrompt(text string, isCommand func(string) bool) string {
+	// The command is the text's, not the attached files' list after it.
+	if body, files := harness.SplitAttachments(text); len(files) > 0 {
+		return harness.WithAttachments(escapeACPPrompt(body, isCommand), files)
+	}
 	t := strings.TrimLeft(text, " \t\r\n")
 	if !strings.HasPrefix(t, "/") {
 		return text
@@ -608,6 +618,15 @@ type promptQueue struct {
 	steerBusy bool     // the worker is running
 	// onReply takes a person's answer to a request of the agent (a reply input event).
 	onReply func(data string)
+	// onClose runs when the input closes: what waits on a person is given up.
+	onClose func()
+}
+
+// setSteer sets the steering function (once the session is open).
+func (q *promptQueue) setSteer(f func(text string) bool) {
+	q.mu.Lock()
+	q.steer = f
+	q.mu.Unlock()
 }
 
 // Reply hands a reply input event to the conversation (forwardInput).
@@ -679,9 +698,13 @@ func (q *promptQueue) steerAll() {
 
 func (q *promptQueue) Close() error {
 	q.mu.Lock()
-	defer q.mu.Unlock()
 	q.closed = true
 	q.signal()
+	onClose := q.onClose
+	q.mu.Unlock()
+	if onClose != nil {
+		onClose()
+	}
 	return nil
 }
 
@@ -1045,8 +1068,15 @@ func (a *acpClient) askPermission(ctx context.Context, p acp.RequestPermissionRe
 	req := a.pending.Open(acpx.PermissionRequest(p))
 	rl := harness.ACPLine{Type: harness.ACPRequest, Request: &req, ToolCallID: req.ToolCallID}
 	a.mu.Lock()
-	a.withDiffsLocked(&rl, diffs)
-	a.emit(rl.String())
+	// The request shows the whole change it is about: its own diffs, else the ones the tool
+	// call carried before (Codex sends them with the call). The diff lines keep their own rules.
+	snapshot := diffs
+	if len(snapshot) == 0 {
+		snapshot = a.diffs[req.ToolCallID]
+	}
+	a.withDiffsLocked(&harness.ACPLine{ToolCallID: req.ToolCallID}, diffs)
+	rl.Diffs = snapshot
+	a.emit(boundRequestLine(rl))
 	a.mu.Unlock()
 
 	reply, by := a.awaitReply(ctx, req.ID)
@@ -1067,6 +1097,35 @@ func (a *acpClient) askPermission(ctx context.Context, p acp.RequestPermissionRe
 	return resp, nil
 }
 
+// maxRequestLine bounds an acp.request line well under the output's line limit: a request a
+// person cannot see cannot be answered. Larger details are cut (diff texts first, then the
+// tool's input and text), never the request itself.
+const maxRequestLine = 512 << 10
+
+func boundRequestLine(l harness.ACPLine) string {
+	line := l.String()
+	if len(line) <= maxRequestLine {
+		return line
+	}
+	diffs := make([]harness.ACPDiff, len(l.Diffs))
+	for i, d := range l.Diffs {
+		d.OldText, d.NewText, d.Truncated = nil, "", true
+		diffs[i] = d
+	}
+	l.Diffs = diffs
+	if line = l.String(); len(line) <= maxRequestLine {
+		return line
+	}
+	r := *l.Request
+	r.RawInput, r.Text = nil, truncate(r.Text, 4<<10)
+	l.Request = &r
+	if line = l.String(); len(line) <= maxRequestLine {
+		return line
+	}
+	l.Diffs = nil
+	return l.String()
+}
+
 // awaitReply waits for a person's reply to an open request; by is "user", or "timeout" / "cancelled"
 // when none came.
 func (a *acpClient) awaitReply(ctx context.Context, id string) (acpx.Reply, string) {
@@ -1076,6 +1135,8 @@ func (a *acpClient) awaitReply(ctx context.Context, id string) (acpx.Reply, stri
 		return reply, "user"
 	case ctx.Err() != nil:
 		return reply, "cancelled"
+	case a.pending.Closed():
+		return reply, "closed" // the conversation was closed while it waited
 	}
 	return reply, "timeout"
 }
@@ -1094,8 +1155,8 @@ func (a *acpClient) UnstableCreateElicitation(ctx context.Context, p acp.Unstabl
 	}
 	req := a.pending.Open(r)
 	a.mu.Lock()
-	a.flushLocked() // the question follows what the agent said before it
-	a.emit(harness.ACPLine{Type: harness.ACPRequest, Request: &req}.String())
+	// Requests come apart from the ordered notifications: a message being streamed is not cut here.
+	a.emit(boundRequestLine(harness.ACPLine{Type: harness.ACPRequest, Request: &req}))
 	a.mu.Unlock()
 
 	reply, by := a.awaitReply(ctx, req.ID)
@@ -1115,8 +1176,14 @@ func (a *acpClient) UnstableCreateElicitation(ctx context.Context, p acp.Unstabl
 }
 
 // UnstableCompleteElicitation: the agent says a link question was completed on its side (the
-// sign-in finished); the request has been answered already.
-func (a *acpClient) UnstableCompleteElicitation(context.Context, acp.UnstableCompleteElicitationNotification) error {
+// sign-in finished). A question still waiting for the person's consent is answered by it.
+func (a *acpClient) UnstableCompleteElicitation(_ context.Context, n acp.UnstableCompleteElicitationNotification) error {
+	if a.pending == nil {
+		return nil
+	}
+	if id, ok := a.pending.ResolveElicitation(string(n.ElicitationId)); ok {
+		a.notice("request %s: the agent reports the interaction complete", id)
+	}
 	return nil
 }
 

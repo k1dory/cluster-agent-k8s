@@ -30,6 +30,7 @@ func TestACPQueuedPromptKeepsInputOpen(t *testing.T) {
 	secondQueued := make(chan struct{})
 	secondStarted := make(chan struct{})
 	inputDone := make(chan struct{})
+	thirdDelivered := make(chan struct{})
 	requests := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++ // forwardInput makes one request at a time
@@ -47,8 +48,11 @@ func TestACPQueuedPromptKeepsInputOpen(t *testing.T) {
 			}
 		case 3:
 			events = []model.Event{{ID: 2, Type: model.EventInput, Data: "third"}, {ID: 3, Type: model.EventRunClose}}
+			defer close(thirdDelivered)
 		default:
-			t.Errorf("unexpected input poll %d", requests)
+			// After the close the runner still listens for a cancel: a long poll that ends with the run.
+			<-r.Context().Done()
+			return
 		}
 		_ = json.NewEncoder(w).Encode(events)
 	}))
@@ -72,7 +76,7 @@ func TestACPQueuedPromptKeepsInputOpen(t *testing.T) {
 			chat.mu.Unlock()
 			close(secondStarted)
 			select {
-			case <-inputDone:
+			case <-thirdDelivered:
 			case <-ctx.Done():
 				return acp.PromptResponse{}, ctx.Err()
 			}

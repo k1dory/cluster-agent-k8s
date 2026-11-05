@@ -120,7 +120,7 @@ harness:
   command: claude-agent-acp        # or codex-acp, opencode acp, any agent that speaks ACP (gemini --experimental-acp…)
   input: acp
   permissions: allow               # allow (default) | deny | ask (a person answers)
-  ask_timeout: 900                 # permissions ask: seconds a request waits for a person
+  # ask_timeout: 900               # with permissions ask: seconds a request waits for a person
   mode: default                    # optional: the session mode (claude-agent-acp default, codex-acp agent-full-access, OpenCode build)
   mcp: auto                        # auto (default) | always
   thought_level: high              # optional: the reasoning level (config option of category thought_level)
@@ -194,9 +194,12 @@ calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
     offers): a form (Claude's AskUserQuestion, an MCP server's form) with its JSON Schema, or a
     link to open (an MCP server's OAuth sign-in).
   - In the conversation it is a `request` turn whose `data` is that line. The answer is
-    `POST /v1/sandboxes/{id}/requests/{request_id}`: `{"option_id": …}` for a permission,
-    `{"action": "accept", "content": {…}}` for a form, `{"action": "accept"}` once a link is done,
-    `{"action": "decline"}` / `"cancel"`. It travels to the run as a `reply` input event; the
+    `POST /v1/sandboxes/{id}/requests/{request_id}` with the request turn's `run_id` (an answer
+    goes to the run that asked, never to a later one): `{"run_id": …, "option_id": …}` for a
+    permission, `{"run_id": …, "action": "accept", "content": {…}}` for a form (each answer of
+    its field's type and among its choices), `{"action": "accept"}` to consent to a link,
+    `{"action": "decline"}` / `"cancel"`. A link question is also answered when the agent reports
+    the interaction complete. It travels to the run as a `reply` input event; the
     runner checks it against the request (an option offered, the form's required and known
     fields) and answers the agent.
   - The resolution is an `acp.request_resolved` line (a `resolved` turn): `outcome` (the

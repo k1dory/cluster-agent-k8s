@@ -400,14 +400,16 @@ paths:
           application/json:
             schema:
               type: object
+              required: [run_id]
               properties:
+                run_id: { type: string, description: "The run that asked (the request turn's run_id): an answer never goes to another run" }
                 option_id: { type: string, description: "A permission: the option chosen" }
                 action: { type: string, enum: [accept, decline, cancel], description: "A question" }
                 content: { type: object, additionalProperties: true, description: "An accepted form: its fields" }
       responses:
         "202": { description: "Handed to the run that waits", content: { application/json: { schema: { type: object, properties: { run_id: { type: string }, request_id: { type: string } } } } } }
         "400": { description: "Not an answer (no option_id or action, both, an unknown action)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "409": { description: "No run is waiting, or the sandbox's harness is not ACP", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "The run that asked has ended, or the sandbox's harness is not ACP", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/sandboxes/{id}/runs/{run}/close:
     parameters: [{ $ref: "#/components/parameters/id" }, { name: run, in: path, required: true, schema: { type: string } }]
     post:

@@ -109,7 +109,7 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 		var paths []string
 		for _, a := range req.Attachments {
 			cp, err := orchestrator.CleanFSPath(a)
-			if err != nil || cp == "." {
+			if err != nil || cp == "." || !harness.AttachmentPath("/workspace/"+cp) {
 				writeErr(w, http.StatusBadRequest, fmt.Errorf("attachment path %q", a))
 				return
 			}
@@ -387,19 +387,24 @@ type ReplyResponse struct {
 	RequestID string `json:"request_id"`
 }
 
-// replyRequest: JSON {option_id} for a permission, {action, content} for a question. The
-// runner answers the agent and writes the resolution (role resolved in the conversation).
+// replyRequest: JSON {run_id, option_id} for a permission, {run_id, action, content} for a
+// question; run_id is the request turn's (the run that asked). The runner answers the agent and
+// writes the resolution (role resolved in the conversation).
 func (p *Platform) replyRequest(w http.ResponseWriter, r *http.Request) {
 	if _, ok := p.sandbox(w, r); !ok {
 		return
 	}
-	var reply acpx.Reply
-	if err := json.NewDecoder(io.LimitReader(r.Body, 128<<10)).Decode(&reply); err != nil {
+	var body struct {
+		acpx.Reply
+		RunID string `json:"run_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 128<<10)).Decode(&body); err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	reply := body.Reply
 	reply.RequestID = r.PathValue("request_id")
-	run, err := p.Orch.Reply(r.Context(), r.PathValue("id"), reply)
+	run, err := p.Orch.Reply(r.Context(), r.PathValue("id"), body.RunID, reply)
 	if err != nil {
 		writeOrchErr(w, err)
 		return

@@ -22,15 +22,17 @@ func reqMsg(role string, l harness.ACPLine) model.Message {
 func TestChatStateFollowsRequestsAndCommands(t *testing.T) {
 	s := newChatState()
 	perm := acpx.Request{ID: "req_aaaaaaaaaaaaaaaa", Kind: acpx.RequestPermission, Title: "Edit", Options: []acpx.Option{{ID: "yes", Name: "Allow", Kind: "allow_once"}, {ID: "no", Name: "Reject", Kind: "reject_once"}}}
-	form := acpx.Request{ID: "req_bbbbbbbbbbbbbbbb", Kind: acpx.RequestForm, Message: "Which db?", Schema: json.RawMessage(`{"type":"object","properties":{"db":{"type":"string","oneOf":[{"const":"pg"},{"const":"mysql"}]},"n":{"type":"integer"}},"required":["db"]}`)}
-	s.observe(reqMsg(model.RoleRequest, harness.ACPLine{Type: harness.ACPRequest, Request: &perm}))
+	form := acpx.Request{ID: "req_bbbbbbbbbbbbbbbb", Kind: acpx.RequestForm, Message: "Please answer the following questions.", Schema: json.RawMessage(`{"type":"object","properties":{"db":{"type":"string","oneOf":[{"const":"pg"},{"const":"mysql"}]},"n":{"type":"integer"},"question_1":{"type":"array","title":"Features","description":"Which features?","items":{"anyOf":[{"const":"auth"},{"const":"billing"}]}}},"required":["db"]}`)}
+	pm := reqMsg(model.RoleRequest, harness.ACPLine{Type: harness.ACPRequest, Request: &perm})
+	pm.RunID = "run_a"
+	s.observe(pm)
 	s.observe(reqMsg(model.RoleRequest, harness.ACPLine{Type: harness.ACPRequest, Request: &form}))
 	s.observe(reqMsg(model.RoleCommands, harness.ACPLine{Type: harness.ACPCommands, Commands: []harness.ACPCommand{{Name: "review", Hint: "branch", Description: "Review"}}}))
 
 	if r, err := s.request(""); err != nil || r.ID != form.ID {
 		t.Fatalf("latest: %+v %v", r, err)
 	}
-	if r, err := s.request(perm.ID); err != nil || r.ID != perm.ID {
+	if r, err := s.request(perm.ID); err != nil || r.ID != perm.ID || r.RunID != "run_a" {
 		t.Fatalf("named: %+v %v", r, err)
 	}
 	s.observe(reqMsg(model.RoleResolved, harness.ACPLine{Type: harness.ACPResolved, RequestID: form.ID, Outcome: "accept", By: "user"}))
@@ -49,7 +51,8 @@ func TestChatStateFollowsRequestsAndCommands(t *testing.T) {
 			t.Fatalf("permission view: %s", renderRequest(perm))
 		}
 	}
-	if v := renderRequest(form); !strings.Contains(v, "db: pg | mysql  (required)") || !strings.Contains(v, "n: integer") {
+	if v := renderRequest(form); !strings.Contains(v, "db: pg | mysql  (required)") || !strings.Contains(v, "n: integer") ||
+		!strings.Contains(v, "question_1 (Features) — Which features?: any of auth | billing") {
 		t.Fatalf("form view: %s", v)
 	}
 }

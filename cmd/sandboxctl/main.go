@@ -1841,7 +1841,7 @@ func (c *cli) chat(id string, raw bool) error {
 			fmt.Print(state.help())
 		case "/reply", "/decline", "/cancel":
 			rid, args := replyArgs(arg)
-			var req acpx.Request
+			var req openRequest
 			if req, err = state.request(rid); err != nil {
 				break
 			}
@@ -1852,10 +1852,12 @@ func (c *cli) chat(id string, raw bool) error {
 			case "/cancel":
 				reply = acpx.Reply{Action: acpx.ActionCancel}
 			default:
-				reply, err = buildReply(req, args)
+				reply, err = buildReply(req.Request, args)
 			}
 			if err == nil {
-				err = c.do("POST", "/v1/sandboxes/"+id+"/requests/"+req.ID, reply, nil)
+				// The answer goes to the run that asked.
+				body := map[string]any{"run_id": req.RunID, "option_id": reply.OptionID, "action": reply.Action, "content": reply.Content}
+				err = c.do("POST", "/v1/sandboxes/"+id+"/requests/"+req.ID, body, nil)
 			}
 		case "/close":
 			err = c.do("POST", "/v1/sandboxes/"+id+"/messages/close", nil, nil)

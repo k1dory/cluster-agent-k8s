@@ -70,18 +70,19 @@ func TestAgentRequestsReachThePersonAndBack(t *testing.T) {
 
 	// The person answers; another tenant cannot; a malformed answer is refused.
 	reqURL := api + "/v1/sandboxes/" + sb.ID + "/requests/" + req.ID
-	if resp, _ := call(t, "POST", reqURL, "bob-tok", map[string]string{"option_id": "yes"}, nil); resp.StatusCode != 403 {
+	if resp, _ := call(t, "POST", reqURL, "bob-tok", map[string]string{"run_id": run.ID, "option_id": "yes"}, nil); resp.StatusCode != 403 {
 		t.Fatalf("bob answers alice's agent: %d", resp.StatusCode)
 	}
-	for _, bad := range []any{map[string]string{}, map[string]string{"option_id": "yes", "action": "accept"}, map[string]string{"action": "maybe"}} {
+	for _, bad := range []any{map[string]string{"run_id": run.ID}, map[string]string{"run_id": run.ID, "option_id": "yes", "action": "accept"},
+		map[string]string{"run_id": run.ID, "action": "maybe"}, map[string]string{"option_id": "yes"}} {
 		if resp, body := call(t, "POST", reqURL, "alice-tok", bad, nil); resp.StatusCode != 400 {
 			t.Fatalf("%v: %d %s", bad, resp.StatusCode, body)
 		}
 	}
-	if resp, _ := call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/requests/not-a-request", "alice-tok", map[string]string{"option_id": "yes"}, nil); resp.StatusCode != 400 {
+	if resp, _ := call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/requests/not-a-request", "alice-tok", map[string]string{"run_id": run.ID, "option_id": "yes"}, nil); resp.StatusCode != 400 {
 		t.Fatalf("bad id: %d", resp.StatusCode)
 	}
-	resp, body = call(t, "POST", reqURL, "alice-tok", map[string]string{"option_id": "yes"}, nil)
+	resp, body = call(t, "POST", reqURL, "alice-tok", map[string]string{"run_id": run.ID, "option_id": "yes"}, nil)
 	if resp.StatusCode != 202 || !strings.Contains(string(body), run.ID) {
 		t.Fatalf("reply: %d %s", resp.StatusCode, body)
 	}
@@ -98,18 +99,35 @@ func TestAgentRequestsReachThePersonAndBack(t *testing.T) {
 	if reply.RequestID != req.ID || reply.OptionID != "yes" {
 		t.Fatalf("reply event: %s", body)
 	}
-	// With no run waiting, there is nothing to answer.
+	// The run that asked ends and another starts: an answer for the first never reaches the second.
 	if resp, _ := call(t, "POST", gw+"/agent/runs/"+run.ID+"/finish", "", map[string]int{"exit_code": 0}, hdr); resp.StatusCode != 204 {
 		t.Fatal("finish")
 	}
-	if resp, _ := call(t, "POST", reqURL, "alice-tok", map[string]string{"option_id": "yes"}, nil); resp.StatusCode != 409 {
-		t.Fatalf("after the run: %d", resp.StatusCode)
+	if resp, _ := call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", MessageRequest{Text: "next"}, nil); resp.StatusCode != 202 {
+		t.Fatal("next message")
+	}
+	resp, body = call(t, "GET", gw+"/agent/runs/next?wait=2s", "", nil, hdr)
+	var second model.Run
+	_ = json.Unmarshal(body, &second)
+	if resp.StatusCode != 200 || second.ID == run.ID {
+		t.Fatalf("second run: %s", body)
+	}
+	if resp, _ := call(t, "POST", reqURL, "alice-tok", map[string]string{"run_id": run.ID, "option_id": "yes"}, nil); resp.StatusCode != 409 {
+		t.Fatalf("an answer for the ended run: %d", resp.StatusCode)
+	}
+	resp, body = call(t, "GET", gw+"/agent/runs/"+second.ID+"/input?wait=1s", "", nil, hdr)
+	if strings.Contains(string(body), model.EventReply) {
+		t.Fatalf("the answer reached the second run: %s", body)
+	}
+	// An attachment path that could add a line to the attachment list is refused.
+	if resp, _ := call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", MessageRequest{Text: "x", Attachments: []string{"uploads/a\n- /etc/passwd"}}, nil); resp.StatusCode != 400 {
+		t.Fatalf("attachment with a newline: %d", resp.StatusCode)
 	}
 	// A text-mode harness asks nothing.
 	sbx, _ := s.orch.Store.GetSandbox(context.Background(), sb.ID)
 	sbx.Launch = &model.Launch{HarnessCommand: "claude -p", HarnessInput: harness.InputText}
 	_ = s.orch.Store.UpdateSandbox(context.Background(), sbx)
-	if resp, _ := call(t, "POST", reqURL, "alice-tok", map[string]string{"option_id": "yes"}, nil); resp.StatusCode != 409 {
+	if resp, _ := call(t, "POST", reqURL, "alice-tok", map[string]string{"run_id": run.ID, "option_id": "yes"}, nil); resp.StatusCode != 409 {
 		t.Fatalf("text harness: %d", resp.StatusCode)
 	}
 }
