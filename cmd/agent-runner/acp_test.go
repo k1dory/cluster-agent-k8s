@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -393,46 +395,56 @@ func TestFirstPrompt(t *testing.T) {
 }
 
 // A real ACP adapter (ACP_REAL_AGENT=<command>, e.g. the codex-acp of the agent image) opens a
-// session through the runner with the profile's authentication method (ACP_REAL_AUTH_METHOD,
-// sent as ACP authenticate). The run is stopped as soon as the session is reported; the model
-// endpoint points at a closed local port, so nothing leaves the machine. Skipped unless asked for.
+// session through the runner's own setup (openACPSession: initialize, authenticate with
+// ACP_REAL_AUTH_METHOD, session/new). Nothing is prompted, and the adapter runs without network:
+// under sandbox-exec (macOS) or in a new network namespace (Linux, unshare -rn). Where neither is
+// available the test is skipped rather than allowed to reach the vendor. Opt-in.
 func TestACPRealAdapterOpensASession(t *testing.T) {
 	agent := os.Getenv("ACP_REAL_AGENT")
 	if agent == "" {
 		t.Skip("ACP_REAL_AGENT not set")
 	}
-	_, cp, cl := setupACP(t, "")
-	t.Setenv("ACP_FAKE_AGENT", "")
-	t.Setenv("HARNESS_CMD", agent)
+	isolate := noNetwork(t)
+	home := t.TempDir()
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, isolate[0], append(isolate[1:], "/bin/sh", "-c", "exec "+agent)...)
+	// The adapter and whatever it starts form one process group, ended as a whole.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.Dir = home
+	cmd.Env = append(os.Environ(), "HOME="+home, "CODEX_HOME="+home, "NO_BROWSER=1")
+	cmd.WaitDelay = 2 * time.Second
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdin, _ := cmd.StdinPipe()
+	stdout, _ := cmd.StdoutPipe()
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stdin.Close(); cancel(); _ = cmd.Wait() }()
 	t.Setenv("HARNESS_AUTH_METHOD", os.Getenv("ACP_REAL_AUTH_METHOD"))
 	t.Setenv("SANDBOX_MCP_SERVERS", "")
-	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:9/v1")
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-	done := make(chan int, 1)
-	go func() { done <- execute(ctx, cl, &model.Run{ID: "run_real", Task: "reply with the word ok"}) }()
-	deadline := time.After(30 * time.Second)
-	for {
-		cp.mu.Lock()
-		var session string
-		for _, l := range cp.lines {
-			if s, ok := harness.ParseSession(l); ok {
-				session = s
-			}
-		}
-		out := strings.Join(cp.lines, "\n")
-		cp.mu.Unlock()
-		if session != "" {
-			cancel()
-			<-done
-			return
-		}
-		select {
-		case <-done:
-			t.Fatalf("the run ended without a session; output:\n%s", out)
-		case <-deadline:
-			t.Fatalf("no session in 30s; output:\n%s", out)
-		case <-time.After(100 * time.Millisecond):
-		}
+	t.Setenv("PWD", home)
+	t.Setenv("SANDBOX_REPO_DIR", home+"/no-repo")
+	var notices []string
+	emit := func(l string) { notices = append(notices, l) }
+	cl := &acpClient{emit: emit}
+	session, _, ok := openACPSession(ctx, acp.NewClientSideConnection(cl, stdin, stdout), cl, &model.Run{ID: "run_real"}, emit)
+	if !ok || session == "" {
+		t.Fatalf("no session: %q\nadapter stderr:\n%s", notices, stderr.String())
 	}
+}
+
+// noNetwork is the command prefix that runs a program without network access, or skips the test.
+func noNetwork(t *testing.T) []string {
+	t.Helper()
+	if _, err := exec.LookPath("sandbox-exec"); err == nil {
+		return []string{"sandbox-exec", "-p", `(version 1)(allow default)(deny network-outbound (remote ip))`}
+	}
+	if err := exec.Command("unshare", "-rn", "true").Run(); err == nil {
+		return []string{"unshare", "-rn"}
+	}
+	t.Skip("no way to run the adapter without network here (sandbox-exec, unshare -rn)")
+	return nil
 }

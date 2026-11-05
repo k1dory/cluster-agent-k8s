@@ -115,10 +115,10 @@ type acpAuthenticator interface {
 	Authenticate(ctx context.Context, params acp.AuthenticateRequest) (acp.AuthenticateResponse, error)
 }
 
-// driveACP holds the conversation: initialize, the session, then one prompt per message until
-// the input is closed (run.close, the idle period) or the run is cancelled. startInput starts
-// delivering the user's messages into the sink it is given. The result is the run's exit code.
-func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, emit func(string), chat *chatState, startInput func(inputSink)) int {
+// openACPSession initializes the agent, authenticates it when the profile names a method, and
+// loads the run's session (a continuing conversation) or starts a new one; fresh says which.
+// Nothing is prompted here: a failure has been reported through emit when ok is false.
+func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, emit func(string)) (sessionID acp.SessionId, fresh, ok bool) {
 	notice := func(format string, a ...any) { emit("[agent-runner] " + fmt.Sprintf(format, a...)) }
 	init, err := conn.Initialize(ctx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
@@ -128,7 +128,7 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 	})
 	if err != nil {
 		notice("acp initialize: %v", err)
-		return 1
+		return "", false, false
 	}
 	// The profile names the agent's authentication method (spec.harness.auth_method): an API key
 	// in the environment, say. Without one the agent is not asked, and one that needs it refuses
@@ -136,16 +136,16 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 	if method := os.Getenv("HARNESS_AUTH_METHOD"); method != "" {
 		if ids := authMethodIDs(init.AuthMethods); !slices.Contains(ids, method) {
 			notice("acp authenticate: the agent offers %v, not %q (spec.harness.auth_method)", ids, method)
-			return 1
+			return "", false, false
 		}
 		auth, ok := conn.(acpAuthenticator)
 		if !ok {
 			notice("acp authenticate: the connection cannot authenticate")
-			return 1
+			return "", false, false
 		}
 		if _, err := auth.Authenticate(ctx, acp.AuthenticateRequest{MethodId: method}); err != nil {
 			notice("acp authenticate %s: %v", method, err)
-			return 1
+			return "", false, false
 		}
 	}
 	authNeeded := func(op string, err error) {
@@ -168,8 +168,6 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 		notice("%d mcp server(s) not passed: the agent does not take MCP servers over HTTP", skipped)
 	}
 
-	var sessionID acp.SessionId
-	fresh := false
 	if run.Session != "" && run.ResumeOf != "" {
 		if init.AgentCapabilities.LoadSession {
 			// session/load replays the conversation as updates: the transcript already has it.
@@ -190,11 +188,24 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 		ns, err := conn.NewSession(ctx, acp.NewSessionRequest{Cwd: cwd, McpServers: servers})
 		if err != nil {
 			authNeeded("session/new", err)
-			return 1
+			return "", false, false
 		}
 		sessionID, fresh = ns.SessionId, true
 	}
+	return sessionID, fresh, true
+}
+
+// driveACP holds the conversation: the session (openACPSession), then one prompt per message
+// until the input is closed (run.close, the idle period) or the run is cancelled. startInput
+// starts delivering the user's messages into the sink it is given. The result is the run's exit
+// code.
+func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, emit func(string), chat *chatState, startInput func(inputSink)) int {
+	sessionID, fresh, ok := openACPSession(ctx, conn, cl, run, emit)
+	if !ok {
+		return 1
+	}
 	emit(harness.ACPLine{Type: harness.ACPSession, SessionID: string(sessionID)}.String())
+	notice := func(format string, a ...any) { emit("[agent-runner] " + fmt.Sprintf(format, a...)) }
 
 	inputs := newPromptQueue()
 	startInput(inputs)
