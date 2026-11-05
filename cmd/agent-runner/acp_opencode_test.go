@@ -80,6 +80,9 @@ func TestACPOpenCodeExampleAnswersThroughTheGateway(t *testing.T) {
 	if bin == "" {
 		t.Skip("set OPENCODE_TEST_BIN to run the OpenCode model-call test (it runs by itself in the agent image's check)")
 	}
+	if runOfflineInNetns(t) {
+		return
+	}
 	lines, seen := modelCallThroughGateway(t, "environment-opencode-acp.yaml", "opencode", bin, "api.anthropic.com", anthropicAnswer("pong-from-the-gateway"))
 	assertAnswered(t, lines, seen, "pong-from-the-gateway", "api.anthropic.com")
 	for _, r := range seen {

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +27,31 @@ func TestMain(m *testing.M) {
 	if os.Getenv("ACP_FAKE_AGENT") == "1" {
 		runFakeAgent()
 		os.Exit(0)
+	}
+	// noNetwork's prefix on Linux: unshare -rn <test binary> --netns-exec <program> <args>…
+	if len(os.Args) > 2 && os.Args[1] == "--netns-exec" {
+		if err := loopbackUp(); err != nil {
+			fmt.Fprintln(os.Stderr, "loopback up in the agent's network namespace:", err)
+			os.Exit(2)
+		}
+		path, err := exec.LookPath(os.Args[2])
+		if err == nil {
+			err = syscall.Exec(path, os.Args[2:], os.Environ())
+		}
+		fmt.Fprintln(os.Stderr, "netns exec:", err)
+		os.Exit(127)
+	}
+	if os.Getenv("ACP_TEST_NETNS") == "1" {
+		if err := loopbackUp(); err != nil {
+			fmt.Fprintln(os.Stderr, "loopback up in the test's network namespace:", err)
+			os.Exit(2)
+		}
+	}
+	if os.Getenv("ACP_LOOPBACK_SELFTEST") == "1" {
+		os.Exit(loopbackSelftest())
+	}
+	if u := os.Getenv("ACP_BRIDGE_CLIENT"); u != "" {
+		os.Exit(bridgeClient(u))
 	}
 	os.Exit(m.Run())
 }
@@ -497,8 +523,9 @@ func noNetwork(t *testing.T) []string {
 		return []string{"sandbox-exec", "-p", `(version 1)(allow default)(deny network-outbound (remote ip))(allow network-outbound (remote ip "localhost:*"))`}
 	}
 	if err := exec.Command("unshare", "-rn", "true").Run(); err == nil {
-		// A new network namespace has only lo, and it starts down.
-		return []string{"unshare", "-rn", "/bin/sh", "-c", `ip link set lo up 2>/dev/null; exec "$@"`, "sh"}
+		// A new network namespace has only lo, and it starts down: the test binary brings it up
+		// and then execs the agent (TestMain, --netns-exec), with no ip(8) needed.
+		return []string{"unshare", "-rn", os.Args[0], "--netns-exec"}
 	}
 	t.Skip("no way to run the adapter without network here (sandbox-exec, unshare -rn)")
 	return nil
