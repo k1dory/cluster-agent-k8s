@@ -504,11 +504,11 @@ func openRealACP(t *testing.T, isolate []string, agent, home string, env []strin
 	emit := func(l string) { notices = append(notices, l) }
 	cl := &acpClient{emit: emit}
 	conn := &loggedInit{ClientSideConnection: acp.NewClientSideConnection(cl, stdin, stdout), t: t}
-	session, fresh, ok := openACPSession(ctx, conn, cl, run, emit)
-	if !ok || session == "" {
+	s, ok := openACPSession(ctx, conn, cl, run, emit)
+	if !ok || s.id == "" {
 		t.Fatalf("no session: %q\nadapter stderr:\n%s", notices, stderr.String())
 	}
-	return session, fresh, notices, conn.loadSession
+	return s.id, s.fresh, notices, conn.loadSession
 }
 
 // noNetwork is the command prefix that runs a program with loopback only (an agent may talk to a
