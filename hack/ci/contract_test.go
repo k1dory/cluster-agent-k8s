@@ -308,3 +308,35 @@ esac
 		t.Fatalf("a failed download must clean its scratch directory: %v", leftovers)
 	}
 }
+
+// A cold download is tried the way it will be run: a runner's Trivy settings (an unreadable
+// TRIVY_CONFIG, a trivy.yaml in the working directory) do not reject a good archive.
+func TestTrivyDownloadIgnoresAmbientTrivySettings(t *testing.T) {
+	bin := t.TempDir()
+	// A curl that serves an archive holding a "trivy" that refuses to run when it sees any
+	// TRIVY_* setting but the cache directory, or a configuration file other than ours.
+	stub(t, bin, "curl", `out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2 ;; http*) url=$1; shift ;; *) shift ;; esac; done
+case "$url" in
+  *checksums.txt)
+    sum=$( (sha256sum "$(dirname "$out")"/*.tar.gz 2>/dev/null || shasum -a 256 "$(dirname "$out")"/*.tar.gz) | awk '{print $1}')
+    for n in $(ls "$(dirname "$out")" | grep '\.tar\.gz$'); do echo "$sum  $n"; done > "$out" ;;
+  *.tar.gz)
+    d=$(mktemp -d); printf '#!/usr/bin/env bash\nif env | grep "^TRIVY_" | grep -qv "^TRIVY_CACHE_DIR="; then exit 3; fi\ncase " $* " in *"hack/ci/trivy.yaml"*) ;; *) exit 4 ;; esac\necho "Version: stub"\n' > "$d/trivy"
+    chmod +x "$d/trivy"; tar -C "$d" -czf "$out" trivy; rm -rf "$d" ;;
+  *) exit 22 ;;
+esac
+`)
+	ciBin := t.TempDir()
+	cmd := exec.Command("bash", "-c", ". hack/ci/lib.sh && ci_trivy")
+	cmd.Dir = repoRoot(t)
+	cmd.Env = append(os.Environ(), "PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"), "CI_BIN="+ciBin, "TRIVY_BIN=",
+		"TRIVY_CONFIG=/nonexistent/trivy.yaml", "TRIVY_DOWNLOAD_DB_ONLY=true")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("a good archive must be kept whatever Trivy settings the runner carries: %v\n%s", err, out)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(ciBin, "trivy-*", "trivy")); len(matches) != 1 {
+		t.Fatalf("the download must publish one scanner: %v", matches)
+	}
+}

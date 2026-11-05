@@ -83,7 +83,10 @@ ci_trivy() {
     got=$(sha256sum "$tmp/$name" 2>/dev/null | awk '{ print $1 }' || shasum -a 256 "$tmp/$name" | awk '{ print $1 }')
     [ -n "$want" ] && [ "$want" = "$got" ] || { rm -rf "$tmp"; ci_die "trivy $TRIVY_VERSION: checksum mismatch for $name"; }
     tar -C "$tmp" -xzf "$tmp/$name" trivy || { rm -rf "$tmp"; ci_die "trivy $TRIVY_VERSION: cannot extract trivy from $name"; }
-    "$tmp/trivy" --version >/dev/null 2>&1 || { rm -rf "$tmp"; ci_die "trivy $TRIVY_VERSION: the extracted binary does not run"; }
+    # Tried the way it will be run (ci_trivy_run): no ambient Trivy settings, the repository's
+    # configuration file, so a runner's TRIVY_CONFIG or trivy.yaml cannot reject a good download.
+    env -i PATH="$PATH" HOME="${HOME:-/tmp}" TMPDIR="${TMPDIR:-/tmp}" "$tmp/trivy" --config "$ci_dir/trivy.yaml" --version >/dev/null 2>&1 \
+      || { rm -rf "$tmp"; ci_die "trivy $TRIVY_VERSION: the extracted binary does not run"; }
     mkdir -p "$dir" && mv "$tmp/trivy" "$dir/trivy" && rm -rf "$tmp"
   fi
   echo "$dir/trivy"

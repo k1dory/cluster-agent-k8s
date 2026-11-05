@@ -150,14 +150,18 @@ echo "== every image: known vulnerabilities (trivy $TRIVY_VERSION; every HIGH an
 # image built above and no other copy of the tag. Hermes's own tree (/opt/hermes, the agent
 # and the tools its image bundles, pinned by digest) is reported but not part of the verdict:
 # its fix is a HERMES_VERSION bump, not a change here.
+# Each image is exported from the daemon by its recorded id with the docker CLI (so whatever
+# the CLI needs to reach the daemon, a TLS context included, is what the scan uses too) and
+# scanned from the archive, one at a time: the archive of the largest image is a few GiB.
 for name in sandboxd sandboxctl agent agent-hermes; do
   id=$(cat "$iids/$name" 2>/dev/null) && [ -n "$id" ] || ci_die "images: no image id recorded for the $name build"
-  docker image inspect "$id" >/dev/null 2>&1 || ci_die "images: the $name image built here ($id) is no longer in the daemon"
   skip=""
   [ "$name" = agent-hermes ] && skip=opt/hermes
   echo "-- $prefix/$name:$tag ($id)"
-  ci_trivy_scan image "$skip" --image-src docker "$id" \
+  docker image save -o "$iids/$name.tar" "$id" || ci_die "images: cannot export the $name image built here ($id) from the daemon"
+  ci_trivy_scan image "$skip" --input "$iids/$name.tar" \
     || ci_die "images: fixable HIGH or CRITICAL vulnerabilities in $prefix/$name:$tag (upgrade the base image or a harness in hack/ci/versions.env, or accept the finding in .trivyignore.yaml with an expiry)"
+  rm -f "$iids/$name.tar"
 done
 rm -rf "$iids"
 ci_ok images
