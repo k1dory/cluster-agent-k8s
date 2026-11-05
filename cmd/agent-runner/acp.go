@@ -57,13 +57,7 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	cmd.Cancel = func() error { return signalGroup(cmd, syscall.SIGTERM) }
 	cmd.WaitDelay = 20 * time.Second
 	cmd.Env = env
-	cmd.Dir = os.Getenv("PWD")
-	if _, err := os.Stat(filepath.Join(repoDir(), ".git")); err == nil {
-		cmd.Dir = repoDir()
-	}
-	if cmd.Dir == "" {
-		cmd.Dir, _ = os.Getwd()
-	}
+	cmd.Dir = harnessDir()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return 1
@@ -100,7 +94,8 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{Notices: true, Compaction: true})
 	cl := &acpClient{emit: emit, permissions: os.Getenv("HARNESS_PERMISSIONS"), instructionsDelivered: delivered,
 		usageDir: filepath.Join(os.Getenv("HOME"), ".sandbox-acp-usage"), wire: wire, systemPrompt: wire.SystemPrompt,
-		pending: acpx.NewPending(), askTimeout: askTimeout(os.Getenv("HARNESS_ASK_TIMEOUT"))}
+		pending: acpx.NewPending(), askTimeout: askTimeout(os.Getenv("HARNESS_ASK_TIMEOUT")),
+		resumePrompt: envValue(env, "SANDBOX_RESUME_PROMPT")}
 	conn := wire.Connect(cl)
 	exit := driveACP(runCtx, conn, cl, run, emit, chat, func(inputs inputSink) {
 		go forwardInput(runCtx, c, run.ID, inputs, cancel, chat)
@@ -324,13 +319,7 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 		}
 		failed(op, cctx, err)
 	}
-	cwd := os.Getenv("PWD")
-	if _, err := os.Stat(filepath.Join(repoDir(), ".git")); err == nil {
-		cwd = repoDir()
-	}
-	if cwd == "" {
-		cwd, _ = os.Getwd()
-	}
+	cwd := harnessDir()
 	// harness.mcp: always passes the servers to an agent that takes them without declaring MCP
 	// over HTTP (Hermes); auto (the default) only to one that declares it.
 	httpMCP := init.AgentCapabilities.McpCapabilities.Http || os.Getenv("HARNESS_MCP") == harness.MCPAlways
@@ -471,7 +460,7 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 	if sess.instructions {
 		instructions = "" // the session's system prompt has them
 	}
-	prompt := firstPrompt(run, sess.fresh, instructions, os.Getenv("SANDBOX_RESUME_PROMPT"), cl.isCommand)
+	prompt := firstPrompt(run, sess.fresh, instructions, cl.resumePrompt, cl.isCommand)
 	turnTimeout := acpTurnTimeout()
 	for {
 		inputs.setTurn(true)
@@ -604,7 +593,7 @@ func firstPrompt(run *model.Run, fresh bool, instructions, resumePrompt string, 
 	if run.ResumeOf != "" && run.Mode != model.RunMessage {
 		task = resumePrompt
 		if task == "" {
-			task = "The sandbox was restarted to update the agent. Continue the task where you left off."
+			task = defaultResumePrompt
 		}
 		if fresh {
 			task = run.Task // nothing to continue: do the task again
@@ -647,20 +636,8 @@ func authMethodIDs(methods []acp.AuthMethod) []string {
 // http MCP capability gets none (skipped counts them).
 func acpMCPServers(raw string, http bool) (servers []acp.McpServer, skipped int) {
 	servers = []acp.McpServer{}
-	if strings.TrimSpace(raw) == "" {
-		return servers, 0
-	}
-	var list []struct {
-		Name string `json:"name"`
-		URL  string `json:"url"`
-	}
-	if json.Unmarshal([]byte(raw), &list) != nil {
-		return servers, 0
-	}
+	list, _ := parseMCPServers(raw) // malformed: none (writeMCPConfig reports it for claude)
 	for _, s := range list {
-		if s.Name == "" || s.URL == "" {
-			continue
-		}
 		if !http {
 			skipped++
 			continue
@@ -829,6 +806,8 @@ type acpClient struct {
 	askTimeout time.Duration
 	// lastCommands is the list of commands last written (acp.commands is written when it changes).
 	lastCommands string
+	// resumePrompt is $SANDBOX_RESUME_PROMPT as execute set it for this run.
+	resumePrompt string
 	// usageDir keeps the last cumulative usage of the sessions of an agent that reports one
 	// (acpUsage); "" keeps it in memory only.
 	usageDir string

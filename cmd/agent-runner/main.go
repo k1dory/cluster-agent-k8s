@@ -12,7 +12,6 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,6 +22,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,23 +38,13 @@ type client struct {
 }
 
 func newClient() (*client, error) {
-	certDir := os.Getenv("CERT_DIR")
-	if certDir == "" {
-		certDir = "/certs"
-	}
 	base := strings.TrimRight(os.Getenv("API_URL"), "/")
 	if base == "" {
 		return nil, errors.New("API_URL is not set")
 	}
-	cert, err := tls.LoadX509KeyPair(filepath.Join(certDir, "tls.crt"), filepath.Join(certDir, "tls.key"))
+	cert, pool, err := loadIdentity(certDir())
 	if err != nil {
-		return nil, fmt.Errorf("client cert: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if gw, err := os.ReadFile(filepath.Join(certDir, "gateway-ca.crt")); err == nil && len(bytes.TrimSpace(gw)) > 0 {
-		pool.AppendCertsFromPEM(gw)
-	} else {
-		pool, _ = x509.SystemCertPool()
+		return nil, err
 	}
 	tr := &http.Transport{TLSClientConfig: &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: pool, MinVersion: tls.VersionTLS12}}
 	return &client{base: base, http: &http.Client{Transport: tr, Timeout: 3 * time.Minute}}, nil
@@ -95,11 +85,7 @@ func main() {
 	go serveFiles(ctx, c, workspaceRoot())
 	// Harnesses that cannot present the client certificate reach the gateway through the
 	// bridge (bridge.go); its address is in their environment.
-	certDir := os.Getenv("CERT_DIR")
-	if certDir == "" {
-		certDir = "/certs"
-	}
-	go serveGatewayBridge(ctx, certDir)
+	go serveGatewayBridge(ctx, certDir())
 	_ = os.Setenv("SANDBOX_GATEWAY_BRIDGE", "http://"+gatewayBridgeAddr)
 	fmt.Println("agent-runner: waiting for runs")
 	serveRuns(ctx, c)
@@ -301,18 +287,12 @@ func writeMCPConfig(servers, path string) (string, int, error) {
 	if strings.TrimSpace(servers) == "" {
 		return "", 0, nil
 	}
-	var list []struct {
-		Name string `json:"name"`
-		URL  string `json:"url"`
-	}
-	if err := json.Unmarshal([]byte(servers), &list); err != nil {
-		return "", 0, fmt.Errorf("SANDBOX_MCP_SERVERS: %w", err)
+	list, err := parseMCPServers(servers)
+	if err != nil {
+		return "", 0, err
 	}
 	cfg := map[string]map[string]map[string]string{"mcpServers": {}}
 	for _, s := range list {
-		if s.Name == "" || s.URL == "" {
-			continue
-		}
 		cfg["mcpServers"][s.Name] = map[string]string{"type": "http", "url": gatewayBridgeURL(s.URL)}
 	}
 	if len(cfg["mcpServers"]) == 0 {
@@ -326,6 +306,45 @@ func writeMCPConfig(servers, path string) (string, int, error) {
 		return "", 0, err
 	}
 	return path, len(cfg["mcpServers"]), nil
+}
+
+// parseMCPServers reads SANDBOX_MCP_SERVERS ([{name, url}]); entries without both are left out.
+func parseMCPServers(raw string) ([]model.MCPServer, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	var list []model.MCPServer
+	if err := json.Unmarshal([]byte(raw), &list); err != nil {
+		return nil, fmt.Errorf("SANDBOX_MCP_SERVERS: %w", err)
+	}
+	return slices.DeleteFunc(list, func(s model.MCPServer) bool { return s.Name == "" || s.URL == "" }), nil
+}
+
+// harnessDir is where a harness starts: inside the checkout when there is one, else $PWD (else
+// the runner's own directory).
+func harnessDir() string {
+	if _, err := os.Stat(filepath.Join(repoDir(), ".git")); err == nil {
+		return repoDir()
+	}
+	if d := os.Getenv("PWD"); d != "" {
+		return d
+	}
+	d, _ := os.Getwd()
+	return d
+}
+
+// defaultResumePrompt tells a harness that a rollout interrupted it (a resume run without a
+// message of its own).
+const defaultResumePrompt = "The sandbox was restarted to update the agent. Continue the task where you left off."
+
+// envValue is the value of name in env (the last one wins, as for exec), "" when absent.
+func envValue(env []string, name string) string {
+	for i := len(env) - 1; i >= 0; i-- {
+		if v, ok := strings.CutPrefix(env[i], name+"="); ok {
+			return v
+		}
+	}
+	return ""
 }
 
 func repoDir() string {
@@ -386,7 +405,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 		case run.Mode == model.RunMessage:
 			env = append(env, "SANDBOX_RESUME_PROMPT="+run.Task)
 		case os.Getenv("SANDBOX_RESUME_PROMPT") == "":
-			env = append(env, "SANDBOX_RESUME_PROMPT=The sandbox was restarted to update the agent. Continue the task where you left off.")
+			env = append(env, "SANDBOX_RESUME_PROMPT="+defaultResumePrompt)
 		}
 	}
 	// An ACP harness is one program for the whole conversation: a resume is session/load of the
@@ -435,10 +454,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	}
 	cmd.WaitDelay = 20 * time.Second
 	cmd.Env = env
-	cmd.Dir = os.Getenv("PWD")
-	if _, err := os.Stat(filepath.Join(repoDir(), ".git")); err == nil {
-		cmd.Dir = repoDir() // the harness starts inside the checkout
-	}
+	cmd.Dir = harnessDir()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return 1
