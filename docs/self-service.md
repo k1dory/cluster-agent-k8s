@@ -239,9 +239,11 @@ sandboxctl run sb_1234 "add integration tests for the checkout flow"
 
 The sandbox records the agent's connections. Its pod gets `SANDBOX_MCP_SERVERS`, a JSON list of
 the MCP endpoints those connections give it (`[{"name":"tools","url":"https://mcp.tools.example.com/mcp"}]`);
-the runner writes them as a Claude Code MCP configuration (`$SANDBOX_MCP_CONFIG`) and the
-default harness command loads it with `--mcp-config`. A custom `harness.command` names
-`"$SANDBOX_MCP_CONFIG"` itself where it wants it. The gateway decides what each call may do; the
+an ACP harness (the default, Claude over ACP) gets them in its session (`session/new`, load,
+resume) by their gateway bridge URLs. For a non-ACP harness the runner writes them as a Claude
+Code MCP configuration (`$SANDBOX_MCP_CONFIG`) that a `claude` command loads with
+`--mcp-config`; another custom `harness.command` names `"$SANDBOX_MCP_CONFIG"` itself where it
+wants it. The gateway decides what each call may do; the
 configuration only tells the harness where the servers are.
 
 An ACP agent (`harness.input: acp`, e.g. `command: claude-agent-acp` or `codex-acp`) gets the

@@ -90,8 +90,13 @@ data:
       cpu_limit: "2"
       memory_request: "1Gi"
       memory_limit: "4Gi"
-      harness_command: "claude -p \"$SANDBOX_TASK\" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none"
-      harness_resume_command: "claude -p \"$SANDBOX_RESUME_PROMPT\" --resume \"$SANDBOX_SESSION\" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none"
+      harness_command: "claude-agent-acp"
+      harness_resume_command: ""
+      harness_input: "acp"
+      harness_permissions: "allow"
+      harness_mode: "default"
+      harness_mcp: ""
+      harness_auth_method: ""
       resume_prompt: ""
       termination_seconds: 30
       pod_firewall: true
@@ -326,7 +331,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: agent-sandbox-0.1.0
       annotations:
-        checksum/config: d8560b7dda77b5b4f4b6d2df8cc661947f7543d1d7d84481e19f90a7d78101ba
+        checksum/config: 00e40b8af9b361e0f523af78b1bb06fdadd54fe615073faa4b89997ad8f729c1
     spec:
       serviceAccountName: agent-sandbox-sandboxd
       hostNetwork: true

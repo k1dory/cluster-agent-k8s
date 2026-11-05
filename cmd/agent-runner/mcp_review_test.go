@@ -1,20 +1,21 @@
 package main
 
 import (
-	"context"
-	"net/http"
-	"net/http/httptest"
+	"encoding/json"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
+	acp "github.com/coder/acp-go-sdk"
+
+	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"gopkg.in/yaml.v3"
 )
 
+// The chart's default harness is Claude over ACP, and the sandbox's MCP servers reach it in the
+// session on start and when the next run continues the conversation, by their gateway bridge
+// URLs. The agent here is the scripted one; the shipped settings come from the chart's values.
 func TestReviewShippedHarnessLoadsMCPOnStartAndResume(t *testing.T) {
 	raw, err := os.ReadFile("../../deploy/helm/agent-sandbox/values.yaml")
 	if err != nil {
@@ -22,70 +23,68 @@ func TestReviewShippedHarnessLoadsMCPOnStartAndResume(t *testing.T) {
 	}
 	var values struct {
 		Agent struct {
-			Command string `yaml:"harnessCommand"`
-			Resume  string `yaml:"harnessResumeCommand"`
+			Command     string `yaml:"harnessCommand"`
+			Input       string `yaml:"harnessInput"`
+			Permissions string `yaml:"harnessPermissions"`
+			Mode        string `yaml:"harnessMode"`
+			Resume      string `yaml:"harnessResumeCommand"`
 		} `yaml:"agent"`
 	}
 	if err := yaml.Unmarshal(raw, &values); err != nil {
 		t.Fatal(err)
 	}
-	for _, mode := range []string{"start", "resume"} {
-		t.Run(mode, func(t *testing.T) {
-			root := t.TempDir()
-			bin := filepath.Join(root, "bin")
-			if err := os.Mkdir(bin, 0700); err != nil {
+	a := values.Agent
+	if a.Command != "claude-agent-acp" || a.Input != harness.InputACP || a.Permissions != "allow" || a.Mode != "default" || a.Resume != "" {
+		t.Fatalf("the chart's default harness must be Claude over ACP: %+v", a)
+	}
+
+	want := "http://127.0.0.1:4480/https/tools.review.example.com/mcp"
+	seen := map[string]bool{}
+	// Each run talks to a control plane of its own (one conversation each).
+	for _, run := range []*model.Run{
+		{ID: "run_review_mcp", Task: "fixture task"},
+		{ID: "run_review_next", Task: "next", ResumeOf: "run_review_mcp", Session: "sess_new", Mode: model.RunMessage},
+	} {
+		agentLog, _, cl := setupACP(t, a.Permissions)
+		t.Setenv("HARNESS_INPUT", a.Input)
+		t.Setenv("HARNESS_MODE", "") // the scripted agent has no modes; the real adapter's is checked in acp_examples_test.go
+		t.Setenv("SANDBOX_MCP_SERVERS", `[{"name":"tools","url":"https://tools.review.example.com/mcp"}]`)
+		if code := runACP(t, cl, run); code != 0 {
+			t.Fatalf("%s: exit %d", run.ID, code)
+		}
+		for _, r := range readAgentLog(t, agentLog) {
+			if r.Kind != "new" && r.Kind != "load" {
+				continue
+			}
+			var req struct {
+				McpServers []acp.McpServer `json:"mcpServers"`
+			}
+			if err := json.Unmarshal(r.V, &req); err != nil {
 				t.Fatal(err)
 			}
-			// The fixture records argv only; no LLM process or external request is started.
-			stub := filepath.Join(bin, "claude")
-			if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$SANDBOX_REVIEW_ARGS\"\n"), 0700); err != nil {
-				t.Fatal(err)
-			}
-			argsFile := filepath.Join(root, "harness-args")
-			t.Setenv("HOME", root) // isolated home of the fixture agent
-			t.Setenv("PWD", root)
-			t.Setenv("PATH", bin+string(os.PathListSeparator)+"/usr/bin:/bin")
-			t.Setenv("SANDBOX_REVIEW_ARGS", argsFile)
-			t.Setenv("SANDBOX_REPO_DIR", root)
-			t.Setenv("SANDBOX_MCP_SERVERS", `[{"name":"tools","url":"https://tools.review.example.com/mcp"}]`)
-			t.Setenv("HARNESS_CMD", values.Agent.Command)
-			t.Setenv("HARNESS_RESUME_CMD", values.Agent.Resume)
-			t.Setenv("HARNESS_INPUT", "")
-			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-			defer cancel()
-			selected, err := exec.CommandContext(ctx, "/bin/sh", "-lc", "command -v claude").Output()
-			if err != nil || strings.TrimSpace(string(selected)) != stub {
-				t.Fatal("test setup: login shell must select the fixture harness")
-			}
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte("[]"))
-			}))
-			defer srv.Close()
-			run := &model.Run{ID: "run_review_mcp", Task: "fixture task"}
-			if mode == "resume" {
-				run.ResumeOf, run.Session, run.Mode = "run_previous", "session_fixture", model.RunMessage
-			}
-			if code := execute(ctx, &client{base: srv.URL, http: srv.Client()}, run); code != 0 {
-				t.Fatalf("fixture harness exit: %d", code)
-			}
-			args, err := os.ReadFile(argsFile)
-			if err != nil {
-				t.Fatal(err)
-			}
-			parts := strings.Split(strings.TrimSpace(string(args)), "\n")
-			loaded := ""
-			for i, arg := range parts {
-				if arg == "--mcp-config" && i+1 < len(parts) {
-					loaded = parts[i+1]
+			for _, s := range req.McpServers {
+				if s.Http != nil && s.Http.Name == "tools" && strings.EqualFold(s.Http.Url, want) {
+					seen[r.Kind] = true
 				}
 			}
-			if loaded == "" {
-				t.Fatal("the shipped harness must load the generated MCP configuration")
-			}
-			if config, err := os.ReadFile(loaded); err != nil || !strings.Contains(string(config), "tools.review.example.com") {
-				t.Fatal("the harness must receive the configuration of the sandbox's MCP servers")
-			}
-		})
+		}
+	}
+	if !seen["new"] || !seen["load"] {
+		t.Fatalf("the MCP server must reach the session on start and on load: %v", seen)
+	}
+}
+
+// A pod without a configured harness runs claude-agent-acp over ACP, not claude -p; a configured
+// one is left as it is.
+func TestRunnerDefaultHarnessIsClaudeOverACP(t *testing.T) {
+	for _, c := range []struct{ cmd, input, wantCmd, wantInput string }{
+		{"", "", "claude-agent-acp", harness.InputACP},
+		{"", harness.InputText, "claude-agent-acp", harness.InputText},
+		{`claude -p "$SANDBOX_TASK"`, "", `claude -p "$SANDBOX_TASK"`, ""},
+		{"codex-acp", harness.InputACP, "codex-acp", harness.InputACP},
+	} {
+		if cmd, input := harnessOf(c.cmd, c.input); cmd != c.wantCmd || input != c.wantInput {
+			t.Errorf("harnessOf(%q, %q) = %q, %q", c.cmd, c.input, cmd, input)
+		}
 	}
 }

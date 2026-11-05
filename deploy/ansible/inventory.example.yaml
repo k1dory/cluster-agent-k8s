@@ -22,7 +22,9 @@ all:
         agent_image: registry.example.com/agent-sandbox/agent:latest
         sandboxd_image: registry.example.com/agent-sandbox/sandboxd:latest
         network_attachment: agent-sandbox/sandbox-vlan
-        harness_cmd: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
+        harness_cmd: claude-agent-acp
+        harness_input: acp                      # text | stream-json | acp
+        harness_mode: default
         policies_repo: https://github.com/you/agent-policies.git   # or "" to copy ../../policies from the controller
         policies_version: main
         with_postgres: true                    # compose profile; false when database_url points elsewhere

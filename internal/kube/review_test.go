@@ -153,6 +153,36 @@ func TestLaunchShapesThePod(t *testing.T) {
 	}
 }
 
+// The deployment's default harness (Claude over ACP) reaches a sandbox without a harness of its
+// own; a profile that names its command brings its whole harness, never the default's ACP input
+// or mode.
+func TestProfileHarnessReplacesTheDefaultAsAWhole(t *testing.T) {
+	ctx := context.Background()
+	client := fake.NewSimpleClientset()
+	rt := &Runtime{Client: client, Cfg: PodConfig{Namespace: "review", Image: "agent:default", GatewayIP: "10.77.77.1",
+		HarnessCommand: "claude-agent-acp", HarnessInput: "acp", HarnessMode: "default", HarnessPermissions: "allow"}}
+	envOf := func(sb *model.Sandbox) map[string]string {
+		name, err := rt.CreatePod(ctx, sb)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pod, _ := client.CoreV1().Pods("review").Get(ctx, name, metav1.GetOptions{})
+		env := map[string]string{}
+		for _, e := range pod.Spec.Containers[0].Env {
+			env[e.Name] = e.Value
+		}
+		return env
+	}
+	env := envOf(&model.Sandbox{ID: "sb_default", Slug: "dev", Tenant: "acme", Launch: &model.Launch{Model: "claude-opus-5-5"}})
+	if env["HARNESS_CMD"] != "claude-agent-acp" || env["HARNESS_INPUT"] != "acp" || env["HARNESS_MODE"] != "default" || env["HARNESS_PERMISSIONS"] != "allow" {
+		t.Fatalf("default harness: %v", env)
+	}
+	env = envOf(&model.Sandbox{ID: "sb_codex", Slug: "dev2", Tenant: "acme", Launch: &model.Launch{HarnessCommand: `codex exec --json "$SANDBOX_TASK"`}})
+	if env["HARNESS_CMD"] != `codex exec --json "$SANDBOX_TASK"` || env["HARNESS_INPUT"] != "" || env["HARNESS_MODE"] != "" || env["HARNESS_PERMISSIONS"] != "" {
+		t.Fatalf("profile harness mixed with the default: %v", env)
+	}
+}
+
 // The names of the pod and the workspace volume are what the API server accepts: a sandbox
 // id carries an underscore (sb_…), which a DNS subdomain may not; the fake client never
 // validated them, the first real cluster refused the volume.

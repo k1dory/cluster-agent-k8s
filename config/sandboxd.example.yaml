@@ -102,13 +102,18 @@ kube:
   cpu_limit: "2"
   memory_request: 1Gi
   memory_limit: 4Gi
-  # The runner appends --mcp-config "$SANDBOX_MCP_CONFIG" to this default command when the sandbox's
-  # connections give the agent MCP servers; a custom command names "$SANDBOX_MCP_CONFIG" itself.
-  harness_command: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
-  # Continues a run that a forced rollout interrupted: $SANDBOX_SESSION is the harness session id
-  # captured from its output, $SANDBOX_RESUME_PROMPT the continuation text (resume_prompt below).
-  harness_resume_command: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
-  # Codex: 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'
+  # The harness of sandboxes whose profile names none (these are the defaults when unset): Claude
+  # over ACP. MCP servers go into the ACP session; the agent continues its own session, so an ACP
+  # harness needs no resume command.
+  harness_command: claude-agent-acp
+  harness_input: acp                 # text | stream-json | acp
+  harness_permissions: allow         # acp: allow | deny
+  harness_mode: default              # acp: the agent's session mode
+  # harness_mcp: always              # acp: pass MCP servers to an agent that does not declare HTTP
+  # harness_auth_method: api-key     # acp: the agent's authentication method
+  # A non-ACP harness: harness_command 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose
+  # --permission-mode bypassPermissions --permission-prompts none', harness_input "" and a resume
+  # command ($SANDBOX_SESSION, $SANDBOX_RESUME_PROMPT); Codex: 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'
   resume_prompt: ""
   pod_firewall: true                 # init container with NET_ADMIN locks egress to the gateway (cross-node isolation)
   gateway_ca_configmap: agent-sandbox-gateway-ca   # where the gateway root is published for the pods

@@ -31,8 +31,9 @@ multipart with `text` and `file` parts), `GET /v1/sandboxes/{id}/messages` (one 
 
 ## The conversation model
 
-A sandbox's conversation is a chain of runs that share one harness session. The main path is an
-ACP harness (`input: acp`, [below](#acp-harnesses)): one protocol for every agent, through which
+A sandbox's conversation is a chain of runs that share one harness session. The main path, and the
+deployment's default harness (`claude-agent-acp`), is an ACP harness (`input: acp`,
+[below](#acp-harnesses)): one protocol for every agent, through which
 the runner sets the mode, the model and the system prompt, records diffs and permission
 decisions, counts usage per turn and continues the session in the next run. `text` and
 `stream-json` remain for harnesses that do not speak ACP. Three things make the conversation
@@ -57,7 +58,7 @@ moment join the same conversation instead of starting two.
    message as another one, so the harness keeps its context and answers each in the same
    process. The delivery is reported as `input`.
 
-   A `text`-mode harness (the default) gets its task on stdin and then EOF: `claude -p` reads a
+   A `text`-mode harness (the default input of a profile that names its own command) gets its task on stdin and then EOF: `claude -p` reads a
    non-terminal stdin to its end before it starts. Its messages never become `input` events. A
    message for a run that is still queued joins that run's task (reported as `input`; the task
    is what the harness reads), and one sent while the run is executing is queued as the next run
@@ -88,8 +89,10 @@ moment join the same conversation instead of starting two.
    first (`claude -p` completes its turn and writes its result on it), SIGTERM 5 seconds later if it
    is still running.
 
-   `claude -p` runs with `--permission-mode bypassPermissions --permission-prompts none` in the
-   shipped commands: since Claude Code 2.1.302 `-p` starts in a manual mode that refuses every
+   The deployment's default harness is not `claude -p` but Claude over ACP (`claude-agent-acp`,
+   `agent.harnessInput: acp` in the chart, `kube.harness_input` in sandboxd's configuration).
+   Where `claude -p` is used (claude-subscription), it runs with
+   `--permission-mode bypassPermissions --permission-prompts none`: since Claude Code 2.1.302 `-p` starts in a manual mode that refuses every
    edit and non-read-only command nobody approves, and in a pod nobody does. The sandbox is the
    boundary; for recorded per-request decisions use ACP. Its MCP configuration names the servers
    by their gateway bridge URLs. `codex exec --json` gets its usage counted from each

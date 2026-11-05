@@ -100,6 +100,11 @@ data:
       memory_limit: {{ .Values.agent.resources.memoryLimit | quote }}
       harness_command: {{ .Values.agent.harnessCommand | quote }}
       harness_resume_command: {{ .Values.agent.harnessResumeCommand | quote }}
+      harness_input: {{ .Values.agent.harnessInput | quote }}
+      harness_permissions: {{ .Values.agent.harnessPermissions | quote }}
+      harness_mode: {{ .Values.agent.harnessMode | quote }}
+      harness_mcp: {{ .Values.agent.harnessMcp | quote }}
+      harness_auth_method: {{ .Values.agent.harnessAuthMethod | quote }}
       resume_prompt: {{ .Values.agent.resumePrompt | quote }}
       termination_seconds: {{ .Values.agent.terminationSeconds }}
       pod_firewall: {{ .Values.agent.podFirewall }}

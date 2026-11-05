@@ -127,14 +127,21 @@ func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 			*dst = v
 		}
 	}
-	pick(&e.HarnessCommand, l.HarnessCommand)
-	pick(&e.HarnessResumeCommand, l.HarnessResumeCommand)
+	// A profile that names its own harness brings all of its harness settings: the deployment's
+	// default (Claude over ACP) must not lend its input mode or ACP mode to, say, `codex exec`.
+	if l.HarnessCommand != "" {
+		e.HarnessCommand, e.HarnessResumeCommand = l.HarnessCommand, l.HarnessResumeCommand
+		e.HarnessInput, e.HarnessPermissions, e.HarnessAuthMethod = l.HarnessInput, l.HarnessPermissions, l.HarnessAuthMethod
+		e.HarnessMode, e.HarnessMCP = l.HarnessMode, l.HarnessMCP
+	} else {
+		pick(&e.HarnessResumeCommand, l.HarnessResumeCommand)
+		pick(&e.HarnessInput, l.HarnessInput)
+		pick(&e.HarnessPermissions, l.HarnessPermissions)
+		pick(&e.HarnessAuthMethod, l.HarnessAuthMethod)
+		pick(&e.HarnessMode, l.HarnessMode)
+		pick(&e.HarnessMCP, l.HarnessMCP)
+	}
 	pick(&e.ResumePrompt, l.ResumePrompt)
-	pick(&e.HarnessInput, l.HarnessInput)
-	pick(&e.HarnessPermissions, l.HarnessPermissions)
-	pick(&e.HarnessAuthMethod, l.HarnessAuthMethod)
-	pick(&e.HarnessMode, l.HarnessMode)
-	pick(&e.HarnessMCP, l.HarnessMCP)
 	if l.ChatIdle > 0 {
 		e.ChatIdleSeconds = l.ChatIdle
 	}

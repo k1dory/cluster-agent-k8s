@@ -112,10 +112,23 @@ agent:
     cpuLimit: "2"
     memoryRequest: 1Gi
     memoryLimit: 4Gi
-  harnessCommand: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
-  # Continue a run interrupted by a forced rollout ($SANDBOX_SESSION is the harness session id
-  # captured from its output). Codex: 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'
-  harnessResumeCommand: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
+  # The harness of sandboxes whose EnvironmentProfile names none: Claude over the Agent Client
+  # Protocol (claude-agent-acp in the agent image; docs/chat-and-files.md, "ACP harnesses"). The
+  # runner sets the mode, passes the instructions as the system prompt, answers permission
+  # requests by harnessPermissions and records them, and continues the session in the next run
+  # itself (no resume command). A profile with its own command brings its own harness settings.
+  # Replacing the command with a non-ACP one means setting harnessInput (and harnessMode) too.
+  harnessCommand: claude-agent-acp
+  harnessInput: acp               # text | stream-json | acp
+  harnessPermissions: allow       # acp: allow | deny
+  harnessMode: default            # acp: the agent's session mode (claude-agent-acp: default keeps its permission checks on)
+  harnessMcp: ""                  # acp: auto (default) | always
+  harnessAuthMethod: ""           # acp: the agent's authentication method, if it needs one
+  # A non-ACP harness continues a run interrupted by a forced rollout with this command
+  # ($SANDBOX_SESSION is the session id captured from its output), e.g.
+  # 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose'
+  # or 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'.
+  harnessResumeCommand: ""
   resumePrompt: ""
   env:
     ANTHROPIC_BASE_URL: https://api.anthropic.com

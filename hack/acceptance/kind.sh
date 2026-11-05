@@ -106,6 +106,9 @@ agent:
   resources: { cpuRequest: 100m, cpuLimit: "1", memoryRequest: 256Mi, memoryLimit: 1Gi }
   harnessCommand: 'echo "acceptance: \$SANDBOX_TASK"'
   harnessResumeCommand: 'echo "acceptance: \$SANDBOX_RESUME_PROMPT"'
+  # A text harness: the chart's default is Claude over ACP.
+  harnessInput: ""
+  harnessMode: ""
   versions: { stable: $prefix/agent:$tag }
 network:
   name: sandbox-vlan
