@@ -400,41 +400,22 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 	var from string
 	tenant := o.metaOf(ctx, id).tenant
 	err := o.Store.WithTenantLock(ctx, tenant, func(ctx context.Context) error {
-		cur, err := o.Store.GetSandbox(ctx, id)
-		if err != nil {
+		// Writers that do not take the lock can still move the record between the read and the
+		// transition: the reconciler (this replica's or another's) settling a stop whose pod is
+		// gone as sleeping, waitReady, a failure being recorded. The transition then fails its
+		// precondition; reading again and deciding from the new status keeps a rollout's restart
+		// (stopping → waking) from leaving the sandbox asleep because the leader settled the
+		// stop first.
+		for attempt := 0; ; attempt++ {
+			err := o.startTransition(ctx, id, &sb, &from)
+			if errors.Is(err, errRetryStart) && attempt < 10 {
+				continue
+			}
+			if errors.Is(err, errRetryStart) {
+				return fmt.Errorf("%w: sandbox %s kept changing", ErrConflict, id)
+			}
 			return err
 		}
-		switch cur.Status {
-		case model.StatusWaking, model.StatusRunning:
-			// Another caller (or replica) started the pod between our read and the lock: nothing to do.
-			sb = cur
-			return errAlreadyStarted
-		case model.StatusDeleting:
-			return fmt.Errorf("%w: sandbox is being deleted", ErrConflict)
-		case model.StatusCreating:
-		default:
-			if err := o.checkQuota(ctx, cur.Tenant, cur.Slug, false); err != nil {
-				return err
-			}
-		}
-		from = cur.AgentVersion
-		sb, err = o.setStatusFrom(ctx, id, []model.SandboxStatus{cur.Status}, model.StatusWaking, func(s *model.Sandbox) {
-			if s.DesiredVersion != "" {
-				s.AgentVersion, s.DesiredVersion = s.DesiredVersion, ""
-			}
-			if s.AgentVersion == "" {
-				s.AgentVersion = o.Cfg.DefaultAgentVersion
-			}
-			if s.Launch != nil && s.AgentVersion != "" {
-				// A rollout moves the sandbox to another image; the rest of the launch stays.
-				s.Launch.Image = s.AgentVersion
-			}
-			if o.Cfg.EnvVersion != nil {
-				s.EnvVersion = o.Cfg.EnvVersion(s)
-			}
-			s.PodName, s.IP = "", ""
-		})
-		return err
 	})
 	if errors.Is(err, errAlreadyStarted) {
 		return sb, nil
@@ -498,6 +479,54 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 	}
 	go o.waitReady(id)
 	return sb, nil
+}
+
+// errRetryStart: startTransition lost its precondition to another writer; read again.
+var errRetryStart = errors.New("sandbox moved during start")
+
+// startTransition is one attempt of startPod's locked step: read the record, decide, and move it
+// to waking with the status read as precondition. errRetryStart when another writer moved the
+// record in between; out and from receive the record and the agent version it had.
+func (o *Orchestrator) startTransition(ctx context.Context, id string, out **model.Sandbox, from *string) error {
+	cur, err := o.Store.GetSandbox(ctx, id)
+	if err != nil {
+		return err
+	}
+	switch cur.Status {
+	case model.StatusWaking, model.StatusRunning:
+		// Another caller (or replica) started the pod between our read and the lock: nothing to do.
+		*out = cur
+		return errAlreadyStarted
+	case model.StatusDeleting:
+		return fmt.Errorf("%w: sandbox is being deleted", ErrConflict)
+	case model.StatusCreating:
+	default:
+		if err := o.checkQuota(ctx, cur.Tenant, cur.Slug, false); err != nil {
+			return err
+		}
+	}
+	*from = cur.AgentVersion
+	sb, err := o.setStatusFrom(ctx, id, []model.SandboxStatus{cur.Status}, model.StatusWaking, func(s *model.Sandbox) {
+		if s.DesiredVersion != "" {
+			s.AgentVersion, s.DesiredVersion = s.DesiredVersion, ""
+		}
+		if s.AgentVersion == "" {
+			s.AgentVersion = o.Cfg.DefaultAgentVersion
+		}
+		if s.Launch != nil && s.AgentVersion != "" {
+			// A rollout moves the sandbox to another image; the rest of the launch stays.
+			s.Launch.Image = s.AgentVersion
+		}
+		if o.Cfg.EnvVersion != nil {
+			s.EnvVersion = o.Cfg.EnvVersion(s)
+		}
+		s.PodName, s.IP = "", ""
+	})
+	if errors.Is(err, ErrConflict) {
+		return errRetryStart
+	}
+	*out = sb
+	return err
 }
 
 // waitReady polls the runtime until the pod is ready, then flips the status to running.

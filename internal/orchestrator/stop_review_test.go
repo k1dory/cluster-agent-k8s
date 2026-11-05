@@ -645,3 +645,49 @@ func TestReviewOrphanRemovedAfterTheStopFinished(t *testing.T) {
 		t.Fatal("orphan pod left running behind a sleeping sandbox")
 	}
 }
+
+// wakeWriteHookStore runs hook once, just before the first write that moves a sandbox to
+// waking: after the writer read the record, before its write lands.
+type wakeWriteHookStore struct {
+	store.Store
+	hook func()
+}
+
+func (s *wakeWriteHookStore) UpdateSandbox(ctx context.Context, sb *model.Sandbox) error {
+	if h := s.hook; h != nil && sb.Status == model.StatusWaking {
+		s.hook = nil
+		h()
+	}
+	return s.Store.UpdateSandbox(ctx, sb)
+}
+
+// A rollout restart on replica A (stop, then start on the new version) deleted the pod; the
+// leader B reconciles before A's start lands, sees stopping with no pod and settles the
+// sandbox as sleeping. A's transition then failed its precondition (stopping) and the rolled-out
+// sandbox stayed asleep. The start now reads again and wakes it from sleeping.
+func TestReviewRolloutRestartSurvivesTheLeaderSettlingItsStop(t *testing.T) {
+	ctx := context.Background()
+	fake := NewFakeRuntime()
+	mem := store.NewMemory()
+	now := time.Now()
+	sb := &model.Sandbox{ID: "sb_restart", Slug: "dev", Tenant: "acme", Name: "r", Owner: "alice", Status: model.StatusRunning,
+		CreatedAt: now, LastActivity: now, AgentVersion: "img:1", DesiredVersion: "img:2"}
+	_ = fake.EnsureVolume(ctx, sb)
+	sb.PodName, _ = fake.CreatePod(ctx, sb)
+	if err := mem.CreateSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	leader := New(mem, fake, nil, events.New(), Config{}, nil)
+	hs := &wakeWriteHookStore{Store: mem, hook: func() { leader.Reconcile(ctx) }}
+	a := New(hs, fake, nil, events.New(), Config{}, nil)
+	if _, err := a.stopPod(ctx, sb.ID, model.StatusWaking); err != nil {
+		t.Fatalf("rollout restart: %v", err)
+	}
+	got := waitStatus(t, a, sb.ID, model.StatusRunning)
+	if got.AgentVersion != "img:2" || got.DesiredVersion != "" {
+		t.Fatalf("restarted sandbox: %+v", got)
+	}
+	if hs.hook != nil {
+		t.Fatal("the leader's pass never ran inside the window")
+	}
+}
