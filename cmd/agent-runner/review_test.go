@@ -110,7 +110,7 @@ func TestMCPServersBecomeAHarnessConfig(t *testing.T) {
 	var cfg struct {
 		Servers map[string]map[string]string `json:"mcpServers"`
 	}
-	if err := json.Unmarshal(b, &cfg); err != nil || len(cfg.Servers) != 2 || cfg.Servers["registry"]["url"] != "https://mcp.registry.example.com/mcp" || cfg.Servers["registry"]["type"] != "http" || cfg.Servers["shared/tools"]["url"] != "https://tools.example.com/rpc" {
+	if err := json.Unmarshal(b, &cfg); err != nil || len(cfg.Servers) != 2 || cfg.Servers["registry"]["url"] != "http://127.0.0.1:4480/https/mcp.registry.example.com/mcp" || cfg.Servers["registry"]["type"] != "http" || cfg.Servers["shared/tools"]["url"] != "http://127.0.0.1:4480/https/tools.example.com/rpc" {
 		t.Fatalf("config: %v %s", err, b)
 	}
 	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	acp "github.com/coder/acp-go-sdk"
 
@@ -540,5 +541,49 @@ func TestACPWriteTextFileIsAcknowledged(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("the runner wrote the file: %v", err)
+	}
+}
+
+// A cancelled run interrupts the harness before it terminates it: `claude -p` completes its turn
+// on SIGINT; SIGTERM comes only to one still running after interruptGrace.
+func TestCancelledHarnessIsInterruptedFirst(t *testing.T) {
+	for _, tc := range []struct {
+		name, onInt string
+		want        string
+	}{
+		{"exits on SIGINT", "echo got-int; exit 0", "got-int"},
+		{"ignores SIGINT", "echo ignored-int", "got-term"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, cp, c := setupACP(t, "")
+			t.Setenv("HARNESS_INPUT", "")
+			t.Setenv("ACP_FAKE_AGENT", "")
+			t.Setenv("SANDBOX_MCP_SERVERS", "")
+			t.Setenv("HARNESS_CMD", `trap '`+tc.onInt+`' INT; trap 'echo got-term; exit 0' TERM; echo ready; while :; do sleep 0.05; done`)
+			old := interruptGrace
+			interruptGrace = 300 * time.Millisecond
+			defer func() { interruptGrace = old }()
+			ctx, cancel := context.WithCancel(t.Context())
+			go func() {
+				for ctx.Err() == nil {
+					cp.mu.Lock()
+					ready := strings.Contains(strings.Join(cp.lines, "\n"), "ready")
+					cp.mu.Unlock()
+					if ready {
+						cancel()
+						return
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+			}()
+			execute(ctx, c, &model.Run{ID: "run_cancel", Task: "x"})
+			cancel()
+			cp.mu.Lock()
+			out := strings.Join(cp.lines, "\n")
+			cp.mu.Unlock()
+			if !strings.Contains(out, tc.want) || tc.want == "got-int" && strings.Contains(out, "got-term") {
+				t.Fatalf("output:\n%s", out)
+			}
+		})
 	}
 }
