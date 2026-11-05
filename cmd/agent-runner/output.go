@@ -397,8 +397,14 @@ func (s *outputSpool) send() {
 // post delivers a few lines outside a run's output stream (a notice before the harness starts),
 // retried within outputDrainBudget.
 func (c *client) post(ctx context.Context, runID string, lines []string) {
+	c.postWhile(ctx, context.Background(), runID, lines)
+}
+
+// postWhile is post given up when alive ends (the run was cancelled meanwhile).
+func (c *client) postWhile(ctx, alive context.Context, runID string, lines []string) {
 	dctx, done := deliveryCtx(ctx, outputDrainBudget, finishReserve)
 	defer done()
+	defer context.AfterFunc(alive, done)()
 	if err := c.postBatch(dctx, runID, lines); err != nil {
 		fmt.Fprintf(os.Stderr, "agent-runner: run %s: %d output line(s) not delivered: %v\n", runID, len(lines), err)
 	}

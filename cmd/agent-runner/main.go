@@ -419,24 +419,25 @@ func harnessOf(cmdline, input string) (string, string) {
 // user input events are written to the harness stdin.
 func execute(ctx context.Context, c *client, run *model.Run) int {
 	cmdline, input := harnessOf(os.Getenv("HARNESS_CMD"), os.Getenv("HARNESS_INPUT"))
-	// The setup (a clone can take minutes) runs under a watch for the run's cancel: forwardInput,
-	// which acts on it during the run, only starts with the harness.
-	setup, stopWatch := watchCancel(ctx, c, run.ID)
-	notice := workspaceRepo.ensure(setup)
-	stopWatch()
-	if errors.Is(context.Cause(setup), errRunCancelled) {
-		c.post(ctx, run.ID, []string{"[agent-runner] run cancelled before the harness started"})
-		return 1
+	// Everything before the harness runs (a clone can take minutes, a notice can wait on the
+	// control plane) is under a watch for the run's cancel, and so is the run itself until
+	// forwardInput, which acts on a cancel during the run, has taken over.
+	w := watchCancel(ctx, c, run.ID)
+	defer w.release()
+	defer w.stop()
+	notice := workspaceRepo.ensure(w.ctx)
+	if notice != "" && !w.cancelled() {
+		c.postWhile(ctx, w.ctx, run.ID, []string{notice})
 	}
-	if notice != "" {
-		c.post(ctx, run.ID, []string{notice})
+	if w.cancelled() {
+		return c.cancelledBeforeStart(ctx, run.ID)
 	}
 	env := append(os.Environ(), "SANDBOX_TASK="+run.Task, "SANDBOX_RUN_ID="+run.ID)
 	// The profile's harness files (a Codex config.toml, Claude Code settings) are in place
 	// before the harness reads them. A file that cannot be written fails the run: a harness
 	// started without its provider settings would talk to the wrong endpoint.
 	if n, err := writeHarnessFiles(os.Getenv("SANDBOX_HARNESS_FILES"), os.Getenv("HOME")); err != nil {
-		c.post(ctx, run.ID, []string{"[agent-runner] harness files: " + err.Error()})
+		c.postWhile(ctx, w.ctx, run.ID, []string{"[agent-runner] harness files: " + err.Error()})
 		return 1
 	} else if n > 0 {
 		fmt.Printf("agent-runner: %d harness file(s) written from the profile\n", n)
@@ -469,7 +470,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	// An ACP harness is one program for the whole conversation: a resume is session/load of the
 	// same agent, MCP servers go into session/new, the runner is its client (acp.go).
 	if input == harness.InputACP {
-		return executeACP(ctx, c, run, cmdline, env)
+		return executeACP(ctx, c, run, cmdline, env, w)
 	}
 	if run.ResumeOf != "" {
 		switch resume := os.Getenv("HARNESS_RESUME_CMD"); {
@@ -486,7 +487,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 		cmdline = withMCPConfig(cmdline)
 	}
 	fmt.Printf("agent-runner: run %s: %q\n", run.ID, truncate(run.Task, 80))
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(w.ctx) // a cancel the watch sees stops the harness too
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, "/bin/sh", "-lc", cmdline)
 	// The harness and everything it starts are one process group, signalled as a whole, as the
@@ -525,6 +526,10 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 		return 1
 	}
 	cmd.Stdout, cmd.Stderr = out, out
+	if w.cancelled() {
+		_, _, _ = stdin.Close(), stdout.Close(), out.Close()
+		return c.cancelledBeforeStart(ctx, run.ID)
+	}
 	err = cmd.Start()
 	_ = out.Close() // the harness has its copy
 	if err != nil {
@@ -558,6 +563,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	wg.Add(2)
 	go func() { defer wg.Done(); streamOutput(ctx, c, run.ID, stdout, chat.sawLine) }()
 	go func() { defer wg.Done(); forwardInput(runCtx, c, run.ID, stdinSink{stdin, chat.mode}, cancel, chat) }()
+	w.stop() // forwardInput reads the input from its start: a cancel since is its
 
 	err = cmd.Wait()
 	close(exited)
@@ -586,10 +592,19 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 // errRunCancelled is the cause of a setup context ended by the run's cancel (watchCancel).
 var errRunCancelled = errors.New("run cancelled")
 
-// watchCancel follows the run's input for a run.cancel until stop is called; the context it
-// returns ends (cause errRunCancelled) when one comes. Reading the input consumes nothing:
-// forwardInput reads the same events from the start once the harness runs.
-func watchCancel(ctx context.Context, c *client, runID string) (context.Context, func()) {
+// runWatch follows the run's input for a run.cancel from the moment the run is claimed until
+// forwardInput has taken over (stop). ctx is the run's: it ends, cause errRunCancelled, when a
+// cancel comes, whether the harness has started or not. Reading the input consumes nothing:
+// forwardInput reads the same events from the start.
+type runWatch struct {
+	ctx     context.Context
+	stop    func() // ends the watch; idempotent
+	release func() // ends ctx once the run is over
+}
+
+func (w *runWatch) cancelled() bool { return errors.Is(context.Cause(w.ctx), errRunCancelled) }
+
+func watchCancel(ctx context.Context, c *client, runID string) *runWatch {
 	setup, cancel := context.WithCancelCause(ctx)
 	watch, endWatch := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -608,14 +623,24 @@ func watchCancel(ctx context.Context, c *client, runID string) (context.Context,
 			for _, e := range evs {
 				after = e.ID
 				if e.Type == model.EventRunCancel {
-					fmt.Println("agent-runner: run cancelled by the control plane while it was being set up")
+					fmt.Println("agent-runner: run cancelled by the control plane before its harness took input")
 					cancel(errRunCancelled)
 					return
 				}
 			}
 		}
 	}()
-	return setup, func() { endWatch(); <-done }
+	var once sync.Once
+	return &runWatch{ctx: setup, stop: func() { once.Do(func() { endWatch(); <-done }) }, release: func() { cancel(context.Canceled) }}
+}
+
+// cancelledBeforeStart ends a run cancelled before its harness started: a notice (tried briefly:
+// the run is over either way) and exit 1.
+func (c *client) cancelledBeforeStart(ctx context.Context, runID string) int {
+	dctx, done := deliveryCtx(ctx, 10*time.Second, finishReserve)
+	defer done()
+	_ = c.postBatch(dctx, runID, []string{"[agent-runner] run cancelled before the harness started"})
+	return 1
 }
 
 // interruptGrace is how long a cancelled harness has after SIGINT before SIGTERM.

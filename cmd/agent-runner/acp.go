@@ -33,9 +33,9 @@ import (
 // What the agent reports becomes the ACP lines of internal/harness (acp.session, acp.message,
 // acp.tool_call with its diffs, acp.permission, acp.turn_end) on the run's output, so the
 // control plane reads the transcript, the session id and the turn ends like any harness's.
-func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, env []string) int {
+func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, env []string, w *runWatch) int {
 	fmt.Printf("agent-runner: run %s (acp): %q\n", run.ID, truncate(run.Task, 80))
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(w.ctx) // a cancel the watch sees ends the conversation too
 	defer cancel()
 	// The agent is stopped by the runner (stdin closed, then SIGTERM), not by runCtx: a cancelled
 	// run still gets its session/cancel first.
@@ -45,7 +45,7 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	// env:NAME) are in place before it starts.
 	env, delivered, err := deliverInstructions(env, os.Getenv("HARNESS_INSTRUCTIONS"), os.Getenv("SANDBOX_INSTRUCTIONS"), os.Getenv("HOME"))
 	if err != nil {
-		c.post(ctx, run.ID, []string{"[agent-runner] instructions: " + err.Error()})
+		c.postWhile(ctx, w.ctx, run.ID, []string{"[agent-runner] instructions: " + err.Error()})
 		return 1
 	}
 	cmd := exec.CommandContext(procCtx, "/bin/sh", "-lc", cmdline)
@@ -75,6 +75,10 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 		return 1
 	}
 	cmd.Stderr = errW
+	if w.cancelled() {
+		_, _, _, _ = stdin.Close(), stdout.Close(), errR.Close(), errW.Close()
+		return c.cancelledBeforeStart(ctx, run.ID)
+	}
 	err = cmd.Start()
 	_ = errW.Close() // the agent has its copy
 	if err != nil {
@@ -117,6 +121,7 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	conn := wire.Connect(cl)
 	exit := driveACP(runCtx, conn, cl, run, emit, chat, func(inputs inputSink) {
 		go forwardInput(runCtx, c, run.ID, inputs, cancel, chat)
+		w.stop() // forwardInput reads the input from its start: a cancel since is its
 	})
 
 	// The conversation is over: end of input, a grace period for the agent to exit on its own,

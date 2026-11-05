@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -255,5 +256,59 @@ func TestCancelDuringTheCloneStopsTheRun(t *testing.T) {
 	cp.mu.Unlock()
 	if code == 0 || !strings.Contains(out, "run cancelled before the harness started") {
 		t.Fatalf("exit %d, output:\n%s", code, out)
+	}
+}
+
+// A cancel that comes while a notice before the harness waits on a stalled control plane (here
+// the failed clone's) is seen: the notice is given up, and the harness never starts.
+func TestCancelDuringAStalledNoticeStopsTheRun(t *testing.T) {
+	isolatedGit(t)
+	workspaceRepo = repoSync{}
+	t.Cleanup(func() { workspaceRepo = repoSync{} })
+	_, cp, _ := setupACP(t, "")
+	t.Setenv("HARNESS_INPUT", "")
+	t.Setenv("ACP_FAKE_AGENT", "")
+	t.Setenv("SANDBOX_MCP_SERVERS", "")
+	marker := filepath.Join(t.TempDir(), "started")
+	t.Setenv("HARNESS_CMD", `touch "`+marker+`"`)
+	root := t.TempDir()
+	t.Setenv("SANDBOX_REPO_DIR", filepath.Join(root, "repo"))
+	t.Setenv("SANDBOX_REPO", filepath.Join(root, "missing.git")) // the clone fails at once: a notice
+	start := time.Now()
+	var mu sync.Mutex
+	stalled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/events"):
+			mu.Lock()
+			first := !stalled
+			stalled = true
+			mu.Unlock()
+			if first { // the repository notice: the control plane does not answer for a while
+				select {
+				case <-time.After(6 * time.Second):
+				case <-r.Context().Done():
+					return
+				}
+			}
+			cp.ServeHTTP(w, r)
+		case strings.HasSuffix(r.URL.Path, "/input"):
+			if time.Since(start) < 500*time.Millisecond { // cancelled while the notice waits
+				time.Sleep(500 * time.Millisecond)
+				_, _ = w.Write([]byte("[]"))
+				return
+			}
+			_, _ = w.Write([]byte(`[{"id":1,"type":"run.cancel"}]`))
+		default:
+			cp.ServeHTTP(w, r)
+		}
+	}))
+	defer srv.Close()
+	code := execute(t.Context(), &client{base: srv.URL, http: srv.Client()}, &model.Run{ID: "run_cancel_notice", Task: "x"})
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the harness of a cancelled run was started")
+	}
+	if d := time.Since(start); code == 0 || d > 5*time.Second {
+		t.Fatalf("exit %d after %s", code, d)
 	}
 }
