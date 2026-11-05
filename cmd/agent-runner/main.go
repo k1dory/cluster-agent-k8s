@@ -95,6 +95,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, "agent-runner: repository:", err)
 	}
 	go serveFiles(ctx, c, workspaceRoot())
+	// Harnesses that cannot present the client certificate reach the gateway through the
+	// bridge (bridge.go); its address is in their environment.
+	certDir := os.Getenv("CERT_DIR")
+	if certDir == "" {
+		certDir = "/certs"
+	}
+	go serveGatewayBridge(ctx, certDir)
+	_ = os.Setenv("SANDBOX_GATEWAY_BRIDGE", "http://"+gatewayBridgeAddr)
 	fmt.Println("agent-runner: waiting for runs")
 	for ctx.Err() == nil {
 		var run model.Run

@@ -279,8 +279,8 @@ func authMethodIDs(methods []acp.AuthMethod) []string {
 }
 
 // acpMCPServers turns SANDBOX_MCP_SERVERS ([{name, url}]) into the session's MCP servers. They
-// are HTTP servers behind the gateway; an agent without the http MCP capability gets none
-// (skipped counts them).
+// are HTTP servers behind the gateway, given as their gateway bridge URLs; an agent without the
+// http MCP capability gets none (skipped counts them).
 func acpMCPServers(raw string, http bool) (servers []acp.McpServer, skipped int) {
 	servers = []acp.McpServer{}
 	if strings.TrimSpace(raw) == "" {
@@ -301,7 +301,9 @@ func acpMCPServers(raw string, http bool) (servers []acp.McpServer, skipped int)
 			skipped++
 			continue
 		}
-		servers = append(servers, acp.McpServer{Http: &acp.McpServerHttpInline{Name: s.Name, Url: s.URL, Headers: []acp.HttpHeader{}, Type: "http"}})
+		// Through the gateway bridge: an ACP agent's MCP client need not present the pod's
+		// client certificate itself (bridge.go).
+		servers = append(servers, acp.McpServer{Http: &acp.McpServerHttpInline{Name: s.Name, Url: gatewayBridgeURL(s.URL), Headers: []acp.HttpHeader{}, Type: "http"}})
 	}
 	return servers, skipped
 }
