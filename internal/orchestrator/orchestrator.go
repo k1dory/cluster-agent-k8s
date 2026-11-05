@@ -163,10 +163,15 @@ type Orchestrator struct {
 	stopping map[string]bool      // sandboxes this replica is taking down right now
 	stopSeen map[string]time.Time // when the reconciler first saw a sandbox stopping with its pod alive
 	leading  atomic.Bool
+	started  atomic.Bool
 }
 
 // Leading reports whether this replica holds the reconciler lease.
 func (o *Orchestrator) Leading() bool { return o.leading.Load() }
+
+// Started reports whether the reconciler (Run or IdleLoop) has been started. Policies and
+// Quotas are plain fields read by it: they must be set before, never after.
+func (o *Orchestrator) Started() bool { return o.started.Load() }
 
 type sbMeta struct{ tenant, slug string }
 
@@ -1349,6 +1354,7 @@ func (o *Orchestrator) PreviewHost(sb *model.Sandbox) string {
 // lease reconciles (idle sleep, expiry, deferred rollouts, refused deletes, orphaned pods); the
 // others stand by and take over when the lease is lost.
 func (o *Orchestrator) Run(ctx context.Context) {
+	o.started.Store(true)
 	for ctx.Err() == nil {
 		lease, held, err := o.Store.TryLead(ctx, "orchestrator")
 		if err != nil {
@@ -1462,6 +1468,7 @@ func (o *Orchestrator) failRun(ctx context.Context, sandboxID string, r *model.R
 
 // IdleLoop is the single-replica form of Run, kept for callers that manage leadership themselves.
 func (o *Orchestrator) IdleLoop(ctx context.Context) {
+	o.started.Store(true)
 	o.leading.Store(true)
 	defer o.leading.Store(false)
 	t := time.NewTicker(o.Cfg.IdleCheckEvery)

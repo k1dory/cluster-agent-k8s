@@ -311,11 +311,6 @@ func serve(cfgPath string, log *slog.Logger) error {
 		DefaultHarnessInput: cfg.Kube.HarnessInput,
 	}, log)
 	orch.ListenerPublishes = hasListener
-	orchDone := make(chan struct{})
-	go func() { // reconciler on the replica holding the lease
-		orch.Run(ctx)
-		close(orchDone)
-	}()
 
 	var secretProvider secrets.Provider = secrets.Static{}
 	switch cfg.Secrets.Provider {
@@ -363,10 +358,19 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	// The configuration services: ownership guard, quotas, connections, catalogue (one wiring
 	// for sandboxd and the integration tests, see internal/app).
-	services, err := app.Wire(ctx, app.Deps{Store: st, Policies: pols, Secrets: secretProvider, Orch: orch, Log: log, CITrustMaxTTL: cfg.CIAuth.MaxTTL})
+	services, err := app.Wire(ctx, app.Deps{Store: st, Policies: pols, Secrets: secretProvider, Orch: orch, Log: log, Replica: replicaName(), CITrustMaxTTL: cfg.CIAuth.MaxTTL})
 	if err != nil {
 		return err
 	}
+	// The reconciler starts only now: Wire installs the ownership guard and the quotas on the
+	// orchestrator, and a replica that wins the lease reconciles at once. Started earlier, the
+	// first pass ran without them (revoked slugs kept running) and Wire wrote both fields under
+	// a goroutine already reading them.
+	orchDone := make(chan struct{})
+	go func() { // reconciler on the replica holding the lease
+		orch.Run(ctx)
+		close(orchDone)
+	}()
 	services.Watch(ctx, log)
 	if startSyncer != nil {
 		startSyncer(services.Guard, services.Connections)
