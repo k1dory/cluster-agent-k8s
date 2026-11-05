@@ -60,13 +60,19 @@ type HarnessSpec struct {
 	Command       string `yaml:"command,omitempty" json:"command,omitempty"`
 	ResumeCommand string `yaml:"resume_command,omitempty" json:"resume_command,omitempty"`
 	ResumePrompt  string `yaml:"resume_prompt,omitempty" json:"resume_prompt,omitempty"`
-	// Input: "text" (default; a line on stdin) or "stream-json" (Claude Code's streaming
-	// input, which keeps the conversation open: follow-up messages reach the running harness).
+	// Input: "text" (default; a line on stdin), "stream-json" (Claude Code's streaming
+	// input, which keeps the conversation open: follow-up messages reach the running harness)
+	// or "acp" (the command is an Agent Client Protocol agent, e.g. claude-agent-acp or
+	// codex-acp: the runner drives it over JSON-RPC, follow-ups are prompts of the same session).
 	// ChatIdle: seconds without a new message after a turn before the runner closes an open
 	// conversation (0 = runtime default, 600). Between runs the conversation continues through
 	// ResumeCommand with $SANDBOX_SESSION and the message in $SANDBOX_RESUME_PROMPT.
 	Input    string `yaml:"input,omitempty" json:"input,omitempty"`
 	ChatIdle *int   `yaml:"chat_idle,omitempty" json:"chat_idle,omitempty"`
+	// Permissions answers the permission requests of an "acp" harness: "allow" (the default:
+	// the sandbox, its policy and the gateway are the boundary) or "deny". Every request and
+	// the decision are recorded in the run's output.
+	Permissions string `yaml:"permissions,omitempty" json:"permissions,omitempty"`
 	// Files are the harness's own configuration files, path (relative to the agent's home) →
 	// content: a Codex config.toml naming its provider, a Claude Code settings.json. The runner
 	// writes them before every run (SANDBOX_HARNESS_FILES). They are configuration, stored in
@@ -222,8 +228,19 @@ func (s *Service) validate(ctx context.Context, kind, tenant string, raw json.Ra
 		if err := validateResources(e.Resources); err != nil {
 			return nil, err
 		}
-		if e.Harness.Input != "" && e.Harness.Input != harness.InputText && e.Harness.Input != harness.InputStreamJSON {
-			return nil, fmt.Errorf("%w: spec.harness.input must be %s or %s", ErrInvalid, harness.InputText, harness.InputStreamJSON)
+		switch e.Harness.Input {
+		case "", harness.InputText, harness.InputStreamJSON, harness.InputACP:
+		default:
+			return nil, fmt.Errorf("%w: spec.harness.input must be %s, %s or %s", ErrInvalid, harness.InputText, harness.InputStreamJSON, harness.InputACP)
+		}
+		switch e.Harness.Permissions {
+		case "":
+		case harness.PermissionsAllow, harness.PermissionsDeny:
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.permissions applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+		default:
+			return nil, fmt.Errorf("%w: spec.harness.permissions must be %s or %s", ErrInvalid, harness.PermissionsAllow, harness.PermissionsDeny)
 		}
 		if e.Harness.ChatIdle != nil && *e.Harness.ChatIdle < 0 {
 			return nil, fmt.Errorf("%w: spec.harness.chat_idle must be >= 0", ErrInvalid)
@@ -450,7 +467,8 @@ func (s *Service) Resolve(ctx context.Context, tenant, agentRef string, admin bo
 		Launch: model.Launch{
 			Image: image, HarnessCommand: es.Harness.Command, HarnessResumeCommand: es.Harness.ResumeCommand,
 			ResumePrompt: es.Harness.ResumePrompt, HarnessInput: es.Harness.Input, ChatIdle: intOf(es.Harness.ChatIdle),
-			Model: es.Model.Name, Instructions: as.Instructions, Env: envVars, HarnessFiles: es.Harness.Files,
+			HarnessPermissions: es.Harness.Permissions,
+			Model:              es.Model.Name, Instructions: as.Instructions, Env: envVars, HarnessFiles: es.Harness.Files,
 			CPURequest: es.Resources.CPURequest, CPULimit: es.Resources.CPULimit,
 			MemoryRequest: es.Resources.MemoryRequest, MemoryLimit: es.Resources.MemoryLimit,
 			VolumeSize: es.Resources.VolumeSize, RuntimeClass: es.RuntimeClass,

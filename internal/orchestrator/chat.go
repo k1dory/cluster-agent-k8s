@@ -113,10 +113,11 @@ func (o *Orchestrator) say(ctx context.Context, sandboxID, text string) (*model.
 	return r, DeliveredNew, wake, nil
 }
 
-// streamsInput says whether the sandbox's harness takes messages during a run (stream-json).
-// Anything else is text mode, as the runner reads it: stdin carries the task and is closed.
+// streamsInput says whether the sandbox's harness takes messages during a run (stream-json, or
+// acp: the next prompt of the same session). Anything else is text mode, as the runner reads
+// it: stdin carries the task and is closed.
 func streamsInput(sb *model.Sandbox) bool {
-	return sb.Launch != nil && sb.Launch.HarnessInput == harness.InputStreamJSON
+	return sb.Launch != nil && (sb.Launch.HarnessInput == harness.InputStreamJSON || sb.Launch.HarnessInput == harness.InputACP)
 }
 
 // CloseRun asks the runner to close the harness's input: an open conversation ends, the run

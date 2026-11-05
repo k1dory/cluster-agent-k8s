@@ -2128,7 +2128,8 @@ components:
             command: { type: string }
             resume_command: { type: string, description: "Continues a session: $SANDBOX_SESSION, the message (or the rollout prompt) in $SANDBOX_RESUME_PROMPT" }
             resume_prompt: { type: string, description: "What a rollout resume tells the harness (default: continue the task)" }
-            input: { type: string, enum: [text, stream-json], description: "How messages reach the harness: a line on stdin, or Claude Code's streaming JSON input (keeps the conversation open)" }
+            input: { type: string, enum: [text, stream-json, acp], description: "How messages reach the harness: a line on stdin, Claude Code's streaming JSON input (keeps the conversation open), or the Agent Client Protocol (the command is an ACP agent; every message is a prompt of the same session)" }
+            permissions: { type: string, enum: [allow, deny], description: "input acp only: how the runner answers the agent's permission requests (default allow); every request and decision is recorded in the run's output" }
             chat_idle: { type: integer, minimum: 0, description: "stream-json: seconds without a message after a turn before the runner closes the conversation (0 = 600)" }
             files:
               type: object

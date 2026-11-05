@@ -85,6 +85,49 @@ moment join the same conversation instead of starting two.
 Forced rollouts keep working on the same mechanism: the interrupted run is re-queued with
 `mode: resume` and the harness is told to continue where it left off.
 
+### ACP harnesses
+
+`input: acp` makes the profile's command an [Agent Client Protocol](https://agentclientprotocol.com)
+agent and agent-runner its client, over the agent's stdio (JSON-RPC). The image carries the
+adapters for both vendors, pinned in `hack/ci/versions.env`:
+
+```yaml
+harness:
+  command: claude-agent-acp        # or codex-acp, or any agent that speaks ACP (gemini --experimental-acp…)
+  input: acp
+  permissions: allow               # allow (default) | deny
+```
+
+- **One session per conversation.** The run's task is the first `session/prompt` of a new
+  session; every later message is the next prompt of the same session (a message sent while a
+  turn runs waits for it to end). A run that continues the conversation (the next message after
+  the run finished, a rollout) loads the session it reported with `session/load` — the history
+  the agent replays is not written again — so `resume_command` is not used. An agent without
+  `loadSession` starts a new session and the runner says so in the output.
+- **MCP servers** of the agent's connections go into `session/new` as HTTP servers (the agent
+  must announce `mcpCapabilities.http`; otherwise they are left out with a notice).
+- **Instructions.** ACP has no system prompt: a new session's first prompt carries the agent
+  definition's instructions ahead of the task, in an `<instructions>` block.
+- **Permissions.** `session/request_permission` is answered by `permissions`: the agent's
+  `allow_once` (else `allow_always`) option, or with `deny` its `reject_once` (else
+  `reject_always`). The sandbox, its policy and the gateway stay the boundary either way. Every
+  request and its decision is a line of the run's output.
+- **Output.** The runner writes what the agent reports as one JSON line each:
+
+  | `type`            | fields                                                    | transcript |
+  |-------------------|-----------------------------------------------------------|------------|
+  | `acp.session`     | `session_id`                                              | — (the run's session) |
+  | `acp.message`     | `text` (the agent's chunks of one message, joined)        | `assistant` |
+  | `acp.tool_call`   | `tool_call_id`, `title`, `kind`, `status`, `diffs[]` (`path`, `old_text`, `new_text`) | `tool` |
+  | `acp.tool_update` | `tool_call_id`, `status`, `diffs[]`                       | `log` |
+  | `acp.permission`  | `tool_call_id`, `title`, `decision`                       | `log` |
+  | `acp.turn_end`    | `stop_reason`                                             | ends the turn (`chat_idle` counts from here) |
+
+  A prompt's usage, when the agent reports it, is a `{"type":"usage",…}` line the run's
+  accounting adds up. The agent's stderr is passed through as it is.
+- **The runner offers no file system or terminal** to the agent (client capabilities are empty):
+  the agent uses its own tools inside the pod, under the pod's network lock.
+
 ### The transcript
 
 `GET /messages` derives the conversation from the sandbox's event stream, so it survives

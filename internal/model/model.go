@@ -43,14 +43,17 @@ type Launch struct {
 	HarnessResumeCommand string `json:"harness_resume_command,omitempty"`
 	ResumePrompt         string `json:"resume_prompt,omitempty"`
 	// HarnessInput says how the runner hands messages to the harness: "text" (a line on stdin;
-	// the default) or "stream-json" (Claude Code's streaming input: one JSON user message per
-	// line, which keeps the conversation open for follow-ups). ChatIdle is how many seconds a
+	// the default), "stream-json" (Claude Code's streaming input: one JSON user message per
+	// line, which keeps the conversation open for follow-ups) or "acp" (the Agent Client
+	// Protocol: the runner is the client, every message a prompt of the same session). ChatIdle is how many seconds a
 	// run in stream-json mode waits for the next message after a turn before the runner closes
 	// the conversation (0 = the runtime default, 600).
 	HarnessInput string `json:"harness_input,omitempty"`
 	ChatIdle     int    `json:"chat_idle,omitempty"`
-	Model        string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
-	Instructions string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
+	// HarnessPermissions answers an "acp" harness's permission requests: allow (default) or deny.
+	HarnessPermissions string `json:"harness_permissions,omitempty"`
+	Model              string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
+	Instructions       string `json:"instructions,omitempty"` // exported as SANDBOX_INSTRUCTIONS
 	// Env is the profile's own variables for the agent container. They never reach the init
 	// containers and never shadow a platform variable (see PlatformEnv).
 	Env map[string]string `json:"env,omitempty"`
@@ -85,7 +88,7 @@ func PlatformEnv(name string) bool {
 	}
 	switch name {
 	case "GATEWAY_IP", "GATEWAY_CA_FILE", "REGISTRAR_URL", "API_URL", "CERT_DIR", "HOME",
-		"HARNESS_CMD", "HARNESS_RESUME_CMD", "HARNESS_INPUT", "HARNESS_CHAT_IDLE":
+		"HARNESS_CMD", "HARNESS_RESUME_CMD", "HARNESS_INPUT", "HARNESS_CHAT_IDLE", "HARNESS_PERMISSIONS":
 		return true
 	}
 	return false
