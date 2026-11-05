@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -189,3 +190,49 @@ func TestReviewDeleteWaitsForTenantLock(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// deleteHookRuntime runs during, once, inside DeletePod: a Delete arriving while a sleep is
+// taking the pod down.
+type deleteHookRuntime struct {
+	*FakeRuntime
+	during func()
+}
+
+func (r *deleteHookRuntime) DeletePod(ctx context.Context, sb *model.Sandbox) error {
+	if h := r.during; h != nil {
+		r.during = nil
+		h()
+	}
+	return r.FakeRuntime.DeletePod(ctx, sb)
+}
+
+// A sleep finishing after a Delete marked the sandbox deleting wrote sleeping over it; when the
+// cluster had refused the delete, the reconciler no longer retried it. The sleep now settles
+// only out of stopping.
+func TestReviewSleepDoesNotUndoADelete(t *testing.T) {
+	o, fake, sb := reviewRunningSandbox(t)
+	ctx := context.Background()
+	fake.SetFailDelete(nil)
+	rt := &deleteHookRuntime{FakeRuntime: fake.FakeRuntime}
+	o.Runtime = rt
+	rt.during = func() {
+		fake.SetFailDelete(errFakeRefused)
+		if err := o.Delete(ctx, sb.ID); err == nil {
+			t.Error("delete succeeded although the cluster refused it")
+		}
+		fake.SetFailDelete(nil)
+	}
+	if _, err := o.Sleep(ctx, sb.ID, false); err == nil {
+		t.Fatal("sleep reported success over a delete in progress")
+	}
+	got, err := o.Store.GetSandbox(ctx, sb.ID)
+	if err != nil || got.Status != model.StatusDeleting {
+		t.Fatalf("sandbox after sleep raced a refused delete: %v %+v", err, got)
+	}
+	o.Reconcile(ctx)
+	if _, err := o.Store.GetSandbox(ctx, sb.ID); err == nil {
+		t.Fatal("the reconciler did not retry the delete")
+	}
+}
+
+var errFakeRefused = errors.New("cluster refused")

@@ -728,7 +728,15 @@ func (o *Orchestrator) stopPod(ctx context.Context, id string, final model.Sandb
 	if final == model.StatusWaking {
 		return o.startPod(ctx, id)
 	}
-	return o.setStatus(ctx, id, final, func(s *model.Sandbox) { s.PodName, s.IP = "", "" })
+	// Only out of stopping: a Delete that moved the sandbox to deleting meanwhile must keep it
+	// there (its retry depends on it), and a reconciler that already settled it has done this.
+	sb, err = o.setStatusFrom(ctx, id, []model.SandboxStatus{model.StatusStopping}, final, func(s *model.Sandbox) { s.PodName, s.IP = "", "" })
+	if errors.Is(err, ErrConflict) {
+		if cur, gerr := o.Store.GetSandbox(ctx, id); gerr == nil && cur.Status == final {
+			return cur, nil
+		}
+	}
+	return sb, err
 }
 
 // detached returns a context that outlives the caller's (a request whose client went away) but
