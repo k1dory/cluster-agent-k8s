@@ -94,7 +94,8 @@ func TestLaunchShapesThePod(t *testing.T) {
 	sb := &model.Sandbox{ID: "sb_launch", Slug: "dev", Tenant: "acme", AgentVersion: "agent:py-1.2", AgentRef: "backend", AgentRevision: 3,
 		EnvironmentRef: "py", EnvironmentRevision: 2, Launch: &model.Launch{
 			Image: "agent:py-1.2", HarnessCommand: "codex exec \"$SANDBOX_TASK\" --json", Model: "claude-opus-5-5", Instructions: "Be brief.",
-			HarnessInput: "acp", HarnessMode: "agent-full-access", HarnessMCP: "always",
+			HarnessInput: "acp", HarnessMode: "agent-full-access", HarnessMCP: "always", HarnessThoughtLevel: "high",
+			HarnessSessionMeta: `{"a":1}`, HarnessInstructions: "file",
 			// GATEWAY_IP, SANDBOX_ID and KEEP must not win: platform and operator names stay theirs.
 			Env:      map[string]string{"PIP_INDEX_URL": "https://pypi.example.com", "GATEWAY_IP": "192.0.2.9", "SANDBOX_ID": "forged", "KEEP": "2"},
 			CPULimit: "3", MemoryRequest: "2Gi", VolumeSize: "20Gi", RuntimeClass: "gvisor"}}
@@ -120,7 +121,8 @@ func TestLaunchShapesThePod(t *testing.T) {
 		t.Fatalf("image: %s", c.Image)
 	case env["HARNESS_CMD"] != "codex exec \"$SANDBOX_TASK\" --json":
 		t.Fatalf("harness: %q", env["HARNESS_CMD"])
-	case env["HARNESS_INPUT"] != "acp" || env["HARNESS_MODE"] != "agent-full-access" || env["HARNESS_MCP"] != "always":
+	case env["HARNESS_INPUT"] != "acp" || env["HARNESS_MODE"] != "agent-full-access" || env["HARNESS_MCP"] != "always" ||
+		env["HARNESS_THOUGHT_LEVEL"] != "high" || env["HARNESS_SESSION_META"] != `{"a":1}` || env["HARNESS_INSTRUCTIONS"] != "file":
 		t.Fatalf("acp launch env: %v", env)
 	case env["ANTHROPIC_MODEL"] != "claude-opus-5-5" || env["SANDBOX_MODEL"] != "claude-opus-5-5" || env["SANDBOX_INSTRUCTIONS"] != "Be brief." || env["PIP_INDEX_URL"] == "" || env["KEEP"] != "1" || env["ANTHROPIC_BASE_URL"] == "":
 		t.Fatalf("env merge: %v", env)

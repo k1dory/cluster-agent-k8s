@@ -61,6 +61,9 @@ type PodConfig struct {
 	HarnessAuthMethod    string // acp: the authenticate method id
 	HarnessMode          string // acp: the session mode set after the session opens
 	HarnessMCP           string // acp: auto | always
+	HarnessThoughtLevel  string // acp: the reasoning level
+	HarnessSessionMeta   string // acp: the sessions' _meta (JSON)
+	HarnessInstructions  string // acp: "", file or env:NAME
 	// Env is the operator's environment (deployment configuration): trusted, set on every
 	// container of the pod. UserEnv is the sandbox's profile environment: it reaches the agent
 	// container only, and never under a platform name (model.PlatformEnv) or one Env sets.
@@ -133,6 +136,7 @@ func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 		e.HarnessCommand, e.HarnessResumeCommand = l.HarnessCommand, l.HarnessResumeCommand
 		e.HarnessInput, e.HarnessPermissions, e.HarnessAuthMethod = l.HarnessInput, l.HarnessPermissions, l.HarnessAuthMethod
 		e.HarnessMode, e.HarnessMCP = l.HarnessMode, l.HarnessMCP
+		e.HarnessThoughtLevel, e.HarnessSessionMeta, e.HarnessInstructions = l.HarnessThoughtLevel, l.HarnessSessionMeta, l.HarnessInstructions
 	} else {
 		pick(&e.HarnessResumeCommand, l.HarnessResumeCommand)
 		pick(&e.HarnessInput, l.HarnessInput)
@@ -140,6 +144,9 @@ func (c PodConfig) effective(sb *model.Sandbox) PodConfig {
 		pick(&e.HarnessAuthMethod, l.HarnessAuthMethod)
 		pick(&e.HarnessMode, l.HarnessMode)
 		pick(&e.HarnessMCP, l.HarnessMCP)
+		pick(&e.HarnessThoughtLevel, l.HarnessThoughtLevel)
+		pick(&e.HarnessSessionMeta, l.HarnessSessionMeta)
+		pick(&e.HarnessInstructions, l.HarnessInstructions)
 	}
 	pick(&e.ResumePrompt, l.ResumePrompt)
 	if l.ChatIdle > 0 {
@@ -294,6 +301,9 @@ func (r *Runtime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, err
 		{Name: "HARNESS_AUTH_METHOD", Value: c.HarnessAuthMethod},
 		{Name: "HARNESS_MODE", Value: c.HarnessMode},
 		{Name: "HARNESS_MCP", Value: c.HarnessMCP},
+		{Name: "HARNESS_THOUGHT_LEVEL", Value: c.HarnessThoughtLevel},
+		{Name: "HARNESS_SESSION_META", Value: c.HarnessSessionMeta},
+		{Name: "HARNESS_INSTRUCTIONS", Value: c.HarnessInstructions},
 		{Name: "SANDBOX_AGENT_VERSION", Value: c.Image},
 		{Name: "SANDBOX_ENV_VERSION", Value: sb.EnvVersion},
 		{Name: "SANDBOX_AGENT_REF", Value: sb.AgentRef},

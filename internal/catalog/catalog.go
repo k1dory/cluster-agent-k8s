@@ -35,6 +35,12 @@ import (
 	"agent-sandbox/internal/store"
 )
 
+// envNameRe is an environment variable name harness.instructions may export.
+var envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
+
+// MaxSessionMetaSize bounds spec.harness.session_meta: it travels in the pod's environment.
+const MaxSessionMetaSize = 16 << 10
+
 // authMethodRe is what an ACP authentication method or session mode id may look like
 // (spec.harness.auth_method, spec.harness.mode).
 var authMethodRe = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
@@ -91,6 +97,20 @@ type HarnessSpec struct {
 	// (the default: when it declares MCP over HTTP) or "always" (for an agent that takes them
 	// without declaring it, such as Hermes).
 	MCP string `yaml:"mcp,omitempty" json:"mcp,omitempty"`
+	// ThoughtLevel is the reasoning level an "acp" harness is put on (the agent's config option
+	// of category thought_level: codex-acp reasoning_effort low…xhigh, OpenCode effort, Hermes
+	// reasoning_effort). Empty: the agent's default.
+	ThoughtLevel string `yaml:"thought_level,omitempty" json:"thought_level,omitempty"`
+	// SessionMeta is metadata every session request of an "acp" harness carries (_meta of
+	// session/new, load, resume): agent-specific options, e.g. claude-agent-acp's
+	// {"claudeCode":{"options":{"maxTurns":…,"maxBudgetUsd":…}}}. Configuration, not secrets.
+	SessionMeta map[string]any `yaml:"session_meta,omitempty" json:"session_meta,omitempty"`
+	// Instructions says how an "acp" harness gets the agent definition's instructions: empty (the
+	// session's system prompt when the agent takes one, else ahead of the first prompt), "file"
+	// (written to $HOME/.sandbox/instructions.md, $SANDBOX_INSTRUCTIONS_FILE, for a configuration
+	// that names it: OpenCode's `instructions`) or "env:NAME" (exported as NAME: Hermes's
+	// HERMES_ENVIRONMENT_HINT).
+	Instructions string `yaml:"instructions,omitempty" json:"instructions,omitempty"`
 	// Files are the harness's own configuration files, path (relative to the agent's home) →
 	// content: a Codex config.toml naming its provider, a Claude Code settings.json. The runner
 	// writes them before every run (SANDBOX_HARNESS_FILES). They are configuration, stored in
@@ -284,6 +304,34 @@ func (s *Service) validate(ctx context.Context, kind, tenant string, raw json.Ra
 			}
 		default:
 			return nil, fmt.Errorf("%w: spec.harness.mcp must be %s or %s", ErrInvalid, harness.MCPAuto, harness.MCPAlways)
+		}
+		if l := e.Harness.ThoughtLevel; l != "" {
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.thought_level applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+			if !authMethodRe.MatchString(l) {
+				return nil, fmt.Errorf("%w: spec.harness.thought_level must be a value id (letters, digits, . _ : -, at most 64)", ErrInvalid)
+			}
+		}
+		if len(e.Harness.SessionMeta) > 0 {
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.session_meta applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+			if b, err := json.Marshal(e.Harness.SessionMeta); err != nil || len(b) > MaxSessionMetaSize {
+				return nil, fmt.Errorf("%w: spec.harness.session_meta must be a JSON object of at most %d bytes", ErrInvalid, MaxSessionMetaSize)
+			}
+		}
+		if m := e.Harness.Instructions; m != "" {
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.instructions applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+			name, isEnv := strings.CutPrefix(m, "env:")
+			switch {
+			case m == "file":
+			case isEnv && envNameRe.MatchString(name) && !model.PlatformEnv(name):
+			default:
+				return nil, fmt.Errorf("%w: spec.harness.instructions must be file or env:NAME (a variable the profile may set)", ErrInvalid)
+			}
 		}
 		if e.Harness.ChatIdle != nil && *e.Harness.ChatIdle < 0 {
 			return nil, fmt.Errorf("%w: spec.harness.chat_idle must be >= 0", ErrInvalid)
@@ -511,11 +559,21 @@ func (s *Service) Resolve(ctx context.Context, tenant, agentRef string, admin bo
 			Image: image, HarnessCommand: es.Harness.Command, HarnessResumeCommand: es.Harness.ResumeCommand,
 			ResumePrompt: es.Harness.ResumePrompt, HarnessInput: es.Harness.Input, ChatIdle: intOf(es.Harness.ChatIdle),
 			HarnessPermissions: es.Harness.Permissions, HarnessAuthMethod: es.Harness.AuthMethod,
-			HarnessMode: es.Harness.Mode, HarnessMCP: es.Harness.MCP,
+			HarnessMode: es.Harness.Mode, HarnessMCP: es.Harness.MCP, HarnessThoughtLevel: es.Harness.ThoughtLevel,
+			HarnessSessionMeta: sessionMetaJSON(es.Harness.SessionMeta), HarnessInstructions: es.Harness.Instructions,
 			Model: es.Model.Name, Instructions: as.Instructions, Env: envVars, HarnessFiles: es.Harness.Files,
 			CPURequest: es.Resources.CPURequest, CPULimit: es.Resources.CPULimit,
 			MemoryRequest: es.Resources.MemoryRequest, MemoryLimit: es.Resources.MemoryLimit,
 			VolumeSize: es.Resources.VolumeSize, RuntimeClass: es.RuntimeClass,
 		},
 	}, nil
+}
+
+// sessionMetaJSON is spec.harness.session_meta as the pod gets it (HARNESS_SESSION_META).
+func sessionMetaJSON(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(meta)
+	return string(b)
 }

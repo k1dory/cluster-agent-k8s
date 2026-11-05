@@ -1,20 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 
-	acp "github.com/coder/acp-go-sdk"
-
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/model"
+	"github.com/k1dory/acpx"
 )
 
 // The shipped OpenCode profile, as the runner applies it (its harness files written to a clean
@@ -62,7 +65,8 @@ func exampleSmoke(t *testing.T, file, binEnv, program string, extraEnv func(home
 	if err := json.Unmarshal(doc.Spec, &profile); err != nil {
 		t.Fatal(err)
 	}
-	if profile.Harness.Command != program+" acp" {
+	args, ok := strings.CutPrefix(profile.Harness.Command, program+" acp")
+	if !ok {
 		t.Fatalf("the example's command is %q; this test runs %s acp", profile.Harness.Command, program)
 	}
 	home := t.TempDir()
@@ -83,11 +87,17 @@ func exampleSmoke(t *testing.T, file, binEnv, program string, extraEnv func(home
 	t.Setenv("HARNESS_MODE", profile.Harness.Mode)
 	t.Setenv("HARNESS_MCP", profile.Harness.MCP)
 	t.Setenv("SANDBOX_MODEL", profile.Model.Name)
+	t.Setenv("HARNESS_THOUGHT_LEVEL", profile.Harness.ThoughtLevel)
+	meta, _ := json.Marshal(profile.Harness.SessionMeta)
+	if len(profile.Harness.SessionMeta) == 0 {
+		meta = nil
+	}
+	t.Setenv("HARNESS_SESSION_META", string(meta))
 	t.Setenv("SANDBOX_INSTRUCTIONS", "")
 	t.Setenv("SANDBOX_MCP_SERVERS", "")
 	t.Setenv("PWD", home)
 	t.Setenv("SANDBOX_REPO_DIR", home+"/no-repo")
-	agent := `"` + bin + `" acp`
+	agent := `"` + bin + `" acp` + args
 	session, fresh, notices, canLoad := openRealACP(t, isolate, agent, home, env, &model.Run{ID: "run_example"})
 	if !fresh || len(notices) != 0 {
 		t.Fatalf("first run: fresh %v, notices %q", fresh, notices)
@@ -115,13 +125,18 @@ func TestACPOpenCodeExampleAnswersThroughTheGateway(t *testing.T) {
 	if runOfflineInNetns(t) {
 		return
 	}
-	lines, seen := modelCallThroughGateway(t, "environment-opencode-acp.yaml", "opencode", bin, "api.anthropic.com", anthropicAnswer("pong-from-the-gateway"))
+	// The instructions reach OpenCode's system prompt through the file its configuration names
+	// (harness.instructions: file), not the first prompt.
+	handler, check := systemPromptRecorder(anthropicAnswer("pong-from-the-gateway"))
+	lines, seen := modelCallThroughGateway(t, "environment-opencode-acp.yaml", "opencode", bin, "api.anthropic.com", handler,
+		func(string) map[string]string { return map[string]string{"SANDBOX_INSTRUCTIONS": instructionMarker} })
 	assertAnswered(t, lines, seen, "pong-from-the-gateway", "api.anthropic.com")
 	for _, r := range seen {
 		if r.Path == "/v1/messages" && r.APIKey != "placeholder-the-gateway-injects-the-real-key" {
 			t.Fatalf("the model call carried %q, not the profile's placeholder key", r.APIKey)
 		}
 	}
+	check(t)
 }
 
 // The shipped Hermes profile's model call, from the real hermes of the agent-hermes image
@@ -139,11 +154,15 @@ func TestACPHermesExampleAnswersThroughTheGateway(t *testing.T) {
 		return
 	}
 	// The image puts HERMES_HOME in the agent's home; here that home is the test's.
-	lines, seen := modelCallThroughGateway(t, "environment-hermes-acp.yaml", "hermes", bin, "api.anthropic.com", anthropicAnswer("pong-from-the-gateway"),
+	// The instructions reach Hermes's system prompt as its environment hint
+	// (harness.instructions: env:HERMES_ENVIRONMENT_HINT), not the first prompt.
+	handler, check := systemPromptRecorder(anthropicAnswer("pong-from-the-gateway"))
+	lines, seen := modelCallThroughGateway(t, "environment-hermes-acp.yaml", "hermes", bin, "api.anthropic.com", handler,
 		func(home string) map[string]string {
-			return map[string]string{"HERMES_HOME": filepath.Join(home, ".hermes")}
+			return map[string]string{"HERMES_HOME": filepath.Join(home, ".hermes"), "SANDBOX_INSTRUCTIONS": instructionMarker}
 		})
 	assertAnswered(t, lines, seen, "pong-from-the-gateway", "api.anthropic.com")
+	check(t)
 }
 
 // The shipped claude-acp profile against the real adapter: it declares the client system prompt,
@@ -207,9 +226,14 @@ func TestACPClaudeExampleTakesTheSystemPromptAndMode(t *testing.T) {
 	defer stopAdapter(stdin, cancel, cmd)
 	var notices []string
 	emit := func(l string) { notices = append(notices, l) }
-	wire := newACPWire(stdin, stdout)
-	cl := &acpClient{emit: emit, systemPrompt: wire.SystemPrompt}
-	s, ok := openACPSession(ctx, acp.NewClientSideConnection(cl, wire, wire), cl, &model.Run{ID: "run_claude"}, emit)
+	// The runner's own wiring: notices and compaction updates asked for, the profile's session
+	// options in _meta (the adapter refuses options it cannot take).
+	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{Notices: true, Compaction: true})
+	cl := &acpClient{emit: emit, wire: wire, systemPrompt: wire.SystemPrompt}
+	conn := wire.Connect(cl)
+	meta, _ := json.Marshal(profile.Harness.SessionMeta)
+	t.Setenv("HARNESS_SESSION_META", string(meta))
+	s, ok := openACPSession(ctx, conn, cl, &model.Run{ID: "run_claude"}, emit)
 	switch {
 	case !ok:
 		t.Fatalf("no session: %q\nadapter stderr:\n%s", notices, stderr.String())
@@ -217,5 +241,38 @@ func TestACPClaudeExampleTakesTheSystemPromptAndMode(t *testing.T) {
 		t.Fatalf("the adapter's system prompt was not used (capability %v)", wire.SystemPrompt())
 	case len(notices) != 0:
 		t.Fatalf("notices: %q", notices)
+	}
+}
+
+const instructionMarker = "Instruction-marker-7f3a: answer in one word."
+
+// systemPromptRecorder wraps a Messages API and checks, after the run, that the instruction marker
+// was in a request's system prompt and in none of its messages.
+func systemPromptRecorder(answer http.Handler) (http.Handler, func(t *testing.T)) {
+	var mu sync.Mutex
+	var system, messages []string
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req struct {
+			System   json.RawMessage `json:"system"`
+			Messages json.RawMessage `json:"messages"`
+		}
+		if json.Unmarshal(body, &req) == nil && strings.HasSuffix(r.URL.Path, "/v1/messages") {
+			mu.Lock()
+			system, messages = append(system, string(req.System)), append(messages, string(req.Messages))
+			mu.Unlock()
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		answer.ServeHTTP(w, r)
+	})
+	return h, func(t *testing.T) {
+		t.Helper()
+		mu.Lock()
+		defer mu.Unlock()
+		inSystem := strings.Contains(strings.Join(system, "\n"), "Instruction-marker-7f3a")
+		inMessages := strings.Contains(strings.Join(messages, "\n"), "Instruction-marker-7f3a")
+		if !inSystem || inMessages {
+			t.Fatalf("the instructions must be in the system prompt only: %d model call(s), in the system prompt %v, in the messages %v", len(system), inSystem, inMessages)
+		}
 	}
 }

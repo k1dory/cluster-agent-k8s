@@ -41,6 +41,10 @@ RUN { test -n "${CLAUDE_CODE_VERSION}" && test -n "${CODEX_VERSION}" && test -n 
  # the base image ships user `node` with UID 1000; the pod runs as 1000, so that identity becomes `agent`
  && userdel -r node \
  && useradd -m -u 1000 -s /bin/bash agent
+# Claude Code's managed settings, which no user or repository settings override: only hooks
+# defined here run. A repository's .claude/settings.json could otherwise run commands from hooks,
+# past the permission requests the runner answers and records.
+RUN mkdir -p /etc/claude-code && printf '{\n  "allowManagedHooksOnly": true\n}\n' > /etc/claude-code/managed-settings.json
 COPY --from=build /out/agent-init /out/agent-runner /usr/local/bin/
 COPY images/agent/netlock.sh /usr/local/bin/netlock.sh
 COPY images/agent/profile.sh /etc/profile.d/sandbox.sh

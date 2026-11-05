@@ -18,6 +18,13 @@
 # and not used: the key comes from the environment as a placeholder the policy rule for
 # api.anthropic.com replaces (`x-api-key: secret:anthropic`, docs/self-service.md).
 #
+# Instructions: Hermes takes no ACP system prompt; harness.instructions `env:HERMES_ENVIRONMENT_HINT`
+# exports the agent definition's instructions as the hint Hermes adds to its system prompt for an
+# embedding platform. Hardening: no adopting other agents' logins found in the home directory, no
+# LSP downloads, plugin update checks, remote connectors or password-manager vaults, and the
+# toolsets that reach outside the pod or run in the background (web, browser, connectors, cron,
+# kanban, media generation) are off.
+#
 # Hermes takes the sandbox's MCP servers (over HTTP) without declaring it: `mcp: always` passes
 # them. A turn lost when Hermes's gateway restarts is discarded by the runner, which then sends
 # the prompt again; Hermes reports the session's running token total, which the runner turns
@@ -33,6 +40,7 @@ spec:
     input: acp
     permissions: allow
     mcp: always
+    instructions: env:HERMES_ENVIRONMENT_HINT
     files:
       .hermes/config.yaml: |
         model:
@@ -41,7 +49,21 @@ spec:
         approvals:
           mode: "off"
         agent:
-          disabled_toolsets: [web, search, x_search, browser]
+          disabled_toolsets: [web, search, x_search, browser, connections, cronjob, kanban, image_gen, video_gen, tts, computer_use]
+        auth:
+          adopt_external_logins: false
+        lsp:
+          install_strategy: manual
+        plugins:
+          auto_update_check_hours: 0
+        tools:
+          connectors:
+            enabled: false
+        vault:
+          onepassword:
+            enabled: false
+          bitwarden:
+            enabled: false
         model_catalog:
           enabled: false
         security:

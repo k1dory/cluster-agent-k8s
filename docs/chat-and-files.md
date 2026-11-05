@@ -122,8 +122,17 @@ harness:
   permissions: allow               # allow (default) | deny
   mode: default                    # optional: the session mode (claude-agent-acp default, codex-acp agent-full-access, OpenCode build)
   mcp: auto                        # auto (default) | always
+  thought_level: high              # optional: the reasoning level (config option of category thought_level)
+  instructions: file               # optional: file | env:NAME (default: system prompt, else a prefix)
+  session_meta:                    # optional: _meta of every session request (agent-specific options)
+    claudeCode: {options: {maxTurns: 200, promptSuggestions: false}}
   auth_method: api-key             # optional: the agent's authentication method (ACP authenticate)
 ```
+
+The ACP side of agent-runner is [`github.com/k1dory/acpx`](https://github.com/k1dory/acpx), the platform's client layer over acp-go-sdk
+v0.13.5: what the SDK does not type (the client system prompt, steering, notices, compaction
+updates, the client's session capabilities) is carried there at the JSON-RPC level, with ready
+calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
 
 - **One session per conversation.** The run's task is the first `session/prompt` of a new
   session; every later message is the next prompt of the same session (a message sent while a
@@ -158,17 +167,36 @@ harness:
   `developer_instructions` after the config's own) gets the agent definition's
   instructions as one, appended to its own, in `session/new` and again in a load or resume (a
   system prompt is not part of the history): they survive the agent compacting its context. Any
-  other agent (OpenCode, Hermes) gets them ahead of the task in a new session's first prompt, in an
-  `<instructions>` block. (acp-go-sdk v0.13.5 has no field for it: the runner adds it at the
-  JSON-RPC level, `cmd/agent-runner/acp_wire.go`.)
+  other agent gets them ahead of the task in a new session's first prompt, in an
+  `<instructions>` block, unless the profile says where its configuration reads them
+  (`instructions`): `file` writes them to `~/.sandbox/instructions.md`
+  (`$SANDBOX_INSTRUCTIONS_FILE`) before the agent starts, which OpenCode's `instructions` names;
+  `env:NAME` exports them as `NAME` (Hermes's `HERMES_ENVIRONMENT_HINT`). Either way they are part
+  of the agent's system prompt and the first prompt carries no copy. (acp-go-sdk v0.13.5 has no
+  systemPrompt field: [`github.com/k1dory/acpx`](https://github.com/k1dory/acpx) adds it at the JSON-RPC level.)
+- **Reasoning level.** `thought_level` (`HARNESS_THOUGHT_LEVEL`) is selected like the model,
+  through the agent's configuration option of category `thought_level` (codex-acp
+  `reasoning_effort`, OpenCode `effort`, Hermes `reasoning_effort`), by value or display name.
+- **Session options.** `session_meta` (`HARNESS_SESSION_META`, at most 16 KiB of JSON) is the
+  `_meta` of every session request: claude-agent-acp takes `claudeCode.options` from it
+  (`maxTurns`, `maxBudgetUsd` — the turn ends with `budget_exhausted` —, `promptSuggestions`,
+  `fallbackModel`, `effort`). It is configuration: no secret goes there.
 - **Permissions.** `session/request_permission` is answered by `permissions`: the agent's
   `allow_once` (else `allow_always`) option, or with `deny` its `reject_once` (else
   `reject_always`). The sandbox, its policy and the gateway stay the boundary either way. Every
   request and its decision is a line of the run's output, with the change's diff when the
   request carries one (OpenCode and Hermes send it nowhere else).
-- **Messages.** A message that starts with `/` is sent with a zero-width space ahead of it, so
-  the agent reads it as text and not as one of its slash commands (OpenCode ends the turn empty
-  on an unknown one).
+- **Messages.** A message sent while a turn runs joins that turn when the agent takes steering
+  (`_session/steering`, declared in initialize `_meta.steering.supported`: claude-agent-acp,
+  codex-acp), the run's output says so; otherwise it waits for the turn to end and is the next
+  prompt. A message that starts with `/` reaches the agent as a command only when the agent
+  advertised that command (`available_commands_update`: `/compact`, `/review`…); any other is
+  sent with a zero-width space ahead of it, so the agent reads it as text (OpenCode ends the turn
+  empty on an unknown command).
+- **End of the conversation.** The runner closes the session on the agent's side
+  (`session/close`, when declared) so the agent writes its state, then ends the agent: stdin
+  closed, a grace period, SIGTERM to its whole process group and SIGKILL to what is left. Helpers
+  an agent starts in the background (Hermes's gateway daemon) do not outlive the run.
 - **Output.** The runner writes what the agent reports as one JSON line each:
 
   | `type`            | fields                                                    | transcript |
@@ -179,6 +207,15 @@ harness:
   | `acp.tool_update` | `tool_call_id`, `status`, `diffs[]`, `diffs_replace`       | `log` |
   | `acp.permission`  | `tool_call_id`, `title`, `decision`, `diffs[]`, `diffs_replace` | `log` |
   | `acp.turn_end`    | `stop_reason`                                             | ends the turn (`chat_idle` counts from here) |
+  | `acp.thought`     | `text` (the agent's reasoning before a message, its chunks joined) | `log` |
+  | `acp.plan`        | `entries[]` (`content`, `status`, `priority`): the whole plan each time it changes | `log` |
+  | `acp.notice`      | `severity`, `title`, `text`: a notice for the user (a limit near, an error it recovered from) | `log` |
+  | `acp.compaction`  | `compaction_id`, `status` (`in_progress`, `completed`, `failed`, `cancelled`), `error`, `text` (its summary) | `log` |
+  | `acp.session_info`| `title`: the session's title as the agent names it        | `log` |
+
+  Notices and compaction updates come only to a client that advertises
+  `clientCapabilities.session.notices` / `.compaction`, which the runner does (the SDK cannot
+  express them; [`github.com/k1dory/acpx`](https://github.com/k1dory/acpx) adds and decodes them).
 
   **The diffs of a tool call are those of its last line that has any.** A line repeats no diff
   the call's previous line already carried; one with different diffs says `diffs_replace`
@@ -226,6 +263,14 @@ harness:
   `webfetch` and `websearch` are denied, and `autoupdate` off, `share` disabled,
   `OPENCODE_DISABLE_MODELS_FETCH`, `OPENCODE_DISABLE_LSP_DOWNLOAD` and
   `OPENCODE_DISABLE_CLAUDE_CODE` keep it from egress and configuration a pod has no use for.
+  The repository is code to work on, not configuration: `OPENCODE_DISABLE_PROJECT_CONFIG` keeps
+  its `opencode.json`, `.opencode/` (agents, plugins, commands) and instruction files out (its
+  `AGENTS.md` is named in `instructions` again, as text), `--pure` runs without external plugins.
+  **Limit:** `opencode acp` serves its own HTTP API on the pod's loopback without a password
+  (`OPENCODE_SERVER_PASSWORD` unset), and the agent's shell runs as the same user with the same
+  environment, so a password would not keep it out either: the agent can answer its own
+  permission requests there. With OpenCode, `permissions: deny` is not a boundary against the
+  agent itself; the pod, its policy and the gateway are.
   After an approved edit OpenCode tells the client through `fs/write_text_file` although the
   runner declares no file system: the runner answers success and writes nothing (the file is
   already on disk). Its Anthropic provider's `baseURL` is the gateway bridge: OpenCode cannot
@@ -240,7 +285,10 @@ harness:
   memory, skills survive restarts); its configuration is a harness file, `.hermes/config.yaml`:
   `approvals.mode: off` with `permissions: allow` (its default, `smart`, lets a model decide, so a
   deny profile would not be obeyed; a deny profile sets `manual`), the remote model catalogue,
-  lazy installs and the web and browser toolsets off. Hermes takes MCP servers over HTTP without
+  lazy installs, adopting other agents' logins from the home directory (`auth.adopt_external_logins`),
+  LSP downloads, plugin update checks, remote connectors, password-manager vaults and the
+  toolsets that reach outside the pod or run in the background (web, browser, connections, cron,
+  kanban, media generation) off. Hermes takes MCP servers over HTTP without
   declaring it: the profile says `mcp: always`. Hermes's own login is interactive and not used:
   the provider key is a placeholder in `env`, and `ANTHROPIC_BASE_URL` (read from the environment
   only) is the gateway bridge (Hermes's httpx client cannot present the pod's client certificate).
@@ -251,12 +299,18 @@ harness:
   instructions as its system prompt and the profile's mode.
   Each also makes a real model call through the runner against a test gateway that requires the
   pod's client certificate: OpenCode's and Hermes's answers come back into the transcript,
-  Codex's request arrives at `/v1/responses` with the certificate.
+  Codex's request arrives at `/v1/responses` with the certificate. OpenCode's and Hermes's model
+  calls must carry the definition's instructions in their system prompt (file, environment hint)
+  and in none of their messages.
 - **Long lines.** For every harness, an output line over 1 MiB is replaced by a
   `[agent-runner] dropped an output line …` notice and reading goes on, so the harness never
   blocks on a reader that gave up.
-- **The runner offers no file system or terminal** to the agent (client capabilities are empty):
+- **The runner offers no file system or terminal** to the agent (client capabilities have none):
   the agent uses its own tools inside the pod, under the pod's network lock.
+- **Claude Code's hooks.** The agent image's managed settings
+  (`/etc/claude-code/managed-settings.json`, which no user or repository settings override) allow
+  only managed hooks: a repository's `.claude/settings.json` cannot run commands from hooks past
+  the permission requests the runner answers and records.
 
 ### The transcript
 

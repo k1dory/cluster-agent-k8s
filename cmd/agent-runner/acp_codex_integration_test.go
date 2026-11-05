@@ -15,6 +15,7 @@ import (
 	acp "github.com/coder/acp-go-sdk"
 
 	"agent-sandbox/internal/catalog"
+	"github.com/k1dory/acpx"
 )
 
 // This smoke test needs the real adapter, not a mock of its authentication
@@ -101,7 +102,7 @@ func codexExampleSession(t *testing.T, adapter, file string) {
 		}
 	}()
 	// The runner's wiring: the wire carries the system prompt.
-	wire := newACPWire(stdin, stdout)
+	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{})
 	conn := acp.NewClientSideConnection(&acpClient{emit: func(string) {}}, wire, wire)
 	if _, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}); err != nil {
 		t.Fatalf("initialize: %v", err)
@@ -111,7 +112,7 @@ func codexExampleSession(t *testing.T, adapter, file string) {
 	if !wire.SystemPrompt() {
 		t.Fatal("codex-acp does not declare sessionCapabilities.systemPrompt")
 	}
-	session, err := conn.NewSession(ctx, acp.NewSessionRequest{Cwd: home, McpServers: []acp.McpServer{}, Meta: sessionMeta("Answer in one word.")})
+	session, err := conn.NewSession(ctx, acp.NewSessionRequest{Cwd: home, McpServers: []acp.McpServer{}, Meta: acpx.SessionMeta(nil, "Answer in one word.")})
 	if err != nil {
 		t.Fatalf("the shipped Codex ACP profile cannot create a session in a clean HOME: %v", err)
 	}
@@ -120,8 +121,8 @@ func codexExampleSession(t *testing.T, adapter, file string) {
 	}
 	// The profile's mode is one codex-acp offers and accepts.
 	var notices []string
-	configureACPSession(ctx, conn, session.SessionId, acpSessionState{modes: session.Modes, options: session.ConfigOptions},
-		profile.Harness.Mode, "", func(f string, a ...any) { notices = append(notices, fmt.Sprintf(f, a...)) })
+	configureACPSession(ctx, conn, session.SessionId, acpSessionState{Modes: session.Modes, Options: session.ConfigOptions},
+		acpSettings{mode: profile.Harness.Mode}, func(f string, a ...any) { notices = append(notices, fmt.Sprintf(f, a...)) })
 	if profile.Harness.Mode == "" || len(notices) != 0 {
 		t.Fatalf("mode %q: %q", profile.Harness.Mode, notices)
 	}
