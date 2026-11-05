@@ -111,6 +111,11 @@ func (r *Registrar) Bootstrap(ctx context.Context, token string, req BootstrapRe
 	if sb.Slug != pod.Slug {
 		return nil, fmt.Errorf("pod slug %q does not match sandbox slug %q", pod.Slug, sb.Slug)
 	}
+	// The tenant goes into the certificate and decides whose policies and secrets apply: it
+	// must be the sandbox's, not whatever the pod's label says.
+	if sb.Tenant != pod.Tenant {
+		return nil, fmt.Errorf("pod tenant %q does not match sandbox tenant %q", pod.Tenant, sb.Tenant)
+	}
 	csr, err := ca.ParseCSR([]byte(req.CSR))
 	if err != nil {
 		return nil, fmt.Errorf("csr: %w", err)
@@ -135,6 +140,13 @@ func (r *Registrar) Bootstrap(ctx context.Context, token string, req BootstrapRe
 		Serial: cert.SerialNumber.Text(16), IssuedAt: time.Now(), NotAfter: cert.NotAfter,
 	}
 	if err := r.Store.CreateInstance(ctx, in); err != nil {
+		return nil, err
+	}
+	// A repeated bootstrap from the same pod (the init container retrying after a lost
+	// response) replaces the identity it got before rather than adding one: the earlier
+	// certificate's key never reached the pod's disk, yet it would stay valid until the pod
+	// goes. The newest instance stands, so racing bootstraps do not retire each other.
+	if err := r.retireEarlier(ctx, pod, n); err != nil {
 		return nil, err
 	}
 	// The orchestrator may be writing the same row (pod name, status): reload and retry on conflict.
@@ -163,6 +175,39 @@ func (r *Registrar) Bootstrap(ctx context.Context, token string, req BootstrapRe
 		Instance: n, Slug: pod.Slug, SandboxID: pod.SandboxID, Tenant: pod.Tenant,
 		Cert: string(certPEM), CA: string(r.CA.PEM()), GatewayCA: string(r.gatewayCA()), NotAfter: cert.NotAfter,
 	}, nil
+}
+
+// errSuperseded: a bootstrap from the same pod allocated a later instance while this one ran.
+var errSuperseded = errors.New("bootstrap superseded by a later one from the same pod")
+
+// retireEarlier keeps only the newest live instance issued to this pod and retires the rest.
+// Every bootstrap does it after storing its own instance, so whichever looks last sees them
+// all; one that finds a newer instance than its own retires itself and fails (the caller
+// retries, and the newest stands).
+func (r *Registrar) retireEarlier(ctx context.Context, pod *PodInfo, n int) error {
+	ins, err := r.Store.ListInstances(ctx, pod.SandboxID)
+	if err != nil {
+		return err
+	}
+	newest := n
+	for _, in := range ins {
+		if in.RetiredAt == nil && in.PodName == pod.Name && in.N > newest {
+			newest = in.N
+		}
+	}
+	for _, in := range ins {
+		if in.RetiredAt != nil || in.PodName != pod.Name || in.N >= newest {
+			continue
+		}
+		if err := r.Store.RetireInstance(ctx, in.N); err != nil {
+			return err
+		}
+		r.log().Warn("repeated bootstrap from the same pod: earlier identity retired", "pod", pod.Name, "sandbox", pod.SandboxID, "retired", in.N, "live", newest)
+	}
+	if newest != n {
+		return errSuperseded
+	}
+	return nil
 }
 
 // RetireSandbox retires every live instance of a sandbox (called when its pod is deleted).
