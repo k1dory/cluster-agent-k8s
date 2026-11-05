@@ -87,6 +87,39 @@ case "$code:$out" in
   *) ci_die "images: a modified file must fail on the missing SHA; got exit $code" ;;
 esac
 
+# acp_in_image IMAGE TEST...: the ACP smoke tests of cmd/agent-runner run inside IMAGE against
+# its real agents, with no network (docker --network none; loopback stays). The test binary is
+# compiled in a build stage and copied, with the shipped examples, into a throwaway image on top
+# of IMAGE: everything goes through the daemon's API (no bind mount, no Go on the host). A
+# skipped test fails the check: here every named agent must be present.
+acp_in_image() {
+  local img=$1; shift
+  local test_img=$img-acp-test out pattern
+  docker build -q -t "$test_img" --build-arg BASE="$img" -f - . >/dev/null <<'DOCKERFILE' || ci_die "images: cannot build the ACP test image on $img"
+ARG BASE
+FROM golang:1.26-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go test -c -o /acp.test ./cmd/agent-runner
+FROM ${BASE}
+COPY --from=build /acp.test /acp.test
+COPY examples /src/examples
+WORKDIR /src/cmd/agent-runner
+DOCKERFILE
+  pattern="^($(IFS='|'; echo "$*"))\$"
+  out=$(docker run --rm --network none -e ACP_TEST_NETWORK=none --entrypoint /acp.test "$test_img" \
+    -test.run "$pattern" -test.v 2>&1) || { printf '%s\n' "$out" | tail -40; ci_die "images: ACP smoke tests failed in $img"; }
+  docker rmi -f "$test_img" >/dev/null 2>&1 || true
+  for t in "$@"; do
+    case "$out" in *"--- PASS: $t "*) echo "$t: pass" ;; *) printf '%s\n' "$out" | tail -20; ci_die "images: $t did not pass in $img (skipped?)" ;; esac
+  done
+}
+
+echo "== agent image: the ACP agents open sessions from the shipped profiles, offline"
+acp_in_image "$agent" TestACPCodexExampleCreatesSession TestACPOpenCodeExampleCreatesAndLoadsASession
+
 echo "== agent image: smoke test and network lock"
 hack/smoke-image.sh "$agent"
 python3 hack/test-netlock.py "$agent"

@@ -489,6 +489,10 @@ func openRealACP(t *testing.T, isolate []string, agent, home string, env []strin
 // server of its own on localhost, as opencode acp does), or skips the test.
 func noNetwork(t *testing.T) []string {
 	t.Helper()
+	// The caller has already cut the network (hack/ci/images.sh: docker run --network none).
+	if os.Getenv("ACP_TEST_NETWORK") == "none" {
+		return []string{"env"}
+	}
 	if _, err := exec.LookPath("sandbox-exec"); err == nil {
 		return []string{"sandbox-exec", "-p", `(version 1)(allow default)(deny network-outbound (remote ip))(allow network-outbound (remote ip "localhost:*"))`}
 	}
