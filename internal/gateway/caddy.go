@@ -493,20 +493,11 @@ func (s *Syncer) hosts() ([]policy.Host, string) {
 	extra, efp := s.Headers.HostHeaders()
 	for i := range hs {
 		for _, name := range extra[hs[i].Name] {
-			hs[i].Injected = appendUnique(hs[i].Injected, name)
+			hs[i].Injected = policy.AppendUnique(hs[i].Injected, name)
 		}
 		sort.Strings(hs[i].Injected)
 	}
 	return hs, fp + "+" + efp
-}
-
-func appendUnique(xs []string, x string) []string {
-	for _, y := range xs {
-		if y == x {
-			return xs
-		}
-	}
-	return append(xs, x)
 }
 
 // SyncOnce renders and (if configured) pushes the config when policies or connection header

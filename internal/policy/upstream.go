@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -88,4 +89,12 @@ func isDNSName(h string) bool {
 		}
 	}
 	return true
+}
+
+// AppendUnique appends x unless xs already holds it.
+func AppendUnique(xs []string, x string) []string {
+	if slices.Contains(xs, x) {
+		return xs
+	}
+	return append(xs, x)
 }

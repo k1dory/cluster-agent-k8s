@@ -7,6 +7,7 @@
 package connections
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/policy"
@@ -91,6 +93,35 @@ type Service struct {
 	// (a connection adds headers and nothing else).
 	Hosts HostPolicy
 	snap  res.Snapshot // every live connection, for the gateway's header-name and host lists
+
+	// specs caches the decoded spec of each live connection by revision: OwnHosts runs on every
+	// DNS query and MCP request (through bindings.Guard) and would decode them all each time.
+	specMu sync.Mutex
+	specs  map[string]cachedSpec
+}
+
+type cachedSpec struct {
+	revision int
+	raw      []byte
+	spec     *Spec
+	err      error
+}
+
+// specOf decodes a snapshot item's spec once per revision. The result is shared: read only.
+func (s *Service) specOf(it *model.CatalogItem) (*Spec, error) {
+	key := it.Tenant + "|" + it.Name
+	s.specMu.Lock()
+	defer s.specMu.Unlock()
+	if c, ok := s.specs[key]; ok && c.revision == it.Revision && bytes.Equal(c.raw, it.Spec) {
+		return c.spec, c.err
+	}
+	var sp Spec
+	err := res.DecodeStrict(it.Spec, &sp)
+	if s.specs == nil {
+		s.specs = map[string]cachedSpec{}
+	}
+	s.specs[key] = cachedSpec{revision: it.Revision, raw: it.Spec, spec: &sp, err: err}
+	return &sp, err
 }
 
 // New returns a service over st; call Refresh (and Watch) so the gateway knows the header names.
@@ -191,12 +222,12 @@ func (s *Service) checkOwnHost(tenant, name string, sp *Spec) error {
 		if it.Tenant == tenant && it.Name == name {
 			continue
 		}
-		var other Spec
-		if err := res.DecodeStrict(it.Spec, &other); err != nil || other.Host != sp.Host {
+		other, err := s.specOf(it)
+		if err != nil || other.Host != sp.Host {
 			continue
 		}
-		if upstreamOf(&other) != upstreamOf(sp) {
-			return fmt.Errorf("%w: %s already goes to %s (connection %s): a host has one upstream", res.ErrInvalid, sp.Host, upstreamOf(&other), res.RefOf(it, tenant))
+		if upstreamOf(other) != upstreamOf(sp) {
+			return fmt.Errorf("%w: %s already goes to %s (connection %s): a host has one upstream", res.ErrInvalid, sp.Host, upstreamOf(other), res.RefOf(it, tenant))
 		}
 		if other.UpstreamHost != sp.UpstreamHost {
 			return fmt.Errorf("%w: %s already sets upstream_host %v (connection %s): a host has one Host header", res.ErrInvalid, sp.Host, other.UpstreamHost, res.RefOf(it, tenant))
@@ -221,8 +252,8 @@ func upstreamOf(sp *Spec) string {
 func (s *Service) OwnHosts() ([]policy.Host, string) {
 	byName := map[string]*policy.Host{}
 	for _, it := range s.snap.All() {
-		var sp Spec
-		if err := res.DecodeStrict(it.Spec, &sp); err != nil {
+		sp, err := s.specOf(it)
+		if err != nil {
 			continue
 		}
 		if s.Hosts != nil {
@@ -237,11 +268,11 @@ func (s *Service) OwnHosts() ([]policy.Host, string) {
 		}
 		h, ok := byName[sp.Host]
 		if !ok {
-			h = &policy.Host{Name: sp.Host, Upstream: upstreamOf(&sp), MCP: sp.Type == TypeMCP, UpstreamHost: sp.UpstreamHost}
+			h = &policy.Host{Name: sp.Host, Upstream: upstreamOf(sp), MCP: sp.Type == TypeMCP, UpstreamHost: sp.UpstreamHost}
 			byName[sp.Host] = h
 		}
 		for name := range sp.Headers {
-			h.Injected = appendUnique(h.Injected, http.CanonicalHeaderKey(name))
+			h.Injected = policy.AppendUnique(h.Injected, http.CanonicalHeaderKey(name))
 		}
 	}
 	names := make([]string, 0, len(byName))
@@ -366,12 +397,12 @@ func (s *Service) Watch(ctx context.Context, log *slog.Logger) {
 func (s *Service) HostHeaders() (map[string][]string, string) {
 	out := map[string][]string{}
 	for _, it := range s.snap.All() {
-		var sp Spec
-		if err := res.DecodeStrict(it.Spec, &sp); err != nil {
+		sp, err := s.specOf(it)
+		if err != nil {
 			continue
 		}
 		for name := range sp.Headers {
-			out[sp.Host] = appendUnique(out[sp.Host], http.CanonicalHeaderKey(name))
+			out[sp.Host] = policy.AppendUnique(out[sp.Host], http.CanonicalHeaderKey(name))
 		}
 	}
 	h := sha256.New()
@@ -385,15 +416,6 @@ func (s *Service) HostHeaders() (map[string][]string, string) {
 		fmt.Fprintf(h, "%s=%s\n", host, strings.Join(out[host], ","))
 	}
 	return out, hex.EncodeToString(h.Sum(nil))[:12]
-}
-
-func appendUnique(xs []string, x string) []string {
-	for _, y := range xs {
-		if y == x {
-			return xs
-		}
-	}
-	return append(xs, x)
 }
 
 // Get returns one connection visible from tenant (own, else shared); revision 0 = latest.
