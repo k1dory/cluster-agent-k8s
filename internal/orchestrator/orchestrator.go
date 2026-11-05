@@ -212,6 +212,9 @@ var slugRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 // errAlreadyStarted is startPod's internal signal that the pod is already up or coming up.
 var errAlreadyStarted = errors.New("already started")
 
+// errUnchanged makes a mutate return the current record without writing it.
+var errUnchanged = errors.New("unchanged")
+
 // CreateRequest is the input of POST /sandboxes.
 type CreateRequest struct {
 	Name          string `json:"name"`
@@ -451,20 +454,41 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 		o.fail(ctx, id, "pod: "+err.Error())
 		return nil, fmt.Errorf("%w: pod: %v", ErrRuntime, err)
 	}
-	// The lock was released before CreatePod: a Delete or a stop may have run meanwhile and found
-	// no pod to remove. The pod is recorded only while the sandbox is still waking; otherwise it
-	// belongs to nobody and is removed here, or it would run on with no record behind it.
+	// The lock was released before CreatePod, so the record may have moved meanwhile:
+	//   - forward, on this pod: its bootstrap named it and a waitReady (any replica) found it
+	//     ready, so the sandbox is waking or running with PodName "" or pod. That is the start
+	//     succeeding, not a conflict: record the name if missing and leave the rest alone.
+	//   - away from it: a Delete (record gone or deleting) or a stop (stopping, sleeping) ran
+	//     and found no pod to remove. Only then is the pod a proven orphan, removed here, or it
+	//     would run on with no record behind it.
+	//   - anything else (error, another pod named): not ours to decide; left as it is.
 	created := *sb
 	created.PodName = pod
+	orphan := false
 	sb, err = o.mutate(ctx, id, func(s *model.Sandbox) error {
-		if s.Status != model.StatusWaking {
-			return fmt.Errorf("%w: sandbox is %s", ErrConflict, s.Status)
+		switch s.Status {
+		case model.StatusWaking, model.StatusRunning:
+			if s.PodName != "" && s.PodName != pod {
+				return fmt.Errorf("%w: sandbox runs pod %s now", ErrConflict, s.PodName)
+			}
+			if s.PodName == pod {
+				return errUnchanged
+			}
+			s.PodName = pod
+			return nil
+		case model.StatusDeleting, model.StatusStopping, model.StatusSleeping:
+			orphan = true
 		}
-		s.PodName = pod
-		return nil
+		return fmt.Errorf("%w: sandbox is %s", ErrConflict, s.Status)
 	})
-	if errors.Is(err, store.ErrNotFound) || errors.Is(err, ErrConflict) {
-		o.Log.Warn("sandbox changed while its pod was created, removing the pod", "id", id, "pod", pod, "err", err)
+	if errors.Is(err, errUnchanged) {
+		err = nil
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		orphan = true
+	}
+	if orphan {
+		o.Log.Warn("sandbox went away while its pod was created, removing the pod", "id", id, "pod", pod, "err", err)
 		if derr := o.Runtime.DeletePod(ctx, &created); derr != nil {
 			o.Log.Error("remove orphan pod", "id", id, "pod", pod, "err", derr)
 		}

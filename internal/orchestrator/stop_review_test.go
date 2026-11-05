@@ -369,3 +369,46 @@ func (r *podWatchRetirer) RetireSandbox(ctx context.Context, id string) error {
 	}
 	return nil
 }
+
+// afterCreateRuntime runs during, once, inside CreatePod after the pod exists, before the
+// creator gets the result back.
+type afterCreateRuntime struct {
+	*FakeRuntime
+	during func(pod string)
+}
+
+func (r *afterCreateRuntime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, error) {
+	pod, err := r.FakeRuntime.CreatePod(ctx, sb)
+	if h := r.during; h != nil && err == nil {
+		r.during = nil
+		h(pod)
+	}
+	return pod, err
+}
+
+// The pod bootstraps (naming itself on the record) and another replica's waitReady flips the
+// sandbox to running before the creator records its result. That is the start succeeding: the
+// creator used to see "not waking", treat its healthy pod as an orphan and delete it.
+func TestReviewWakeKeepsAPodThatBecameReadyFirst(t *testing.T) {
+	o, fake, sb := reviewRunningSandbox(t)
+	ctx := context.Background()
+	if _, err := o.Sleep(ctx, sb.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	o.Runtime = &afterCreateRuntime{FakeRuntime: fake.FakeRuntime, during: func(pod string) {
+		// Bootstrap, then readiness observed by another replica.
+		if _, err := o.mutate(ctx, sb.ID, func(s *model.Sandbox) error { s.PodName = pod; return nil }); err != nil {
+			t.Error(err)
+		}
+		if _, err := o.setStatusFrom(ctx, sb.ID, []model.SandboxStatus{model.StatusWaking}, model.StatusRunning, nil); err != nil {
+			t.Error(err)
+		}
+	}}
+	got, err := o.Wake(ctx, sb.ID)
+	if err != nil || got.Status != model.StatusRunning {
+		t.Fatalf("wake whose pod became ready first: %v %+v", err, got)
+	}
+	if _, _, err := fake.PodStatus(ctx, sb); err != nil {
+		t.Fatalf("the healthy pod was deleted: %v", err)
+	}
+}
