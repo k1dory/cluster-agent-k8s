@@ -450,9 +450,7 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 		}
 		s.id, s.fresh, st = ns.SessionId, true, acpSessionState{Modes: ns.Modes, Options: ns.ConfigOptions}
 	}
-	cctx, done := call(setup)
-	defer done()
-	configureACPSession(cctx, conn, s.id, st, acpSettings{mode: os.Getenv("HARNESS_MODE"), model: os.Getenv("SANDBOX_MODEL"),
+	configureACPSession(func() (context.Context, context.CancelFunc) { return call(setup) }, conn, s.id, st, acpSettings{mode: os.Getenv("HARNESS_MODE"), model: os.Getenv("SANDBOX_MODEL"),
 		thoughtLevel: os.Getenv("HARNESS_THOUGHT_LEVEL")}, notice)
 	return s, true
 }

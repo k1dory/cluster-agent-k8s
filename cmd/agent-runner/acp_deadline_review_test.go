@@ -91,3 +91,35 @@ func TestACPTurnHasAMaximum(t *testing.T) {
 		t.Fatalf("exit %d, notices:\n%s", code, notices(lines))
 	}
 }
+
+// slowConfigConn answers each configuration change after delay, or fails it when its context
+// ends first.
+type slowConfigConn struct {
+	*coreConn
+	delay time.Duration
+}
+
+func (c *slowConfigConn) SetSessionConfigOption(ctx context.Context, p acp.SetSessionConfigOptionRequest) (acp.SetSessionConfigOptionResponse, error) {
+	select {
+	case <-time.After(c.delay):
+	case <-ctx.Done():
+		return acp.SetSessionConfigOptionResponse{}, ctx.Err()
+	}
+	return c.coreConn.SetSessionConfigOption(ctx, p)
+}
+
+// Each setting has its own setup deadline: two that each answer in time are applied though
+// together they take longer than one deadline.
+func TestACPEachSettingHasItsOwnDeadline(t *testing.T) {
+	clearACPEnv(t)
+	t.Setenv("HARNESS_ACP_SETUP_TIMEOUT", "1")
+	t.Setenv("HARNESS_MODE", "plan")
+	t.Setenv("SANDBOX_MODEL", "fast")
+	conn := &slowConfigConn{delay: 700 * time.Millisecond, coreConn: &coreConn{newRes: acp.NewSessionResponse{ConfigOptions: []acp.SessionConfigOption{
+		selectOption("mode", acp.SessionConfigOptionCategoryMode, "default", "default", "plan"),
+		selectOption("model", acp.SessionConfigOptionCategoryModel, "slow", "slow", "fast")}}}}
+	code, lines := runCore(t, conn, nil, &model.Run{ID: "r", Task: "x"})
+	if code != 0 || !hasCall(conn.coreConn, "set_config mode=plan") || !hasCall(conn.coreConn, "set_config model=fast") || notices(lines) != "" {
+		t.Fatalf("exit %d, calls %v, notices:\n%s", code, conn.calls, notices(lines))
+	}
+}
