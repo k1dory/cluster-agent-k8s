@@ -100,11 +100,18 @@ func codexExampleSession(t *testing.T, adapter, file string) {
 			t.Logf("adapter stderr:\n%s", stderr.String())
 		}
 	}()
-	conn := acp.NewClientSideConnection(&acpClient{emit: func(string) {}}, stdin, stdout)
+	// The runner's wiring: the wire carries the system prompt.
+	wire := newACPWire(stdin, stdout)
+	conn := acp.NewClientSideConnection(&acpClient{emit: func(string) {}}, wire, wire)
 	if _, err := conn.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: acp.ProtocolVersionNumber}); err != nil {
 		t.Fatalf("initialize: %v", err)
 	}
-	session, err := conn.NewSession(ctx, acp.NewSessionRequest{Cwd: home, McpServers: []acp.McpServer{}})
+	// codex-acp declares the client system prompt: the instructions go as Codex's
+	// developer_instructions, and a malformed field would refuse the session.
+	if !wire.SystemPrompt() {
+		t.Fatal("codex-acp does not declare sessionCapabilities.systemPrompt")
+	}
+	session, err := conn.NewSession(ctx, acp.NewSessionRequest{Cwd: home, McpServers: []acp.McpServer{}, Meta: sessionMeta("Answer in one word.")})
 	if err != nil {
 		t.Fatalf("the shipped Codex ACP profile cannot create a session in a clean HOME: %v", err)
 	}

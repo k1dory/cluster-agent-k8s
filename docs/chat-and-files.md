@@ -154,10 +154,11 @@ harness:
   `mcpCapabilities.http`, otherwise they are left out with a notice; `mcp: always` passes them
   anyway, for an agent that takes them without saying so (Hermes).
 - **Instructions.** An agent that declares the client system prompt
-  (`sessionCapabilities.systemPrompt`, claude-agent-acp) gets the agent definition's
+  (`sessionCapabilities.systemPrompt`: claude-agent-acp; codex-acp, which hands it to Codex as
+  `developer_instructions` after the config's own) gets the agent definition's
   instructions as one, appended to its own, in `session/new` and again in a load or resume (a
   system prompt is not part of the history): they survive the agent compacting its context. Any
-  other agent gets them ahead of the task in a new session's first prompt, in an
+  other agent (OpenCode, Hermes) gets them ahead of the task in a new session's first prompt, in an
   `<instructions>` block. (acp-go-sdk v0.13.5 has no field for it: the runner adds it at the
   JSON-RPC level, `cmd/agent-runner/acp_wire.go`.)
 - **Permissions.** `session/request_permission` is answered by `permissions`: the agent's
