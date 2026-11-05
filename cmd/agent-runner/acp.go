@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,30 +66,39 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 		return 1
 	}
 	// The run's output is what the runner writes (ACP lines, notices) and the agent's stderr, both
-	// into one spool: neither waits on the control plane.
-	outR, outW := io.Pipe()
-	cmd.Stderr = outW
-	if err := cmd.Start(); err != nil {
+	// into one spool: neither waits on the control plane. The stderr pipe is the runner's own, not a
+	// copier of exec's: Wait would wait on that copier for as long as anything holds the pipe (a
+	// helper that left the group), WaitDelay's 20 s on top of the grace, past the whole shutdown
+	// budget. The runner reads it to EOF and closes it when it stops waiting.
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		return 1
+	}
+	cmd.Stderr = errW
+	err = cmd.Start()
+	_ = errW.Close() // the agent has its copy
+	if err != nil {
+		_ = errR.Close()
 		c.post(ctx, run.ID, []string{"[agent-runner] cannot start harness: " + err.Error()})
 		return 127
 	}
+	defer errR.Close()
 	spool := newOutputSpool(ctx, c, run.ID)
 	// After SIGTERM the agent has until the shutdown budget leaves only enough time for its output
 	// and the result: then its group is killed and its stdin closed, which ends the connection.
 	defer stopAtShutdown(ctx, func() {
 		_ = signalGroup(cmd, syscall.SIGKILL)
 		_ = stdin.Close()
+		time.AfterFunc(500*time.Millisecond, func() { _ = errR.Close() })
 	})()
 	chat := newChat(harness.InputACP, chatIdle())
 	var outputDone sync.WaitGroup
 	outputDone.Add(1)
 	// The conversation's idle clock is driven by driveACP itself (turn ended, next prompt sent),
 	// not by the output, which reaches the control plane later than the next prompt may start.
-	// Once the reading ends the pipe is closed, so no write can wait on a reader that is gone.
 	go func() {
 		defer outputDone.Done()
-		spool.read(outR, nil)
-		_ = outR.CloseWithError(io.ErrClosedPipe)
+		spool.read(errR, nil)
 	}()
 	emit := spool.emit
 
@@ -125,8 +133,16 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	// What the agent left running in its group is stopped too: SIGTERM (a daemon drains on it),
 	// SIGKILL a moment later for what did not exit.
 	endGroup(cmd)
-	_ = outW.Close()
-	outputDone.Wait()
+	// The agent's stderr ends when nothing of the group holds it any more. A process that left the
+	// group (setsid) and kept it is not waited for past the group's kill: the pipe is closed.
+	readDone := make(chan struct{})
+	go func() { outputDone.Wait(); close(readDone) }()
+	select {
+	case <-readDone:
+	case <-time.After(groupKillDelay + 2*time.Second):
+		_ = errR.Close()
+		<-readDone
+	}
 	spool.close(outputDrainBudget) // the output is delivered before the run is finished
 	return exit
 }

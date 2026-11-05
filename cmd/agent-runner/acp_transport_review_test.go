@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -73,4 +76,43 @@ func TestACPDeafAgentHelper(t *testing.T) {
 			os.Exit(0)
 		}
 	}
+}
+
+// A helper that left the agent's process group (setsid) and holds its stderr does not hold the
+// run: the runner owns that pipe and stops waiting on it after the group's kill, instead of
+// exec's copier waiting out WaitDelay (20 s) and, after SIGTERM, the whole shutdown budget.
+func TestACPDetachedHelperHoldingStderrDoesNotHoldTheRun(t *testing.T) {
+	_, _, c := setupACP(t, "")
+	pidFile := filepath.Join(t.TempDir(), "helper.pid")
+	t.Setenv("ACP_SETSID_PID", pidFile)
+	t.Setenv("HARNESS_CMD", `ACP_FAKE_AGENT= ACP_SETSID_HELPER=1 "`+os.Args[0]+`" -test.run=^TestSetsidHelper$ </dev/null >/dev/null & exec "`+os.Args[0]+`"`)
+	old := groupKillDelay
+	groupKillDelay = 300 * time.Millisecond
+	defer func() { groupKillDelay = old }()
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			if pid, _ := strconv.Atoi(strings.TrimSpace(string(b))); pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	start := time.Now()
+	if code := runACP(t, c, &model.Run{ID: "run_detached", Task: "x"}); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if d := time.Since(start); d > 8*time.Second {
+		t.Fatalf("the run took %s: it waited on a pipe a detached helper held", d)
+	}
+}
+
+// TestSetsidHelper leaves its process group and session, keeps the stderr it was given, and
+// sleeps (ACP_SETSID_HELPER).
+func TestSetsidHelper(t *testing.T) {
+	if os.Getenv("ACP_SETSID_HELPER") != "1" {
+		t.Skip("subprocess helper")
+	}
+	_, _ = syscall.Setsid()
+	_ = os.WriteFile(os.Getenv("ACP_SETSID_PID"), []byte(strconv.Itoa(os.Getpid())), 0o600)
+	time.Sleep(60 * time.Second)
+	os.Exit(0)
 }
