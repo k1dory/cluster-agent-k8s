@@ -32,6 +32,13 @@ jobs:
       - run: make ci-vet
       - run: make ci-unit
       - run: make ci-policy
+  scan:
+    # Known vulnerabilities in the module's dependencies (the target downloads the pinned
+    # Trivy); the images are scanned by the images job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make ci-scan
   postgres:
     # The store and Git job contracts on a real PostgreSQL; the service is mapped to the
     # target's input, SANDBOX_TEST_POSTGRES_URL.

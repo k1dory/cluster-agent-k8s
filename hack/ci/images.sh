@@ -29,6 +29,9 @@ harness() { # harness LABEL-NAME COMMAND WANT
   seen=$(docker run --rm --entrypoint /bin/sh "$agent" -lc "$2 --version" 2>&1 || true)
   case "$seen" in *"$3"*) echo "$1 $3" ;; *) ci_die "images: '$2 --version' in the agent image says '$seen', versions.env says $3" ;; esac
 }
+seen=$(docker run --rm --entrypoint npm "$agent" --version 2>&1 || true)
+[ "$seen" = "$NPM_VERSION" ] || ci_die "images: npm in the agent image is '$seen', versions.env says $NPM_VERSION"
+echo "npm $NPM_VERSION"
 harness claude-code claude "$CLAUDE_CODE_VERSION"
 harness codex codex "$CODEX_VERSION"
 harness opencode opencode "$OPENCODE_VERSION"
@@ -136,4 +139,12 @@ acp_in_image "$hermes" TestACPHermesExampleCreatesAndLoadsASession TestACPHermes
 echo "== agent image: smoke test and network lock"
 hack/smoke-image.sh "$agent"
 python3 hack/test-netlock.py "$agent"
+
+echo "== every image: known vulnerabilities (trivy $TRIVY_VERSION, HIGH and CRITICAL with a fix)"
+# The same policy as ci-scan, on what the images carry: the base image's packages and the
+# harnesses' npm packages (the Go modules were scanned at the source). The images are read from
+# the daemon through the API (the scanner runs as a container when a remote daemon built them).
+for img in "$sandboxd" "$ctl" "$agent" "$hermes"; do
+  ci_trivy_scan image "$img" || ci_die "images: fixable HIGH or CRITICAL vulnerabilities in $img (bump the base image or a harness in hack/ci/versions.env, or accept the finding in .trivyignore.yaml with an expiry)"
+done
 ci_ok images

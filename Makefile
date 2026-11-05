@@ -10,7 +10,7 @@ HELM ?= helm
 # or CADDY_BIN (ci-caddy, ci-policy), HELM (ci-helm), IMAGE_PREFIX and IMAGE_TAG (ci-images,
 # ci-e2e-git). Versions and matrices live in hack/ci/versions.env (make ci-versions shows them).
 # A group ends with the line `ci: <group>: ok`; a missing tool or service fails it.
-CI_GROUPS := build vet unit policy postgres caddy helm images e2e-git
+CI_GROUPS := build vet unit policy scan postgres caddy helm images e2e-git
 
 .PHONY: build test vet dev images smoke-image helm-lint policy-test policy-render manifests clean integration \
 	ci ci-fast ci-versions ci-acceptance acceptance publish-images verify-images $(addprefix ci-,$(CI_GROUPS))
@@ -20,9 +20,9 @@ ci: $(addprefix ci-,$(CI_GROUPS))
 	@echo "ci: the full required set ($(CI_GROUPS)): ok"
 
 # The subset a developer runs before pushing (no database, Caddy, Helm or Docker needed, except
-# one Caddy download for the policy gate). Passing it is not passing the full set.
-ci-fast: ci-build ci-vet ci-unit ci-policy
-	@echo "ci: subset fast (build vet unit policy): ok; the full required set is make ci"
+# one Caddy download for the policy gate and one Trivy download for the dependency scan). Passing it is not passing the full set.
+ci-fast: ci-build ci-vet ci-unit ci-policy ci-scan
+	@echo "ci: subset fast (build vet unit policy scan): ok; the full required set is make ci"
 
 # The build, and the one place a provider file may still carry a version (a GitLab service
 # image, a Go image tag) is checked against hack/ci/versions.env and go.mod.
@@ -38,6 +38,10 @@ ci-unit:
 
 ci-policy:
 	hack/ci/policy.sh
+
+# Known vulnerabilities in the module's dependencies (the images are scanned by ci-images).
+ci-scan:
+	hack/ci/scan.sh
 
 ci-postgres:
 	hack/ci/postgres.sh

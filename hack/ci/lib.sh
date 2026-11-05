@@ -65,6 +65,38 @@ ci_cosign() {
   echo "$dir/cosign"
 }
 
+# ci_trivy prints the path of Trivy: TRIVY_BIN when set, else TRIVY_VERSION downloaded once and
+# checked against the release's checksums, like cosign.
+ci_trivy() {
+  if [ -n "${TRIVY_BIN:-}" ]; then echo "$TRIVY_BIN"; return; fi
+  local dir="$CI_BIN/trivy-$TRIVY_VERSION" os arch name want got
+  case "$(ci_os)" in linux) os=Linux ;; darwin) os=macOS ;; *) ci_die "trivy: no release for $(ci_os)" ;; esac
+  case "$(ci_arch)" in amd64) arch=64bit ;; arm64) arch=ARM64 ;; esac
+  name="trivy_${TRIVY_VERSION}_${os}-${arch}.tar.gz"
+  if [ ! -x "$dir/trivy" ]; then
+    mkdir -p "$dir"
+    ci_fetch "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/$name" "$dir/$name"
+    ci_fetch "https://github.com/aquasecurity/trivy/releases/download/v$TRIVY_VERSION/trivy_${TRIVY_VERSION}_checksums.txt" "$dir/checksums.txt"
+    want=$(awk -v n="$name" '$2 == n { print $1 }' "$dir/checksums.txt")
+    got=$(sha256sum "$dir/$name" 2>/dev/null | awk '{ print $1 }' || shasum -a 256 "$dir/$name" | awk '{ print $1 }')
+    [ -n "$want" ] && [ "$want" = "$got" ] || { rm -f "$dir/$name"; ci_die "trivy $TRIVY_VERSION: checksum mismatch for $name"; }
+    tar -C "$dir" -xzf "$dir/$name" trivy && rm -f "$dir/$name"
+  fi
+  echo "$dir/trivy"
+}
+
+# ci_trivy_scan TARGET-KIND TARGET... runs Trivy with the one vulnerability policy every scan
+# uses (ci-scan on the module, ci-images on the images): HIGH and CRITICAL findings that have a
+# fix fail the check; unfixed ones are reported and do not; accepted findings live in
+# .trivyignore.yaml with an expiry. The database is cached under .ci (TRIVY_CACHE_DIR).
+ci_trivy_scan() {
+  local kind=$1 trivy
+  shift
+  trivy=$(ci_trivy)
+  TRIVY_CACHE_DIR=${TRIVY_CACHE_DIR:-$CI_BIN/trivy-cache} "$trivy" "$kind" --quiet --scanners vuln \
+    --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --ignorefile "$ci_root/.trivyignore.yaml" "$@"
+}
+
 # ci_docker makes sure a docker CLI is on PATH (the static CLI is downloaded once when the
 # runner has none) and that a daemon answers; a check that needs Docker fails here otherwise.
 ci_docker() {

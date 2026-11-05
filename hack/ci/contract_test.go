@@ -197,3 +197,29 @@ func TestAcceptanceScriptsParseAndNameEveryPhase(t *testing.T) {
 		}
 	}
 }
+
+// The dependency scan is Trivy's verdict and nothing else: a scanner that finds a fixable
+// finding fails the group, named, and a clean scanner passes it, with the pinned policy on the
+// command line (severity, fixed only, the ignore file) so a provider cannot soften it.
+func TestScanPropagatesTrivyVerdict(t *testing.T) {
+	mod := module(t)
+	bin := t.TempDir()
+	stub(t, bin, "trivy", "echo \"$@\" > \"$STUB_ARGS\"; exit \"${STUB_EXIT:-0}\"\n")
+	args := filepath.Join(t.TempDir(), "args")
+	env := map[string]string{"CI_ROOT": mod, "TRIVY_BIN": filepath.Join(bin, "trivy"), "STUB_ARGS": args, "STUB_EXIT": "0"}
+	out, err := runScript(t, "hack/ci/scan.sh", env, bin)
+	if err != nil || !strings.HasSuffix(strings.TrimSpace(out), "ci: scan: ok") {
+		t.Fatalf("a clean scan must pass: %v\n%s", err, out)
+	}
+	seen, _ := os.ReadFile(args)
+	for _, want := range []string{"fs ", "--severity HIGH,CRITICAL", "--ignore-unfixed", "--exit-code 1", "--ignorefile " + filepath.Join(mod, ".trivyignore.yaml")} {
+		if !strings.Contains(string(seen), want) {
+			t.Fatalf("the scan must run Trivy with %q; ran: %s", want, seen)
+		}
+	}
+	env["STUB_EXIT"] = "1"
+	out, err = runScript(t, "hack/ci/scan.sh", env, bin)
+	if err == nil || strings.Contains(out, "ci: scan: ok") || !strings.Contains(out, "vulnerabilities") {
+		t.Fatalf("a scanner that finds a fixable finding must fail the group, named: %v\n%s", err, out)
+	}
+}
