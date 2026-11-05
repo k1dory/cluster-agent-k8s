@@ -166,6 +166,15 @@ func Decode(it *model.CatalogItem) (Spec, error) {
 // request.
 var allowLoopbackHTTP = testing.Testing()
 
+// LoopbackHTTPForTest sets whether loopback http issuers pass CheckIssuer and returns the
+// function restoring the previous setting. For tests of other packages that need production
+// validation; sandboxd never calls it.
+func LoopbackHTTPForTest(allow bool) (restore func()) {
+	old := allowLoopbackHTTP
+	allowLoopbackHTTP = allow
+	return func() { allowLoopbackHTTP = old }
+}
+
 // CheckIssuer accepts an https URL without user information, query or fragment, as an issuer
 // names itself (and, in tests only, http for a loopback host).
 func CheckIssuer(raw string) error {

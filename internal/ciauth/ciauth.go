@@ -104,6 +104,11 @@ func (s *Service) Exchange(ctx context.Context, raw string) (*Grant, error) {
 		return nil, s.refuse("no issuer claim", err)
 	}
 	issuer := unverified.Issuer
+	// Checked again here, not only when a trust is written: a trust stored before the rules
+	// tightened (an http loopback issuer) must not make the platform fetch from it.
+	if err := citrust.CheckIssuer(issuer); err != nil {
+		return nil, s.refuse("issuer not acceptable: "+issuer, err)
+	}
 	trusts, err := s.trustsOf(ctx, issuer)
 	if err != nil {
 		return nil, err
