@@ -90,9 +90,14 @@ func main() {
 	go serveGatewayBridge(ctx, certDir())
 	_ = os.Setenv("SANDBOX_GATEWAY_BRIDGE", "http://"+gatewayBridgeAddr)
 	fmt.Println("agent-runner: waiting for runs")
+	serveAndDrain(ctx, c)
+}
+
+// serveAndDrain serves runs until ctx ends, then waits for what is left of a harness's process
+// group to be stopped before the runner exits: as PID 1 its exit takes the container down, and a
+// SIGKILL still pending would never be sent.
+func serveAndDrain(ctx context.Context, c *client) {
 	serveRuns(ctx, c)
-	// What is left of a harness's process group is stopped before the runner exits: as PID 1 its
-	// exit takes the container down, and a SIGKILL still pending would never be sent.
 	groupKills.Wait()
 }
 
