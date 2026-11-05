@@ -8,7 +8,7 @@ agent_image: registry.example.com/agent-sandbox/agent:latest
 sandboxd_image: registry.example.com/agent-sandbox/sandboxd:latest
 k8s_namespace: agent-sandbox
 network_attachment: agent-sandbox/sandbox-vlan
-harness_cmd: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose'
+harness_cmd: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
 policies_repo: ""
 policies_version: main
 with_postgres: true

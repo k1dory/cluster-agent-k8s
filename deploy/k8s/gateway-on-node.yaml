@@ -90,8 +90,8 @@ data:
       cpu_limit: "2"
       memory_request: "1Gi"
       memory_limit: "4Gi"
-      harness_command: "claude -p \"$SANDBOX_TASK\" --output-format stream-json --verbose"
-      harness_resume_command: "claude -p \"$SANDBOX_RESUME_PROMPT\" --resume \"$SANDBOX_SESSION\" --output-format stream-json --verbose"
+      harness_command: "claude -p \"$SANDBOX_TASK\" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none"
+      harness_resume_command: "claude -p \"$SANDBOX_RESUME_PROMPT\" --resume \"$SANDBOX_SESSION\" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none"
       resume_prompt: ""
       termination_seconds: 30
       pod_firewall: true

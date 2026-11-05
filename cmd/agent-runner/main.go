@@ -247,7 +247,7 @@ func repoDir() string {
 func execute(ctx context.Context, c *client, run *model.Run) int {
 	cmdline := os.Getenv("HARNESS_CMD")
 	if cmdline == "" {
-		cmdline = `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose`
+		cmdline = `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none`
 	}
 	env := append(os.Environ(), "SANDBOX_TASK="+run.Task, "SANDBOX_RUN_ID="+run.ID)
 	// The profile's harness files (a Codex config.toml, Claude Code settings) are in place

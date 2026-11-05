@@ -112,10 +112,10 @@ agent:
     cpuLimit: "2"
     memoryRequest: 1Gi
     memoryLimit: 4Gi
-  harnessCommand: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose'
+  harnessCommand: 'claude -p "$SANDBOX_TASK" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
   # Continue a run interrupted by a forced rollout ($SANDBOX_SESSION is the harness session id
   # captured from its output). Codex: 'codex exec resume "$SANDBOX_SESSION" "$SANDBOX_RESUME_PROMPT" --json'
-  harnessResumeCommand: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose'
+  harnessResumeCommand: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
   resumePrompt: ""
   env:
     ANTHROPIC_BASE_URL: https://api.anthropic.com

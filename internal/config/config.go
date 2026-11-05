@@ -250,7 +250,7 @@ func Load(path string) (*Config, error) {
 		c.Kube.GatewayCAConfigMap = &n
 	}
 	if c.Kube.HarnessResumeCommand == "" {
-		c.Kube.HarnessResumeCommand = `claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose`
+		c.Kube.HarnessResumeCommand = `claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none`
 	}
 	if c.Runtime == "" {
 		c.Runtime = "kube"
