@@ -24,12 +24,25 @@ import (
 //   - thoughtTokens are reasoning tokens. Agents that count them inside outputTokens
 //     (codex-acp, Hermes: totalTokens = input + output) are left as they are; tokens reported
 //     beside the output (totalTokens counts them on top) are added to it.
+//
+// Both running totals belong to the session, and the session outlives the run: the next run
+// continues it (resume or load) in a new agent process, whose first report still counts from
+// the session's start (OpenCode sums the session's messages; Claude Code restores the session's
+// cost; Hermes keeps its totals). The last totals are therefore kept per session on the
+// workspace volume (usageDir), and a cost the agent reports while the session opens (a load
+// replaying its history) is the base the run counts from.
 type acpUsage struct {
 	cl         *acpClient
 	cumulative bool
-	path       string    // where the last cumulative usage of the session is kept ("" = memory)
+	path       string    // where the session's last totals are kept ("" = memory only)
 	prev       acp.Usage // the last cumulative usage seen
 	costBase   float64   // the session cost at the end of the previous turn
+}
+
+// acpSessionTotals is what is kept of a session between runs.
+type acpSessionTotals struct {
+	Usage *acp.Usage `json:"usage,omitempty"` // cumulativeUsage agents only
+	Cost  *float64   `json:"cost,omitempty"`
 }
 
 // cumulativeUsage names the agents (initialize agentInfo.name) whose PromptResponse.usage is the
@@ -40,17 +53,21 @@ var unsafeFileChars = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
 func newACPUsage(agent, session string, cl *acpClient) *acpUsage {
 	u := &acpUsage{cl: cl, cumulative: cumulativeUsage[agent]}
+	if cl.usageDir != "" && session != "" {
+		u.path = filepath.Join(cl.usageDir, unsafeFileChars.ReplaceAllString(session, "_")+".json")
+		var kept acpSessionTotals
+		if b, err := os.ReadFile(u.path); err == nil && json.Unmarshal(b, &kept) == nil {
+			if kept.Usage != nil {
+				u.prev = *kept.Usage
+			}
+			if kept.Cost != nil {
+				u.costBase = *kept.Cost
+			}
+		}
+	}
+	// What the agent reported while the session opened is the session's total now.
 	if c, ok := cl.sessionCost(); ok {
 		u.costBase = c
-	}
-	// The running total is the session's, and the session outlives the run (session/load in
-	// the next one): its last value is kept on the workspace volume, or the next run would
-	// count the whole conversation again.
-	if u.cumulative && cl.usageDir != "" && session != "" {
-		u.path = filepath.Join(cl.usageDir, unsafeFileChars.ReplaceAllString(session, "_")+".json")
-		if b, err := os.ReadFile(u.path); err == nil {
-			_ = json.Unmarshal(b, &u.prev)
-		}
 	}
 	return u
 }
@@ -76,9 +93,11 @@ func (a *acpUsage) turn(reported *acp.Usage) (string, bool) {
 		}
 		got = true
 	}
+	costSeen := false
 	if c, ok := a.cl.sessionCost(); ok {
+		costSeen = true
 		d := c - a.costBase
-		if d < 0 { // a new agent process counts from zero again
+		if d < 0 { // a total lower than the last: the agent counts from zero again
 			d = c
 		}
 		a.costBase = c
@@ -86,6 +105,9 @@ func (a *acpUsage) turn(reported *acp.Usage) (string, bool) {
 			rec.CostUSD = d
 			got = true
 		}
+	}
+	if a.cumulative && reported != nil || costSeen {
+		a.save()
 	}
 	if !got {
 		return "", false
@@ -98,16 +120,26 @@ func (a *acpUsage) turn(reported *acp.Usage) (string, bool) {
 	return string(b), true
 }
 
+// save keeps the session's last totals for the run that continues it.
+func (a *acpUsage) save() {
+	if a.path == "" {
+		return
+	}
+	kept := acpSessionTotals{Cost: &a.costBase}
+	if a.cumulative {
+		prev := a.prev
+		kept.Usage = &prev
+	}
+	if b, err := json.Marshal(kept); err == nil && os.MkdirAll(filepath.Dir(a.path), 0o700) == nil {
+		_ = os.WriteFile(a.path, b, 0o600)
+	}
+}
+
 // since is the share of a running total that is new since the last one; a total lower than the
 // last (another session, a reset) counts whole.
 func (a *acpUsage) since(u acp.Usage) acp.Usage {
 	p := a.prev
 	a.prev = u
-	if a.path != "" {
-		if b, err := json.Marshal(u); err == nil && os.MkdirAll(filepath.Dir(a.path), 0o700) == nil {
-			_ = os.WriteFile(a.path, b, 0o600)
-		}
-	}
 	if u.InputTokens < p.InputTokens || u.OutputTokens < p.OutputTokens || u.TotalTokens < p.TotalTokens ||
 		intOf(u.CachedReadTokens) < intOf(p.CachedReadTokens) || intOf(u.CachedWriteTokens) < intOf(p.CachedWriteTokens) ||
 		intOf(u.ThoughtTokens) < intOf(p.ThoughtTokens) {

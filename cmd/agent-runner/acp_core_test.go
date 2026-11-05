@@ -29,6 +29,8 @@ type coreConn struct {
 	loadErr, resumeErr error
 	// prompt answers prompt n (0-based) with text; nil: end the turn with no usage.
 	prompt func(n int, text string) (acp.PromptResponse, error)
+	// onOpen runs inside load and resume, before they answer (a load replaying its history).
+	onOpen func()
 
 	mu       sync.Mutex
 	calls    []string
@@ -64,12 +66,18 @@ func (c *coreConn) NewSession(_ context.Context, p acp.NewSessionRequest) (acp.N
 func (c *coreConn) LoadSession(_ context.Context, p acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 	c.call("load")
 	c.loadReq = &p
+	if c.onOpen != nil {
+		c.onOpen()
+	}
 	return acp.LoadSessionResponse{Modes: c.opened.modes, ConfigOptions: c.opened.options}, c.loadErr
 }
 
 func (c *coreConn) ResumeSession(_ context.Context, p acp.ResumeSessionRequest) (acp.ResumeSessionResponse, error) {
 	c.call("resume")
 	c.resumReq = &p
+	if c.onOpen != nil {
+		c.onOpen()
+	}
 	return acp.ResumeSessionResponse{Modes: c.opened.modes, ConfigOptions: c.opened.options}, c.resumeErr
 }
 
@@ -591,5 +599,66 @@ func TestCancelledHarnessIsInterruptedFirst(t *testing.T) {
 				t.Fatalf("output:\n%s", out)
 			}
 		})
+	}
+}
+
+// The session's cost is a running total that outlives the run: the run that continues the
+// session (a new agent process) counts from the total the previous run ended on, kept on the
+// workspace, or from what the agent reports while the session opens; a total that drops counts
+// whole. (OpenCode after session/resume reported the whole session's cost as the first turn's.)
+func TestACPCostAcrossRuns(t *testing.T) {
+	clearACPEnv(t)
+	dir := t.TempDir()
+	costOf := func(lines []string) (out []float64) {
+		for _, l := range lines {
+			if u, _, ok := harness.ParseUsage(l); ok {
+				out = append(out, u.CostUSD)
+			}
+		}
+		return out
+	}
+	near := func(a, b float64) bool { return a-b < 1e-9 && b-a < 1e-9 }
+	report := func(cl **acpClient, total float64) {
+		_ = (*cl).SessionUpdate(context.Background(), acp.SessionNotification{SessionId: "s", Update: acp.SessionUpdate{
+			UsageUpdate: &acp.SessionUsageUpdate{Cost: &acp.Cost{Amount: total, Currency: "USD"}}}})
+	}
+	caps := acp.InitializeResponse{AgentCapabilities: acp.AgentCapabilities{LoadSession: true,
+		SessionCapabilities: acp.SessionCapabilities{Resume: &acp.SessionResumeCapabilities{}}}}
+	agent := func(cl **acpClient, totals ...float64) *coreConn {
+		return &coreConn{init: caps, prompt: func(n int, _ string) (acp.PromptResponse, error) {
+			report(cl, totals[n])
+			return acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
+		}}
+	}
+	next := &model.Run{Task: "again", Session: "sess_new", ResumeOf: "r", Mode: model.RunMessage}
+
+	// Two turns, then a resumed run whose agent reports the session's total.
+	var cl *acpClient
+	cl = &acpClient{usageDir: dir}
+	_, lines := runCore(t, agent(&cl, 0.00004, 0.00008), cl, &model.Run{Task: "a"}, "b")
+	if got := costOf(lines); len(got) != 2 || !near(got[0], 0.00004) || !near(got[1], 0.00004) {
+		t.Fatalf("first run: %v", got)
+	}
+	cl = &acpClient{usageDir: dir}
+	_, lines = runCore(t, agent(&cl, 0.00012), cl, next)
+	if got := costOf(lines); len(got) != 1 || !near(got[0], 0.00004) {
+		t.Fatalf("resumed run charged the old cost again: %v", got)
+	}
+
+	// Nothing kept, but the load replays the session's cost: that is the base.
+	cl = &acpClient{usageDir: t.TempDir()}
+	loaded := agent(&cl, 0.7)
+	loaded.init = acp.InitializeResponse{AgentCapabilities: acp.AgentCapabilities{LoadSession: true}}
+	loaded.onOpen = func() { report(&cl, 0.5) }
+	_, lines = runCore(t, loaded, cl, next)
+	if got := costOf(lines); len(got) != 1 || !near(got[0], 0.2) {
+		t.Fatalf("cost reported on load: %v", got)
+	}
+
+	// A total lower than the kept one: the agent counts from zero, the turn's cost is all of it.
+	cl = &acpClient{usageDir: dir}
+	_, lines = runCore(t, agent(&cl, 0.00001), cl, next)
+	if got := costOf(lines); len(got) != 1 || !near(got[0], 0.00001) {
+		t.Fatalf("reset: %v", got)
 	}
 }

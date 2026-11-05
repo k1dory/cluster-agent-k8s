@@ -525,10 +525,18 @@ func (a *acpClient) flushLocked() {
 func (a *acpClient) SessionUpdate(_ context.Context, n acp.SessionNotification) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	u := n.Update
+	// A cost reported while a load replays the history is the session's total so far: kept (the
+	// run's usage counts from it), not written.
+	if u.UsageUpdate != nil {
+		if c := u.UsageUpdate.Cost; c != nil && (c.Currency == "" || strings.EqualFold(c.Currency, "USD")) {
+			a.cost, a.costSeen = c.Amount, true
+		}
+		return nil
+	}
 	if a.replaying {
 		return nil
 	}
-	u := n.Update
 	switch {
 	case u.AgentMessageChunk != nil:
 		if t := u.AgentMessageChunk.Content.Text; t != nil {
@@ -554,10 +562,6 @@ func (a *acpClient) SessionUpdate(_ context.Context, n acp.SessionNotification) 
 		if l.Status != "" || len(l.Diffs) > 0 {
 			a.flushLocked()
 			a.emit(l.String())
-		}
-	case u.UsageUpdate != nil:
-		if c := u.UsageUpdate.Cost; c != nil && (c.Currency == "" || strings.EqualFold(c.Currency, "USD")) {
-			a.cost, a.costSeen = c.Amount, true
 		}
 	}
 	return nil
