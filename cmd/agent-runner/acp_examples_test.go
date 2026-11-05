@@ -88,3 +88,39 @@ func exampleSmoke(t *testing.T, file, binEnv, program string, extraEnv func(home
 		t.Fatalf("the next run must load session %s, got %s (fresh %v); notices %q", session, again, fresh, notices)
 	}
 }
+
+// The shipped OpenCode profile's model call, from the real opencode through the runner, reaches
+// a gateway that requires the pod's client certificate (through the bridge) and its answer
+// comes back into the transcript. Runs in the agent image's check or with OPENCODE_TEST_BIN.
+func TestACPOpenCodeExampleAnswersThroughTheGateway(t *testing.T) {
+	bin := os.Getenv("OPENCODE_TEST_BIN")
+	if bin == "" && os.Getenv("ACP_TEST_NETWORK") == "none" {
+		bin, _ = exec.LookPath("opencode")
+	}
+	if bin == "" {
+		t.Skip("set OPENCODE_TEST_BIN to run the OpenCode model-call test (it runs by itself in the agent image's check)")
+	}
+	lines, seen := modelCallThroughGateway(t, "environment-opencode-acp.yaml", "opencode", bin, "api.anthropic.com", anthropicAnswer("pong-from-the-gateway"))
+	assertAnswered(t, lines, seen, "pong-from-the-gateway", "api.anthropic.com")
+	for _, r := range seen {
+		if r.Path == "/v1/messages" && r.APIKey != "placeholder-the-gateway-injects-the-real-key" {
+			t.Fatalf("the model call carried %q, not the profile's placeholder key", r.APIKey)
+		}
+	}
+}
+
+// The shipped Hermes profile's model call, from the real hermes of the agent-hermes image
+// through the runner, reaches a gateway that requires the pod's client certificate (through the
+// bridge, ANTHROPIC_BASE_URL) and its answer comes back into the transcript.
+func TestACPHermesExampleAnswersThroughTheGateway(t *testing.T) {
+	bin := os.Getenv("HERMES_TEST_BIN")
+	if bin == "" && os.Getenv("ACP_TEST_NETWORK") == "none" {
+		bin, _ = exec.LookPath("hermes")
+	}
+	if bin == "" {
+		t.Skip("set HERMES_TEST_BIN to run the Hermes model-call test (it runs by itself in the agent-hermes image's check)")
+	}
+	t.Setenv("HERMES_HOME", filepath.Join(os.Getenv("HOME"), ".hermes"))
+	lines, seen := modelCallThroughGateway(t, "environment-hermes-acp.yaml", "hermes", bin, "api.anthropic.com", anthropicAnswer("pong-from-the-gateway"))
+	assertAnswered(t, lines, seen, "pong-from-the-gateway", "api.anthropic.com")
+}

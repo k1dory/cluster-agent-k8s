@@ -132,12 +132,26 @@ harness:
   A diff whose texts exceed 128 KiB keeps its path and sizes and is marked `truncated` (the file
   is in the workspace). A prompt's usage, when the agent reports it, is a `{"type":"usage",…}` line the run's
   accounting adds up. The agent's stderr is passed through as it is.
+- **Gateway bridge.** Every connection out of the pod ends at the gateway, which requires the
+  pod's client certificate (mTLS). Claude Code, git and curl present it from what agent-init
+  writes; most other harnesses cannot (OpenCode on Bun, Hermes on Python's httpx, Codex on Rust
+  read no client certificate from the environment). agent-runner therefore serves a bridge on
+  the pod's loopback, `http://127.0.0.1:4480/https/<host>/<path>` (`$SANDBOX_GATEWAY_BRIDGE`),
+  that forwards to `https://<host>/<path>` through the gateway with the certificate: headers and
+  bodies unchanged (the gateway still swaps placeholder credentials and applies the policy),
+  answers streamed, WebSocket upgrades carried. A profile points its harness's provider at it
+  (`ANTHROPIC_BASE_URL`, OpenCode's provider `baseURL`, Codex's `model_providers.<id>.base_url`;
+  Codex ignores `OPENAI_BASE_URL`), and the MCP servers an ACP
+  agent gets in `session/new` are already bridge URLs. It reaches nothing the pod could not:
+  the certificate is the pod's own and the network lock still admits only the gateway.
 - **OpenCode** (`command: opencode acp`, `examples/catalog/environment-opencode-acp.yaml`) is an
   ACP agent itself: it loads sessions (a conversation continues across runs), takes the MCP
   connections over HTTP and needs no `auth_method` with a provider key in its environment. Its
   configuration is a harness file, `.config/opencode/opencode.json`: with its `permission` rules
   at `ask`, every edit and shell command reaches `permissions` and the run's output; `autoupdate`
   off, `share` disabled and `OPENCODE_DISABLE_MODELS_FETCH` keep it from egress a pod has no use for.
+  Its Anthropic provider's `baseURL` is the gateway bridge (below): OpenCode cannot present the
+  pod's client certificate itself.
 - **Hermes Agent** (`command: hermes acp`, `examples/catalog/environment-hermes-acp.yaml`) runs
   from its own image, `agent-hermes`: the official Hermes image pinned by digest
   (`HERMES_IMAGE` in `hack/ci/versions.env`) with agent-init, agent-runner, the network lock and
@@ -146,10 +160,15 @@ harness:
   agent catalogue (`agent.versions.hermes: …/agent-hermes:sha-…@sha256:…`) and the profile names
   `image: hermes`. `HERMES_HOME` is `~/.hermes` on the workspace volume (config, sessions,
   memory, skills survive restarts); its configuration is a harness file, `.hermes/config.yaml`.
-  Hermes's own login is interactive and not used: the provider key is a placeholder in `env`.
+  Hermes's own login is interactive and not used: the provider key is a placeholder in `env`,
+  and `ANTHROPIC_BASE_URL` is the gateway bridge (Hermes's httpx client cannot present the pod's
+  client certificate).
 - **Checked offline in CI.** `hack/ci/images.sh` runs the ACP smoke tests inside the built
   images with no network: the shipped Codex, OpenCode and Hermes profiles open a session with
   the real agent, and OpenCode's and Hermes's are loaded again by a second process (the next run).
+  Each also makes a real model call through the runner against a test gateway that requires the
+  pod's client certificate: OpenCode's and Hermes's answers come back into the transcript,
+  Codex's request arrives at `/v1/responses` with the certificate.
 - **Long lines.** For every harness, an output line over 1 MiB is replaced by a
   `[agent-runner] dropped an output line …` notice and reading goes on, so the harness never
   blocks on a reader that gave up.

@@ -36,3 +36,7 @@ spec:
           check: false
   env:
     ANTHROPIC_API_KEY: placeholder-the-gateway-injects-the-real-key
+    # Hermes's Anthropic client (httpx) cannot present the pod's client certificate to the
+    # gateway: it goes through agent-runner's gateway bridge on loopback (docs/chat-and-files.md,
+    # "Gateway bridge"). The Anthropic SDK adds /v1 itself.
+    ANTHROPIC_BASE_URL: http://127.0.0.1:4480/https/api.anthropic.com

@@ -119,14 +119,15 @@ DOCKERFILE
 }
 
 echo "== agent image: the ACP agents open sessions from the shipped profiles, offline"
-acp_in_image "$agent" TestACPCodexExampleCreatesSession TestACPOpenCodeExampleCreatesAndLoadsASession
+acp_in_image "$agent" TestACPCodexExampleCreatesSession TestACPOpenCodeExampleCreatesAndLoadsASession \
+  TestACPCodexExampleReachesTheModelThroughTheGateway TestACPOpenCodeExampleAnswersThroughTheGateway
 
 echo "== agent-hermes image: Hermes pinned and labelled, a sandbox agent image, its ACP session offline"
 label=$(docker inspect -f '{{ index .Config.Labels "io.agent-sandbox.harness.hermes.version" }}' "$hermes")
 [ "$label" = "$HERMES_VERSION" ] || ci_die "images: agent-hermes label says '$label', versions.env says $HERMES_VERSION"
 SMOKE_HARNESSES=hermes hack/smoke-image.sh "$hermes"
 python3 hack/test-netlock.py "$hermes"
-acp_in_image "$hermes" TestACPHermesExampleCreatesAndLoadsASession
+acp_in_image "$hermes" TestACPHermesExampleCreatesAndLoadsASession TestACPHermesExampleAnswersThroughTheGateway
 
 echo "== agent image: smoke test and network lock"
 hack/smoke-image.sh "$agent"
