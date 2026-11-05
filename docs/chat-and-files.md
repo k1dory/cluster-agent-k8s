@@ -119,7 +119,8 @@ adapters for both vendors and OpenCode, pinned in `hack/ci/versions.env`:
 harness:
   command: claude-agent-acp        # or codex-acp, opencode acp, any agent that speaks ACP (gemini --experimental-acp…)
   input: acp
-  permissions: allow               # allow (default) | deny
+  permissions: allow               # allow (default) | deny | ask (a person answers)
+  # ask_timeout: 900               # with permissions ask: seconds a request waits for a person
   mode: default                    # optional: the session mode (claude-agent-acp default, codex-acp agent-full-access, OpenCode build)
   mcp: auto                        # auto (default) | always
   thought_level: high              # optional: the reasoning level (config option of category thought_level)
@@ -186,10 +187,39 @@ calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
   `reject_always`). The sandbox, its policy and the gateway stay the boundary either way. Every
   request and its decision is a line of the run's output, with the change's diff when the
   request carries one (OpenCode and Hermes send it nowhere else).
+- **A person in the loop (`permissions: ask`).** The cloud works like an agent at a terminal: what
+  the agent asks a person reaches the person, and the turn waits for the answer.
+  - A permission request becomes an `acp.request` line with the agent's options and the
+    change's diff; the agent may also ask questions (ACP elicitation, which the runner then
+    offers): a form (Claude's AskUserQuestion, an MCP server's form) with its JSON Schema, or a
+    link to open (an MCP server's OAuth sign-in).
+  - In the conversation it is a `request` turn whose `data` is that line. The answer is
+    `POST /v1/sandboxes/{id}/requests/{request_id}` with the request turn's `run_id` (an answer
+    goes to the run that asked, never to a later one): `{"run_id": …, "option_id": …}` for a
+    permission, `{"run_id": …, "action": "accept", "content": {…}}` for a form (each answer of
+    its field's type and among its choices), `{"action": "accept"}` to consent to a link,
+    `{"action": "decline"}` / `"cancel"`. A link question is also answered when the agent reports
+    the interaction complete. It travels to the run as a `reply` input event; the
+    runner checks it against the request (an option offered, the form's required and known
+    fields) and answers the agent.
+  - The resolution is an `acp.request_resolved` line (a `resolved` turn): `outcome` (the
+    option's kind, `accept`, `decline`, `cancelled`, `not_waiting` for an answer to a request no
+    longer waiting) and `by` (`user`, `timeout`, `invalid`, `cancelled`). Unanswered within
+    `ask_timeout` (default 15 minutes), a permission is refused and a question cancelled.
+  - While the turn waits, the run is in progress: the sandbox does not go to sleep, and the
+    conversation's idle clock does not run.
+  - All of it is ACP: `session/request_permission` and `elicitation/create` are the agent's own
+    requests, relayed (`github.com/k1dory/acpx`: `Request`, `Pending`, `PermissionResponse`,
+    `ElicitationResponse`). Claude (claude-agent-acp: forms and links), Codex (codex-acp),
+    Hermes (forms) and OpenCode 2.x ask questions; every ACP agent asks permissions. Limit: with
+    OpenCode the agent can answer its own permission requests through OpenCode's API on loopback
+    (see OpenCode below).
 - **Messages.** A message sent while a turn runs joins that turn when the agent takes steering
   (`_session/steering`, declared in initialize `_meta.steering.supported`: claude-agent-acp,
   codex-acp), the run's output says so; otherwise it waits for the turn to end and is the next
-  prompt. A message that starts with `/` reaches the agent as a command only when the agent
+  prompt. Files a message attached (`attachments`, or uploaded with it) are listed after its text
+  for every harness; an ACP agent gets them as `resource_link` blocks of the prompt, so it sees
+  files, not words. A message that starts with `/` reaches the agent as a command only when the agent
   advertised that command (`available_commands_update`: `/compact`, `/review`…); any other is
   sent with a zero-width space ahead of it, so the agent reads it as text (OpenCode ends the turn
   empty on an unknown command).
@@ -212,6 +242,9 @@ calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
   | `acp.notice`      | `severity`, `title`, `text`: a notice for the user (a limit near, an error it recovered from) | `log` |
   | `acp.compaction`  | `compaction_id`, `status` (`in_progress`, `completed`, `failed`, `cancelled`), `error`, `text` (its summary) | `log` |
   | `acp.session_info`| `title`: the session's title as the agent names it        | `log` |
+  | `acp.request`     | `request` (`request_id`, `kind`: permission / form / url, `title`, `message`, `options[]` (`option_id`, `name`, `kind`), `schema`, `url`), `diffs[]` | `request` (with `data`) |
+  | `acp.request_resolved` | `request_id`, `outcome`, `by`                        | `resolved` (with `data`) |
+  | `acp.commands`    | `commands[]` (`name`, `description`, `hint`): the agent's slash commands, the whole list each time it changes | `commands` (with `data`) |
 
   Notices and compaction updates come only to a client that advertises
   `clientCapabilities.session.notices` / `.compaction`, which the runner does (the SDK cannot
@@ -311,6 +344,27 @@ calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
   (`/etc/claude-code/managed-settings.json`, which no user or repository settings override) allow
   only managed hooks: a repository's `.claude/settings.json` cannot run commands from hooks past
   the permission requests the runner answers and records.
+
+### `/` and `@` in a client
+
+A web chat or another backend builds the same experience as an agent at a terminal from what the
+platform already sends; the platform has no completion endpoints (a picker would call them on
+every keystroke):
+
+- **`/`** lists the agent's commands from the latest `commands` turn (its `data.commands`: name,
+  description, hint for the argument) next to the client's own. A message `/compact` or
+  `/review main` reaches the agent as that command; any other text that starts with `/` reaches
+  it as text.
+- **`@`** picks a workspace file from `GET /v1/sandboxes/{id}/files` (search it as the user
+  types); the message is sent with the chosen paths in `attachments` (relative to `/workspace`).
+  The agent gets them as files (resource links).
+- **Requests** are `request` turns to show (options, a form from its schema, a link) and answer
+  with `POST /requests/{request_id}`; `resolved` turns close them.
+
+`sandboxctl chat` is the reference: `/` or `/help` lists both kinds of commands, `@path` in a
+message attaches that file, `/reply <number>` (a permission), `/reply field=value …` (a form),
+`/reply` (a link done), `/decline` and `/cancel` answer the latest open request (or
+`/reply req_… …` a given one).
 
 ### The transcript
 

@@ -7,7 +7,7 @@ require (
 	github.com/coreos/go-oidc/v3 v3.11.0
 	github.com/go-jose/go-jose/v4 v4.0.2
 	github.com/jackc/pgx/v5 v5.11.0
-	github.com/k1dory/acpx v0.2.0
+	github.com/k1dory/acpx v0.4.0
 	github.com/miekg/dns v1.1.73
 	golang.org/x/sys v0.47.0
 	gopkg.in/yaml.v3 v3.0.1

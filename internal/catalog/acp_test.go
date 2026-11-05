@@ -20,7 +20,10 @@ func TestACPProfileValidationAndLaunch(t *testing.T) {
 	ctx := context.Background()
 	for _, bad := range []string{
 		`{"image":"stable","harness":{"input":"jsonrpc"}}`,
-		`{"image":"stable","harness":{"command":"claude-agent-acp","input":"acp","permissions":"ask"}}`,
+		`{"image":"stable","harness":{"command":"claude-agent-acp","input":"acp","permissions":"maybe"}}`,
+		`{"image":"stable","harness":{"command":"x","input":"acp","permissions":"allow","ask_timeout":60}}`,
+		`{"image":"stable","harness":{"command":"x","input":"acp","permissions":"ask","ask_timeout":-1}}`,
+		`{"image":"stable","harness":{"command":"x","input":"acp","permissions":"ask","ask_timeout":90000}}`,
 		`{"image":"stable","harness":{"permissions":"deny"}}`,
 		`{"image":"stable","harness":{"input":"stream-json","permissions":"allow"}}`,
 		`{"image":"stable","harness":{"auth_method":"api-key"}}`,
@@ -114,5 +117,22 @@ func TestShippedProfilesUseACP(t *testing.T) {
 				t.Errorf("%s (%s): %v", f, d.Name, err)
 			}
 		}
+	}
+}
+
+// permissions ask (a person answers) and its timeout reach the launch.
+func TestACPProfileAsk(t *testing.T) {
+	s := newService()
+	ctx := context.Background()
+	spec := `{"image":"stable","harness":{"command":"claude-agent-acp","input":"acp","permissions":"ask","ask_timeout":300}}`
+	if _, err := s.Put(ctx, model.KindEnvironment, "acme", doc(t, "asking", spec, nil), false, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Put(ctx, model.KindAgent, "acme", doc(t, "pair", `{"policy":"backend-dev","environment":"asking"}`, nil), false, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.Resolve(ctx, "acme", "pair", false)
+	if err != nil || r.Launch.HarnessPermissions != "ask" || r.Launch.HarnessAskTimeout != 300 {
+		t.Fatalf("resolve: %v %+v", err, r.Launch)
 	}
 }

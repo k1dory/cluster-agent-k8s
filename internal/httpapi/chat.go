@@ -13,8 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/orchestrator"
+	"github.com/k1dory/acpx"
 )
 
 // chatRoutes mounts the conversation and workspace endpoints of a sandbox.
@@ -23,6 +25,7 @@ import (
 //	GET  /v1/sandboxes/{id}/messages          the conversation after ?after (one page)
 //	GET  /v1/sandboxes/{id}/messages/stream   the conversation as SSE: replay, then live
 //	POST /v1/sandboxes/{id}/messages/close    end the open conversation (the run finishes)
+//	POST /v1/sandboxes/{id}/requests/{rid}    answer what the agent asks (a permission, a question)
 //	GET  /v1/sandboxes/{id}/files?path=&depth= list the workspace
 //	GET  /v1/sandboxes/{id}/files/content?path= read a file
 //	PUT  /v1/sandboxes/{id}/files/content?path= write a file (the body)
@@ -31,6 +34,7 @@ func (p *Platform) chatRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/sandboxes/{id}/messages", p.auth(p.listMessages))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/messages/stream", p.auth(p.streamMessages))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/messages/close", p.auth(p.closeConversation))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/requests/{request_id}", p.auth(p.idempotent(p.replyRequest)))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/files", p.auth(p.listFiles))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/files/content", p.auth(p.readFile))
 	mux.HandleFunc("PUT /v1/sandboxes/{id}/files/content", p.auth(p.writeFile))
@@ -105,16 +109,14 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 		var paths []string
 		for _, a := range req.Attachments {
 			cp, err := orchestrator.CleanFSPath(a)
-			if err != nil || cp == "." {
+			if err != nil || cp == "." || !harness.AttachmentPath("/workspace/"+cp) {
 				writeErr(w, http.StatusBadRequest, fmt.Errorf("attachment path %q", a))
 				return
 			}
 			paths = append(paths, "/workspace/"+cp)
 		}
-		if text == "" {
-			text = "See the attached files."
-		}
-		text += "\n\nAttached files:\n- " + strings.Join(paths, "\n- ")
+		// Listed after the text (every harness reads it); an ACP agent gets them as resource links.
+		text = harness.WithAttachments(text, paths)
 	}
 	run, delivery, err := p.Orch.Say(r.Context(), id, text)
 	if err != nil {
@@ -377,4 +379,35 @@ func fsStatus(msg string) int {
 		return http.StatusBadRequest
 	}
 	return http.StatusBadGateway
+}
+
+// ReplyResponse names the run the reply went to.
+type ReplyResponse struct {
+	RunID     string `json:"run_id"`
+	RequestID string `json:"request_id"`
+}
+
+// replyRequest: JSON {run_id, option_id} for a permission, {run_id, action, content} for a
+// question; run_id is the request turn's (the run that asked). The runner answers the agent and
+// writes the resolution (role resolved in the conversation).
+func (p *Platform) replyRequest(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	var body struct {
+		acpx.Reply
+		RunID string `json:"run_id"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 128<<10)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	reply := body.Reply
+	reply.RequestID = r.PathValue("request_id")
+	run, err := p.Orch.Reply(r.Context(), r.PathValue("id"), body.RunID, reply)
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, ReplyResponse{RunID: run.ID, RequestID: reply.RequestID})
 }

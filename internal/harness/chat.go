@@ -5,6 +5,14 @@ import (
 	"strings"
 )
 
+// Roles of the turns the ACP lines become besides messages and tool calls (model.Role*): the
+// agent's requests to a person, their resolution, and the agent's commands.
+const (
+	RoleRequest  = "request"
+	RoleResolved = "resolved"
+	RoleCommands = "commands"
+)
+
 // Input modes: how the runner hands a message to the harness.
 const (
 	InputText       = "text"        // one line on stdin
@@ -35,6 +43,20 @@ func ParseMessage(line string) (role, text string) {
 	}
 	if l, ok := parseACP(t); ok {
 		switch {
+		case l.Type == ACPRequest && l.Request != nil:
+			text := l.Request.Title
+			if text == "" {
+				text = l.Request.Message
+			}
+			return RoleRequest, text
+		case l.Type == ACPResolved && l.RequestID != "":
+			return RoleResolved, l.Outcome + " (" + l.By + ")"
+		case l.Type == ACPCommands:
+			names := make([]string, 0, len(l.Commands))
+			for _, c := range l.Commands {
+				names = append(names, "/"+c.Name)
+			}
+			return RoleCommands, strings.Join(names, " ")
 		case l.Type == ACPMessage && strings.TrimSpace(l.Text) != "":
 			return "assistant", strings.TrimSpace(l.Text)
 		case l.Type == ACPToolCall && l.Title != "":

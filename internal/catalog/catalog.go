@@ -81,9 +81,13 @@ type HarnessSpec struct {
 	Input    string `yaml:"input,omitempty" json:"input,omitempty"`
 	ChatIdle *int   `yaml:"chat_idle,omitempty" json:"chat_idle,omitempty"`
 	// Permissions answers the permission requests of an "acp" harness: "allow" (the default:
-	// the sandbox, its policy and the gateway are the boundary) or "deny". Every request and
+	// the sandbox, its policy and the gateway are the boundary), "deny", or "ask": a person
+	// answers each one (and the questions the agent asks) through the API. Every request and
 	// the decision are recorded in the run's output.
 	Permissions string `yaml:"permissions,omitempty" json:"permissions,omitempty"`
+	// AskTimeout is how many seconds a request waits for a person with permissions "ask" before
+	// it is refused (a question: cancelled). 0: 900.
+	AskTimeout *int `yaml:"ask_timeout,omitempty" json:"ask_timeout,omitempty"`
 	// AuthMethod is the id of the authentication method an "acp" harness is told to use
 	// (ACP authenticate, one of the agent's advertised authMethods), e.g. codex-acp's api-key.
 	// Empty: the agent is not asked to authenticate.
@@ -273,12 +277,20 @@ func (s *Service) validate(ctx context.Context, kind, tenant string, raw json.Ra
 		}
 		switch e.Harness.Permissions {
 		case "":
-		case harness.PermissionsAllow, harness.PermissionsDeny:
+		case harness.PermissionsAllow, harness.PermissionsDeny, harness.PermissionsAsk:
 			if e.Harness.Input != harness.InputACP {
 				return nil, fmt.Errorf("%w: spec.harness.permissions applies to input %s only", ErrInvalid, harness.InputACP)
 			}
 		default:
-			return nil, fmt.Errorf("%w: spec.harness.permissions must be %s or %s", ErrInvalid, harness.PermissionsAllow, harness.PermissionsDeny)
+			return nil, fmt.Errorf("%w: spec.harness.permissions must be %s, %s or %s", ErrInvalid, harness.PermissionsAllow, harness.PermissionsDeny, harness.PermissionsAsk)
+		}
+		if t := e.Harness.AskTimeout; t != nil {
+			if e.Harness.Permissions != harness.PermissionsAsk {
+				return nil, fmt.Errorf("%w: spec.harness.ask_timeout applies to permissions %s only", ErrInvalid, harness.PermissionsAsk)
+			}
+			if *t < 0 || *t > 86400 {
+				return nil, fmt.Errorf("%w: spec.harness.ask_timeout must be 0..86400 seconds", ErrInvalid)
+			}
 		}
 		if m := e.Harness.AuthMethod; m != "" {
 			if e.Harness.Input != harness.InputACP {
@@ -561,7 +573,8 @@ func (s *Service) Resolve(ctx context.Context, tenant, agentRef string, admin bo
 			HarnessPermissions: es.Harness.Permissions, HarnessAuthMethod: es.Harness.AuthMethod,
 			HarnessMode: es.Harness.Mode, HarnessMCP: es.Harness.MCP, HarnessThoughtLevel: es.Harness.ThoughtLevel,
 			HarnessSessionMeta: sessionMetaJSON(es.Harness.SessionMeta), HarnessInstructions: es.Harness.Instructions,
-			Model: es.Model.Name, Instructions: as.Instructions, Env: envVars, HarnessFiles: es.Harness.Files,
+			HarnessAskTimeout: intOf(es.Harness.AskTimeout),
+			Model:             es.Model.Name, Instructions: as.Instructions, Env: envVars, HarnessFiles: es.Harness.Files,
 			CPURequest: es.Resources.CPURequest, CPULimit: es.Resources.CPULimit,
 			MemoryRequest: es.Resources.MemoryRequest, MemoryLimit: es.Resources.MemoryLimit,
 			VolumeSize: es.Resources.VolumeSize, RuntimeClass: es.RuntimeClass,

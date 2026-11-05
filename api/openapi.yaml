@@ -379,6 +379,37 @@ paths:
       responses:
         "200": { description: The run being closed, content: { application/json: { schema: { $ref: "#/components/schemas/Run" } } } }
         "409": { description: "No run in progress", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/sandboxes/{id}/requests/{request_id}:
+    parameters: [{ $ref: "#/components/parameters/id" }, { name: request_id, in: path, required: true, schema: { type: string, pattern: "^req_[0-9a-f]{16}$" } }]
+    post:
+      tags: [conversation]
+      summary: Answer what the agent asks
+      description: |
+        With `harness.permissions: ask` an ACP agent's permission requests and questions wait for a
+        person. Each appears in the conversation as a `request` turn whose `data` is the runner's
+        `acp.request` line (`request.kind`: `permission` with `options`, `form` with its JSON
+        `schema`, `url` with the link to open). The answer is `option_id` for a permission, `action`
+        (`accept` with `content` for a form, `accept` once the link is done, `decline`, `cancel`)
+        for a question. The runner checks it against the request and answers the agent; the
+        resolution follows as a `resolved` turn (`by`: user, timeout, invalid; `not_waiting` for a
+        request answered or expired already). Unanswered within `harness.ask_timeout`, a request is
+        refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id]
+              properties:
+                run_id: { type: string, description: "The run that asked (the request turn's run_id): an answer never goes to another run" }
+                option_id: { type: string, description: "A permission: the option chosen" }
+                action: { type: string, enum: [accept, decline, cancel], description: "A question" }
+                content: { type: object, additionalProperties: true, description: "An accepted form: its fields" }
+      responses:
+        "202": { description: "Handed to the run that waits", content: { application/json: { schema: { type: object, properties: { run_id: { type: string }, request_id: { type: string } } } } } }
+        "400": { description: "Not an answer (no option_id or action, both, an unknown action)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "The run that asked has ended, or the sandbox's harness is not ACP", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/sandboxes/{id}/runs/{run}/close:
     parameters: [{ $ref: "#/components/parameters/id" }, { name: run, in: path, required: true, schema: { type: string } }]
     post:
@@ -1885,7 +1916,8 @@ components:
         resume_prompt: { type: string }
         harness_input: { type: string, enum: [text, stream-json, acp], description: "How the runner hands messages to the harness (the profile's harness.input); exported as HARNESS_INPUT" }
         chat_idle: { type: integer, description: "stream-json and acp: seconds without a message after a turn before the conversation is closed (0 = 600); exported as HARNESS_CHAT_IDLE" }
-        harness_permissions: { type: string, enum: [allow, deny], description: "acp: how the agent's permission requests are answered (absent = allow); exported as HARNESS_PERMISSIONS" }
+        harness_permissions: { type: string, enum: [allow, deny, ask], description: "acp: how the agent's permission requests are answered (absent = allow; ask: a person); exported as HARNESS_PERMISSIONS" }
+        harness_ask_timeout: { type: integer, description: "acp, permissions ask: seconds a request waits for a person (0 = 900); exported as HARNESS_ASK_TIMEOUT" }
         harness_auth_method: { type: string, description: "acp: the authentication method the agent is told to use; exported as HARNESS_AUTH_METHOD" }
         harness_mode: { type: string, description: "acp: the session mode the agent is put in after its session opens; exported as HARNESS_MODE" }
         harness_mcp: { type: string, enum: [auto, always], description: "acp: when the agent gets the MCP servers (absent = auto); exported as HARNESS_MCP" }
@@ -2138,7 +2170,8 @@ components:
             resume_command: { type: string, description: "Continues a session: $SANDBOX_SESSION, the message (or the rollout prompt) in $SANDBOX_RESUME_PROMPT" }
             resume_prompt: { type: string, description: "What a rollout resume tells the harness (default: continue the task)" }
             input: { type: string, enum: [text, stream-json, acp], description: "How messages reach the harness: a line on stdin, Claude Code's streaming JSON input (keeps the conversation open), or the Agent Client Protocol (the command is an ACP agent; every message is a prompt of the same session)" }
-            permissions: { type: string, enum: [allow, deny], description: "input acp only: how the runner answers the agent's permission requests (default allow); every request and decision is recorded in the run's output" }
+            permissions: { type: string, enum: [allow, deny, ask], description: "input acp only: how the agent's permission requests are answered: allow (default), deny, or ask (a person, through POST /v1/sandboxes/{id}/requests/{request_id}; the agent may then also ask questions: forms, sign-in links); every request and decision is recorded in the run's output" }
+            ask_timeout: { type: integer, minimum: 0, maximum: 86400, description: "permissions ask only: seconds a request waits for a person before it is refused (0 = 900)" }
             auth_method: { type: string, pattern: "^[A-Za-z0-9._:-]{1,64}$", description: "input acp only: the id of the authentication method the runner asks the agent to use (ACP authenticate; one of the agent's authMethods, e.g. codex-acp's api-key)" }
             mode: { type: string, pattern: "^[A-Za-z0-9._:-]{1,64}$", description: "input acp only: the session mode the runner puts the agent in after the session opens (ACP session/set_mode, or the agent's config option of category mode), e.g. codex-acp's agent-full-access or OpenCode's build; an id the agent does not offer is reported in the run's output" }
             thought_level: { type: string, pattern: "^[A-Za-z0-9._:-]{1,64}$", description: "input acp only: the reasoning level the runner selects through the agent's config option of category thought_level (codex-acp reasoning_effort, OpenCode effort, Hermes reasoning_effort); a level the agent does not offer is reported" }
@@ -2339,9 +2372,10 @@ components:
       properties:
         id: { type: integer, format: int64, description: "The event it came from (resume with ?after=)" }
         run_id: { type: string }
-        role: { type: string, enum: [user, assistant, tool, system, log] }
+        role: { type: string, enum: [user, assistant, tool, system, request, resolved, commands, log], description: "request: the agent asks the person something (answer: POST /requests/{request_id}); resolved: how a request was answered; commands: the slash commands the agent offers now" }
         text: { type: string }
         at: { type: string, format: date-time }
+        data: { type: object, additionalProperties: true, description: "request, resolved, commands: the runner's line (acp.request with request {request_id, kind, title, message, options[], schema, url} and diffs[]; acp.request_resolved {request_id, outcome, by}; acp.commands {commands[{name, description, hint}]}), docs/chat-and-files.md" }
     FSEntry:
       type: object
       properties:

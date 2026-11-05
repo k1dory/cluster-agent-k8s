@@ -11,6 +11,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/k1dory/acpx"
 	"io"
 	"net/http"
 	"net/url"
@@ -26,6 +27,7 @@ import (
 	"agent-sandbox/internal/apply"
 	"agent-sandbox/internal/catalog"
 	"agent-sandbox/internal/drift"
+	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/plan"
 	"agent-sandbox/internal/resource"
@@ -1779,16 +1781,30 @@ func printMessage(m model.Message) {
 		fmt.Printf("%s   ⚙ %s\n", at, m.Text)
 	case model.RoleLog:
 		fmt.Printf("%s   | %s\n", at, m.Text)
+	case model.RoleRequest:
+		var l harness.ACPLine
+		if json.Unmarshal(m.Data, &l) == nil && l.Request != nil {
+			fmt.Printf("%s %s\n", at, renderRequest(*l.Request))
+			return
+		}
+		fmt.Printf("%s ? %s\n", at, m.Text)
+	case model.RoleResolved:
+		fmt.Printf("%s   ✓ answered: %s\n", at, m.Text)
+	case model.RoleCommands:
+		fmt.Printf("%s   agent commands: %s\n", at, m.Text)
 	default:
 		fmt.Printf("%s [%s]\n", at, m.Text)
 	}
 }
 
 // chat replays the conversation, follows it live and sends what you type. Lines starting
-// with / are commands: /attach <file>, /files [path], /close, /quit.
+// with / are commands: /attach <file>, /files [path], /reply, /decline, /cancel (answer what
+// the agent asks), /help (also the agent's own commands), /close, /quit; @path attaches a
+// workspace file to the message.
 func (c *cli) chat(id string, raw bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	state := newChatState()
 	var after int64
 	for {
 		var msgs []model.Message
@@ -1800,6 +1816,7 @@ func (c *cli) chat(id string, raw bool) error {
 		_ = json.NewDecoder(resp.Body).Decode(&msgs)
 		resp.Body.Close()
 		for _, m := range msgs {
+			state.observe(m)
 			printMessage(m)
 		}
 		if next <= after {
@@ -1807,8 +1824,8 @@ func (c *cli) chat(id string, raw bool) error {
 		}
 		after = next
 	}
-	fmt.Println("— type a message and press Enter; /attach <file>, /files [path], /close, /quit —")
-	go c.followMessages(ctx, id, after, raw)
+	fmt.Println("— type a message and press Enter; @path attaches a workspace file; / or /help lists commands —")
+	go c.followMessages(ctx, id, after, raw, state)
 	sc := bufio.NewScanner(os.Stdin)
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
 	for ctx.Err() == nil && sc.Scan() {
@@ -1820,6 +1837,28 @@ func (c *cli) chat(id string, raw bool) error {
 		switch cmd, arg, _ := strings.Cut(line, " "); cmd {
 		case "/quit", "/exit":
 			return nil
+		case "/", "/help":
+			fmt.Print(state.help())
+		case "/reply", "/decline", "/cancel":
+			rid, args := replyArgs(arg)
+			var req openRequest
+			if req, err = state.request(rid); err != nil {
+				break
+			}
+			var reply acpx.Reply
+			switch cmd {
+			case "/decline":
+				reply = acpx.Reply{Action: acpx.ActionDecline}
+			case "/cancel":
+				reply = acpx.Reply{Action: acpx.ActionCancel}
+			default:
+				reply, err = buildReply(req.Request, args)
+			}
+			if err == nil {
+				// The answer goes to the run that asked.
+				body := map[string]any{"run_id": req.RunID, "option_id": reply.OptionID, "action": reply.Action, "content": reply.Content}
+				err = c.do("POST", "/v1/sandboxes/"+id+"/requests/"+req.ID, body, nil)
+			}
 		case "/close":
 			err = c.do("POST", "/v1/sandboxes/"+id+"/messages/close", nil, nil)
 		case "/files":
@@ -1845,7 +1884,11 @@ func (c *cli) chat(id string, raw bool) error {
 				}
 			}
 		default:
-			err = c.do("POST", "/v1/sandboxes/"+id+"/messages", map[string]any{"text": line}, nil)
+			body := map[string]any{"text": line}
+			if files := mentions(line); len(files) > 0 {
+				body["attachments"] = files
+			}
+			err = c.do("POST", "/v1/sandboxes/"+id+"/messages", body, nil)
 		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "chat:", err)
@@ -1855,7 +1898,7 @@ func (c *cli) chat(id string, raw bool) error {
 }
 
 // followMessages prints the conversation as it grows (SSE, reconnecting with Last-Event-ID).
-func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bool) {
+func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bool, state *chatState) {
 	for ctx.Err() == nil {
 		req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/sandboxes/%s/messages/stream?raw=%v", c.base, id, raw), nil)
 		req.Header.Set("Authorization", "Bearer "+c.token)
@@ -1888,6 +1931,7 @@ func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bo
 				continue
 			}
 			after = m.ID
+			state.observe(m)
 			if m.Role != model.RoleUser { // what you typed is already on your screen
 				printMessage(m)
 			}
