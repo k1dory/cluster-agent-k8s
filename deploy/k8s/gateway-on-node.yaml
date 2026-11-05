@@ -326,7 +326,7 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: agent-sandbox-0.1.0
       annotations:
-        checksum/config: 3eade43a6d069a239cc9096d2f3d93975d5f8b6319c1852e470b899f77478e80
+        checksum/config: d8560b7dda77b5b4f4b6d2df8cc661947f7543d1d7d84481e19f90a7d78101ba
     spec:
       serviceAccountName: agent-sandbox-sandboxd
       hostNetwork: true
