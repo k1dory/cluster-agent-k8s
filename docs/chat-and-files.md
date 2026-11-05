@@ -183,13 +183,18 @@ calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
   `_meta` of every session request: claude-agent-acp takes `claudeCode.options` from it
   (`maxTurns`, `maxBudgetUsd` — the turn ends with `budget_exhausted` —, `promptSuggestions`,
   `fallbackModel`, `effort`). It is configuration: no secret goes there.
-- **Deadlines.** Each call that opens the session (`initialize`, `session/resume`,
-  `session/load`, `session/new` and the settings after them) has `HARNESS_ACP_SETUP_TIMEOUT`
-  seconds to answer (default 300; `authenticate` gets `ask_timeout` when that is longer and
-  `permissions` is `ask`). A load that runs out of time falls back to a new session; any other
-  call ends the run with a notice. One prompt may run for `HARNESS_TURN_TIMEOUT` seconds (default
-  7200); past it the turn is cancelled, and so is the run, with a notice. Both are set in the
-  profile's `env`.
+- **Deadlines.** Each call that opens the session (`initialize`, `authenticate`,
+  `session/resume`, `session/load`, `session/new`, and each of the settings after them) has
+  `HARNESS_ACP_SETUP_TIMEOUT` seconds of its own to answer (default 300; `authenticate` gets
+  `ask_timeout` when that is longer and `permissions` is `ask`). What runs out of time is what
+  fails otherwise: a resume or a load that does not answer falls back (to a load, then to a new
+  session), a setting that does not answer is reported and the agent keeps its own, and
+  `initialize`, `authenticate` or `session/new` end the run (exit 1) with a notice. One prompt
+  may run for `HARNESS_TURN_TIMEOUT` seconds (default 7200); past it the runner cancels the
+  turn (`session/cancel`) and ends the run with exit 1 and a notice: the run is `failed`, not
+  `cancelled` (that is a person's `/cancel`). A call still stuck 5 seconds after its deadline
+  (an agent that stopped reading its input) has the agent's process group killed under it. Both
+  are set in the profile's `env`.
 - **Permissions.** `session/request_permission` is answered by `permissions`: the agent's
   `allow_once` (else `allow_always`) option, or with `deny` its `reject_once` (else
   `reject_always`). The sandbox, its policy and the gateway stay the boundary either way. Every

@@ -103,8 +103,9 @@ DNS the moment the address moves to it.
 - **Upgrade.** `helm upgrade` with the new tags. The Deployment's strategy is Recreate: the
   control plane is away for the seconds the new pods take to be ready (agents keep running;
   their identities and the gateway configuration do not depend on the control plane being up;
-  a run's `/finish` is retried until acknowledged). Migrations run at start, are idempotent and
-  are safe to run from several replicas. Nothing on the gateway nodes' disks matters with
+  a run's `/finish` is retried until acknowledged, and the runner takes no other run before;
+  its output waits in a bounded spool in the pod and is retried as well). Migrations run at
+  start, are idempotent and are safe to run from several replicas. Nothing on the gateway nodes' disks matters with
   `ca.source: db`.
 - **Backup.** With `ca.source: db` the database holds everything the control plane needs:
   catalogue, sandboxes, runs, keys, applies, the agent CA and the gateway root. `pg_dump` is the
