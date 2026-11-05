@@ -40,6 +40,10 @@ spec:
         # replaces with the tenant's access token; it adds ChatGPT-Account-ID itself.
         env_key = "CODEX_GATEWAY_PLACEHOLDER"
 
+        # The conversation lives in Codex's session (resume); no second copy of every prompt.
+        [history]
+        persistence = "none"
+
         [analytics]
         enabled = false
 

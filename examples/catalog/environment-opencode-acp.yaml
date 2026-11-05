@@ -3,6 +3,16 @@
 # conversation is one OpenCode session (the next run loads it), the sandbox's MCP connections
 # reach it in session/new, file edits come with their diffs. docs/chat-and-files.md, "ACP harnesses".
 #
+# Instructions: harness.instructions `file` writes the agent definition's instructions to
+# ~/.sandbox/instructions.md, which OpenCode's `instructions` names: they are part of its system
+# prompt (OpenCode takes no ACP system prompt). The repository's AGENTS.md is named there too.
+#
+# The repository is code to work on, not configuration: OPENCODE_DISABLE_PROJECT_CONFIG keeps its
+# opencode.json, .opencode/ (agents, plugins, commands) and instruction files out, `--pure` runs
+# without external plugins. Note: `opencode acp` serves its own API on the pod's loopback, without
+# a password, and the agent's shell runs as the same user: a `deny` profile is not a boundary
+# against the agent itself (the pod and the gateway are).
+#
 # The configuration is OPENCODE_CONFIG_CONTENT and the permission rules OPENCODE_PERMISSION:
 # both take precedence over an opencode.json in the repository, which as a harness file would not
 # (a repository could otherwise point the provider past the bridge or allow what the profile
@@ -25,10 +35,11 @@ description: OpenCode over ACP, the API key held by the gateway
 spec:
   image: stable
   harness:
-    command: opencode acp
+    command: opencode acp --pure
     input: acp
     permissions: allow
     mode: build
+    instructions: file
   model:
     name: claude-sonnet-5-5
   env:
@@ -39,6 +50,7 @@ spec:
         "model": "anthropic/claude-sonnet-5-5",
         "autoupdate": false,
         "share": "disabled",
+        "instructions": ["~/.sandbox/instructions.md", "AGENTS.md"],
         "provider": {
           "anthropic": { "options": { "baseURL": "http://127.0.0.1:4480/https/api.anthropic.com/v1" } }
         }
@@ -48,3 +60,4 @@ spec:
     OPENCODE_DISABLE_MODELS_FETCH: "1"
     OPENCODE_DISABLE_LSP_DOWNLOAD: "1"
     OPENCODE_DISABLE_CLAUDE_CODE: "1"
+    OPENCODE_DISABLE_PROJECT_CONFIG: "1"

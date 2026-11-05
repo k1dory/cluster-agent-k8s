@@ -43,6 +43,10 @@ spec:
         env_key = "OPENAI_API_KEY"
         wire_api = "responses"
 
+        # The conversation lives in Codex's session (resume); no second copy of every prompt.
+        [history]
+        persistence = "none"
+
         [analytics]
         enabled = false
 

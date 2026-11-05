@@ -32,7 +32,7 @@ func TestACPProfileValidationAndLaunch(t *testing.T) {
 		`{"image":"stable","harness":{"thought_level":"high"}}`,
 		`{"image":"stable","harness":{"command":"codex-acp","input":"acp","thought_level":"very high"}}`,
 		`{"image":"stable","harness":{"session_meta":{"a":1}}}`,
-		`{"image":"stable","harness":{"command":"x","input":"acp","session_meta":{"pad":"`+strings.Repeat("x", 17<<10)+`"}}}`,
+		`{"image":"stable","harness":{"command":"x","input":"acp","session_meta":{"pad":"` + strings.Repeat("x", 17<<10) + `"}}}`,
 		`{"image":"stable","harness":{"instructions":"file"}}`,
 		`{"image":"stable","harness":{"command":"x","input":"acp","instructions":"prompt"}}`,
 		`{"image":"stable","harness":{"command":"x","input":"acp","instructions":"env:SANDBOX_INSTRUCTIONS"}}`,

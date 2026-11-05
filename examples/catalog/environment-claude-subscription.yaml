@@ -22,6 +22,13 @@ spec:
     input: acp
     permissions: allow
     mode: default
+    # claude-agent-acp's session options (_meta.claudeCode.options of every session request):
+    # no predicted next prompt after each turn (a generation nobody reads). maxTurns and
+    # maxBudgetUsd (USD, the turn ends with budget_exhausted) are per deployment.
+    session_meta:
+      claudeCode:
+        options:
+          promptSuggestions: false
   model:
     name: claude-opus-5-5
     env:

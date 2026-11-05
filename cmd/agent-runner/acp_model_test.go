@@ -114,6 +114,14 @@ func modelCallThroughGateway(t *testing.T, example, name, bin string, host strin
 	t.Setenv("HARNESS_MODE", profile.Harness.Mode)
 	t.Setenv("HARNESS_MCP", profile.Harness.MCP)
 	t.Setenv("SANDBOX_MODEL", profile.Model.Name)
+	t.Setenv("HARNESS_THOUGHT_LEVEL", profile.Harness.ThoughtLevel)
+	t.Setenv("HARNESS_INSTRUCTIONS", profile.Harness.Instructions)
+	if len(profile.Harness.SessionMeta) > 0 {
+		meta, _ := json.Marshal(profile.Harness.SessionMeta)
+		t.Setenv("HARNESS_SESSION_META", string(meta))
+	} else {
+		t.Setenv("HARNESS_SESSION_META", "")
+	}
 	quoted := make([]string, len(isolate))
 	for i, a := range isolate {
 		quoted[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
