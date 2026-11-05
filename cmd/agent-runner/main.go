@@ -119,23 +119,28 @@ func main() {
 			continue
 		}
 		exit := execute(ctx, c, &run)
-		c.finish(run.ID, exit)
+		c.finish(ctx, run.ID, exit)
 	}
 }
 
+// finishBudget is how long finish insists on an acknowledgement.
+var finishBudget = 10 * time.Minute
+
 // finish reports the result and insists on an acknowledgement: the control plane's /finish is
-// idempotent, so a lost response is retried (with backoff, for several minutes) rather than
-// leaving the run `running` forever. 4xx means the run is gone or not ours: stop.
-func (c *client) finish(runID string, exit int) {
+// idempotent, so a lost response is retried (capped exponential backoff with jitter) for
+// finishBudget rather than leaving the run `running`. 4xx means the run is gone or not ours:
+// stop. After SIGTERM (ctx) it goes on for shutdownGrace only: the pod is going away, and the
+// reconciler fails a run whose pod is gone.
+func (c *client) finish(ctx context.Context, runID string, exit int) {
 	body, _ := json.Marshal(map[string]int{"exit_code": exit})
-	// There is nothing else to do until the result is delivered: retry until it is, or until the
-	// control plane says the run is not ours any more (4xx). The pod has no other work queued
-	// before this run is settled, and the reconciler fails the run if the pod itself dies.
+	dctx, done := deliveryCtx(ctx, finishBudget)
+	defer done()
 	for attempt := 0; ; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(min(1<<min(attempt, 6), 60)) * time.Second)
+		if attempt > 0 && !sleepCtx(dctx, backoff(attempt, time.Second, time.Minute)) {
+			fmt.Fprintf(os.Stderr, "agent-runner: finish of run %s not acknowledged, giving up: %v\n", runID, dctx.Err())
+			return
 		}
-		code, err := c.do(context.Background(), http.MethodPost, "/agent/runs/"+runID+"/finish", body, nil)
+		code, err := c.do(dctx, http.MethodPost, "/agent/runs/"+runID+"/finish", body, nil)
 		if err == nil {
 			return
 		}

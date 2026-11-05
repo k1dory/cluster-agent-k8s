@@ -31,7 +31,7 @@ func TestReviewFinishRetriesTransientFailure(t *testing.T) {
 	}))
 	defer server.Close()
 	c := &client{base: server.URL, http: server.Client()}
-	c.finish("run-review", 7)
+	c.finish(t.Context(), "run-review", 7)
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("finish calls=%d, want two with the same outcome", got)
 	}
@@ -44,7 +44,7 @@ func TestReviewFinishStopsForRetiredRun(t *testing.T) {
 		http.Error(w, "retired", http.StatusForbidden)
 	}))
 	defer server.Close()
-	(&client{base: server.URL, http: server.Client()}).finish("run-review", 0)
+	(&client{base: server.URL, http: server.Client()}).finish(t.Context(), "run-review", 0)
 	if calls.Load() != 1 {
 		t.Fatalf("a terminal authorization error was retried %d times", calls.Load())
 	}
@@ -139,5 +139,36 @@ func TestEveryClaudeCommandLoadsTheMCPConfig(t *testing.T) {
 		if got := withMCPConfig(cmd); got != cmd {
 			t.Errorf("%q must be left alone, got %q", cmd, got)
 		}
+	}
+}
+
+// finish insists for a bounded budget, not forever: a control plane that never answers lets the
+// runner go on (the reconciler settles the run), and after SIGTERM only the shutdown grace is
+// spent on it.
+func TestReviewFinishIsBoundedAndStopsAfterSIGTERM(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	c := &client{base: server.URL, http: server.Client()}
+	oldBudget, oldGrace := finishBudget, shutdownGrace
+	defer func() { finishBudget, shutdownGrace = oldBudget, oldGrace }()
+
+	finishBudget, shutdownGrace = 1500*time.Millisecond, time.Hour
+	start := time.Now()
+	c.finish(t.Context(), "run-down", 1)
+	if d := time.Since(start); d > 5*time.Second || calls.Load() < 2 {
+		t.Fatalf("budget: returned after %s with %d attempts", d, calls.Load())
+	}
+
+	finishBudget, shutdownGrace = time.Hour, 300*time.Millisecond
+	ctx, sigterm := context.WithCancel(t.Context())
+	sigterm()
+	start = time.Now()
+	c.finish(ctx, "run-down", 1)
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("after SIGTERM finish went on for %s", d)
 	}
 }
