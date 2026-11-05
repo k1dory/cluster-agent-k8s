@@ -182,6 +182,13 @@ calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
   `_meta` of every session request: claude-agent-acp takes `claudeCode.options` from it
   (`maxTurns`, `maxBudgetUsd` — the turn ends with `budget_exhausted` —, `promptSuggestions`,
   `fallbackModel`, `effort`). It is configuration: no secret goes there.
+- **Deadlines.** Each call that opens the session (`initialize`, `session/resume`,
+  `session/load`, `session/new` and the settings after them) has `HARNESS_ACP_SETUP_TIMEOUT`
+  seconds to answer (default 300; `authenticate` gets `ask_timeout` when that is longer and
+  `permissions` is `ask`). A load that runs out of time falls back to a new session; any other
+  call ends the run with a notice. One prompt may run for `HARNESS_TURN_TIMEOUT` seconds (default
+  7200); past it the turn is cancelled, and so is the run, with a notice. Both are set in the
+  profile's `env`.
 - **Permissions.** `session/request_permission` is answered by `permissions`: the agent's
   `allow_once` (else `allow_always`) option, or with `deny` its `reject_once` (else
   `reject_always`). The sandbox, its policy and the gateway stay the boundary either way. Every

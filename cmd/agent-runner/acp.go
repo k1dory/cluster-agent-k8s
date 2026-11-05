@@ -127,11 +127,29 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 }
 
 // askTimeout is how long a request waits for a person (HARNESS_ASK_TIMEOUT seconds; 0 or unset: 15 minutes).
-func askTimeout(v string) time.Duration {
+func askTimeout(v string) time.Duration { return secondsOr(v, 15*time.Minute) }
+
+// acpSetupTimeout bounds each call that opens the session: initialize, session/resume,
+// session/load, session/new and the settings after them (HARNESS_ACP_SETUP_TIMEOUT seconds; 0
+// or unset: 5 minutes). An agent that never answers one would hold the run, and the pod, with no
+// turn ever started: the conversation's idle clock only runs after a turn.
+func acpSetupTimeout() time.Duration {
+	return secondsOr(os.Getenv("HARNESS_ACP_SETUP_TIMEOUT"), 5*time.Minute)
+}
+
+// acpTurnTimeout is the longest one prompt may run (HARNESS_TURN_TIMEOUT seconds; 0 or unset: 2
+// hours). A turn past it is cancelled and so is the run: an agent stuck in a turn (a hung tool, a
+// loop) otherwise holds the pod until someone cancels by hand.
+func acpTurnTimeout() time.Duration {
+	return secondsOr(os.Getenv("HARNESS_TURN_TIMEOUT"), 2*time.Hour)
+}
+
+// secondsOr reads a positive number of seconds; anything else is def.
+func secondsOr(v string, def time.Duration) time.Duration {
 	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
 		return time.Duration(n) * time.Second
 	}
-	return 15 * time.Minute
+	return def
 }
 
 // signalGroup sends sig to the process group the command leads.
@@ -231,15 +249,28 @@ type acpOpened struct {
 // prompted here: a failure has been reported through emit when ok is false.
 func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, emit func(string)) (s acpOpened, ok bool) {
 	notice := noticeFunc(emit)
-	init, err := conn.Initialize(ctx, acp.InitializeRequest{
+	// Every call has its own deadline (a load that timed out still leaves session/new its own).
+	setup := acpSetupTimeout()
+	call := func(d time.Duration) (context.Context, context.CancelFunc) { return context.WithTimeout(ctx, d) }
+	// failed reports a call that failed; one that ran out of time says which limit it met.
+	failed := func(op string, cctx context.Context, err error) {
+		if errors.Is(cctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			notice("acp %s: no answer within %s (HARNESS_ACP_SETUP_TIMEOUT)", op, setup)
+			return
+		}
+		notice("acp %s: %v", op, err)
+	}
+	ictx, done := call(setup)
+	init, err := conn.Initialize(ictx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		// The agent works in its own pod with its own tools: the runner offers no file system
 		// or terminal of its own. With permissions ask a person is there: the agent may ask them
 		// questions (a form, a sign-in link).
 		ClientCapabilities: clientCapabilities(cl.permissions),
 	})
+	done()
 	if err != nil {
-		notice("acp initialize: %v", err)
+		failed("initialize", ictx, err)
 		return s, false
 	}
 	if init.AgentInfo != nil {
@@ -259,18 +290,26 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 			notice("acp authenticate: the connection cannot authenticate")
 			return s, false
 		}
-		if _, err := auth.Authenticate(ctx, acp.AuthenticateRequest{MethodId: method}); err != nil {
-			notice("acp authenticate %s: %v", method, err)
+		// Signing in may wait for a person (a link to open): the ask timeout, when longer.
+		d := setup
+		if cl.permissions == harness.PermissionsAsk {
+			d = max(d, cl.askTimeout)
+		}
+		actx, done := call(d)
+		_, err := auth.Authenticate(actx, acp.AuthenticateRequest{MethodId: method})
+		done()
+		if err != nil {
+			failed("authenticate "+method, actx, err)
 			return s, false
 		}
 	}
-	authNeeded := func(op string, err error) {
+	authNeeded := func(op string, cctx context.Context, err error) {
 		var re *acp.RequestError
 		if errors.As(err, &re) && re.Code == acp.NewAuthRequired(nil).Code {
 			notice("acp %s: the agent requires authentication: set spec.harness.auth_method to one of %v", op, authMethodIDs(init.AuthMethods))
 			return
 		}
-		notice("acp %s: %v", op, err)
+		failed(op, cctx, err)
 	}
 	cwd := os.Getenv("PWD")
 	if _, err := os.Stat(filepath.Join(repoDir(), ".git")); err == nil {
@@ -315,22 +354,26 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 		resumer, canResume := conn.(acpResumer)
 		if caps.SessionCapabilities.Resume != nil && canResume {
 			// session/resume continues without replaying the history.
-			r, err := resumer.ResumeSession(ctx, acp.ResumeSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
+			rctx, done := call(setup)
+			r, err := resumer.ResumeSession(rctx, acp.ResumeSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
+			done()
 			if err == nil {
 				s.id, st = prev, acpSessionState{Modes: r.Modes, Options: r.ConfigOptions}
 			} else {
-				authNeeded("session/resume "+run.Session, err)
+				authNeeded("session/resume "+run.Session, rctx, err)
 			}
 		}
 		if s.id == "" && caps.LoadSession {
 			// session/load replays the conversation as updates: the transcript already has it.
 			cl.setReplaying(true)
-			r, err := conn.LoadSession(ctx, acp.LoadSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
+			lctx, done := call(setup)
+			r, err := conn.LoadSession(lctx, acp.LoadSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
+			done()
 			cl.setReplaying(false)
 			if err == nil {
 				s.id, st = prev, acpSessionState{Modes: r.Modes, Options: r.ConfigOptions}
 			} else {
-				authNeeded("session/load "+run.Session, err)
+				authNeeded("session/load "+run.Session, lctx, err)
 			}
 		}
 		switch {
@@ -342,14 +385,18 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 		}
 	}
 	if s.id == "" {
-		ns, err := conn.NewSession(ctx, acp.NewSessionRequest{Meta: meta, Cwd: cwd, McpServers: servers})
+		nctx, done := call(setup)
+		ns, err := conn.NewSession(nctx, acp.NewSessionRequest{Meta: meta, Cwd: cwd, McpServers: servers})
+		done()
 		if err != nil {
-			authNeeded("session/new", err)
+			authNeeded("session/new", nctx, err)
 			return s, false
 		}
 		s.id, s.fresh, st = ns.SessionId, true, acpSessionState{Modes: ns.Modes, Options: ns.ConfigOptions}
 	}
-	configureACPSession(ctx, conn, s.id, st, acpSettings{mode: os.Getenv("HARNESS_MODE"), model: os.Getenv("SANDBOX_MODEL"),
+	cctx, done := call(setup)
+	defer done()
+	configureACPSession(cctx, conn, s.id, st, acpSettings{mode: os.Getenv("HARNESS_MODE"), model: os.Getenv("SANDBOX_MODEL"),
 		thoughtLevel: os.Getenv("HARNESS_THOUGHT_LEVEL")}, notice)
 	return s, true
 }
@@ -412,13 +459,20 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 		instructions = "" // the session's system prompt has them
 	}
 	prompt := firstPrompt(run, sess.fresh, instructions, os.Getenv("SANDBOX_RESUME_PROMPT"), cl.isCommand)
+	turnTimeout := acpTurnTimeout()
 	for {
 		inputs.setTurn(true)
-		resp, err := promptACP(ctx, conn, cl, sessionID, prompt, notice)
+		turnCtx, endTurn := context.WithTimeout(ctx, turnTimeout)
+		resp, err := promptACP(turnCtx, conn, cl, sessionID, prompt, notice)
+		overran := errors.Is(turnCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+		endTurn()
 		inputs.setTurn(false)
 		cl.flush()
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || overran {
+				if overran {
+					notice("the turn ran longer than %s (HARNESS_TURN_TIMEOUT): the run is cancelled", turnTimeout)
+				}
 				// Cancelled: tell the agent, which ends the turn it is in.
 				cctx, done := context.WithTimeout(context.Background(), 2*time.Second)
 				_ = conn.Cancel(cctx, acp.CancelNotification{SessionId: sessionID})
