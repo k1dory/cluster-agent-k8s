@@ -115,3 +115,77 @@ func TestReviewStopAndStartSurviveClientHangUp(t *testing.T) {
 		t.Fatalf("wake with the client gone: %v %+v", err, got)
 	}
 }
+
+// createHookRuntime runs during, once, inside CreatePod before the pod exists: another request
+// acting on the sandbox while the cluster call is in flight (it finds no pod to delete).
+type createHookRuntime struct {
+	*FakeRuntime
+	during func()
+}
+
+func (r *createHookRuntime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, error) {
+	if h := r.during; h != nil {
+		r.during = nil
+		h()
+	}
+	// The volume went with the delete; the cluster call that was already under way still lands.
+	_ = r.FakeRuntime.EnsureVolume(ctx, sb)
+	return r.FakeRuntime.CreatePod(ctx, sb)
+}
+
+// A Delete that ran while a wake was creating the pod found no pod, removed the volume and the
+// record, and the pod created right after ran on with no record behind it. Now the wake sees
+// the record gone when it records its pod and removes the pod.
+func TestReviewDeleteDuringWakeLeavesNoPod(t *testing.T) {
+	o, fake, sb := reviewRunningSandbox(t)
+	ctx := context.Background()
+	if _, err := o.Sleep(ctx, sb.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := fake.PodStatus(ctx, sb); err == nil {
+		t.Fatal("pod alive after sleep")
+	}
+	var delErr error
+	o.Runtime = &createHookRuntime{FakeRuntime: fake.FakeRuntime, during: func() { delErr = o.Delete(ctx, sb.ID) }}
+	if _, err := o.Wake(ctx, sb.ID); err == nil {
+		t.Fatal("wake of a sandbox deleted meanwhile reported success")
+	}
+	if delErr != nil {
+		t.Fatalf("delete during wake: %v", delErr)
+	}
+	if _, err := o.Store.GetSandbox(ctx, sb.ID); err == nil {
+		t.Fatal("record survived the delete")
+	}
+	if _, _, err := fake.PodStatus(ctx, sb); err == nil {
+		t.Fatal("orphan pod left running after wake raced delete")
+	}
+}
+
+// Delete takes the tenant lock: it cannot interleave with a wake's quota check and status move.
+func TestReviewDeleteWaitsForTenantLock(t *testing.T) {
+	o, _, sb := reviewRunningSandbox(t)
+	ctx := context.Background()
+	held, release := make(chan struct{}), make(chan struct{})
+	go func() {
+		_ = o.Store.WithTenantLock(ctx, sb.Tenant, func(context.Context) error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	done := make(chan error, 1)
+	go func() { done <- o.Delete(ctx, sb.ID) }()
+	select {
+	case err := <-done:
+		t.Fatalf("delete ran while the tenant lock was held: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got, _ := o.Store.GetSandbox(ctx, sb.ID); got == nil || got.Status != model.StatusRunning {
+		t.Fatalf("sandbox moved while the lock was held: %+v", got)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

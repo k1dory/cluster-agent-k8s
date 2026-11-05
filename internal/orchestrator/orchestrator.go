@@ -446,10 +446,25 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 		o.fail(ctx, id, "pod: "+err.Error())
 		return nil, fmt.Errorf("%w: pod: %v", ErrRuntime, err)
 	}
+	// The lock was released before CreatePod: a Delete or a stop may have run meanwhile and found
+	// no pod to remove. The pod is recorded only while the sandbox is still waking; otherwise it
+	// belongs to nobody and is removed here, or it would run on with no record behind it.
+	created := *sb
+	created.PodName = pod
 	sb, err = o.mutate(ctx, id, func(s *model.Sandbox) error {
+		if s.Status != model.StatusWaking {
+			return fmt.Errorf("%w: sandbox is %s", ErrConflict, s.Status)
+		}
 		s.PodName = pod
 		return nil
 	})
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, ErrConflict) {
+		o.Log.Warn("sandbox changed while its pod was created, removing the pod", "id", id, "pod", pod, "err", err)
+		if derr := o.Runtime.DeletePod(ctx, &created); derr != nil {
+			o.Log.Error("remove orphan pod", "id", id, "pod", pod, "err", derr)
+		}
+		return nil, fmt.Errorf("%w: sandbox changed while its pod was being created", ErrConflict)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -758,14 +773,9 @@ func (o *Orchestrator) Wake(ctx context.Context, id string) (*model.Sandbox, err
 // record stays in status `deleting` with the error attached; the reconciler and a repeated
 // DELETE retry it, so nothing is silently left behind.
 func (o *Orchestrator) Delete(ctx context.Context, id string) error {
-	sb, err := o.Store.GetSandbox(ctx, id)
+	sb, err := o.markDeleting(ctx, id)
 	if err != nil {
 		return err
-	}
-	if sb.Status != model.StatusDeleting {
-		if sb, err = o.setStatus(ctx, id, model.StatusDeleting, nil); err != nil {
-			return err
-		}
 	}
 	if o.Retirer != nil {
 		_ = o.Retirer.RetireSandbox(ctx, id)
@@ -785,6 +795,33 @@ func (o *Orchestrator) Delete(ctx context.Context, id string) error {
 	delete(o.stopSeen, id)
 	o.mu.Unlock()
 	return err
+}
+
+// markDeleting moves the sandbox to deleting under the tenant lock that startPod and Create take,
+// with the status it read as the precondition: a wake that already passed its lock sees deleting
+// when it records its pod (and removes the pod), and a transition by another writer meanwhile
+// (waitReady flipping to running) is read again rather than overwritten.
+func (o *Orchestrator) markDeleting(ctx context.Context, id string) (*model.Sandbox, error) {
+	var sb *model.Sandbox
+	tenant := o.metaOf(ctx, id).tenant
+	for attempt := 0; ; attempt++ {
+		err := o.Store.WithTenantLock(ctx, tenant, func(ctx context.Context) error {
+			cur, err := o.Store.GetSandbox(ctx, id)
+			if err != nil {
+				return err
+			}
+			if cur.Status == model.StatusDeleting {
+				sb = cur
+				return nil
+			}
+			sb, err = o.setStatusFrom(ctx, id, []model.SandboxStatus{cur.Status}, model.StatusDeleting, nil)
+			return err
+		})
+		if errors.Is(err, ErrConflict) && attempt < 20 {
+			continue
+		}
+		return sb, err
+	}
 }
 
 // CreateRun queues a task and wakes the sandbox if needed.
