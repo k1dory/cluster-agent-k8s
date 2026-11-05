@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -492,5 +493,101 @@ func TestReviewFailureRecordedAfterTheDeadline(t *testing.T) {
 	}
 	if got, _ := mem.GetSandbox(ctx, sb.ID); got.Status != model.StatusDeleting {
 		t.Fatalf("a failed create overwrote the delete: %s %q", got.Status, got.Error)
+	}
+}
+
+// pauseOnce runs fn the first time any of its hooks fires after arm.
+type pauseOnce struct {
+	mu    sync.Mutex
+	armed bool
+	fn    func()
+}
+
+func (p *pauseOnce) arm() { p.mu.Lock(); p.armed = true; p.mu.Unlock() }
+
+func (p *pauseOnce) fire() {
+	p.mu.Lock()
+	run := p.armed
+	p.armed = false
+	p.mu.Unlock()
+	if run {
+		p.fn()
+	}
+}
+
+// lockPauseStore pauses before taking a tenant lock: the moment between observing a record
+// and acting on it under the lock.
+type lockPauseStore struct {
+	store.Store
+	pause *pauseOnce
+}
+
+func (s lockPauseStore) WithTenantLock(ctx context.Context, tenant string, fn func(context.Context) error) error {
+	s.pause.fire()
+	return s.Store.WithTenantLock(ctx, tenant, fn)
+}
+
+// orphanRuntime: during the create, another replica puts the sandbox to sleep (it finds no pod
+// to delete); after the create the pause is armed, and a DeletePod also fires it first.
+type orphanRuntime struct {
+	*FakeRuntime
+	pause       *pauseOnce
+	whileCreate func()
+}
+
+func (r *orphanRuntime) CreatePod(ctx context.Context, sb *model.Sandbox) (string, error) {
+	if h := r.whileCreate; h != nil {
+		r.whileCreate = nil
+		h()
+	}
+	pod, err := r.FakeRuntime.CreatePod(ctx, sb)
+	r.pause.arm()
+	return pod, err
+}
+
+func (r *orphanRuntime) DeletePod(ctx context.Context, sb *model.Sandbox) error {
+	r.pause.fire()
+	return r.FakeRuntime.DeletePod(ctx, sb)
+}
+
+// Replica A's create finishes after replica B put the sandbox to sleep: A sees an orphan. Before
+// A deletes it, B wakes the sandbox and its replacement pod comes up under the same (reused)
+// name. A's deletion must not take the replacement down: it is fenced by the tenant lock and
+// the revision A observed.
+func TestReviewOrphanRemovalSparesTheReplacement(t *testing.T) {
+	ctx := context.Background()
+	fake := NewFakeRuntime()
+	mem := store.NewMemory()
+	now := time.Now()
+	sb := &model.Sandbox{ID: "sb_orphan", Slug: "dev", Tenant: "acme", Name: "o", Owner: "alice", Status: model.StatusSleeping, CreatedAt: now, LastActivity: now}
+	_ = fake.EnsureVolume(ctx, sb)
+	if err := mem.CreateSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	b := New(mem, fake, nil, events.New(), Config{}, nil)
+	pause := &pauseOnce{fn: func() {
+		if _, err := b.Wake(ctx, sb.ID); err != nil {
+			t.Error(err)
+			return
+		}
+		waitFor(t, "replacement running", func() bool {
+			got, _ := mem.GetSandbox(ctx, sb.ID)
+			return got.Status == model.StatusRunning
+		})
+	}}
+	rt := &orphanRuntime{FakeRuntime: fake, pause: pause, whileCreate: func() {
+		if _, err := b.Sleep(ctx, sb.ID, true); err != nil {
+			t.Error(err)
+		}
+	}}
+	a := New(lockPauseStore{Store: mem, pause: pause}, rt, nil, events.New(), Config{}, nil)
+	if _, err := a.Wake(ctx, sb.ID); err == nil {
+		t.Fatal("A's wake of a sandbox put to sleep meanwhile reported success")
+	}
+	if got, _ := mem.GetSandbox(ctx, sb.ID); got.Status != model.StatusRunning {
+		t.Fatalf("sandbox after the race: %s", got.Status)
+	}
+	if _, _, err := fake.PodStatus(ctx, sb); err != nil {
+		t.Fatalf("the replacement pod was deleted as A's orphan: %v", err)
 	}
 }

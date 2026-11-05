@@ -465,7 +465,9 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 	created := *sb
 	created.PodName = pod
 	orphan := false
+	var observed int64
 	sb, err = o.mutate(ctx, id, func(s *model.Sandbox) error {
+		observed = s.Revision
 		switch s.Status {
 		case model.StatusWaking, model.StatusRunning:
 			if s.PodName != "" && s.PodName != pod {
@@ -488,10 +490,7 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 		orphan = true
 	}
 	if orphan {
-		o.Log.Warn("sandbox went away while its pod was created, removing the pod", "id", id, "pod", pod, "err", err)
-		if derr := o.Runtime.DeletePod(ctx, &created); derr != nil {
-			o.Log.Error("remove orphan pod", "id", id, "pod", pod, "err", derr)
-		}
+		o.removeOrphan(ctx, tenant, &created, observed)
 		return nil, fmt.Errorf("%w: sandbox changed while its pod was being created", ErrConflict)
 	}
 	if err != nil {
@@ -773,6 +772,34 @@ func (o *Orchestrator) stopPod(ctx context.Context, id string, final model.Sandb
 		}
 	}
 	return sb, err
+}
+
+// removeOrphan deletes a pod startPod created for a sandbox that went away meanwhile (deleted,
+// stopped, put to sleep). Pod names are reused per sandbox, so between that observation and the
+// deletion another replica could wake the sandbox and create its replacement under the same
+// name. The deletion therefore runs under the tenant lock every wake takes, after checking the
+// record again: gone or deleting (nothing wakes it any more), or still stopping or sleeping at
+// the revision observed (no wake since). Anything else means the sandbox moved on and the name
+// may already be the replacement's: the pod is left to its new owner.
+func (o *Orchestrator) removeOrphan(ctx context.Context, tenant string, created *model.Sandbox, observed int64) {
+	err := o.Store.WithTenantLock(ctx, tenant, func(ctx context.Context) error {
+		cur, err := o.Store.GetSandbox(ctx, created.ID)
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+		case err != nil:
+			return err
+		case cur.Status == model.StatusDeleting:
+		case (cur.Status == model.StatusStopping || cur.Status == model.StatusSleeping) && cur.Revision == observed:
+		default:
+			o.Log.Info("sandbox moved on before its orphan pod was removed, leaving the pod", "id", created.ID, "pod", created.PodName, "status", cur.Status)
+			return nil
+		}
+		o.Log.Warn("sandbox went away while its pod was created, removing the pod", "id", created.ID, "pod", created.PodName)
+		return o.Runtime.DeletePod(ctx, created)
+	})
+	if err != nil {
+		o.Log.Error("remove orphan pod", "id", created.ID, "pod", created.PodName, "err", err)
+	}
 }
 
 // detached returns a context that outlives the caller's (a request whose client went away) but
