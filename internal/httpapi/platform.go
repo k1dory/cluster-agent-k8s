@@ -1160,8 +1160,9 @@ func writeErr(w http.ResponseWriter, status int, err error) {
 }
 
 // writeErrWith writes the envelope from base: its code (empty: the status's) and the record
-// the error travels with. A 500 never carries the error text: what failed inside (the store,
-// the cluster) is logged under the request id, and the client gets the id to quote.
+// the error travels with. A 500 never carries the error text, nor a record (whose own error
+// fields would carry it just the same): what failed inside (the store, the cluster) is logged
+// under the request id, and the client gets the id to quote.
 func writeErrWith(w http.ResponseWriter, status int, base ErrorBody, err error) {
 	if base.Code == "" {
 		base.Code = codeFor(status)
@@ -1171,6 +1172,7 @@ func writeErrWith(w http.ResponseWriter, status int, base ErrorBody, err error) 
 	if status == http.StatusInternalServerError {
 		noteInternal(w, err)
 		base.Error = "internal error"
+		base.Sync, base.Plan, base.Rollback, base.Apply = nil, nil, nil, nil
 		if base.RequestID != "" {
 			base.Error += " (request " + base.RequestID + ")"
 		}

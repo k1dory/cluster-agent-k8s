@@ -59,7 +59,7 @@ info:
       `quota_exceeded`, `rate_limited`, `upstream_failed`, `timeout`, `invalid`, `internal`,
       `unavailable`, and for Git syncs, plans and rollbacks `invalid_plan`, `nothing_to_roll_back`,
       `unreachable`, `credential`, `stopped`). A few errors carry the record they are about
-      (`sync`, `plan`, `rollback`, `apply`). `request_id` also comes back as the `X-Request-Id`
+      (`sync`, `plan`, `rollback`, `apply`), never a 500. `request_id` also comes back as the `X-Request-Id`
       header and is in the server log; send your own `X-Request-Id` to correlate. A 500 says only
       `internal error (request …)`: what failed inside is in the server log under that id.
     * **Malformed query parameters are 400**, never silently defaulted.
@@ -2163,7 +2163,7 @@ components:
         at: { type: string, format: date-time }
     GitSyncError:
       type: object
-      description: A check or sync that did not succeed, with the record
+      description: A check or sync that did not succeed, with the record (not on a 500, which carries no record)
       properties:
         error: { type: string }
         code: { type: string, enum: [unreachable, credential, invalid_plan, stopped, internal] }

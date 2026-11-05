@@ -16,6 +16,7 @@ import (
 	"agent-sandbox/api"
 	"agent-sandbox/internal/apikeys"
 	"agent-sandbox/internal/apply"
+	"agent-sandbox/internal/gitsync"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/orchestrator"
 	"agent-sandbox/internal/store"
@@ -91,7 +92,7 @@ func TestReviewErrorEnvelopeEverywhere(t *testing.T) {
 	check("apply conflict", r, 409, CodeConflict, "apply")
 	r = rec()
 	writeGitSync(r, &model.GitSync{}, errors.New("something else"))
-	check("git sync, unknown failure", r, 500, CodeInternal, "sync")
+	check("git sync, unknown failure", r, 500, CodeInternal, "")
 	if strings.Contains(r.Body.String(), "something else") {
 		t.Fatalf("a 500 carries the inner error: %s", r.Body)
 	}
@@ -148,5 +149,27 @@ func TestReviewInternalErrorReachesTheLogThroughTheRecorder(t *testing.T) {
 	h.ServeHTTP(r, httptest.NewRequest("GET", "/x", nil))
 	if r.Code != 500 || strings.Contains(r.Body.String(), "inner detail") || !strings.Contains(logs.String(), "inner detail") {
 		t.Fatalf("%d %s / log %s", r.Code, r.Body, logs.String())
+	}
+}
+
+// The record a 500 would travel with carries the inner errors too (a sync's error, a bundle's
+// errors, the check's): a 500 attaches no record, so none of them reach the client.
+func TestReviewInternalErrorsDoNotLeakThroughTheAttachedRecord(t *testing.T) {
+	leak := "pq: deadlock detected on 10.0.0.7"
+	g := &model.GitSync{Name: "cfg",
+		Check: &model.GitCheck{Head: "abc", Error: leak},
+		Sync:  &model.GitSyncResult{Commit: "abc", Status: model.GitSyncStopped, Error: leak, Bundles: []model.GitSyncBundle{{Path: "a", Errors: []string{leak}}}},
+		Hook:  &model.GitHook{Error: leak, Reason: leak}}
+	r := httptest.NewRecorder()
+	r.Header().Set("X-Request-Id", "rid-2")
+	writeGitSync(r, g, fmt.Errorf("sync: %s", leak))
+	if r.Code != 500 || strings.Contains(r.Body.String(), "10.0.0.7") || !strings.Contains(r.Body.String(), "rid-2") {
+		t.Fatalf("%d %s", r.Code, r.Body)
+	}
+	// Below 500 the record still travels: it is what the client acts on.
+	r = httptest.NewRecorder()
+	writeGitSync(r, g, fmt.Errorf("%w: apply did not finish", gitsync.ErrStopped))
+	if r.Code != 409 || !strings.Contains(r.Body.String(), `"sync":{`) {
+		t.Fatalf("stopped: %d %s", r.Code, r.Body)
 	}
 }
