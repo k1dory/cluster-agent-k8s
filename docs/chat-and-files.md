@@ -140,7 +140,8 @@ harness:
   that forwards to `https://<host>/<path>` through the gateway with the certificate: headers and
   bodies unchanged (the gateway still swaps placeholder credentials and applies the policy),
   answers streamed, WebSocket upgrades carried. A profile points its harness's provider at it
-  (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, a config file's `baseURL`), and the MCP servers an ACP
+  (`ANTHROPIC_BASE_URL`, OpenCode's provider `baseURL`, Codex's `model_providers.<id>.base_url`;
+  Codex ignores `OPENAI_BASE_URL`), and the MCP servers an ACP
   agent gets in `session/new` are already bridge URLs. It reaches nothing the pod could not:
   the certificate is the pod's own and the network lock still admits only the gateway.
 - **Long lines.** For every harness, an output line over 1 MiB is replaced by a
