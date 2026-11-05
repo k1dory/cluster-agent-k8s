@@ -163,14 +163,27 @@ func signalGroup(cmd *exec.Cmd, sig syscall.Signal) error {
 // groupKillDelay is how long what is left of an agent's process group has between SIGTERM and SIGKILL.
 var groupKillDelay = 10 * time.Second
 
-// endGroup stops whatever is left of the agent's process group once the agent has exited.
+// groupKills counts the process groups still being stopped; main waits for them before the runner
+// exits, so the SIGKILL is not lost with the process that was to send it.
+var groupKills sync.WaitGroup
+
+// endGroup stops whatever is left of the harness's process group once the harness has exited:
+// SIGTERM (a daemon drains on it), SIGKILL after groupKillDelay to what is still there. It
+// returns at once; the kill is awaited on the runner's way out (groupKills).
 func endGroup(cmd *exec.Cmd) {
 	if signalGroup(cmd, syscall.SIGTERM) != nil {
 		return // nothing left
 	}
-	delay := groupKillDelay
+	deadline := time.Now().Add(groupKillDelay)
+	groupKills.Add(1)
 	go func() {
-		time.Sleep(delay)
+		defer groupKills.Done()
+		for time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+			if signalGroup(cmd, 0) != nil {
+				return // the group is gone
+			}
+		}
 		_ = signalGroup(cmd, syscall.SIGKILL)
 	}()
 }

@@ -104,6 +104,14 @@ func main() {
 	go serveGatewayBridge(ctx, certDir)
 	_ = os.Setenv("SANDBOX_GATEWAY_BRIDGE", "http://"+gatewayBridgeAddr)
 	fmt.Println("agent-runner: waiting for runs")
+	serveRuns(ctx, c)
+	// What is left of a harness's process group is stopped before the runner exits: as PID 1 its
+	// exit takes the container down, and a SIGKILL still pending would never be sent.
+	groupKills.Wait()
+}
+
+// serveRuns long-polls for runs and executes them one after the other until ctx ends (SIGTERM).
+func serveRuns(ctx context.Context, c *client) {
 	for ctx.Err() == nil {
 		var run model.Run
 		code, err := c.do(ctx, http.MethodGet, "/agent/runs/next?wait=30s", nil, &run)
@@ -112,7 +120,7 @@ func main() {
 				return
 			}
 			fmt.Fprintln(os.Stderr, "agent-runner: poll:", err)
-			time.Sleep(5 * time.Second)
+			sleepCtx(ctx, 5*time.Second)
 			continue
 		}
 		if code == http.StatusNoContent {
@@ -582,10 +590,9 @@ func forwardInput(ctx context.Context, c *client, runID string, w inputSink, can
 		var evs []model.Event
 		_, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/agent/runs/%s/input?after=%d&wait=%s", runID, after, wait.Round(time.Second)), nil, &evs)
 		if err != nil {
-			if ctx.Err() != nil {
+			if !sleepCtx(ctx, 2*time.Second) {
 				return
 			}
-			time.Sleep(2 * time.Second)
 			continue
 		}
 		for _, e := range evs {
