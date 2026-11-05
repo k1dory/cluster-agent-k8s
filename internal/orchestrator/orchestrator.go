@@ -1406,10 +1406,16 @@ func (o *Orchestrator) lead(ctx context.Context, lease store.Lease) {
 // reconcileStopping finishes a stop that was interrupted (the replica died, or its DeletePod
 // failed after the record said stopping). Once the runtime no longer knows the pod, the sandbox
 // settles as sleeping so it can be woken again. A pod still there after StopTimeout is deleted
-// again, in the background so a slow termination does not hold up the pass.
+// again, in the background so a slow termination does not hold up the pass (see takeOverStop).
 func (o *Orchestrator) reconcileStopping(ctx context.Context, sb *model.Sandbox, now time.Time) {
 	_, _, err := o.Runtime.PodStatus(ctx, sb)
 	if errors.Is(err, ErrPodNotFound) {
+		o.mu.Lock()
+		busy := o.stopping[sb.ID]
+		o.mu.Unlock()
+		if busy {
+			return // this replica's stop is still cleaning up after the pod: it settles itself
+		}
 		o.forgetStop(sb.ID)
 		o.settleStopped(ctx, sb.ID)
 		return
@@ -1430,23 +1436,51 @@ func (o *Orchestrator) reconcileStopping(ctx context.Context, sb *model.Sandbox,
 	o.stopping[sb.ID] = true
 	o.mu.Unlock()
 	o.Log.Warn("sandbox stuck stopping with its pod alive, deleting the pod again", "id", sb.ID, "pod", sb.PodName)
-	go func() {
-		defer func() { o.mu.Lock(); delete(o.stopping, sb.ID); o.mu.Unlock() }()
-		ctx, cancel := o.detached(context.Background())
-		defer cancel()
-		if err := o.Runtime.DeletePod(ctx, sb); err != nil {
-			o.Log.Error("delete pod of a stopping sandbox", "id", sb.ID, "err", err)
-			return // the next pass tries again
+	go o.takeOverStop(sb)
+}
+
+// errStopMoved: the stuck stop was finished or replaced by another writer before the takeover
+// got the lock; there is nothing left that belongs to it.
+var errStopMoved = errors.New("stop finished elsewhere")
+
+// takeOverStop deletes the pod of a stuck stop, retires its identities, cancels its run and
+// settles the sandbox as sleeping. The whole sequence runs under the tenant lock, fenced on the
+// revision the reconciler observed: every wake takes that lock to leave sleeping, so while the
+// cleanup runs no replacement pod, identity or run can exist, even if another replica (or the
+// slow original stopper) settles the sandbox meanwhile. The pod name, the "current" identities
+// and the running run therefore all still belong to the stopped pod. If the record moved on
+// before the lock was taken (finished elsewhere, woken, stopped again), nothing is touched.
+// The lock is held across DeletePod: the recovery path is rare and its tenant waits briefly.
+func (o *Orchestrator) takeOverStop(seen *model.Sandbox) {
+	defer func() { o.mu.Lock(); delete(o.stopping, seen.ID); o.mu.Unlock() }()
+	ctx, cancel := o.detached(context.Background())
+	defer cancel()
+	err := o.Store.WithTenantLock(ctx, seen.Tenant, func(ctx context.Context) error {
+		cur, err := o.Store.GetSandbox(ctx, seen.ID)
+		if err != nil {
+			return err
 		}
-		o.forgetStop(sb.ID)
+		if cur.Status != model.StatusStopping || cur.Revision != seen.Revision {
+			return errStopMoved
+		}
+		if err := o.Runtime.DeletePod(ctx, cur); err != nil {
+			return fmt.Errorf("delete pod: %w", err)
+		}
 		if o.Retirer != nil {
-			if err := o.Retirer.RetireSandbox(ctx, sb.ID); err != nil {
-				o.Log.Error("retire identities", "id", sb.ID, "err", err)
+			if err := o.Retirer.RetireSandbox(ctx, cur.ID); err != nil {
+				o.Log.Error("retire identities", "id", cur.ID, "err", err)
 			}
 		}
-		o.cancelRunning(ctx, sb.ID)
-		o.settleStopped(ctx, sb.ID)
-	}()
+		o.cancelRunning(ctx, cur.ID)
+		o.settleStopped(ctx, cur.ID)
+		return nil
+	})
+	switch {
+	case err == nil, errors.Is(err, errStopMoved), errors.Is(err, store.ErrNotFound):
+		o.forgetStop(seen.ID)
+	default:
+		o.Log.Error("take over a stuck stop", "id", seen.ID, "err", err) // the next pass tries again
+	}
 }
 
 // settleStopped moves a sandbox whose pod is gone from stopping to sleeping.

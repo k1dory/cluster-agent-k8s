@@ -236,3 +236,136 @@ func TestReviewSleepDoesNotUndoADelete(t *testing.T) {
 }
 
 var errFakeRefused = errors.New("cluster refused")
+
+// barrierRuntime removes the pod, then holds DeletePod until release is closed: a slow
+// termination during which other replicas keep working.
+type barrierRuntime struct {
+	*FakeRuntime
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (r *barrierRuntime) DeletePod(ctx context.Context, sb *model.Sandbox) error {
+	err := r.FakeRuntime.DeletePod(ctx, sb)
+	close(r.entered)
+	<-r.release
+	return err
+}
+
+// Replica A takes over a stuck stop. While its DeletePod is still returning, replica B sees the
+// pod gone, settles the sandbox as sleeping and wakes it; a run starts on the replacement pod.
+// A's cleanup must not retire that pod's identities or cancel its run: the takeover holds the
+// tenant lock every wake takes, so the replacement only starts once the cleanup is over.
+func TestReviewStopTakeoverSparesTheReplacement(t *testing.T) {
+	ctx := context.Background()
+	fake := NewFakeRuntime()
+	st := store.NewMemory()
+	now := time.Now()
+	sb := &model.Sandbox{ID: "sb_takeover", Slug: "dev", Tenant: "acme", Name: "t", Owner: "alice", Status: model.StatusRunning, CreatedAt: now, LastActivity: now}
+	if err := fake.EnsureVolume(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	sb.PodName, _ = fake.CreatePod(ctx, sb)
+	if err := st.CreateSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	slow := &barrierRuntime{FakeRuntime: fake, entered: make(chan struct{}), release: make(chan struct{})}
+	ret := &podWatchRetirer{rt: fake, sb: sb}
+	a := New(st, slow, ret, events.New(), Config{StopTimeout: 20 * time.Millisecond}, nil)
+	b := New(st, fake, nil, events.New(), Config{}, nil)
+	if _, err := a.CreateRun(ctx, sb.ID, "old"); err != nil {
+		t.Fatal(err)
+	}
+	run1, err := a.NextRun(ctx, sb.ID, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.setStatusFrom(ctx, sb.ID, []model.SandboxStatus{model.StatusRunning}, model.StatusStopping, nil); err != nil {
+		t.Fatal(err)
+	}
+	// The old pod's runner reported its result before the pod went away.
+	if err := a.FinishRun(ctx, sb.ID, run1.ID, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	a.Reconcile(ctx)
+	time.Sleep(30 * time.Millisecond)
+	a.Reconcile(ctx) // takes the stop over
+	<-slow.entered   // the old pod is gone, A's cleanup has not run yet
+
+	b.Reconcile(ctx) // sees no pod: sleeping
+	woke := make(chan *model.Run, 1)
+	go func() {
+		if _, err := b.Wake(ctx, sb.ID); err != nil {
+			t.Error(err)
+			woke <- nil
+			return
+		}
+		waitFor(t, "replacement running", func() bool {
+			got, _ := st.GetSandbox(ctx, sb.ID)
+			return got.Status == model.StatusRunning
+		})
+		if _, err := b.CreateRun(ctx, sb.ID, "new"); err != nil {
+			t.Error(err)
+		}
+		r, err := b.NextRun(ctx, sb.ID, time.Second)
+		if err != nil {
+			t.Error(err)
+		}
+		woke <- r
+	}()
+	var run2 *model.Run
+	early := false
+	select {
+	case run2 = <-woke:
+		early = true // a replacement started while the old stop was still being cleaned up
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(slow.release)
+	if !early {
+		select {
+		case run2 = <-woke:
+		case <-time.After(5 * time.Second):
+			t.Fatal("wake never completed")
+		}
+	}
+	if run2 == nil {
+		t.FailNow()
+	}
+	waitFor(t, "takeover to finish", func() bool {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		return !a.stopping[sb.ID]
+	})
+	if r, _ := st.GetRun(ctx, run1.ID); r.Status != model.RunDone {
+		t.Fatalf("run of the stopped pod: %s", r.Status)
+	}
+	if ret.calls == 0 || ret.replacementSeen {
+		t.Fatalf("identities retired %d times, while a replacement pod was up: %v", ret.calls, ret.replacementSeen)
+	}
+	if r, _ := st.GetRun(ctx, run2.ID); r.Status != model.RunRunning {
+		t.Fatalf("run on the replacement pod was settled by the old stop's cleanup: %s", r.Status)
+	}
+	if _, _, err := fake.PodStatus(ctx, sb); err != nil {
+		t.Fatalf("replacement pod: %v", err)
+	}
+	if got, _ := st.GetSandbox(ctx, sb.ID); got.Status != model.StatusRunning {
+		t.Fatalf("sandbox after the takeover: %s", got.Status)
+	}
+}
+
+// podWatchRetirer records whether a pod existed when it was asked to retire the sandbox's
+// identities: a retire meant for the stopped pod must happen before any replacement exists.
+type podWatchRetirer struct {
+	rt              *FakeRuntime
+	sb              *model.Sandbox
+	calls           int
+	replacementSeen bool
+}
+
+func (r *podWatchRetirer) RetireSandbox(ctx context.Context, id string) error {
+	r.calls++
+	if _, _, err := r.rt.PodStatus(ctx, r.sb); err == nil {
+		r.replacementSeen = true
+	}
+	return nil
+}
