@@ -1383,7 +1383,9 @@ paths:
         Rotating a key that was already rotated (a retry after the response with the secret was
         lost) withdraws the earlier successor if it has never been used and issues a new one;
         the earlier secret cannot be shown again. If the earlier successor has been used, the
-        rotation is refused with 400: rotate that key instead.
+        rotation is refused with 422: rotate that key instead. A rotation whose outcome the
+        server could not establish (the database stopped answering mid-commit) is a 500 that
+        says so: GET the old key, its `rotated_to` tells whether it took effect.
       requestBody:
         required: false
         content:
@@ -1396,11 +1398,12 @@ paths:
                 grace: { type: string, example: 1h }
       responses:
         "201": { description: The new key with its secret; `replaces` names the old one, content: { application/json: { schema: { $ref: "#/components/schemas/IssuedKey" } } } }
-        "400": { description: "Malformed JSON, unknown field, trailing data or a bad duration; the key is revoked or expired; or it was already rotated to a successor that is in use", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "400": { description: "Malformed JSON, unknown field, trailing data or a bad duration", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "The key is revoked or expired, ttl or grace is negative, or the key was already rotated to a successor that is in use", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "500": { description: "The rotation failed, or its outcome is unknown (the message says which)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/ScopeForbidden" }
         "404": { $ref: "#/components/responses/Error" }
-        "422": { description: "The key is revoked or expired, or a duration is negative", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/KeysDisabled" }
   /v1/whoami:
     get:
@@ -1694,6 +1697,10 @@ paths:
       tags: [gateway]
       security: [{ bootstrapToken: [] }]
       summary: Issue the agent identity (called once by the init container)
+      description: |
+        Idempotent per pod and key: repeating the request with the same CSR (a retry after a
+        lost response) returns the same instance with the same serial and validity. A new key
+        from the same pod replaces its earlier identity.
       requestBody:
         required: true
         content:
@@ -1719,7 +1726,9 @@ paths:
                   ca: { type: string, description: PEM agent CA root }
                   gateway_ca: { type: string, description: PEM root to trust for TLS to the gateway }
                   not_after: { type: string, format: date-time }
+        "400": { description: "The CSR is malformed, or the pod's labels do not match its sandbox (slug, tenant): not retried", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Error" }
+        "503": { description: "The platform could not complete the issuance on its side (the database did not answer): retry the same request", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /authz:
     get:
       tags: [gateway]
