@@ -18,12 +18,12 @@ type flakyRotate struct {
 	cancel       func()
 }
 
-func (f *flakyRotate) RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, grace time.Duration) error {
+func (f *flakyRotate) RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, opts store.RotateOptions) error {
 	if !f.fail {
-		return f.Store.RotateAPIKey(ctx, oldID, next, at, grace)
+		return f.Store.RotateAPIKey(ctx, oldID, next, at, opts)
 	}
 	if f.commit {
-		if err := f.Store.RotateAPIKey(ctx, oldID, next, at, grace); err != nil {
+		if err := f.Store.RotateAPIKey(ctx, oldID, next, at, opts); err != nil {
 			return err
 		}
 	}
@@ -143,5 +143,83 @@ func TestReviewRetriedRotateReplacesTheUnusedSuccessor(t *testing.T) {
 	}
 	if a, _ := s.Get(ctx, again.ID); !a.Active(now) {
 		t.Fatal("the in-use successor stays live")
+	}
+}
+
+// lateCommit: the COMMIT's acknowledgement is lost while the transaction is still completing;
+// it lands after a plain read would already have seen the old row. LockedAPIKey, like a
+// FOR UPDATE, waits for it.
+type lateCommit struct {
+	Store
+	done chan struct{}
+}
+
+func (l *lateCommit) RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, opts store.RotateOptions) error {
+	l.done = make(chan struct{})
+	go func() {
+		defer close(l.done)
+		time.Sleep(100 * time.Millisecond)
+		_ = l.Store.RotateAPIKey(context.Background(), oldID, next, at, opts)
+	}()
+	return errors.New("connection reset during COMMIT")
+}
+
+func (l *lateCommit) LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error) {
+	select {
+	case <-l.done:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return l.Store.LockedAPIKey(ctx, id)
+}
+
+// The recovery read was a plain SELECT: it saw the old row while the commit was still
+// completing, reported "nothing changed", dropped the secret, and the commit then retired the
+// old key. It now waits under the row lock and returns the committed successor.
+func TestReviewRotateRecoveryWaitsForACommitStillCompleting(t *testing.T) {
+	now := time.Now()
+	st := &lateCommit{Store: store.NewMemory()}
+	s := &Service{Store: st, Now: func() time.Time { return now }}
+	ctx := context.Background()
+	old, _, err := s.Create(ctx, "acme", "ci", 0, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, secret, err := s.Rotate(ctx, old.ID, 0, 0, "admin")
+	if err != nil {
+		t.Fatalf("a rotation that committed late must be reported as done: %v", err)
+	}
+	if _, err := s.Authenticate(ctx, secret); err != nil || next == nil {
+		t.Fatalf("the successor must work: %v", err)
+	}
+}
+
+// Rotate a long-lived key to a short-lived successor, then retry with the TTL omitted after
+// that successor expired: the old key is still in its grace period, and the new key gets the
+// old key's original lifetime, not "expires now".
+func TestReviewOmittedTTLRetryUsesTheOriginalLifetime(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now()
+	s := &Service{Store: store.NewMemory(), Now: func() time.Time { return now }}
+	old, _, err := s.Create(ctx, "acme", "ci", 30*24*time.Hour, "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := *old.ExpiresAt
+	short, _, err := s.Rotate(ctx, old.ID, time.Minute, time.Hour, "admin")
+	if err != nil || short.ExpiresAt.Sub(now) != time.Minute {
+		t.Fatalf("explicit short successor: %v %+v", err, short)
+	}
+	now = now.Add(2 * time.Minute)
+	again, _, err := s.Rotate(ctx, old.ID, 0, time.Hour, "admin")
+	if err != nil {
+		t.Fatalf("an omitted-TTL retry within the grace period must succeed: %v", err)
+	}
+	if again.ExpiresAt == nil || !again.ExpiresAt.Equal(original) {
+		t.Fatalf("the new key keeps the original expiry %v, got %v", original, again.ExpiresAt)
+	}
+	// And the stored row says the same as the returned key.
+	if got, _ := s.Get(ctx, again.ID); got.ExpiresAt == nil || !got.ExpiresAt.Equal(original) {
+		t.Fatalf("stored: %+v", got)
 	}
 }

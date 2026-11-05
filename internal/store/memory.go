@@ -1491,25 +1491,39 @@ func (m *Memory) GetGitJobByDelivery(_ context.Context, tenant, name, delivery s
 }
 
 // RotateAPIKey: see Atomics. Every check happens before the first change, under one lock.
-func (m *Memory) RotateAPIKey(_ context.Context, oldID string, next *model.APIKey, at time.Time, grace time.Duration) error {
+func (m *Memory) RotateAPIKey(_ context.Context, oldID string, next *model.APIKey, at time.Time, opts RotateOptions) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	old, ok := m.apiKeys[oldID]
 	if !ok {
 		return ErrNotFound
 	}
-	if !old.Active(at) {
+	if old.RevokedAt != nil || !old.Active(at) {
 		return ErrKeyInactive
 	}
 	if _, dup := m.apiKeys[next.ID]; dup {
 		return fmt.Errorf("%w: api key %s exists", ErrConflict, next.ID)
 	}
 	var withdraw *model.APIKey
-	if prev, ok := m.apiKeys[old.RotatedTo]; ok && old.RotatedTo != "" && prev.Active(at) {
+	if prev, ok := m.apiKeys[old.RotatedTo]; ok && old.RotatedTo != "" && prev.RevokedAt == nil && prev.Active(at) {
 		if prev.LastUsedAt != nil {
 			return &SuccessorInUseError{ID: prev.ID}
 		}
 		withdraw = prev
+	}
+	orig, recorded := memKeyOrigin(m, oldID)
+	if !recorded && old.RotatedTo == "" {
+		orig, recorded = old.ExpiresAt, true
+	}
+	if opts.InheritExpiry {
+		exp := old.ExpiresAt
+		if recorded {
+			exp = orig
+		}
+		if exp != nil && !exp.After(at) {
+			return ErrKeyInactive
+		}
+		next.ExpiresAt = earliest(exp, next.ExpiresAt)
 	}
 	if withdraw != nil {
 		t := at
@@ -1519,18 +1533,62 @@ func (m *Memory) RotateAPIKey(_ context.Context, oldID string, next *model.APIKe
 		next.CreatedAt = at
 	}
 	m.apiKeys[next.ID] = cloneKey(next)
+	if recorded {
+		setMemKeyOrigin(m, oldID, orig)
+	}
 	old.RotatedTo = next.ID
-	if grace <= 0 {
+	if opts.Grace <= 0 {
 		if old.RevokedAt == nil {
 			t := at
 			old.RevokedAt = &t
 		}
 		return nil
 	}
-	if end := at.Add(grace); old.ExpiresAt == nil || end.Before(*old.ExpiresAt) {
+	if end := at.Add(opts.Grace); old.ExpiresAt == nil || end.Before(*old.ExpiresAt) {
 		old.ExpiresAt = &end
 	}
 	return nil
+}
+
+// LockedAPIKey: see Atomics (the store lock serialises it with every write).
+func (m *Memory) LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error) {
+	return m.GetAPIKey(ctx, id)
+}
+
+// earliest of two optional times (nil: none).
+func earliest(a, b *time.Time) *time.Time {
+	switch {
+	case a == nil:
+		return b
+	case b == nil || a.Before(*b):
+		t := *a
+		return &t
+	}
+	t := *b
+	return &t
+}
+
+// memKeyOrigins holds each Memory's original_expires_at column (Postgres: a column of
+// api_keys): kept beside the struct so the store's other code is untouched.
+var (
+	memKeyOriginsMu sync.Mutex
+	memKeyOrigins   = map[*Memory]map[string]*time.Time{}
+)
+
+func memKeyOrigin(m *Memory, id string) (*time.Time, bool) {
+	memKeyOriginsMu.Lock()
+	defer memKeyOriginsMu.Unlock()
+	t, ok := memKeyOrigins[m][id]
+	return t, ok
+}
+
+func setMemKeyOrigin(m *Memory, id string, t *time.Time) {
+	memKeyOriginsMu.Lock()
+	defer memKeyOriginsMu.Unlock()
+	if memKeyOrigins[m] == nil {
+		memKeyOrigins[m] = map[string]*time.Time{}
+	}
+	memKeyOrigins[m][id] = t
 }
 
 // SwapBlob: see Atomics.

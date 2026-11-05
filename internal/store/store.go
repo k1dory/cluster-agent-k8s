@@ -426,7 +426,15 @@ type Atomics interface {
 	// to next (revoked at `at` when grace is 0, else expiring at `at`+grace or sooner).
 	// ErrNotFound for an unknown oldID, ErrKeyInactive when oldID is revoked or expired at
 	// `at`, ErrConflict when next.ID exists. On any error nothing changed.
-	RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, grace time.Duration) error
+	//
+	// Any recorded revocation of oldID refuses the rotation whatever its time (a revocation
+	// that landed after `at` but before the lock still stands). With opts.InheritExpiry the new
+	// key expires when oldID did before its first rotation (or at next.ExpiresAt if sooner,
+	// the caller's cap); next.ExpiresAt is set to what was stored.
+	RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, opts RotateOptions) error
+	// LockedAPIKey reads a key under its row lock: it waits for a transaction holding the row
+	// (a rotation whose COMMIT is still completing) and returns what that left.
+	LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error)
 	// SwapBlob replaces the blob under name with data only if it still holds old, and reports
 	// whether it did (false: another writer got there first). ErrNotFound when absent.
 	SwapBlob(ctx context.Context, name string, old, data []byte) (bool, error)
@@ -437,6 +445,12 @@ type Atomics interface {
 	// instance and, unless another pod is already current, the pod's name. issue runs inside
 	// the transaction (it signs; keep it short); its error aborts everything.
 	BindInstance(ctx context.Context, b InstanceBinding, issue func(n int, existing *model.Instance) (*model.Instance, error)) (*BoundInstance, error)
+}
+
+// RotateOptions: the grace period of the old key and how the new key's expiry is set.
+type RotateOptions struct {
+	Grace         time.Duration
+	InheritExpiry bool
 }
 
 // InstanceBinding names the pod and the serial its certificate carries.

@@ -40,7 +40,8 @@ var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$`)
 // Store is what the service needs: the key table and its atomic rotation.
 type Store interface {
 	store.APIKeys
-	RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, grace time.Duration) error
+	RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, opts store.RotateOptions) error
+	LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error)
 }
 
 // MaxTTL caps a key's lifetime when the caller names one longer; 0 = no cap.
@@ -135,28 +136,14 @@ func (s *Service) Rotate(ctx context.Context, id string, ttl, grace time.Duratio
 	if grace < 0 || ttl < 0 {
 		return nil, "", fmt.Errorf("%w: ttl and grace must not be negative", ErrInvalid)
 	}
-	if ttl == 0 {
-		// The old key's lifetime before an earlier rotation shortened it to the grace period.
-		// Read outside the transaction: it decides only the new key's lifetime.
-		remaining := old.ExpiresAt
-		if old.RotatedTo != "" {
-			if prev, err := s.Store.GetAPIKey(ctx, old.RotatedTo); err == nil {
-				remaining = prev.ExpiresAt
-			} else if !errors.Is(err, store.ErrNotFound) {
-				return nil, "", err
-			}
-		}
-		if remaining != nil {
-			if ttl = remaining.Sub(now); ttl <= 0 {
-				return nil, "", fmt.Errorf("%w: key %s expires now; create a new one", ErrInvalid, id)
-			}
-		}
-	}
+	// ttl 0: the new key expires when the old one did before its first rotation, which the
+	// store recorded then (an earlier successor's lifetime may have been chosen shorter).
+	// MaxTTL still caps it: build sets that cap as the new key's expiry.
 	next, secret, err := s.build(old.Tenant, old.Name, ttl, by, "")
 	if err != nil {
 		return nil, "", err
 	}
-	err = s.Store.RotateAPIKey(ctx, old.ID, next, now, grace)
+	err = s.Store.RotateAPIKey(ctx, old.ID, next, now, store.RotateOptions{Grace: grace, InheritExpiry: ttl == 0})
 	var inUse *store.SuccessorInUseError
 	switch {
 	case err == nil:
@@ -168,15 +155,19 @@ func (s *Service) Rotate(ctx context.Context, id string, ttl, grace time.Duratio
 	case errors.Is(err, store.ErrNotFound):
 		return nil, "", err
 	}
-	// The transaction may have committed with the acknowledgement lost. Ask, on a context of
-	// its own (the request's may be what failed): the old key names its successor only if it
-	// did. Nothing is ever deleted: the transaction left either everything or nothing.
+	// The transaction may have committed with the acknowledgement lost, or still be
+	// committing. Ask under the old key's row lock, on a context of its own (the request's may
+	// be what failed): the read waits for that transaction, and the old key names its
+	// successor only if it committed. If the answer does not come in time the outcome stays
+	// unknown. Nothing is ever deleted: the transaction left either everything or nothing.
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	if cur, gerr := s.Store.GetAPIKey(rctx, old.ID); gerr == nil && cur.RotatedTo == next.ID {
-		return next, secret, nil
-	} else if gerr != nil {
+	cur, gerr := s.Store.LockedAPIKey(rctx, old.ID)
+	switch {
+	case gerr != nil:
 		return nil, "", fmt.Errorf("rotating key %s: %w (whether it took effect is unknown: %v; GET the key: rotated_to says)", old.ID, err, gerr)
+	case cur.RotatedTo == next.ID:
+		return next, secret, nil
 	}
 	return nil, "", fmt.Errorf("rotating key %s: %w (nothing changed; retry)", old.ID, err)
 }

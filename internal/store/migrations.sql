@@ -187,6 +187,10 @@ CREATE TABLE IF NOT EXISTS api_keys (
 CREATE INDEX IF NOT EXISTS api_keys_tenant ON api_keys (tenant, created_at DESC);
 -- trust names the CITrust that issued a key to a CI job (short-lived; pruned once long expired).
 ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS trust text NOT NULL DEFAULT '';
+-- The key's expiry before its first rotation shortened it to the grace period ('infinity':
+-- none; NULL: never rotated, or rotated before this was kept): an omitted-TTL retry of the
+-- rotation gives the new key this lifetime, not the earlier successor's.
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS original_expires_at timestamptz;
 -- Tokens used once (a CI provider's ID token exchanged for a key), until they expire anyway.
 CREATE TABLE IF NOT EXISTS token_uses (
     id         text PRIMARY KEY,

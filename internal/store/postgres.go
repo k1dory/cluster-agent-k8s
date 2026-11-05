@@ -1633,7 +1633,7 @@ func qualified(table, cols string) string {
 // RotateAPIKey: see Atomics. The old key and its earlier successor are locked for the
 // transaction, so a concurrent use (TouchAPIKey) of that successor either lands first and is
 // seen, or waits until the withdrawal is decided.
-func (p *Postgres) RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, grace time.Duration) error {
+func (p *Postgres) RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, opts RotateOptions) error {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -1643,7 +1643,7 @@ func (p *Postgres) RotateAPIKey(ctx context.Context, oldID string, next *model.A
 	if err != nil {
 		return err
 	}
-	if !old.Active(at) {
+	if old.RevokedAt != nil || !old.Active(at) {
 		return ErrKeyInactive
 	}
 	if old.RotatedTo != "" {
@@ -1652,13 +1652,34 @@ func (p *Postgres) RotateAPIKey(ctx context.Context, oldID string, next *model.A
 		case errors.Is(err, ErrNotFound):
 		case err != nil:
 			return err
-		case prev.Active(at) && prev.LastUsedAt != nil:
+		case prev.RevokedAt != nil || !prev.Active(at):
+		case prev.LastUsedAt != nil:
 			return &SuccessorInUseError{ID: prev.ID}
-		case prev.Active(at):
+		default:
 			if _, err := tx.Exec(ctx, `UPDATE api_keys SET revoked_at=COALESCE(revoked_at, $2) WHERE id=$1`, prev.ID, at); err != nil {
 				return err
 			}
 		}
+	}
+	// The expiry before the first rotation: recorded then, read back on a retry.
+	var recorded bool
+	var orig *time.Time
+	if err := tx.QueryRow(ctx, `SELECT original_expires_at IS NOT NULL,
+		CASE WHEN original_expires_at = 'infinity' THEN NULL ELSE original_expires_at END FROM api_keys WHERE id=$1`, oldID).Scan(&recorded, &orig); err != nil {
+		return err
+	}
+	if !recorded && old.RotatedTo == "" {
+		orig, recorded = old.ExpiresAt, true
+	}
+	if opts.InheritExpiry {
+		exp := old.ExpiresAt
+		if recorded {
+			exp = orig
+		}
+		if exp != nil && !exp.After(at) {
+			return ErrKeyInactive
+		}
+		next.ExpiresAt = earliest(exp, next.ExpiresAt)
 	}
 	if next.CreatedAt.IsZero() {
 		next.CreatedAt = at
@@ -1671,15 +1692,36 @@ func (p *Postgres) RotateAPIKey(ctx context.Context, oldID string, next *model.A
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("%w: api key %s exists", ErrConflict, next.ID)
 	}
-	if grace <= 0 {
+	if recorded {
+		// NULL would read as "not recorded": a key without expiry is kept as infinity.
+		if _, err := tx.Exec(ctx, `UPDATE api_keys SET original_expires_at=COALESCE($2::timestamptz, 'infinity') WHERE id=$1`, oldID, orig); err != nil {
+			return err
+		}
+	}
+	if opts.Grace <= 0 {
 		_, err = tx.Exec(ctx, `UPDATE api_keys SET rotated_to=$2, revoked_at=COALESCE(revoked_at, $3) WHERE id=$1`, oldID, next.ID, at)
 	} else {
-		_, err = tx.Exec(ctx, `UPDATE api_keys SET rotated_to=$2, expires_at=LEAST(COALESCE(expires_at, $3::timestamptz), $3::timestamptz) WHERE id=$1`, oldID, next.ID, at.Add(grace))
+		_, err = tx.Exec(ctx, `UPDATE api_keys SET rotated_to=$2, expires_at=LEAST(COALESCE(expires_at, $3::timestamptz), $3::timestamptz) WHERE id=$1`, oldID, next.ID, at.Add(opts.Grace))
 	}
 	if err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+// LockedAPIKey: see Atomics. FOR UPDATE waits for the transaction holding the row and then
+// reads the version it committed (READ COMMITTED re-reads the updated row).
+func (p *Postgres) LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error) {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(context.WithoutCancel(ctx))
+	k, err := scanKey(tx.QueryRow(ctx, `SELECT `+keyCols+` FROM api_keys WHERE id=$1 FOR UPDATE`, id))
+	if err != nil {
+		return nil, err
+	}
+	return k, tx.Commit(ctx)
 }
 
 // SwapBlob: see Atomics.
