@@ -147,3 +147,38 @@ func TestReviewRetryAfterGrowsAndCaps(t *testing.T) {
 		t.Fatalf("retryAfter: %v %v %v", retryAfter(1), retryAfter(2), retryAfter(50))
 	}
 }
+
+// A succeeds, B fails, A is restored: nothing needs loading, but the failure B left in the
+// status must not stay there forever (Run reports recovery and stops retrying).
+func TestReviewRevertingToTheAcceptedConfigClearsTheFailure(t *testing.T) {
+	var refuse atomic.Bool
+	caddy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if refuse.Load() {
+			http.Error(w, `{"error":"Caddyfile:1 - no"}`, http.StatusBadRequest)
+		}
+	}))
+	defer caddy.Close()
+	c, _ := ca.Generate("t", time.Hour)
+	cfg := reviewCfg()
+	cfg.CaddyAdmin = caddy.URL
+	hosts := &staticHosts{hs: []policy.Host{{Name: "a.example.com", Upstream: "https://a.example.com"}}}
+	hosts.fp.Store("A")
+	s := &Syncer{Cfg: cfg, Policies: hosts, AgentCA: c.PEM()}
+	if err := s.SyncOnce(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+	loaded := s.Status().LastSync
+	refuse.Store(true)
+	hosts.fp.Store("B")
+	if err := s.SyncOnce(t.Context(), false); err == nil || s.Status().Healthy() {
+		t.Fatal("B must fail")
+	}
+	hosts.fp.Store("A")
+	if err := s.SyncOnce(t.Context(), false); err != nil {
+		t.Fatal(err)
+	}
+	st := s.Status()
+	if !st.Healthy() || !st.FailingSince.IsZero() || st.LastError != "" || st.Host != "" || !st.LastSync.Equal(loaded) {
+		t.Fatalf("restoring the accepted configuration must clear the failure and keep LastSync: %+v", st)
+	}
+}

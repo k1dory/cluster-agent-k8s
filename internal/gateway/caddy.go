@@ -456,6 +456,8 @@ type Syncer struct {
 
 	mu     sync.Mutex
 	status SyncStatus
+	// acceptedSkipped: the hosts left out of the configuration Caddy last accepted.
+	acceptedSkipped []string
 	// lastSkipped: the hosts the previous render left out, so a host that keeps being skipped
 	// is logged when it starts and stops being, not on every tick.
 	lastSkipped string
@@ -505,6 +507,17 @@ func (s *Syncer) hosts() ([]policy.Host, string) {
 func (s *Syncer) SyncOnce(ctx context.Context, force bool) error {
 	hs, fp := s.hosts()
 	if !force && fp == s.last {
+		if s.tried != fp {
+			// Back to the configuration Caddy already runs (a failed change was reverted):
+			// nothing to load, and the failure it left behind is over. LastSync stays the
+			// time that configuration was loaded.
+			s.tried = fp
+			s.mu.Lock()
+			s.clearFailure()
+			s.status.Skipped = append([]string(nil), s.acceptedSkipped...)
+			s.lastSkipped = strings.Join(s.acceptedSkipped, ",")
+			s.mu.Unlock()
+		}
 		return nil
 	}
 	s.tried = fp
@@ -512,7 +525,9 @@ func (s *Syncer) SyncOnce(ctx context.Context, force bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err == nil {
-		s.status.LastSync, s.status.FailingSince, s.status.Failures, s.status.LastError, s.status.Host = time.Now(), time.Time{}, 0, "", ""
+		s.status.LastSync = time.Now()
+		s.clearFailure()
+		s.acceptedSkipped = append([]string(nil), s.status.Skipped...)
 		return nil
 	}
 	if s.status.Failures == 0 {
@@ -527,6 +542,11 @@ func (s *Syncer) SyncOnce(ctx context.Context, force bool) error {
 		s.status.Host = ""
 	}
 	return err
+}
+
+// clearFailure resets the failure fields; s.mu held.
+func (s *Syncer) clearFailure() {
+	s.status.FailingSince, s.status.Failures, s.status.LastError, s.status.Host = time.Time{}, 0, "", ""
 }
 
 // rejection is a /load Caddy refused, with the host its error points at.
