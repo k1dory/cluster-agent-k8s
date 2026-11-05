@@ -263,7 +263,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	// before the harness reads them. A file that cannot be written fails the run: a harness
 	// started without its provider settings would talk to the wrong endpoint.
 	if n, err := writeHarnessFiles(os.Getenv("SANDBOX_HARNESS_FILES"), os.Getenv("HOME")); err != nil {
-		c.post(run.ID, []string{"[agent-runner] harness files: " + err.Error()})
+		c.post(ctx, run.ID, []string{"[agent-runner] harness files: " + err.Error()})
 		return 1
 	} else if n > 0 {
 		fmt.Printf("agent-runner: %d harness file(s) written from the profile\n", n)
@@ -348,7 +348,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	}
 	cmd.Stderr = cmd.Stdout
 	if err := cmd.Start(); err != nil {
-		c.post(run.ID, []string{"[agent-runner] cannot start harness: " + err.Error()})
+		c.post(ctx, run.ID, []string{"[agent-runner] cannot start harness: " + err.Error()})
 		return 127
 	}
 	chat := newChat(os.Getenv("HARNESS_INPUT"), chatIdle())
@@ -367,7 +367,7 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); streamOutput(c, run.ID, stdout, chat.sawLine) }()
+	go func() { defer wg.Done(); streamOutput(ctx, c, run.ID, stdout, chat.sawLine) }()
 	go func() { defer wg.Done(); forwardInput(runCtx, c, run.ID, stdinSink{stdin, chat.mode}, cancel, chat) }()
 
 	err = cmd.Wait()
@@ -428,92 +428,14 @@ func readLines(r io.Reader, max int, out chan<- string) {
 	}
 }
 
-func streamOutput(c *client, runID string, r io.Reader, onLine func(string)) {
-	var batch []string
-	flush := func() {
-		if len(batch) > 0 {
-			c.post(runID, batch)
-			batch = nil
-		}
-	}
-	t := time.NewTicker(500 * time.Millisecond)
-	defer t.Stop()
-	lines := make(chan string)
-	go func() {
-		readLines(r, maxOutputLine, lines)
-		close(lines)
-	}()
-	for {
-		select {
-		case l, ok := <-lines:
-			if !ok {
-				flush()
-				return
-			}
-			fmt.Println(l) // also to pod stdout for kubectl logs / log shipping
-			if onLine != nil {
-				onLine(l)
-			}
-			batch = append(batch, l)
-			if len(batch) >= 50 {
-				flush()
-			}
-		case <-t.C:
-			flush()
-		}
-	}
-}
-
-// post ships a batch of output lines and insists on an acknowledgement: transient failures
-// are retried, a 413 splits the batch, a single oversized line is dropped with a notice
-// (the control plane keeps lines before it, so a retry never duplicates them).
-func (c *client) post(runID string, lines []string) {
-	body := []byte(strings.Join(lines, "\n") + "\n")
-	batch := newBatchID()
-	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(1<<attempt) * 500 * time.Millisecond)
-		}
-		req, _ := http.NewRequest(http.MethodPost, c.base+"/agent/runs/"+runID+"/events", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "text/plain")
-		req.Header.Set("X-Batch-Id", batch) // same id on every retry: the server skips lines it already stored
-		resp, err := c.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		resp.Body.Close()
-		switch {
-		case resp.StatusCode < 300:
-			return
-		case resp.StatusCode == http.StatusRequestEntityTooLarge:
-			var ack struct {
-				Error string `json:"error"`
-			}
-			_ = json.Unmarshal(data, &ack)
-			stored := storedCount(ack.Error)
-			rest := lines[min(stored, len(lines)):]
-			if len(rest) == len(lines) && len(lines) == 1 {
-				fmt.Fprintf(os.Stderr, "agent-runner: dropping a %d-byte output line: %s\n", len(lines[0]), ack.Error)
-				return
-			}
-			if len(rest) == len(lines) {
-				c.post(runID, rest[:len(rest)/2])
-				c.post(runID, rest[len(rest)/2:])
-				return
-			}
-			c.post(runID, rest)
-			return
-		case resp.StatusCode == http.StatusForbidden, resp.StatusCode == http.StatusNotFound:
-			fmt.Fprintf(os.Stderr, "agent-runner: post output: %s: %s\n", resp.Status, strings.TrimSpace(string(data)))
-			return
-		default:
-			lastErr = fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(data)))
-		}
-	}
-	fmt.Fprintln(os.Stderr, "agent-runner: post output gave up:", lastErr)
+// streamOutput reads the harness's output lines into the run's spool until EOF, then waits for
+// the spool to be delivered (outputDrainBudget at most): the run is finished only after its
+// output. Reading never waits on the control plane (outputSpool). ctx is the process's signal
+// context.
+func streamOutput(ctx context.Context, c *client, runID string, r io.Reader, onLine func(string)) {
+	spool := newOutputSpool(ctx, c, runID)
+	spool.read(r, onLine)
+	spool.close(outputDrainBudget)
 }
 
 func newBatchID() string {

@@ -46,7 +46,7 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	// env:NAME) are in place before it starts.
 	env, delivered, err := deliverInstructions(env, os.Getenv("HARNESS_INSTRUCTIONS"), os.Getenv("SANDBOX_INSTRUCTIONS"), os.Getenv("HOME"))
 	if err != nil {
-		c.post(run.ID, []string{"[agent-runner] instructions: " + err.Error()})
+		c.post(ctx, run.ID, []string{"[agent-runner] instructions: " + err.Error()})
 		return 1
 	}
 	cmd := exec.CommandContext(procCtx, "/bin/sh", "-lc", cmdline)
@@ -72,25 +72,27 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	if err != nil {
 		return 1
 	}
-	// The run's output is what the runner writes (ACP lines, notices) and the agent's stderr.
+	// The run's output is what the runner writes (ACP lines, notices) and the agent's stderr, both
+	// into one spool: neither waits on the control plane.
 	outR, outW := io.Pipe()
 	cmd.Stderr = outW
 	if err := cmd.Start(); err != nil {
-		c.post(run.ID, []string{"[agent-runner] cannot start harness: " + err.Error()})
+		c.post(ctx, run.ID, []string{"[agent-runner] cannot start harness: " + err.Error()})
 		return 127
 	}
+	spool := newOutputSpool(ctx, c, run.ID)
 	chat := newChat(harness.InputACP, chatIdle())
 	var outputDone sync.WaitGroup
 	outputDone.Add(1)
 	// The conversation's idle clock is driven by driveACP itself (turn ended, next prompt sent),
-	// not by the output, which reaches streamOutput later than the next prompt may start. Once
-	// the reading ends the pipe is closed, so no write can wait on a reader that is gone.
+	// not by the output, which reaches the control plane later than the next prompt may start.
+	// Once the reading ends the pipe is closed, so no write can wait on a reader that is gone.
 	go func() {
 		defer outputDone.Done()
-		streamOutput(c, run.ID, outR, nil)
+		spool.read(outR, nil)
 		_ = outR.CloseWithError(io.ErrClosedPipe)
 	}()
-	emit := func(line string) { _, _ = io.WriteString(outW, line+"\n") }
+	emit := spool.emit
 
 	// The agent's notices and compaction updates are asked for by the wire (the SDK cannot) and
 	// told apart from the SDK's own updates in their place in the stream (Classify): the client
@@ -120,6 +122,7 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	endGroup(cmd)
 	_ = outW.Close()
 	outputDone.Wait()
+	spool.close(outputDrainBudget) // the output is delivered before the run is finished
 	return exit
 }
 
