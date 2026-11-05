@@ -495,13 +495,38 @@ func (p *Postgres) GetRun(ctx context.Context, id string) (*model.Run, error) {
 	return scanRun(p.pool.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE id=$1`, id))
 }
 
-func (p *Postgres) UpdateRun(ctx context.Context, r *model.Run) error {
-	u := r.Usage
-	tag, err := p.pool.Exec(ctx, `UPDATE runs SET status=$2, exit_code=$3, started_at=$4, finished_at=$5,
-		model=$6, input_tokens=$7, output_tokens=$8, cache_read_tokens=$9, cache_write_tokens=$10, cost_usd=$11, turns=$12,
-		agent_version=$13, session=$14, agent_ref=$15, agent_revision=$16, environment_ref=$17, environment_revision=$18 WHERE id=$1`,
-		r.ID, r.Status, r.ExitCode, r.StartedAt, r.FinishedAt, u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
-		r.AgentVersion, r.Session, r.AgentRef, r.AgentRevision, r.EnvironmentRef, r.EnvironmentRevision)
+// runExists turns "no row matched the condition" into ErrNotFound or ErrConflict.
+func (p *Postgres) runExists(ctx context.Context, id string) error {
+	if _, err := p.GetRun(ctx, id); err != nil {
+		return err
+	}
+	return ErrConflict
+}
+
+func (p *Postgres) RecordRunUsage(ctx context.Context, id string, u model.Usage, total bool) error {
+	// Add mirrors model.Usage.Add (an empty model keeps the recorded one); total replaces.
+	tag, err := p.pool.Exec(ctx, `UPDATE runs SET
+		model = CASE WHEN $2 THEN $3 WHEN $3 = '' THEN model ELSE $3 END,
+		input_tokens = CASE WHEN $2 THEN 0 ELSE input_tokens END + $4,
+		output_tokens = CASE WHEN $2 THEN 0 ELSE output_tokens END + $5,
+		cache_read_tokens = CASE WHEN $2 THEN 0 ELSE cache_read_tokens END + $6,
+		cache_write_tokens = CASE WHEN $2 THEN 0 ELSE cache_write_tokens END + $7,
+		cost_usd = CASE WHEN $2 THEN 0 ELSE cost_usd END + $8,
+		turns = CASE WHEN $2 THEN 0 ELSE turns END + $9
+		WHERE id=$1 AND status <> ALL($10)`,
+		id, total, u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
+		[]string{string(model.RunDone), string(model.RunFailed)})
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return p.runExists(ctx, id)
+	}
+	return nil
+}
+
+func (p *Postgres) SetRunSession(ctx context.Context, id, session string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE runs SET session=$2 WHERE id=$1`, id, session)
 	if err != nil {
 		return err
 	}
@@ -509,6 +534,32 @@ func (p *Postgres) UpdateRun(ctx context.Context, r *model.Run) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (p *Postgres) SettleRun(ctx context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error) {
+	states := make([]string, len(from))
+	for i, f := range from {
+		states[i] = string(f)
+	}
+	var u model.Usage
+	if usage != nil {
+		u = *usage
+	}
+	r, err := scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, exit_code=$4, finished_at=$5,
+		model = CASE WHEN $6 THEN $7 ELSE model END,
+		input_tokens = CASE WHEN $6 THEN $8 ELSE input_tokens END,
+		output_tokens = CASE WHEN $6 THEN $9 ELSE output_tokens END,
+		cache_read_tokens = CASE WHEN $6 THEN $10 ELSE cache_read_tokens END,
+		cache_write_tokens = CASE WHEN $6 THEN $11 ELSE cache_write_tokens END,
+		cost_usd = CASE WHEN $6 THEN $12 ELSE cost_usd END,
+		turns = CASE WHEN $6 THEN $13 ELSE turns END
+		WHERE id=$1 AND status = ANY($2) RETURNING `+runCols,
+		id, states, to, exitCode, finishedAt, usage != nil,
+		u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns))
+	if errors.Is(err, ErrNotFound) {
+		return nil, p.runExists(ctx, id)
+	}
+	return r, err
 }
 
 func (p *Postgres) queryRuns(ctx context.Context, q string, args ...any) ([]*model.Run, error) {
@@ -573,10 +624,12 @@ func (p *Postgres) QueuedRun(ctx context.Context, sandboxID string) (*model.Run,
 		ORDER BY created_at, id LIMIT 1`, sandboxID, model.RunQueued))
 }
 
-func (p *Postgres) ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string) (*model.Run, error) {
+func (p *Postgres) ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, error) {
 	r, err := scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4,
-		session = CASE WHEN session = '' THEN $5 ELSE session END
-		WHERE id=$1 AND status=$2 RETURNING `+runCols, runID, model.RunQueued, model.RunRunning, startedAt, session))
+		session = CASE WHEN session = '' THEN $5 ELSE session END,
+		agent_version=$6, agent_ref=$7, agent_revision=$8, environment_ref=$9, environment_revision=$10
+		WHERE id=$1 AND status=$2 RETURNING `+runCols, runID, model.RunQueued, model.RunRunning, startedAt, session,
+		stamp.AgentVersion, stamp.AgentRef, stamp.AgentRevision, stamp.EnvironmentRef, stamp.EnvironmentRevision))
 	if errors.Is(err, ErrNotFound) {
 		if _, gerr := p.GetRun(ctx, runID); gerr != nil {
 			return nil, gerr

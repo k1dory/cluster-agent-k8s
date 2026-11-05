@@ -352,7 +352,23 @@ type Store interface {
 
 	CreateRun(ctx context.Context, r *model.Run) error
 	GetRun(ctx context.Context, id string) (*model.Run, error)
-	UpdateRun(ctx context.Context, r *model.Run) error
+	// Runs are never written back from a copy: every transition is one conditional write of the
+	// columns it owns, so a reader holding an older copy (an output line carrying usage, a cancel
+	// racing a finish) cannot put a settled run back to running or drop another writer's usage.
+	//
+	// RecordRunUsage adds u to the run's usage, or replaces it when total (the harness reported
+	// its own running total). It is accepted while the run is queued, running or cancelled (a
+	// cancelled harness spent those tokens before it saw run.cancel) and refused with
+	// ErrConflict once the run is done or failed: its final usage is recorded by then.
+	RecordRunUsage(ctx context.Context, id string, u model.Usage, total bool) error
+	// SetRunSession records the harness session id and touches nothing else. It is accepted in
+	// every status: the column decides no transition, and a message run queued behind a run
+	// that was cancelled still needs that run's session to continue the conversation.
+	SetRunSession(ctx context.Context, id, session string) error
+	// SettleRun moves a run from one of from to the final status to, with exit code, finish time
+	// and (when usage is not nil) the usage total, in one conditional write; ErrConflict when the
+	// run is no longer in one of from (another writer settled it first), ErrNotFound when absent.
+	SettleRun(ctx context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error)
 	ListRuns(ctx context.Context, sandboxID string) ([]*model.Run, error)
 	// QueryRuns returns runs matching f across sandboxes, oldest first.
 	QueryRuns(ctx context.Context, f Filter) ([]*model.Run, error)
@@ -362,9 +378,10 @@ type Store interface {
 	// QueuedRun returns the oldest queued run of the sandbox (the one a claim takes next);
 	// ErrNotFound when none is queued.
 	QueuedRun(ctx context.Context, sandboxID string) (*model.Run, error)
-	// ClaimRun moves that run to running, recording session if the run has none yet, in one
-	// conditional write; ErrConflict when it is no longer queued (claimed or cancelled).
-	ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string) (*model.Run, error)
+	// ClaimRun moves that run to running, recording session if the run has none yet and the
+	// stamp of what executes it, in one conditional write; ErrConflict when it is no longer
+	// queued (claimed or cancelled).
+	ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, error)
 	RunningRun(ctx context.Context, sandboxID string) (*model.Run, error)
 	// AppendQueuedTask adds text to the task of a run that is still queued and returns the run;
 	// ErrConflict once it has been claimed (the harness may already have read its task).
@@ -408,6 +425,16 @@ type Store interface {
 	TokenUses
 
 	Close() error
+}
+
+// RunStamp is what a run records at its claim about what executes it: the agent image and the
+// catalogue revisions of the sandbox at that moment. It never changes afterwards.
+type RunStamp struct {
+	AgentVersion        string
+	AgentRef            string
+	AgentRevision       int
+	EnvironmentRef      string
+	EnvironmentRevision int
 }
 
 // IdempotencyTTL is how long a stored response is replayed.

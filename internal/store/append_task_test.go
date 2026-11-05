@@ -86,20 +86,20 @@ func testClaimRun(t *testing.T, s Store) {
 	if err != nil || q.ID != "claim-1" || q.Status != model.RunQueued {
 		t.Fatalf("oldest queued: %v %+v", err, q)
 	}
-	r, err := s.ClaimRun(ctx, q.ID, now, "sess")
+	r, err := s.ClaimRun(ctx, q.ID, now, "sess", RunStamp{})
 	if err != nil || r.Status != model.RunRunning || r.Session != "sess" || r.StartedAt == nil {
 		t.Fatalf("claim: %v %+v", err, r)
 	}
 	if got, _ := s.GetRun(ctx, q.ID); got.Status != model.RunRunning || got.Session != "sess" {
 		t.Fatalf("claim not stored: %+v", got)
 	}
-	if _, err := s.ClaimRun(ctx, q.ID, now, "sess"); !errors.Is(err, ErrConflict) {
+	if _, err := s.ClaimRun(ctx, q.ID, now, "sess", RunStamp{}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("second claim: %v", err)
 	}
-	if _, err := s.ClaimRun(ctx, "run_nope", now, ""); !errors.Is(err, ErrNotFound) {
+	if _, err := s.ClaimRun(ctx, "run_nope", now, "", RunStamp{}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown run: %v", err)
 	}
-	if r, err := s.ClaimRun(ctx, "claim-2", now, "other"); err != nil || r.Session != "own" {
+	if r, err := s.ClaimRun(ctx, "claim-2", now, "other", RunStamp{}); err != nil || r.Session != "own" {
 		t.Fatalf("a run's own session is kept: %v %+v", err, r)
 	}
 }
