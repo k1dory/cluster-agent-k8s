@@ -1620,7 +1620,10 @@ paths:
       description: |
         Limits: 4 MiB per request, 1 MiB per line. Lines up to the first violation are stored and
         the 413 message says how many (`stored N lines`), so a retry resumes after them. Lines
-        that carry usage (Claude Code's `result`, generic `{"type":"usage"}`) update the run's accounting.
+        that carry usage (Claude Code's `result`, generic `{"type":"usage"}`) update the run's accounting
+        while the run is `queued`, `running` or `cancelled` (a cancelled harness still reports what it
+        spent before it saw `run.cancel`). Once the run is `done` or `failed` the lines are still
+        stored but their usage is ignored: send all output before `POST /agent/runs/{run}/finish`.
 
         Send `X-Batch-Id` (any id, kept across retries of the same batch): the server remembers how
         many lines of that batch it stored, records that before every response, and a retry skips
@@ -1669,6 +1672,12 @@ paths:
       tags: [agent]
       security: [{ mtls: [] }]
       summary: Mark the run finished
+      description: |
+        Settles a `queued` or `running` run as `done` (exit code 0) or `failed`. Send the run's output
+        first: usage on output lines appended after this call is ignored. On a run that was
+        cancelled meanwhile the status stays `cancelled`, but a non-zero `usage` total given here is
+        still recorded. On a run already `done` or `failed` (a retry after a lost response) nothing
+        changes. Each of these answers 204.
       requestBody:
         content:
           application/json:
