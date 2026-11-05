@@ -277,8 +277,11 @@ func serve(cfgPath string, log *slog.Logger) error {
 	// Events appended by any replica (this one included) reach the SSE clients through the store,
 	// so the orchestrator does not publish locally as well.
 	listener, hasListener := st.(store.EventListener)
+	listening := make(chan struct{})
 	if hasListener {
-		go listener.ListenEvents(ctx, func(e *model.Event) { hub.Publish(*e) })
+		go listener.ListenEvents(ctx, func() { close(listening) }, func(e *model.Event) { hub.Publish(*e) })
+	} else {
+		close(listening)
 	}
 	// The environment version: everything that shapes a pod besides the task. A change here
 	// shows as drift between a sandbox's env_version and GET /v1/version.
@@ -420,6 +423,13 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	if ing != nil {
 		servers = append(servers, &http.Server{Addr: cfg.Listen.Ingress, Handler: ing, ReadHeaderTimeout: 10 * time.Second})
+	}
+	// No request before the event listener knows where its feed starts: an event appended earlier
+	// would fall below its cursor and never reach this replica's hub (see store.EventListener).
+	select {
+	case <-listening:
+	case <-ctx.Done():
+		servers = nil // shutting down before serving: straight to the lease hand-over below
 	}
 	errCh := make(chan error, len(servers))
 	for _, s := range servers {

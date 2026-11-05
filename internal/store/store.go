@@ -307,8 +307,13 @@ type Lease interface {
 // EventListener is implemented by stores that can tell this process about events other
 // processes appended (Postgres LISTEN/NOTIFY). fn is called for every new event, in id order,
 // until ctx ends. Replicas use it to feed their local event hub.
+//
+// ready is called once, as soon as the listener knows where its feed starts: every event
+// appended after that reaches fn. A replica must not serve requests before: an event appended
+// meanwhile (the answer to a request it is waiting for) would fall below the starting cursor
+// and never reach its hub, which then is the only way such events are published locally.
 type EventListener interface {
-	ListenEvents(ctx context.Context, fn func(e *model.Event))
+	ListenEvents(ctx context.Context, ready func(), fn func(e *model.Event))
 }
 
 // Store is the persistence interface. Postgres is the production implementation,

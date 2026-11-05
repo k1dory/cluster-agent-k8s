@@ -370,21 +370,31 @@ const eventsChannel = "agent_sandbox_events"
 
 // ListenEvents feeds events appended by any replica to fn, in id order, until ctx ends.
 // NOTIFY wakes the loop; the query by id guarantees nothing is skipped or duplicated even
-// when notifications coalesce or the connection is replaced.
-func (p *Postgres) ListenEvents(ctx context.Context, fn func(e *model.Event)) {
-	last, ok := listenStart(ctx, func(ctx context.Context) (int64, error) {
+// when notifications coalesce or the connection is replaced. ready is called once the starting
+// cursor is known (see EventListener).
+func (p *Postgres) ListenEvents(ctx context.Context, ready func(), fn func(e *model.Event)) {
+	listenLoop(ctx, func(ctx context.Context) (int64, error) {
 		var id int64
 		err := p.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM events`).Scan(&id)
 		return id, err
-	}, 2*time.Second)
+	}, ready, func(ctx context.Context, last *int64) error { return p.listenOnce(ctx, last, fn) }, 2*time.Second)
+}
+
+// listenLoop is ListenEvents without the database: the cursor read, the readiness signal and
+// one listening session, retried every wait until ctx ends.
+func listenLoop(ctx context.Context, read func(context.Context) (int64, error), ready func(), once func(context.Context, *int64) error, wait time.Duration) {
+	last, ok := listenStart(ctx, read, wait)
 	if !ok {
 		return
 	}
+	if ready != nil {
+		ready()
+	}
 	for ctx.Err() == nil {
-		if err := p.listenOnce(ctx, &last, fn); err != nil && ctx.Err() == nil {
+		if err := once(ctx, &last); err != nil && ctx.Err() == nil {
 			select {
 			case <-ctx.Done():
-			case <-time.After(2 * time.Second):
+			case <-time.After(wait):
 			}
 		}
 	}
