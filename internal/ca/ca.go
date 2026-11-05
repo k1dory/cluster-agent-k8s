@@ -268,10 +268,11 @@ func ParseBundle(b []byte) (*CA, error) {
 	return Parse(certPEM, keyPEM)
 }
 
-// Blobs is where a shared CA lives (the store's GetOrCreateBlob and PutBlob).
+// Blobs is where a shared CA lives (the store's GetOrCreateBlob, GetBlob and SwapBlob).
 type Blobs interface {
 	GetOrCreateBlob(ctx context.Context, name string, create func() ([]byte, error)) ([]byte, error)
-	PutBlob(ctx context.Context, name string, data []byte) error
+	GetBlob(ctx context.Context, name string) ([]byte, error)
+	SwapBlob(ctx context.Context, name string, old, data []byte) (bool, error)
 }
 
 // KeySealer encrypts the CA key before it reaches the database (credentials.Sealer, under
@@ -374,8 +375,27 @@ func LoadOrCreateSharedNamed(ctx context.Context, st Blobs, name, cn string, sl 
 		if err != nil {
 			return nil, err
 		}
-		if err := st.PutBlob(ctx, name, sealed); err != nil {
+		// Only over the plaintext this replica read: replicas starting together race to
+		// upgrade, and a blind write would let one with another credentials.key replace a
+		// sealed bundle the others already use. The loser reads the winner's and must be
+		// able to open it, which is the check that every replica has the same key.
+		swapped, err := st.SwapBlob(ctx, name, data, sealed)
+		if err != nil {
 			return nil, fmt.Errorf("ca %s: storing the key encrypted: %w", name, err)
+		}
+		if !swapped {
+			now, err := st.GetBlob(ctx, name)
+			if err != nil {
+				return nil, fmt.Errorf("ca %s: %w", name, err)
+			}
+			won, err := ParseSealedBundle(now, sl, name)
+			if err != nil {
+				return nil, err
+			}
+			if !won.Cert.Equal(c.Cert) {
+				return nil, fmt.Errorf("ca %s: the stored CA changed while it was being upgraded", name)
+			}
+			return won, nil
 		}
 		if log != nil {
 			log.Warn("CA key found in clear in the database: stored it again encrypted under credentials.key", "blob", name)
