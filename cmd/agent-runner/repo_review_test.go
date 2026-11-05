@@ -312,3 +312,24 @@ func TestCancelDuringAStalledNoticeStopsTheRun(t *testing.T) {
 		t.Fatalf("exit %d after %s", code, d)
 	}
 }
+
+// A symlink at the checkout path, even a dangling one, was there before the clone: a failed clone
+// leaves it in place.
+func TestFailedCloneKeepsADanglingSymlink(t *testing.T) {
+	isolatedGit(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	root := t.TempDir()
+	checkout := filepath.Join(root, "repo")
+	if err := os.Symlink(filepath.Join(root, "elsewhere"), checkout); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("SANDBOX_REPO_DIR", checkout)
+	t.Setenv("SANDBOX_REPO", filepath.Join(root, "missing.git"))
+	if err := ensureRepo(ctx); err == nil {
+		t.Fatal("a clone of a missing repository succeeded")
+	}
+	if target, err := os.Readlink(checkout); err != nil || target != filepath.Join(root, "elsewhere") {
+		t.Fatalf("the symlink at the checkout path is gone: %q %v", target, err)
+	}
+}

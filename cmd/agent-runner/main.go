@@ -232,7 +232,9 @@ func ensureRepo(ctx context.Context) error {
 			}
 		}
 	}
-	_, statErr := os.Stat(dir)
+	// Whether the clone creates the path: Lstat, since Stat follows a symlink there and calls a
+	// dangling one absent. Only what the clone created is cleaned up after it.
+	_, statErr := os.Lstat(dir)
 	created := os.IsNotExist(statErr)
 	fmt.Println("agent-runner: cloning", repo, "into", dir)
 	cctx, done := context.WithTimeout(ctx, cloneTimeout)
@@ -249,7 +251,7 @@ func ensureRepo(ctx context.Context) error {
 	if err == nil {
 		return nil
 	}
-	if created {
+	if fi, err := os.Lstat(dir); created && err == nil && fi.IsDir() {
 		_ = os.RemoveAll(dir) // a clone cut short leaves a .git that would pass for a checkout
 	}
 	if errors.Is(cctx.Err(), context.DeadlineExceeded) {
