@@ -30,7 +30,8 @@ type gatewayRequest struct {
 // the way it would in a pod: through the gateway bridge, by the base URL its profile sets.
 // handler answers what passes the client-certificate check. It returns the run's output and
 // what the gateway saw. bin is the agent program; the profile's command must start with name.
-func modelCallThroughGateway(t *testing.T, example, name, bin string, host string, handler http.Handler) ([]string, []gatewayRequest) {
+// homeEnv adds variables that depend on the agent's (test) home, as the image would set them.
+func modelCallThroughGateway(t *testing.T, example, name, bin string, host string, handler http.Handler, homeEnv ...func(home string) map[string]string) ([]string, []gatewayRequest) {
 	t.Helper()
 	isolate := noNetwork(t)
 	var mu sync.Mutex
@@ -73,6 +74,11 @@ func modelCallThroughGateway(t *testing.T, example, name, bin string, host strin
 	}
 	for k, v := range profile.Env {
 		t.Setenv(k, v)
+	}
+	for _, f := range homeEnv {
+		for k, v := range f(home) {
+			t.Setenv(k, v)
+		}
 	}
 	t.Setenv("HARNESS_PERMISSIONS", profile.Harness.Permissions)
 	t.Setenv("HARNESS_AUTH_METHOD", profile.Harness.AuthMethod)
