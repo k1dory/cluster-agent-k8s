@@ -777,12 +777,24 @@ func (p *Postgres) AppendEvent(ctx context.Context, e *model.Event) error {
 	if e.At.IsZero() {
 		e.At = time.Now()
 	}
+	// Readers page by id (ListenEvents, ?after=), so ids must become visible in order: with a
+	// bare bigserial, writer A takes id 10, B takes 11 and commits first, a reader moves its
+	// cursor to 11 and A's 10 is never read. The id is taken under a transaction-scoped lock
+	// held to the commit, so the next writer's id is drawn only after this one is visible.
+	// The lock is global, not per sandbox: the listener reads every sandbox's events with one
+	// cursor. It is held for one INSERT: the batch is one implicit transaction, one round trip.
 	// The NOTIFY wakes every replica's ListenEvents so their SSE clients see this event.
-	return p.pool.QueryRow(ctx, `WITH ins AS (
+	b := &pgx.Batch{}
+	b.Queue(eventsLockSQL)
+	b.Queue(`WITH ins AS (
 			INSERT INTO events (sandbox_id, tenant, slug, run_id, type, data, at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id)
 		SELECT id FROM ins, pg_notify('`+eventsChannel+`', id::text)`,
-		e.SandboxID, e.Tenant, e.Slug, e.RunID, e.Type, e.Data, e.At).Scan(&e.ID)
+		e.SandboxID, e.Tenant, e.Slug, e.RunID, e.Type, e.Data, e.At).QueryRow(func(row pgx.Row) error { return row.Scan(&e.ID) })
+	return p.pool.SendBatch(ctx, b).Close()
 }
+
+// eventsLockSQL serialises event ids with their commits (see AppendEvent).
+const eventsLockSQL = `SELECT pg_advisory_xact_lock(hashtext('agent-sandbox:events'))`
 
 func (p *Postgres) ListEvents(ctx context.Context, sandboxID string, afterID int64, limit int) ([]*model.Event, error) {
 	if limit <= 0 {
@@ -2038,8 +2050,11 @@ func (p *Postgres) FirstUseAPIKey(ctx context.Context, id string, at time.Time) 
 	return ErrKeyInactive
 }
 
-// LastEventID implements EventHead. The sequence may be ahead of the newest committed row
-// (rolled back or in-flight inserts); max(id) is what a reader can see.
+// LastEventID implements EventHead: the newest visible id. It is a safe boundary because ids
+// follow commit order (AppendEvent draws its id under eventsLockSQL, held to the commit): when
+// N is visible, every id below N is committed or never will be, and an insert still in flight
+// takes an id above N, so it is never mistaken for history. Without that lock a smaller id
+// could commit after N and fall below a cursor already past it.
 func (p *Postgres) LastEventID(ctx context.Context) (int64, error) {
 	var id int64
 	err := p.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM events`).Scan(&id)
