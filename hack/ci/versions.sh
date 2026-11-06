@@ -20,11 +20,15 @@ case "${1:-plain}" in
     echo "helm: $HELM_VERSION"
     echo "postgres: $POSTGRES_IMAGE"
     echo "docker cli (when the runner has none): $DOCKER_CLI_VERSION"
-    echo "agent image harnesses: claude-code $CLAUDE_CODE_VERSION, codex $CODEX_VERSION"
+    echo "agent image harnesses: claude-code $CLAUDE_CODE_VERSION, codex $CODEX_VERSION, claude-agent-acp $CLAUDE_AGENT_ACP_VERSION, codex-acp $CODEX_ACP_VERSION, opencode $OPENCODE_VERSION (npm $NPM_VERSION); agent-hermes: hermes $HERMES_VERSION ($HERMES_IMAGE)"
     echo "cosign: $COSIGN_VERSION"
+    echo "trivy: $TRIVY_VERSION"
+    ;;
+  hermes-build-args)
+    echo "--build-arg HERMES_IMAGE=$HERMES_IMAGE --build-arg HERMES_VERSION=$HERMES_VERSION"
     ;;
   build-args)
-    echo "--build-arg CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION --build-arg CODEX_VERSION=$CODEX_VERSION"
+    echo "--build-arg NPM_VERSION=$NPM_VERSION --build-arg CLAUDE_CODE_VERSION=$CLAUDE_CODE_VERSION --build-arg CODEX_VERSION=$CODEX_VERSION --build-arg CLAUDE_AGENT_ACP_VERSION=$CLAUDE_AGENT_ACP_VERSION --build-arg CODEX_ACP_VERSION=$CODEX_ACP_VERSION --build-arg OPENCODE_VERSION=$OPENCODE_VERSION"
     ;;
   verify)
     # Where a provider file cannot read versions.env (GitLab's service and job images are
@@ -34,5 +38,5 @@ case "${1:-plain}" in
     gomm=$(sed -n 's/^go \([0-9]*\.[0-9]*\).*/\1/p' "$ci_root/go.mod")
     grep -q "image: golang:$gomm\b" "$gl" || ci_die "versions: .gitlab-ci.yml's Go image is not golang:$gomm (go.mod)"
     ;;
-  *) ci_die "usage: versions.sh [plain|github|forgejo|verify|build-args]" ;;
+  *) ci_die "usage: versions.sh [plain|github|forgejo|verify|build-args|hermes-build-args]" ;;
 esac

@@ -5,6 +5,14 @@ import (
 	"strings"
 )
 
+// Roles of the turns the ACP lines become besides messages and tool calls (model.Role*): the
+// agent's requests to a person, their resolution, and the agent's commands.
+const (
+	RoleRequest  = "request"
+	RoleResolved = "resolved"
+	RoleCommands = "commands"
+)
+
 // Input modes: how the runner hands a message to the harness.
 const (
 	InputText       = "text"        // one line on stdin
@@ -26,10 +34,34 @@ func FormatInput(mode, text string) string {
 // ParseMessage pulls a conversation turn out of one output line. role is "assistant" for text
 // the agent said, "tool" for a tool call (text = the tool name), "" when the line is not a
 // turn (progress, usage, system events). Understood: Claude Code stream-json (assistant
-// messages with text / tool_use blocks) and Codex --json (agent_message items).
+// messages with text / tool_use blocks), Codex --json (agent_message items) and the ACP lines
+// the runner writes for an ACP harness (acp.message, acp.tool_call).
 func ParseMessage(line string) (role, text string) {
 	t := strings.TrimSpace(line)
 	if len(t) < 2 || t[0] != '{' {
+		return "", ""
+	}
+	if l, ok := parseACP(t); ok {
+		switch {
+		case l.Type == ACPRequest && l.Request != nil:
+			text := l.Request.Title
+			if text == "" {
+				text = l.Request.Message
+			}
+			return RoleRequest, text
+		case l.Type == ACPResolved && l.RequestID != "":
+			return RoleResolved, l.Outcome + " (" + l.By + ")"
+		case l.Type == ACPCommands:
+			names := make([]string, 0, len(l.Commands))
+			for _, c := range l.Commands {
+				names = append(names, "/"+c.Name)
+			}
+			return RoleCommands, strings.Join(names, " ")
+		case l.Type == ACPMessage && strings.TrimSpace(l.Text) != "":
+			return "assistant", strings.TrimSpace(l.Text)
+		case l.Type == ACPToolCall && l.Title != "":
+			return "tool", l.Title
+		}
 		return "", ""
 	}
 	switch {
@@ -80,7 +112,8 @@ func ParseMessage(line string) (role, text string) {
 }
 
 // IsTurnEnd reports whether the line marks the end of an agent turn: Claude Code's `result`
-// line, Codex's `turn.completed` event. The runner starts the idle countdown of an open
+// line, Codex's `turn.completed` event, the runner's `acp.turn_end`. The runner starts the
+// idle countdown of an open
 // conversation from here.
 func IsTurnEnd(line string) bool {
 	t := strings.TrimSpace(line)
@@ -93,5 +126,5 @@ func IsTurnEnd(line string) bool {
 	if json.Unmarshal([]byte(t), &v) != nil {
 		return false
 	}
-	return v.Type == "result" || v.Type == "turn.completed"
+	return v.Type == "result" || v.Type == "turn.completed" || v.Type == ACPTurnEnd
 }

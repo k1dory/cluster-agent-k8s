@@ -12,17 +12,25 @@ import (
 // body carries the provider's ID token; the answer is a short-lived tenant key under the
 // CITrust that accepts the token (see internal/ciauth). No bearer: the token is the
 // credential. A refusal says nothing about which trusts exist.
-func (p *Platform) ciAuthRoutes(mux *http.ServeMux) {
+func (p *Platform) ciAuthRoutes(mux *routeMux) {
 	mux.HandleFunc("POST /v1/auth/ci", func(w http.ResponseWriter, r *http.Request) {
 		if p.CIAuth == nil || p.Keys == nil {
 			writeErr(w, http.StatusServiceUnavailable, ciauth.ErrDisabled)
 			return
 		}
+		// Every exchange counts against its source address, refused or not: the route takes
+		// no bearer, so it is where a guess costs nothing else.
+		if lim := p.authLimiter(); lim != nil {
+			if d := lim.take("ci|" + sourceOf(r)); d > 0 {
+				writeRateLimited(w, d)
+				return
+			}
+		}
 		var body struct {
 			Token string `json:"token"`
 		}
 		if err := decodeStrict(w, r, &body, 2*ciauth.MaxTokenBytes); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			writeBodyErr(w, err)
 			return
 		}
 		if body.Token == "" {

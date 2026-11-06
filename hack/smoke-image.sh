@@ -9,8 +9,8 @@ run() { docker run --rm --entrypoint /bin/sh "$IMG" -lc "$*"; }
 echo "== user and tools"
 test "$(run id -u)" = "1000"                      # the pod runs as 1000; must be `agent`, not `node`
 test "$(run id -un)" = "agent"
-run 'claude --version >/dev/null'
-run 'codex --version >/dev/null'
+# The harnesses the image must carry (SMOKE_HARNESSES; agent-hermes: hermes).
+for h in ${SMOKE_HARNESSES:-claude codex}; do run "command -v $h >/dev/null"; done
 run 'git --version >/dev/null && /usr/sbin/nft --version >/dev/null && test -x /usr/local/bin/netlock.sh'
 run 'test -x /usr/local/bin/agent-init && test -x /usr/local/bin/agent-runner'
 

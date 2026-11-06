@@ -58,6 +58,11 @@ type Services struct {
 // Wire builds the services, loads their snapshots and installs the guard and the quotas on the
 // orchestrator. Call Watch to keep the snapshots fresh.
 func Wire(ctx context.Context, d Deps) (*Services, error) {
+	if d.Orch.Started() {
+		// Policies and Quotas are read by the reconciler without a lock, and its first pass would
+		// already have run without them: start it after Wire.
+		return nil, fmt.Errorf("app.Wire: the orchestrator's reconciler is already running")
+	}
 	defaults := func(t string) tenants.Quota {
 		q := d.Orch.Cfg.QuotaFor(t)
 		return tenants.Quota{MaxSandboxes: q.MaxSandboxes, MaxAwake: q.MaxAwake}

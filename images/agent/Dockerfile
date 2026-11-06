@@ -13,30 +13,51 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags=
  && CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w" -o /out/agent-runner ./cmd/agent-runner
 
 FROM node:22-bookworm-slim
-# The harnesses are pinned: CLAUDE_CODE_VERSION and CODEX_VERSION have no default here. They come
+# The harnesses are pinned: CLAUDE_CODE_VERSION, CODEX_VERSION, the ACP adapters
+# (CLAUDE_AGENT_ACP_VERSION, CODEX_ACP_VERSION) and OPENCODE_VERSION have no default here. They come
 # from hack/ci/versions.env (`hack/ci/versions.sh build-args`, which make images, ci-images and
 # publish-images pass), so an image never installs whatever npm calls latest that day, and the
 # versions it carries are labels `docker inspect` shows.
+ARG NPM_VERSION
 ARG CLAUDE_CODE_VERSION
 ARG CODEX_VERSION
+ARG CLAUDE_AGENT_ACP_VERSION
+ARG CODEX_ACP_VERSION
+ARG OPENCODE_VERSION
 LABEL io.agent-sandbox.harness.claude-code.version="${CLAUDE_CODE_VERSION}" \
-      io.agent-sandbox.harness.codex.version="${CODEX_VERSION}"
+      io.agent-sandbox.harness.codex.version="${CODEX_VERSION}" \
+      io.agent-sandbox.harness.claude-agent-acp.version="${CLAUDE_AGENT_ACP_VERSION}" \
+      io.agent-sandbox.harness.codex-acp.version="${CODEX_ACP_VERSION}" \
+      io.agent-sandbox.harness.opencode.version="${OPENCODE_VERSION}"
 # nftables: the netlock init container (pod-level egress firewall) runs from this same image.
-RUN { test -n "${CLAUDE_CODE_VERSION}" && test -n "${CODEX_VERSION}"; } \
-      || { echo "build args CLAUDE_CODE_VERSION and CODEX_VERSION are required (hack/ci/versions.sh build-args)" >&2; exit 1; } \
- && apt-get update && apt-get install -y --no-install-recommends \
+# The base image's packages are upgraded at build time (its tag lags Debian's security updates)
+# and its npm is replaced by the pinned one (NPM_VERSION: the base's copy carries its own
+# modules, which ci-images scans with the rest of the image).
+RUN { test -n "${NPM_VERSION}" && test -n "${CLAUDE_CODE_VERSION}" && test -n "${CODEX_VERSION}" && test -n "${CLAUDE_AGENT_ACP_VERSION}" && test -n "${CODEX_ACP_VERSION}" && test -n "${OPENCODE_VERSION}"; } \
+      || { echo "build args NPM_VERSION, CLAUDE_CODE_VERSION, CODEX_VERSION, CLAUDE_AGENT_ACP_VERSION, CODEX_ACP_VERSION and OPENCODE_VERSION are required (hack/ci/versions.sh build-args)" >&2; exit 1; } \
+ && apt-get update && apt-get upgrade -y --no-install-recommends && apt-get install -y --no-install-recommends \
       git curl ca-certificates python3 python3-venv python3-pip build-essential jq ripgrep openssh-client nftables \
  && rm -rf /var/lib/apt/lists/* \
+ && npm install -g npm@${NPM_VERSION} \
  && npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} @openai/codex@${CODEX_VERSION} \
+      @agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION} @agentclientprotocol/codex-acp@${CODEX_ACP_VERSION} \
+      opencode-ai@${OPENCODE_VERSION} \
  && npm cache clean --force \
  # the base image ships user `node` with UID 1000; the pod runs as 1000, so that identity becomes `agent`
  && userdel -r node \
  && useradd -m -u 1000 -s /bin/bash agent
+# Claude Code's managed settings, which no user or repository settings override: only hooks
+# defined here run. A repository's .claude/settings.json could otherwise run commands from hooks,
+# past the permission requests the runner answers and records.
+RUN mkdir -p /etc/claude-code && printf '{\n  "allowManagedHooksOnly": true\n}\n' > /etc/claude-code/managed-settings.json
 COPY --from=build /out/agent-init /out/agent-runner /usr/local/bin/
 COPY images/agent/netlock.sh /usr/local/bin/netlock.sh
 COPY images/agent/profile.sh /etc/profile.d/sandbox.sh
 # A gateway root can be baked in for layouts without the ConfigMap mount (compose/VM): put it at this path.
 ENV GATEWAY_CA_FILE=/etc/sandbox/gateway-ca/gateway-ca.crt
+# codex-acp starts the codex named here, the one pinned above (CODEX_VERSION), not the copy it
+# carries in its own dependencies.
+ENV CODEX_PATH=/usr/local/bin/codex
 # Every login shell (agent-runner uses `sh -lc`) sources the identity environment.
 ENV ENV=/etc/profile.d/sandbox.sh \
     BASH_ENV=/etc/profile.d/sandbox.sh \

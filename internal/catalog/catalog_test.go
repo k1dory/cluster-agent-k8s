@@ -22,6 +22,8 @@ func (images) ResolveVersion(v string, admin bool) (string, error) {
 		return "registry/agent:1.0", nil
 	case "canary":
 		return "registry/agent:1.1", nil
+	case "hermes":
+		return "registry/agent-hermes:1.0", nil
 	}
 	if admin {
 		return v, nil

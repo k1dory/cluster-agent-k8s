@@ -9,6 +9,9 @@ import (
 	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/store"
+	"encoding/json"
+	"github.com/k1dory/acpx"
+	"regexp"
 )
 
 // Delivery says how a message reached the agent.
@@ -34,11 +37,22 @@ func (o *Orchestrator) Say(ctx context.Context, sandboxID, text string) (run *mo
 	// happens after this one is released: locks are a bounded resource shared by every caller.
 	wake := false
 	err = o.Store.WithTenantLock(ctx, "sandbox:"+sandboxID, func(ctx context.Context) error {
+		// Under an Idempotency-Key, an earlier attempt's delivery is checked under this lock, so
+		// a slow attempt that resumes after another delivered never delivers the text again.
+		var said bool
+		if run, how, wake, said, err = o.keyedSaid(ctx, sandboxID); err != nil || said {
+			return err
+		}
 		run, how, wake, err = o.say(ctx, sandboxID, text)
+		if err == nil {
+			o.recordSaid(ctx, sandboxID, run, how)
+		}
 		return err
 	})
 	if err == nil && wake {
-		o.wakeForRun(ctx, sandboxID, run.ID)
+		// Under a key, a wake that did not start the sandbox fails the request: the delivery is
+		// recorded, so the retry finds it and wakes again (keyedSaid) instead of saying it twice.
+		err = o.wakeKeyed(ctx, sandboxID, run.ID)
 	}
 	return run, how, err
 }
@@ -73,7 +87,7 @@ func (o *Orchestrator) say(ctx context.Context, sandboxID, text string) (*model.
 			}
 		}
 	}
-	if active != nil && !streamsInput(sb) {
+	if active != nil && !o.streamsInput(sb) {
 		if newest.Status == model.RunQueued {
 			r, err := o.Store.AppendQueuedTask(ctx, newest.ID, "\n\n"+text)
 			if err == nil {
@@ -113,11 +127,74 @@ func (o *Orchestrator) say(ctx context.Context, sandboxID, text string) (*model.
 	return r, DeliveredNew, wake, nil
 }
 
-// streamsInput says whether the sandbox's harness takes messages during a run (stream-json).
-// Anything else is text mode, as the runner reads it: stdin carries the task and is closed.
-func streamsInput(sb *model.Sandbox) bool {
-	return sb.Launch != nil && sb.Launch.HarnessInput == harness.InputStreamJSON
+// streamsInput says whether the sandbox's harness takes messages during a run (stream-json, or
+// acp: the next prompt of the same session). Anything else is text mode, as the runner reads
+// it: stdin carries the task and is closed.
+func (o *Orchestrator) streamsInput(sb *model.Sandbox) bool {
+	in := o.harnessInput(sb)
+	return in == harness.InputStreamJSON || in == harness.InputACP
 }
+
+// harnessInput is the input mode the sandbox's pod runs with, as the runtime builds it: a
+// profile that names its own harness brings its own input mode; otherwise the profile's input,
+// or the deployment's default (kube.harness_input).
+func (o *Orchestrator) harnessInput(sb *model.Sandbox) string {
+	if l := sb.Launch; l != nil && (l.HarnessCommand != "" || l.HarnessInput != "") {
+		return l.HarnessInput
+	}
+	return o.Cfg.DefaultHarnessInput
+}
+
+// Reply hands a person's answer to a request of the agent (an acp.request in the run's output)
+// to the run that waits for it. The runner checks the answer against the request it holds and
+// writes how the request was resolved (acp.request_resolved); a reply to a request no longer
+// waiting is resolved as such there.
+func (o *Orchestrator) Reply(ctx context.Context, sandboxID, runID string, reply acpx.Reply) (*model.Run, error) {
+	if !requestIDRe.MatchString(reply.RequestID) {
+		return nil, fmt.Errorf("%w: request_id must be a request id (req_…)", ErrBadRequest)
+	}
+	switch {
+	case reply.OptionID != "" && reply.Action != "":
+		return nil, fmt.Errorf("%w: give option_id (a permission) or action (a question), not both", ErrBadRequest)
+	case reply.OptionID == "" && reply.Action == "":
+		return nil, fmt.Errorf("%w: option_id or action is required", ErrBadRequest)
+	case reply.Action != "" && reply.Action != acpx.ActionAccept && reply.Action != acpx.ActionDecline && reply.Action != acpx.ActionCancel:
+		return nil, fmt.Errorf("%w: action must be accept, decline or cancel", ErrBadRequest)
+	case len(reply.OptionID) > 256:
+		return nil, fmt.Errorf("%w: option_id is too long", ErrBadRequest)
+	}
+	data, err := json.Marshal(reply)
+	if err != nil || len(data) > maxReplyBytes {
+		return nil, fmt.Errorf("%w: the reply exceeds %d bytes", ErrBadRequest, maxReplyBytes)
+	}
+	sb, err := o.Store.GetSandbox(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	if o.harnessInput(sb) != harness.InputACP {
+		return nil, fmt.Errorf("%w: the sandbox's harness asks nothing (input %q, not acp)", ErrConflict, o.harnessInput(sb))
+	}
+	// The answer goes to the run that asked (the request turn's run_id), never to another one
+	// that happens to run now.
+	if runID == "" {
+		return nil, fmt.Errorf("%w: run_id is required: the run that asked (the request's run_id)", ErrBadRequest)
+	}
+	r, err := o.Store.GetRun(ctx, runID)
+	if err != nil || r.SandboxID != sandboxID {
+		return nil, fmt.Errorf("run %s: %w", runID, store.ErrNotFound)
+	}
+	if r.Status != model.RunRunning {
+		return nil, fmt.Errorf("%w: run %s is %s: the request is no longer waiting", ErrConflict, runID, r.Status)
+	}
+	o.Touch(ctx, sandboxID)
+	return r, o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventReply, Data: string(data)})
+}
+
+// requestIDRe is what the runner names a request (acpx.Pending).
+var requestIDRe = regexp.MustCompile(`^req_[0-9a-f]{16}$`)
+
+// maxReplyBytes bounds a reply: a form's answers.
+const maxReplyBytes = 64 << 10
 
 // CloseRun asks the runner to close the harness's input: an open conversation ends, the run
 // finishes when the harness exits. A queued run is cancelled instead (nothing to close).
@@ -196,6 +273,10 @@ func (o *Orchestrator) message(ctx context.Context, e model.Event, runs map[stri
 			role, text = model.RoleLog, e.Data
 		}
 		m.Role, m.Text = role, text
+		switch role {
+		case model.RoleRequest, model.RoleResolved, model.RoleCommands:
+			m.Data = json.RawMessage(e.Data)
+		}
 		return m, true
 	case model.EventRunDone:
 		m.Role, m.Text = model.RoleSystem, "run "+e.Data

@@ -13,7 +13,7 @@ import (
 // and keeps its access token fresh for the gateway. Same scope rules as the credentials: a
 // tenant in its own, the admin in a tenant's (?tenant=) or the shared one. Starting a sign-in
 // returns where to approve it and the code to type; nothing ever returns a token.
-func (p *Platform) oauthRoutes(mux *http.ServeMux) {
+func (p *Platform) oauthRoutes(mux *routeMux) {
 	scope := func(w http.ResponseWriter, r *http.Request) (string, bool) {
 		if p.OAuth == nil {
 			writeErr(w, http.StatusServiceUnavailable, credentials.ErrDisabled)
@@ -57,7 +57,7 @@ func (p *Platform) oauthRoutes(mux *http.ServeMux) {
 			Provider string `json:"provider"`
 		}
 		if err := decodeStrict(w, r, &req, 4096); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			writeBodyErr(w, err)
 			return
 		}
 		c, created, err := p.OAuth.Start(r.Context(), tenant, r.PathValue("name"), req.Provider, principalOf(r).Subject)

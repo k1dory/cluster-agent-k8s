@@ -91,10 +91,28 @@ func (v *Verifier) idTokenVerifier(ctx context.Context) (*gooidc.IDTokenVerifier
 	}
 	provider, err := gooidc.NewProvider(dctx, v.cfg.Discovery)
 	if err != nil {
-		v.lastErr = fmt.Errorf("oidc discovery: %w", err)
+		v.lastErr = fmt.Errorf("%w: oidc discovery: %w", httpapi.ErrVerifierUnavailable, err)
 		return nil, v.lastErr
 	}
-	v.verifier = provider.Verifier(&gooidc.Config{ClientID: v.cfg.ClientID, SkipClientIDCheck: v.cfg.ClientID == ""})
+	var meta struct {
+		JWKS string   `json:"jwks_uri"`
+		Algs []string `json:"id_token_signing_alg_values_supported"`
+	}
+	if err := provider.Claims(&meta); err != nil {
+		v.lastErr = fmt.Errorf("%w: oidc discovery: %w", httpapi.ErrVerifierUnavailable, err)
+		return nil, v.lastErr
+	}
+	// The provider's own key set, behind one that notes when the keys could not be fetched:
+	// go-oidc reports that inside a formatted error, so the outage could not be told from a
+	// bad signature otherwise.
+	keys := &fetchNotingKeySet{inner: gooidc.NewRemoteKeySet(context.WithoutCancel(dctx), meta.JWKS)}
+	var algs []string
+	for _, a := range meta.Algs {
+		if supportedAlgs[a] {
+			algs = append(algs, a)
+		}
+	}
+	v.verifier = gooidc.NewVerifier(v.cfg.Issuer, keys, &gooidc.Config{ClientID: v.cfg.ClientID, SkipClientIDCheck: v.cfg.ClientID == "", SupportedSigningAlgs: algs})
 	v.lastErr = nil
 	return v.verifier, nil
 }
@@ -105,8 +123,12 @@ func (v *Verifier) Verify(ctx context.Context, raw string) (httpapi.Principal, e
 	if err != nil {
 		return httpapi.Principal{}, err
 	}
-	tok, err := ver.Verify(ctx, raw)
+	var fetchErr error
+	tok, err := ver.Verify(context.WithValue(ctx, fetchErrKey{}, &fetchErr), raw)
 	if err != nil {
+		if fetchErr != nil {
+			return httpapi.Principal{}, fmt.Errorf("%w: oidc keys: %w", httpapi.ErrVerifierUnavailable, fetchErr)
+		}
 		return httpapi.Principal{}, err
 	}
 	var claims map[string]any
@@ -168,4 +190,28 @@ func contains(raw any, want string) bool {
 		}
 	}
 	return false
+}
+
+// supportedAlgs are the signing algorithms go-oidc verifies (what Provider.Verifier keeps of
+// the provider's list).
+var supportedAlgs = map[string]bool{
+	gooidc.RS256: true, gooidc.RS384: true, gooidc.RS512: true,
+	gooidc.ES256: true, gooidc.ES384: true, gooidc.ES512: true,
+	gooidc.PS256: true, gooidc.PS384: true, gooidc.PS512: true, gooidc.EdDSA: true,
+}
+
+type fetchErrKey struct{}
+
+// fetchNotingKeySet is a remote key set that records, for the Verify call it serves, an
+// error fetching the keys: the provider did not answer, which says nothing about the token.
+type fetchNotingKeySet struct{ inner *gooidc.RemoteKeySet }
+
+func (k *fetchNotingKeySet) VerifySignature(ctx context.Context, jwt string) ([]byte, error) {
+	payload, err := k.inner.VerifySignature(ctx, jwt)
+	if err != nil && strings.HasPrefix(err.Error(), "fetching keys") {
+		if p, ok := ctx.Value(fetchErrKey{}).(*error); ok {
+			*p = err
+		}
+	}
+	return payload, err
 }

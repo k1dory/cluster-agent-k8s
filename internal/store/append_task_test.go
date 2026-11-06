@@ -10,8 +10,7 @@ import (
 )
 
 // A message joins a run's task only while the run is queued: once the runner claims it, the
-// harness may already have read the task, and the caller must queue a new run instead. A claim
-// can be released back to the queue.
+// harness may already have read the task, and the caller must queue a new run instead.
 func testAppendQueuedTask(t *testing.T, s Store) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Microsecond)
@@ -27,7 +26,11 @@ func testAppendQueuedTask(t *testing.T, s Store) {
 	if err != nil || r.Task != "add tests\n\nuse pytest" || r.Status != model.RunQueued {
 		t.Fatalf("append to a queued run: %v %+v", err, r)
 	}
-	claimed, err := s.ClaimQueuedRun(ctx, sb.ID, now)
+	next, err := s.QueuedRun(ctx, sb.ID)
+	if err != nil || next.ID != run.ID {
+		t.Fatalf("queued run: %v %+v", err, next)
+	}
+	claimed, err := s.ClaimRun(ctx, next.ID, now, "", RunStamp{})
 	if err != nil || claimed.Task != "add tests\n\nuse pytest" {
 		t.Fatalf("claim: %v %+v", err, claimed)
 	}
@@ -39,23 +42,6 @@ func testAppendQueuedTask(t *testing.T, s Store) {
 	}
 	if _, err := s.AppendQueuedTask(ctx, "run_nope", "x"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown run: %v", err)
-	}
-	// A claim the caller cannot go on with is undone: the run is queued again, claimable, and
-	// accepts messages again.
-	if err := s.ReleaseRun(ctx, run.ID); err != nil {
-		t.Fatalf("release: %v", err)
-	}
-	if got, _ := s.GetRun(ctx, run.ID); got.Status != model.RunQueued || got.StartedAt != nil {
-		t.Fatalf("released run: %+v", got)
-	}
-	if err := s.ReleaseRun(ctx, run.ID); !errors.Is(err, ErrConflict) {
-		t.Fatalf("release of a queued run: %v", err)
-	}
-	if err := s.ReleaseRun(ctx, "run_nope"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("release of an unknown run: %v", err)
-	}
-	if again, err := s.ClaimQueuedRun(ctx, sb.ID, now); err != nil || again.ID != run.ID {
-		t.Fatalf("claim after release: %v %+v", err, again)
 	}
 }
 
@@ -86,20 +72,20 @@ func testClaimRun(t *testing.T, s Store) {
 	if err != nil || q.ID != "claim-1" || q.Status != model.RunQueued {
 		t.Fatalf("oldest queued: %v %+v", err, q)
 	}
-	r, err := s.ClaimRun(ctx, q.ID, now, "sess")
+	r, err := s.ClaimRun(ctx, q.ID, now, "sess", RunStamp{})
 	if err != nil || r.Status != model.RunRunning || r.Session != "sess" || r.StartedAt == nil {
 		t.Fatalf("claim: %v %+v", err, r)
 	}
 	if got, _ := s.GetRun(ctx, q.ID); got.Status != model.RunRunning || got.Session != "sess" {
 		t.Fatalf("claim not stored: %+v", got)
 	}
-	if _, err := s.ClaimRun(ctx, q.ID, now, "sess"); !errors.Is(err, ErrConflict) {
+	if _, err := s.ClaimRun(ctx, q.ID, now, "sess", RunStamp{}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("second claim: %v", err)
 	}
-	if _, err := s.ClaimRun(ctx, "run_nope", now, ""); !errors.Is(err, ErrNotFound) {
+	if _, err := s.ClaimRun(ctx, "run_nope", now, "", RunStamp{}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown run: %v", err)
 	}
-	if r, err := s.ClaimRun(ctx, "claim-2", now, "other"); err != nil || r.Session != "own" {
+	if r, err := s.ClaimRun(ctx, "claim-2", now, "other", RunStamp{}); err != nil || r.Session != "own" {
 		t.Fatalf("a run's own session is kept: %v %+v", err, r)
 	}
 }

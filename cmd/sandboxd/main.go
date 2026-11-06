@@ -125,11 +125,27 @@ func serve(cfgPath string, log *slog.Logger) error {
 	go pols.Watch(ctx.Done(), 5*time.Second, func(err error) { log.Error("policy reload rejected, keeping previous policies", "err", err) })
 
 	var agentCA *ca.CA
+	// CA keys kept in the database are encrypted under credentials.key, the key the tenants'
+	// credentials use; without it they are stored in clear, as before.
+	var caSealer ca.KeySealer
 	if cfg.CA.Source == "db" {
-		if agentCA, err = ca.LoadOrCreateShared(ctx, st); err != nil {
+		key, err := credentials.ParseKey(cfg.Credentials.Key)
+		if err != nil {
+			return fmt.Errorf("credentials: %w", err)
+		}
+		if key != nil {
+			sl, err := credentials.NewSealer(key)
+			if err != nil {
+				return fmt.Errorf("credentials: %w", err)
+			}
+			caSealer = sl
+		} else {
+			log.Warn("no credentials.key: the CA private keys in the database (agent CA, gateway root) are stored in clear; set credentials.key to encrypt them")
+		}
+		if agentCA, err = ca.LoadOrCreateShared(ctx, st, caSealer, log); err != nil {
 			return fmt.Errorf("ca (db): %w", err)
 		}
-		log.Info("agent CA loaded from the database (shared by replicas)")
+		log.Info("agent CA loaded from the database (shared by replicas)", "encrypted", caSealer != nil)
 	} else if agentCA, err = ca.LoadOrCreate(cfg.CA.Dir); err != nil {
 		return fmt.Errorf("ca: %w", err)
 	}
@@ -141,7 +157,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 	if cfg.CA.Source == "db" && cfg.Gateway.RootDir != "" {
 		// One gateway root for every replica: Caddy signs its site certificates under it, so an
 		// agent bootstrapped through one replica trusts the others.
-		root, err := ca.LoadOrCreateSharedNamed(ctx, st, "gateway-ca", "agent-sandbox gateway root")
+		root, err := ca.LoadOrCreateSharedNamed(ctx, st, "gateway-ca", "agent-sandbox gateway root", caSealer, log)
 		if err != nil {
 			return fmt.Errorf("gateway root (db): %w", err)
 		}
@@ -229,7 +245,9 @@ func serve(cfgPath string, log *slog.Logger) error {
 			TokenAudience: k.TokenAudience, RuntimeClassName: k.RuntimeClassName, StorageClass: k.StorageClass,
 			VolumeSize: k.VolumeSize, CPURequest: k.CPURequest, CPULimit: k.CPULimit, MemoryRequest: k.MemoryRequest,
 			MemoryLimit: k.MemoryLimit, HarnessCommand: k.HarnessCommand, HarnessResumeCommand: k.HarnessResumeCommand,
-			ResumePrompt: k.ResumePrompt, Env: k.Env, PriorityClassName: k.PriorityClassName,
+			ResumePrompt: k.ResumePrompt, HarnessInput: k.HarnessInput, HarnessPermissions: k.HarnessPermissions,
+			HarnessMode: k.HarnessMode, HarnessMCP: k.HarnessMCP, HarnessAuthMethod: k.HarnessAuthMethod,
+			Env: k.Env, PriorityClassName: k.PriorityClassName,
 			TerminationSeconds: k.TerminationSeconds, PodFirewall: *k.PodFirewall, GatewayCAConfigMap: *k.GatewayCAConfigMap,
 		}}
 		reg.Resolver = &kube.Resolver{Client: client, Namespace: k.Namespace, Audience: k.TokenAudience}
@@ -275,14 +293,20 @@ func serve(cfgPath string, log *slog.Logger) error {
 	// Events appended by any replica (this one included) reach the SSE clients through the store,
 	// so the orchestrator does not publish locally as well.
 	listener, hasListener := st.(store.EventListener)
+	listening := make(chan struct{})
 	if hasListener {
-		go listener.ListenEvents(ctx, func(e *model.Event) { hub.Publish(*e) })
+		go listener.ListenEvents(ctx, func() { close(listening) }, func(e *model.Event) { hub.Publish(*e) })
+	} else {
+		close(listening)
 	}
 	// The environment version: everything that shapes a pod besides the task. A change here
 	// shows as drift between a sandbox's env_version and GET /v1/version.
 	envVersion := func(sb *model.Sandbox) string {
 		h := sha256.New()
 		fmt.Fprintf(h, "policy=%s\nimage=%s\nharness=%s\nresume=%s\n", pols.ContentHash(sb.Slug), sb.AgentVersion, cfg.Kube.HarnessCommand, cfg.Kube.HarnessResumeCommand)
+		if k := cfg.Kube; k.HarnessInput != "" || k.HarnessPermissions != "" || k.HarnessMode != "" || k.HarnessMCP != "" || k.HarnessAuthMethod != "" {
+			fmt.Fprintf(h, "input=%s\npermissions=%s\nmode=%s\nmcp=%s\nauth=%s\n", k.HarnessInput, k.HarnessPermissions, k.HarnessMode, k.HarnessMCP, k.HarnessAuthMethod)
+		}
 		if sb.Launch != nil {
 			b, _ := json.Marshal(sb.Launch)
 			fmt.Fprintf(h, "launch=%s\nagent=%s@%d\nenvironment=%s@%d\n", b, sb.AgentRef, sb.AgentRevision, sb.EnvironmentRef, sb.EnvironmentRevision)
@@ -303,13 +327,9 @@ func serve(cfgPath string, log *slog.Logger) error {
 		ReadyTimeout: cfg.Sandbox.ReadyTimeout, IdleCheckEvery: cfg.Sandbox.IdleCheckEvery,
 		DefaultQuota: cfg.Quotas.Default, Quotas: cfg.Quotas.Tenants,
 		DefaultAgentVersion: cfg.Agent.Default, Versions: cfg.Agent.Versions, EnvVersion: envVersion,
+		DefaultHarnessInput: cfg.Kube.HarnessInput,
 	}, log)
 	orch.ListenerPublishes = hasListener
-	orchDone := make(chan struct{})
-	go func() { // reconciler on the replica holding the lease
-		orch.Run(ctx)
-		close(orchDone)
-	}()
 
 	var secretProvider secrets.Provider = secrets.Static{}
 	switch cfg.Secrets.Provider {
@@ -357,10 +377,19 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	// The configuration services: ownership guard, quotas, connections, catalogue (one wiring
 	// for sandboxd and the integration tests, see internal/app).
-	services, err := app.Wire(ctx, app.Deps{Store: st, Policies: pols, Secrets: secretProvider, Orch: orch, Log: log, CITrustMaxTTL: cfg.CIAuth.MaxTTL})
+	services, err := app.Wire(ctx, app.Deps{Store: st, Policies: pols, Secrets: secretProvider, Orch: orch, Log: log, Replica: replicaName(), CITrustMaxTTL: cfg.CIAuth.MaxTTL})
 	if err != nil {
 		return err
 	}
+	// The reconciler starts only now: Wire installs the ownership guard and the quotas on the
+	// orchestrator, and a replica that wins the lease reconciles at once. Started earlier, the
+	// first pass ran without them (revoked slugs kept running) and Wire wrote both fields under
+	// a goroutine already reading them.
+	orchDone := make(chan struct{})
+	go func() { // reconciler on the replica holding the lease
+		orch.Run(ctx)
+		close(orchDone)
+	}()
 	services.Watch(ctx, log)
 	if startSyncer != nil {
 		startSyncer(services.Guard, services.Connections)
@@ -387,6 +416,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 		Keys: &apikeys.Service{Store: st, MaxTTL: cfg.APIKeys.MaxTTL}, Credentials: creds, OAuth: oauth,
 		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Replica: replicaName(), Log: log.With("log", "api")}
 	services.Install(platform)
+	platform.AuthLimit = cfg.AuthLimit // per-address limit on CI exchanges and failed bearer tokens
 	// CI jobs trade their provider's ID token for a key of the trusting tenant.
 	platform.CIAuth = &ciauth.Service{Trusts: st, Keys: platform.Keys, Uses: st, MaxTTL: cfg.CIAuth.MaxTTL, Log: log.With("log", "ci-auth")}
 	if cfg.OIDC != nil {
@@ -404,12 +434,25 @@ func serve(cfgPath string, log *slog.Logger) error {
 	gw := &httpapi.Gateway{Orch: orch, Registrar: reg, Authz: az, Log: log.With("log", "gateway-api"),
 		MCP: &mcpproxy.Handler{Authz: az, Hosts: services.Guard, Log: log.With("log", "mcp")}}
 
-	servers := []*http.Server{
-		{Addr: cfg.Listen.API, Handler: platform.Routes(), ReadHeaderTimeout: 10 * time.Second},
-		{Addr: cfg.Listen.Gateway, Handler: gw.Routes(), ReadHeaderTimeout: 10 * time.Second},
+	// Timeouts: a client gets 10s to send its headers and a kept-alive connection is dropped
+	// after 2 minutes of silence. There is deliberately no ReadTimeout or WriteTimeout: both
+	// count from the start of the request, so either would cut the SSE streams (events, trace,
+	// messages), the agent long-polls (up to 2 minutes of wait) and a slow multipart upload.
+	// Bodies are bounded by size instead (internal/httpapi/body.go), and handlers that wait
+	// end with the request's context.
+	server := func(addr string, h http.Handler) *http.Server {
+		return &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
 	}
+	servers := []*http.Server{server(cfg.Listen.API, platform.Routes()), server(cfg.Listen.Gateway, gw.Routes())}
 	if ing != nil {
-		servers = append(servers, &http.Server{Addr: cfg.Listen.Ingress, Handler: ing, ReadHeaderTimeout: 10 * time.Second})
+		servers = append(servers, server(cfg.Listen.Ingress, ing))
+	}
+	// No request before the event listener knows where its feed starts: an event appended earlier
+	// would fall below its cursor and never reach this replica's hub (see store.EventListener).
+	select {
+	case <-listening:
+	case <-ctx.Done():
+		servers = nil // shutting down before serving: straight to the lease hand-over below
 	}
 	errCh := make(chan error, len(servers))
 	for _, s := range servers {
@@ -428,6 +471,9 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	for _, s := range servers {
 		httpapi.ShutdownServer(context.Background(), s)
+	}
+	if ing != nil {
+		ing.Close()
 	}
 	// The lead is handed over before the process ends: the reconciler releases its lease
 	// (unlock, connection closed), so a standby takes over within its polling interval rather

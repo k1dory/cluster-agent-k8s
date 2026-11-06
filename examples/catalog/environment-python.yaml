@@ -8,12 +8,14 @@ spec:
   image: stable                     # a version name from the server's catalogue (`sandboxctl version`);
                                     # the admin may write an image reference instead
   harness:
-    # Streaming input keeps the conversation open: follow-up messages reach this process.
-    command: 'claude -p --input-format stream-json --output-format stream-json --verbose'
-    input: stream-json
+    # Claude over the Agent Client Protocol: every message is a prompt of one session, the next
+    # run continues it (session/resume or load), permission requests are answered by
+    # `permissions` and recorded (docs/chat-and-files.md, "ACP harnesses").
+    command: claude-agent-acp
+    input: acp
+    permissions: allow
+    mode: default                   # Claude's permission checks on: its requests reach the runner
     chat_idle: 600                  # close an idle conversation after 10 minutes (the run ends)
-    # Between runs the conversation continues: the message arrives in $SANDBOX_RESUME_PROMPT.
-    resume_command: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose'
   model:
     name: claude-opus-5-5           # exported to the pod as SANDBOX_MODEL and ANTHROPIC_MODEL
     env:

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,5 +52,35 @@ func TestHarnessCommandsKeepTheAgentsVariables(t *testing.T) {
 	}
 	if c.Gateway.IP != "10.0.0.1" {
 		t.Fatalf("sandboxd's own variables must still expand: gateway.ip = %q", c.Gateway.IP)
+	}
+}
+
+// Without a harness of its own a deployment runs Claude over ACP, with no resume command (the
+// agent continues its session itself). One that names its command keeps its input mode and the
+// Claude Code resume default.
+func TestDefaultHarnessIsClaudeOverACP(t *testing.T) {
+	load := func(kube string) *Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "c.yaml")
+		if err := os.WriteFile(path, []byte("api_token: x\nruntime: fake\npolicies_dir: policies\nkube:\n"+kube), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	k := load("  volume_size: 10Gi\n").Kube
+	if k.HarnessCommand != "claude-agent-acp" || k.HarnessInput != "acp" || k.HarnessMode != "default" || k.HarnessResumeCommand != "" {
+		t.Fatalf("default harness: %+v", k)
+	}
+	k = load("  harness_command: 'claude -p \"$SANDBOX_TASK\"'\n").Kube
+	if k.HarnessInput != "" || k.HarnessMode != "" || !strings.Contains(k.HarnessResumeCommand, "claude -p") {
+		t.Fatalf("own command: %+v", k)
+	}
+	k = load("  harness_command: codex-acp\n  harness_input: acp\n  harness_mode: agent-full-access\n").Kube
+	if k.HarnessInput != "acp" || k.HarnessMode != "agent-full-access" || k.HarnessResumeCommand != "" {
+		t.Fatalf("own ACP command: %+v", k)
 	}
 }

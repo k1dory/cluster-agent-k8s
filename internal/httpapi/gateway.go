@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"bufio"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -33,8 +32,12 @@ type Gateway struct {
 
 // Routes builds the gateway mux.
 func (g *Gateway) Routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
+	return logRequests(g.Log, g.routes().ServeMux)
+}
+
+func (g *Gateway) routes() *routeMux {
+	mux := newRouteMux()
+	mux.HandleFunc("GET /healthz", healthz)
 	mux.Handle("GET /authz", g.Authz)
 	mux.Handle("POST /authz", g.Authz)
 	mux.HandleFunc("POST /bootstrap", g.bootstrap)
@@ -50,22 +53,27 @@ func (g *Gateway) Routes() http.Handler {
 	if g.MCP != nil {
 		mux.Handle("/", g.MCP) // everything else is an MCP host proxied by Caddy (see gateway template)
 	}
-	return logRequests(g.Log, mux)
+	return mux
 }
 
 func (g *Gateway) bootstrap(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	var req registrar.BootstrapRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeStrict(w, r, &req, smallBodyLimit); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	res, err := g.Registrar.Bootstrap(r.Context(), token, req)
-	if errors.Is(err, registrar.ErrUnauthorized) {
+	switch {
+	case errors.Is(err, registrar.ErrUnauthorized):
 		writeErr(w, http.StatusUnauthorized, err)
 		return
-	}
-	if err != nil {
+	case errors.Is(err, registrar.ErrUnavailable):
+		// The platform's side (the store, a lost race with the pod's own retry): agent-init
+		// retries a 503, and exits on a 400.
+		writeErr(w, http.StatusServiceUnavailable, err)
+		return
+	case err != nil:
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
@@ -113,7 +121,7 @@ func waitParam(r *http.Request) time.Duration {
 }
 
 func (g *Gateway) nextRun(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
-	run, err := g.Orch.NextRun(r.Context(), id.SandboxID, waitParam(r))
+	run, err := g.Orch.NextRunFor(r.Context(), id.SandboxID, runOwner(id), waitParam(r))
 	if errors.Is(err, store.ErrNotFound) || errors.Is(err, r.Context().Err()) && err != nil {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -123,6 +131,38 @@ func (g *Gateway) nextRun(w http.ResponseWriter, r *http.Request, id *identity.I
 		return
 	}
 	writeJSON(w, http.StatusOK, run)
+}
+
+// runOwner is what a claim is handed to: the pod's instance ("" when the certificate has none).
+func runOwner(id *identity.Identity) string {
+	if id.Instance <= 0 {
+		return ""
+	}
+	return strconv.Itoa(id.Instance)
+}
+
+// runCall reads the run a call is about and the attempt it names (X-Run-Attempt, 0 when the
+// runner does not send it), refuses an attempt the run was handed out past (409), and
+// confirms the claim: the runner's first call about a run says it got it, so it is not handed
+// out again. false: the response is written.
+func (g *Gateway) runCall(w http.ResponseWriter, r *http.Request, id *identity.Identity) (*model.Run, int, bool) {
+	run, err := g.ownRun(r, id)
+	if err != nil {
+		writeOrchErr(w, err)
+		return nil, 0, false
+	}
+	attempt := 0
+	if h := r.Header.Get("X-Run-Attempt"); h != "" {
+		if attempt, err = strconv.Atoi(h); err != nil || attempt < 1 {
+			writeErr(w, http.StatusBadRequest, errors.New("X-Run-Attempt must be a positive integer"))
+			return nil, 0, false
+		}
+	}
+	if err := g.Orch.AckClaim(r.Context(), run, runOwner(id), attempt); err != nil {
+		writeOrchErr(w, err)
+		return nil, 0, false
+	}
+	return run, attempt, true
 }
 
 func (g *Gateway) ownRun(r *http.Request, id *identity.Identity) (*model.Run, error) {
@@ -137,63 +177,65 @@ func (g *Gateway) ownRun(r *http.Request, id *identity.Identity) (*model.Run, er
 }
 
 func (g *Gateway) appendOutput(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
-	run, err := g.ownRun(r, id)
-	if err != nil {
-		writeOrchErr(w, err)
+	run, attempt, ok := g.runCall(w, r, id)
+	if !ok {
 		return
 	}
 	// Limits: MaxBodyBytes per request, MaxLineBytes per line. Exceeding either is a 413 and
 	// nothing after the offending point is stored; lines before it are, and are acknowledged.
+	// A body that breaks off otherwise stores nothing: the runner sends it again whole.
 	//
-	// With X-Batch-Id the server remembers how many lines of that batch it stored, so a retry
-	// of the same batch (after a lost response or a 5xx) skips them instead of duplicating
-	// output and usage. Progress is recorded before every response, success or error.
-	batchKey := ""
-	skip := 0
+	// The lines, the usage and session they carry and, with X-Batch-Id, the batch's progress
+	// are stored in one write, or nothing is. A 5xx does not say which (the commit may have
+	// happened and its acknowledgement been lost), so the runner retries under the same
+	// X-Batch-Id: a retry (after a lost response, on any replica, even at once) stores only what
+	// is not stored yet; the same id with another body, or with more lines than a body that was
+	// stored whole, is a 422.
+	batchID := ""
 	if bid := r.Header.Get("X-Batch-Id"); bid != "" && len(bid) <= 100 {
-		batchKey = "batch|" + run.ID + "|" + bid
-		if rec, err := g.Orch.Store.GetIdempotent(r.Context(), batchKey); err == nil {
-			skip = rec.Status
-		}
+		batchID = bid
 	}
-	n := 0
-	remember := func() {
-		if batchKey != "" {
-			_ = g.Orch.Store.PutIdempotent(r.Context(), &store.Idempotent{Key: batchKey, Status: n, Body: []byte{}})
-		}
-	}
-	sc := bufio.NewScanner(http.MaxBytesReader(w, r.Body, MaxBodyBytes))
+	var lines []string
+	sc := bufio.NewScanner(maxBytes(w, r.Body, MaxBodyBytes))
 	sc.Buffer(make([]byte, 0, 64<<10), MaxLineBytes)
 	for sc.Scan() {
-		line := sc.Text()
-		if line == "" {
-			continue
+		if line := sc.Text(); line != "" {
+			lines = append(lines, line)
 		}
-		if n < skip {
-			n++
-			continue
-		}
-		if err := g.Orch.Output(r.Context(), id.SandboxID, run.ID, line); err != nil {
-			remember()
-			writeErr(w, http.StatusInternalServerError, fmt.Errorf("stored %d lines, then: %w", n, err))
-			return
-		}
-		n++
 	}
-	remember()
+	tooLarge := ""
 	if err := sc.Err(); err != nil {
 		var mbe *http.MaxBytesError
 		switch {
 		case errors.As(err, &mbe):
-			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("body exceeds %d bytes (stored %d lines)", MaxBodyBytes, n))
+			tooLarge = fmt.Sprintf("body exceeds %d bytes", MaxBodyBytes)
 		case errors.Is(err, bufio.ErrTooLong):
-			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("line exceeds %d bytes (stored %d lines)", MaxLineBytes, n))
+			tooLarge = fmt.Sprintf("line exceeds %d bytes", MaxLineBytes)
 		default:
-			writeErr(w, http.StatusBadRequest, fmt.Errorf("read body (stored %d lines): %w", n, err))
+			writeErr(w, http.StatusBadRequest, fmt.Errorf("read body (stored 0 lines): %w", err))
+			return
 		}
+	}
+	res, err := g.Orch.OutputBatch(r.Context(), id.SandboxID, run.ID, batchID, attempt, lines, tooLarge != "")
+	switch {
+	case errors.Is(err, store.ErrBatchMismatch):
+		writeErr(w, http.StatusUnprocessableEntity, err)
+		return
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrConflict):
+		writeOrchErr(w, err) // refused before anything was written
+		return
+	case err != nil:
+		// Not "nothing was stored": the commit may have happened with its acknowledgement lost.
+		// The detail goes to the request log; the runner is told what makes the retry safe.
+		noteInternal(w, err)
+		writeErr(w, http.StatusServiceUnavailable, errors.New("the batch may or may not have been stored: send it again with the same X-Batch-Id"))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int{"accepted": n, "skipped": skip})
+	if tooLarge != "" {
+		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("%s (stored %d lines)", tooLarge, len(lines)))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"accepted": len(lines), "skipped": res.Skipped})
 }
 
 // Output stream limits for POST /agent/runs/{run}/events.
@@ -203,9 +245,14 @@ const (
 )
 
 func (g *Gateway) pollInput(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
-	run, err := g.ownRun(r, id)
-	if err != nil {
-		writeOrchErr(w, err)
+	run, _, ok := g.runCall(w, r, id)
+	if !ok {
+		return
+	}
+	// The runner acts on run.cancel, not on the status: a cancelled run without one (written by
+	// a replica of an older release that failed between the two) gets it now.
+	if err := g.Orch.EnsureCancelDelivered(r.Context(), run); err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
 	after, err := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
@@ -220,7 +267,7 @@ func (g *Gateway) pollInput(w http.ResponseWriter, r *http.Request, id *identity
 		// Type and run scope are both applied in the store, before LIMIT: events of other runs
 		// in this sandbox cannot fill the page and hide ours.
 		out, err := g.Orch.Store.QueryEvents(r.Context(), store.Filter{SandboxID: id.SandboxID, AfterID: after,
-			Types: []string{model.EventInput, model.EventRunCancel, model.EventRunClose}, RunScope: run.ID, Limit: 200})
+			Types: []string{model.EventInput, model.EventReply, model.EventRunCancel, model.EventRunClose}, RunScope: run.ID, Limit: 200})
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
@@ -241,17 +288,21 @@ func (g *Gateway) pollInput(w http.ResponseWriter, r *http.Request, id *identity
 }
 
 func (g *Gateway) finish(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
-	run, err := g.ownRun(r, id)
-	if err != nil {
-		writeOrchErr(w, err)
+	run, attempt, ok := g.runCall(w, r, id)
+	if !ok {
 		return
 	}
 	var req struct {
 		ExitCode int          `json:"exit_code"`
 		Usage    *model.Usage `json:"usage,omitempty"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	if err := g.Orch.FinishRun(r.Context(), id.SandboxID, run.ID, req.ExitCode, req.Usage); err != nil {
+	// A body that does not decode is refused, never read as exit 0 without usage: that would
+	// record a failed run as a success. The runner retries finish until it is acknowledged.
+	if err := decodeStrict(w, r, &req, smallBodyLimit); err != nil {
+		writeBodyErr(w, err)
+		return
+	}
+	if err := g.Orch.FinishRunAttempt(r.Context(), id.SandboxID, run.ID, attempt, req.ExitCode, req.Usage); err != nil {
 		writeOrchErr(w, err)
 		return
 	}
@@ -291,8 +342,8 @@ func (g *Gateway) fsRequests(w http.ResponseWriter, r *http.Request, id *identit
 // fsResult records the pod's answer to a file request.
 func (g *Gateway) fsResult(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
 	var res model.FSResult
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxBodyBytes)).Decode(&res); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeStrict(w, r, &res, MaxBodyBytes); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	if res.Blob != "" && !orchestrator.OwnsFSBlob(id.SandboxID, res.Blob) {
@@ -308,7 +359,7 @@ func (g *Gateway) fsResult(w http.ResponseWriter, r *http.Request, id *identity.
 
 // putBlob stores file content the pod read, under a name confined to its sandbox.
 func (g *Gateway) putBlob(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
-	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, orchestrator.MaxFileBytes))
+	data, err := io.ReadAll(maxBytes(w, r.Body, orchestrator.MaxFileBytes))
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {

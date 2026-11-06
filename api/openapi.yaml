@@ -56,9 +56,19 @@ info:
     Contract notes:
     * **Errors** are always `{error, code, request_id}`; `code` is stable
       (`bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `too_large`,
-      `quota_exceeded`, `upstream_failed`, `internal`, `unavailable`). `request_id` also comes back
-      as the `X-Request-Id` header and is in the server log; send your own `X-Request-Id` to correlate.
+      `quota_exceeded`, `rate_limited`, `upstream_failed`, `timeout`, `invalid`, `internal`,
+      `unavailable`, and for Git syncs, plans and rollbacks `invalid_plan`, `nothing_to_roll_back`,
+      `unreachable`, `credential`, `stopped`; `preview_host_taken` when another sandbox holds the
+      preview host). A few errors carry the record they are about
+      (`sync`, `plan`, `rollback`, `apply`), never a 500. `request_id` also comes back as the `X-Request-Id`
+      header and is in the server log; send your own `X-Request-Id` to correlate. A 500 says only
+      `internal error (request …)`: what failed inside is in the server log under that id.
     * **Malformed query parameters are 400**, never silently defaulted.
+    * **Request bodies** are read whole under a cap per kind of route, never cut short: small JSON
+      bodies (sandboxes, runs, input, messages, preview, rollouts, rollback, replies) at most 1 MiB,
+      one versioned document 1 MiB, a plan or apply bundle 8 MiB, a multipart message 8 files of
+      16 MiB, a workspace file 16 MiB. Over the cap is 413 (`too_large`). A JSON body is exactly
+      one object with known fields only: unknown fields, a second document or trailing data are 400.
     * **Paging**: list endpoints take `limit` and `after`. `X-Next-Cursor` is present only when
       another page exists (the server fetches one row more than `limit`); its value is opaque and
       keeps working after the anchor row is deleted or stops matching the filter. Event endpoints
@@ -66,8 +76,22 @@ info:
     * **Idempotency**: `POST /v1/sandboxes` and `POST .../runs` honour `Idempotency-Key`. The key is
       reserved before the request runs: a concurrent repeat gets 409 with `Retry-After: 1`, a repeat
       with a different body gets 422, a repeat after success replays the stored response with
-      `Idempotency-Replayed: true` (24h, per tenant and route).
+      `Idempotency-Replayed: true` (24h, per tenant and route). A JSON body is compared as sent;
+      a multipart body by what it carries (fields, file names and contents in order), not by its
+      bytes, so a retry under a new boundary replays. A reservation left unfinished for two minutes
+      (its replica died), or released by a failed attempt, is taken over by the next repeat, which
+      answers with the sandbox or run an earlier attempt created rather than creating another (a
+      sandbox it created and that was deleted since is not made again: 409). A message that starts
+      a run is delivered once for all attempts. One that is delivered into a run that already
+      exists (input to a running run, or text joined to a queued run's task) is delivered once
+      too, except when the replica that delivered it dies before recording the delivery: the
+      next attempt then delivers it again. A client for which a repeated message is harmful
+      should not retry such a message automatically. A reservation left unfinished by a replica
+      of a release before this behaviour is not run again: 409 until it expires, so check whether
+      it took effect and retry under a new key.
     * Unknown routes and methods answer the same JSON error shape (404 / 405 with `Allow`).
+    * **Rate limits**: `POST /v1/auth/ci` and failed bearer authentication are limited per source
+      address (429 `rate_limited` with `Retry-After`, see `components/responses/RateLimited`).
 servers:
   - url: http://localhost:8080
     description: platform API
@@ -318,6 +342,9 @@ paths:
         already uploaded; multipart/form-data with a `text` field and `file` parts uploads each file
         to `uploads/<name>` first. Attached paths are listed after the text so the agent knows where
         to look. Supports `Idempotency-Key`.
+
+        Limits: a JSON body is at most 1 MiB; a multipart body carries at most 8 `file` parts of
+        16 MiB each and is at most 8 × 16 MiB + 1 MiB as a whole. Over either is 413.
       parameters: [{ $ref: "#/components/parameters/idempotencyKey" }]
       requestBody:
         required: true
@@ -369,7 +396,7 @@ paths:
         - { name: after, in: query, schema: { type: integer, format: int64 } }
         - { name: raw, in: query, schema: { type: boolean, default: false } }
       responses:
-        "200": { description: "text/event-stream; event = role, id = event id, data = Message" }
+        "200": { description: "text/event-stream; event = role, id = event id, data = Message; a final `event: error` frame (an Error body) when the log cannot be read: reconnect with Last-Event-ID" }
   /v1/sandboxes/{id}/messages/close:
     parameters: [{ $ref: "#/components/parameters/id" }]
     post:
@@ -379,6 +406,37 @@ paths:
       responses:
         "200": { description: The run being closed, content: { application/json: { schema: { $ref: "#/components/schemas/Run" } } } }
         "409": { description: "No run in progress", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  /v1/sandboxes/{id}/requests/{request_id}:
+    parameters: [{ $ref: "#/components/parameters/id" }, { name: request_id, in: path, required: true, schema: { type: string, pattern: "^req_[0-9a-f]{16}$" } }]
+    post:
+      tags: [conversation]
+      summary: Answer what the agent asks
+      description: |
+        With `harness.permissions: ask` an ACP agent's permission requests and questions wait for a
+        person. Each appears in the conversation as a `request` turn whose `data` is the runner's
+        `acp.request` line (`request.kind`: `permission` with `options`, `form` with its JSON
+        `schema`, `url` with the link to open). The answer is `option_id` for a permission, `action`
+        (`accept` with `content` for a form, `accept` once the link is done, `decline`, `cancel`)
+        for a question. The runner checks it against the request and answers the agent; the
+        resolution follows as a `resolved` turn (`by`: user, timeout, invalid; `not_waiting` for a
+        request answered or expired already). Unanswered within `harness.ask_timeout`, a request is
+        refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id]
+              properties:
+                run_id: { type: string, description: "The run that asked (the request turn's run_id): an answer never goes to another run" }
+                option_id: { type: string, description: "A permission: the option chosen" }
+                action: { type: string, enum: [accept, decline, cancel], description: "A question" }
+                content: { type: object, additionalProperties: true, description: "An accepted form: its fields" }
+      responses:
+        "202": { description: "Handed to the run that waits", content: { application/json: { schema: { type: object, properties: { run_id: { type: string }, request_id: { type: string } } } } } }
+        "400": { description: "Not an answer (no option_id or action, both, an unknown action)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "The run that asked has ended, or the sandbox's harness is not ACP", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/sandboxes/{id}/runs/{run}/close:
     parameters: [{ $ref: "#/components/parameters/id" }, { name: run, in: path, required: true, schema: { type: string } }]
     post:
@@ -444,6 +502,8 @@ paths:
       description: |
         Default: `text/event-stream`, each message is `id: <event id>`, `event: <type>`, `data: <Event JSON>`.
         Pass `after` (or the `Last-Event-ID` header) to replay from the persisted log, `run` to see one run only.
+        Frames are read from the log, so a slow client gets every event late rather than losing any; if the
+        log cannot be read the stream ends with an `event: error` frame (an `Error` body): reconnect with `Last-Event-ID`.
         With `stream=false` the same filter returns a JSON array (up to `limit`, default 1000) and closes;
         a full page carries `X-Next-Cursor` (the last event id) for the next `after`.
       parameters:
@@ -466,6 +526,9 @@ paths:
     put:
       tags: [preview]
       summary: Expose a port of the sandbox under a stable host name
+      description: >-
+        Removing the preview (port 0) or changing its access level signs out everyone signed in to
+        it: tickets and cookies issued before are refused. Moving the port keeps them.
       requestBody:
         required: true
         content:
@@ -482,11 +545,21 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Sandbox" }
+        "409":
+          description: >-
+            `preview_host_taken`: the host is `<name>-<owner>.<domain>`, and another sandbox with
+            the same name and owner already exposes it. Retrying does not help; remove that
+            sandbox's preview (port 0) or use another name.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
   /v1/sandboxes/{id}/preview/ticket:
     parameters: [{ $ref: "#/components/parameters/id" }]
     post:
       tags: [preview]
       summary: Mint a short-lived sign-in ticket for the preview (your auth service checked the user)
+      description: >-
+        The ticket, and the cookie it is exchanged for, are bound to this sandbox, its tenant and the
+        preview's current access generation: a sandbox created again under the same name, or a
+        preview whose access was changed or removed since, refuses them.
       requestBody:
         required: true
         content:
@@ -790,6 +863,9 @@ paths:
         may). Syncing the same commit again finds the same applies and writes nothing; a sync whose
         apply stopped is continued by syncing that commit again. The record comes back with the
         outcome and one entry per bundle (apply id, status, changes).
+        The files read are bounded: 1 MiB per file, 256 files, 16 MiB together. Sizes are read
+        before any content; a set over a bound is refused before anything is applied (422,
+        `invalid_plan`, error `… too large: …`).
       requestBody:
         required: false
         content:
@@ -808,7 +884,7 @@ paths:
         "409": { description: "An apply did not finish (failed or conflict; code `stopped`, with the record): sync the same commit again once the cause is fixed", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
         "413": { description: "Body over the limit (4096 bytes; code `too_large`)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "422":
-          description: "A bundle is not valid, nothing of it written (code `invalid_plan`, with the record); the credential is not available (code `credential`, with the record); or `commit` is not a 40-digit SHA (code `invalid`, no record)"
+          description: "A bundle is not valid or the files are over the size bounds, nothing of it written (code `invalid_plan`, with the record); the credential is not available (code `credential`, with the record); or `commit` is not a 40-digit SHA (code `invalid`, no record)"
           content:
             application/json:
               schema:
@@ -898,7 +974,9 @@ paths:
           description: The key, its secret (shown once), the trust that matched and the token's subject
           content: { application/json: { schema: { $ref: "#/components/schemas/CIGrant" } } }
         "400": { description: "The body is not one JSON object with `token`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { description: "The body is over its limit (32 KiB; code `too_large`)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { description: "No CITrust accepts the token (unknown issuer, another audience, claims that match no trust, expired, already exchanged, two tenants' trusts matching)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
         "503": { description: "CI authentication is disabled, or the issuer's keys could not be fetched", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/bindings:
     get:
@@ -1183,9 +1261,10 @@ paths:
       responses:
         "200": { description: Replaced, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
         "201": { description: Added, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
-        "400": { description: "Malformed JSON, unknown field, trailing data, or a body over the limit (the value itself may be up to 65536 bytes)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "400": { description: "Malformed JSON, unknown field or trailing data", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "413": { description: "The body is over its limit (code `too_large`): 6 × 65536 + 1024 bytes of JSON, room for a value of 65536 bytes however it is escaped", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "422": { description: "Bad name or empty / oversized value", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/CredentialsDisabled" }
     delete:
@@ -1345,7 +1424,16 @@ paths:
       description: |
         Issues a new key with the same tenant and name and retires this one: at once when `grace`
         is empty, else after `grace` so the holder can switch over. `ttl` is the new key's
-        lifetime (empty: this key's remaining one). A revoked or expired key cannot be rotated.
+        lifetime (empty: this key's remaining one, as it was before any earlier rotation). A
+        revoked or expired key cannot be rotated. The rotation is one transaction: on an error
+        nothing changed and a retry is safe.
+
+        Rotating a key that was already rotated (a retry after the response with the secret was
+        lost) withdraws the earlier successor if it has never been used and issues a new one;
+        the earlier secret cannot be shown again. If the earlier successor has been used, the
+        rotation is refused with 422: rotate that key instead. A rotation whose outcome the
+        server could not establish (the database stopped answering mid-commit) is a 500 that
+        says so: GET the old key, its `rotated_to` tells whether it took effect.
       requestBody:
         required: false
         content:
@@ -1359,10 +1447,11 @@ paths:
       responses:
         "201": { description: The new key with its secret; `replaces` names the old one, content: { application/json: { schema: { $ref: "#/components/schemas/IssuedKey" } } } }
         "400": { description: "Malformed JSON, unknown field, trailing data or a bad duration", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "The key is revoked or expired, ttl or grace is negative, or the key was already rotated to a successor that is in use", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "500": { description: "The rotation failed, or its outcome is unknown (the message says which)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/ScopeForbidden" }
         "404": { $ref: "#/components/responses/Error" }
-        "422": { description: "The key is revoked or expired, or a duration is negative", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/KeysDisabled" }
   /v1/whoami:
     get:
@@ -1423,7 +1512,11 @@ paths:
           `force` → `forced`: the run is cancelled, the pod replaced, and (unless `resume: false`) a
           new run with `resume_of` and the captured harness `session` is queued so the agent
           continues the conversation on the new version;
-        * creating / waking / stopping → `deferred`; deleting → `skipped`.
+        * creating / waking / stopping → `deferred`; deleting → `skipped`;
+        * running, but whether a run is in progress cannot be read (the database did not answer), or
+          the restart could not begin (the sandbox moved meanwhile) → `deferred` with that `reason`:
+          nothing was stopped, the version stays pending and the reconciler applies it once the
+          sandbox is running and idle.
 
         Tenants may only name versions from the catalogue (`GET /v1/version`); the admin may pass
         any image reference. Every decision is a `rollout` event in the sandbox's trace.
@@ -1526,7 +1619,13 @@ paths:
         lifecycle, user input and every gateway decision (`egress.allow` / `egress.deny`, data is
         an `Egress` object). `run.output` is excluded unless `type` lists it or is `all`.
         `stream=true` switches to SSE and keeps following live events after the replay;
-        reconnect with `Last-Event-ID`.
+        reconnect with `Last-Event-ID`. A stream that cannot read the log ends with an
+        `event: error` frame (an `Error` body). With `to`, the replay keeps the window up to the
+        newest event when the stream began and everything after that is followed live; such a
+        stream's frames are named `<event id>:<boundary>`, and `Last-Event-ID` takes that value
+        back as sent, so a resume keeps the boundary of the stream it continues. Such a stream
+        opens with an `event: checkpoint` frame that has an id (`<cursor>:<boundary>`) and no
+        data: it is no event, only the cursor to resume with when no event has arrived yet.
       parameters:
         - { name: tenant, in: query, schema: { type: string } }
         - { name: slug, in: query, schema: { type: string } }
@@ -1569,6 +1668,14 @@ paths:
       tags: [agent]
       security: [{ mtls: [] }]
       summary: Long-poll for the next queued run of the calling sandbox
+      description: |
+        The run is handed to the calling pod instance under a new `attempt`. Until the runner's
+        first call about the run (`events`, `input` or `finish`) confirms it got it, the same
+        instance asking again gets the same run back under the next attempt (its previous
+        response was lost); no other instance gets it. Send the attempt back as `X-Run-Attempt`
+        on every call about the run: a call naming an earlier attempt is refused with 409. While
+        the instance executes a run it confirmed, it is handed no other one (204): a request of
+        it delayed past its own retry does not start the next run.
       parameters:
         - name: wait
           in: query
@@ -1588,14 +1695,26 @@ paths:
       summary: Append output (one event per line of the body)
       description: |
         Limits: 4 MiB per request, 1 MiB per line. Lines up to the first violation are stored and
-        the 413 message says how many (`stored N lines`), so a retry resumes after them. Lines
-        that carry usage (Claude Code's `result`, generic `{"type":"usage"}`) update the run's accounting.
+        the 413 message says how many (`stored N lines`), so a retry resumes after them. The lines,
+        their usage and session are stored in one write, all of them or none. A 5xx (or a lost
+        response) does not say which: the write may have been committed while its acknowledgement
+        was lost. Retry it with the same `X-Batch-Id`, which makes the retry safe; a retry without
+        one may store the lines and their usage twice. Lines
+        that carry usage (Claude Code's `result`, generic `{"type":"usage"}`) update the run's accounting
+        while the run is `queued`, `running` or `cancelled` (a cancelled harness still reports what it
+        spent before it saw `run.cancel`). Once the run is `done` or `failed` the lines are still
+        stored but their usage is ignored: send all output before `POST /agent/runs/{run}/finish`.
 
-        Send `X-Batch-Id` (any id, kept across retries of the same batch): the server remembers how
-        many lines of that batch it stored, records that before every response, and a retry skips
-        them (`skipped` in the answer). Without it a retry after a lost response duplicates lines.
+        Send `X-Batch-Id` (any id, kept across retries of the same batch): the server records how
+        many lines of that batch it stored in the same write as the lines, and a retry (on any
+        replica, even one racing the original) skips them (`skipped` in the answer). The same id
+        with a body that does not start with the lines already stored, or one that adds lines to a
+        body that was stored whole (not cut short by a 413, including one cut short now), is a 422.
+        The progress of a batch is kept for 24 hours after the last call under its id. Without it a
+        retry after a lost response duplicates lines.
       parameters:
         - { name: X-Batch-Id, in: header, schema: { type: string, maxLength: 100 } }
+        - { $ref: "#/components/parameters/RunAttempt" }
       requestBody:
         content:
           text/plain:
@@ -1610,7 +1729,10 @@ paths:
                 properties:
                   accepted: { type: integer, description: "Lines of this batch stored in total" }
                   skipped: { type: integer, description: "Lines skipped because an earlier attempt stored them" }
+        "409": { description: "X-Run-Attempt names an attempt the run was handed out past", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "413": { $ref: "#/components/responses/Error" }
+        "422": { description: "X-Batch-Id was already used for a different body (nothing is stored)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: "The write failed, or its acknowledgement was lost: the batch may or may not be stored. Send it again with the same X-Batch-Id", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /agent/runs/{run}/input:
     parameters: [{ name: run, in: path, required: true, schema: { type: string } }]
     get:
@@ -1620,9 +1742,10 @@ paths:
       description: |
         Returns `input` and `run.cancel` events with id > `after`, filtered in the store, so a
         run producing a lot of output cannot push them out of reach. Keep `after` at the id of the
-        last event you received.
+        last event you received. A run that is `cancelled` always has its `run.cancel` here.
       parameters:
         - { name: after, in: query, schema: { type: integer, format: int64 } }
+        - { $ref: "#/components/parameters/RunAttempt" }
         - { name: wait, in: query, schema: { type: string, default: 30s } }
       responses:
         "200":
@@ -1632,12 +1755,21 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Event" }
+        "409": { description: "X-Run-Attempt names an attempt the run was handed out past: this attempt must stop", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /agent/runs/{run}/finish:
     parameters: [{ name: run, in: path, required: true, schema: { type: string } }]
     post:
       tags: [agent]
       security: [{ mtls: [] }]
       summary: Mark the run finished
+      description: |
+        Settles a `queued` or `running` run as `done` (exit code 0) or `failed`. Send the run's output
+        first: usage on output lines appended after this call is ignored. On a run that was
+        cancelled meanwhile the status stays `cancelled`, but a non-zero `usage` total given here is
+        still recorded. On a run already `done` or `failed` (a retry after a lost response) nothing
+        changes. Each of these answers 204. The new status and `run.finished` are one write.
+      parameters:
+        - { $ref: "#/components/parameters/RunAttempt" }
       requestBody:
         content:
           application/json:
@@ -1650,12 +1782,94 @@ paths:
                   description: Optional harness total; overrides what was parsed from the output stream
       responses:
         "204": { description: Recorded }
+        "400": { description: "The body is not one JSON object with these fields (nothing is recorded)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "X-Run-Attempt names an attempt the run was handed out past (nothing is recorded)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { $ref: "#/components/responses/Error" }
+  /agent/fs/requests:
+    get:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Long-poll for file operations asked of this pod
+      description: |
+        Returns `fs.request` events with id > `after` that have no answer yet; each event's
+        `data` is an `FSRequest` (JSON). Requests older than ten minutes are not returned: the
+        caller stopped waiting long ago. Keep `after` at the id of the last event you received.
+      parameters:
+        - { name: after, in: query, schema: { type: integer, format: int64 } }
+        - { name: wait, in: query, schema: { type: string, default: 30s } }
+      responses:
+        "200":
+          description: File requests (possibly none once `wait` is over)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Event" }
+        "400": { $ref: "#/components/responses/Error" }
+  /agent/fs/results:
+    post:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Answer a file request
+      description: |
+        The body is one `FSResult` object (at most 4 MiB, unknown fields are 400). For a read,
+        upload the content first (`POST /agent/blobs`) and name the blob; a blob of another
+        sandbox is 403.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FSResult" }
+      responses:
+        "204": { description: Recorded }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /agent/blobs:
+    post:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Upload file content the pod read (at most 16 MiB)
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "201":
+          description: Stored under a name confined to the calling sandbox
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string, description: "Blob name to put in the FSResult" }
+                  size: { type: integer }
+        "413": { $ref: "#/components/responses/Error" }
+  /agent/blobs/{name}:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string }, description: "Blob name from an FSRequest (may contain slashes)" }
+    get:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Download content the control plane wants written into the workspace
+      responses:
+        "200":
+          description: The content
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "404": { description: "No such blob, or one of another sandbox", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
   /bootstrap:
     post:
       tags: [gateway]
       security: [{ bootstrapToken: [] }]
       summary: Issue the agent identity (called once by the init container)
+      description: |
+        Idempotent per pod and key: repeating the request with the same CSR (a retry after a
+        lost response) returns the same instance with the same serial and validity. A new key
+        from the same pod replaces its earlier identity.
       requestBody:
         required: true
         content:
@@ -1681,7 +1895,9 @@ paths:
                   ca: { type: string, description: PEM agent CA root }
                   gateway_ca: { type: string, description: PEM root to trust for TLS to the gateway }
                   not_after: { type: string, format: date-time }
+        "400": { description: "The CSR is malformed, or the pod's labels do not match its sandbox (slug, tenant): not retried", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Error" }
+        "503": { description: "The platform could not complete the issuance on its side (the database did not answer): retry the same request", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /authz:
     get:
       tags: [gateway]
@@ -1691,6 +1907,13 @@ paths:
         Reads `X-Agent-Cert`, `X-Forwarded-Host`, `X-Forwarded-Method`, `X-Forwarded-Uri`.
         200 means allowed; response headers `Authorization`, `X-Api-Key`, `X-Agent-*` are copied
         onto the upstream request by Caddy. 403 otherwise.
+      responses:
+        "200": { description: Allowed }
+        "403": { description: Denied }
+    post:
+      tags: [gateway]
+      security: []
+      summary: Caddy forward_auth hook (same as GET; Caddy may forward with the original method's body)
       responses:
         "200": { description: Allowed }
         "403": { description: Denied }
@@ -1742,6 +1965,11 @@ components:
       in: query
       schema: { type: string }
       description: "Admin only: the tenant scope to work in (empty = shared items). Tenant tokens are confined to their own scope and read shared items."
+    RunAttempt:
+      name: X-Run-Attempt
+      in: header
+      schema: { type: integer, minimum: 1 }
+      description: "The `attempt` of the run as `/agent/runs/next` handed it out. Absent: any attempt (a runner of an older release)."
     idempotencyKey:
       name: Idempotency-Key
       in: header
@@ -1758,7 +1986,18 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     Unauthorized:
-      description: "No bearer token, or one that is unknown, revoked or expired (`bad token`); every authenticated route answers it"
+      description: "No bearer token, or one that is unknown, revoked or expired (`bad token`); every authenticated route answers it, and 429 (`rate_limited`, see RateLimited) once an address has failed too often. A JWT the identity provider could not be asked about (its discovery or keys do not answer) is 503 `unavailable` instead, and spends nothing of the address's budget"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: |
+        Too many attempts from this address (code `rate_limited`): every `POST /v1/auth/ci`, and
+        every bearer token that fails authentication, spends one of a per-address budget (30 at
+        once, one more per second, per replica). While it is spent, every token from the address
+        is refused unchecked, valid ones too; requests without a token are not counted.
+      headers:
+        Retry-After: { schema: { type: integer }, description: Seconds until the next attempt is accepted }
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -1785,8 +2024,12 @@ components:
         error: { type: string, description: Human-readable message }
         code:
           type: string
-          enum: [bad_request, unauthorized, forbidden, not_found, conflict, too_large, quota_exceeded, upstream_failed, invalid, internal, unavailable]
+          enum: [bad_request, unauthorized, forbidden, not_found, conflict, too_large, quota_exceeded, rate_limited, upstream_failed, timeout, invalid, internal, unavailable, invalid_plan, nothing_to_roll_back, unreachable, credential, stopped, preview_host_taken]
         request_id: { type: string }
+        sync: { $ref: "#/components/schemas/GitSync", description: "Git check or sync errors: the record" }
+        plan: { type: object, description: "invalid_plan of an apply: the plan with the problems per document" }
+        rollback: { type: object, description: "invalid_plan or nothing_to_roll_back of a rollback: the rollback" }
+        apply: { $ref: "#/components/schemas/Apply", description: "conflict of an apply: the apply the key or plan belongs to" }
     CreateSandbox:
       type: object
       required: [name, slug, owner]
@@ -1867,6 +2110,7 @@ components:
         created_at: { type: string, format: date-time }
         started_at: { type: string, format: date-time, nullable: true }
         finished_at: { type: string, format: date-time, nullable: true }
+        attempt: { type: integer, description: "How many times the run was handed to a runner; the runner sends it back as X-Run-Attempt" }
     Launch:
       type: object
       description: The environment profile rendered at creation, kept on the sandbox; every pod of the sandbox starts with it
@@ -1883,6 +2127,16 @@ components:
         harness_command: { type: string }
         harness_resume_command: { type: string }
         resume_prompt: { type: string }
+        harness_input: { type: string, enum: [text, stream-json, acp], description: "How the runner hands messages to the harness (the profile's harness.input); exported as HARNESS_INPUT" }
+        chat_idle: { type: integer, description: "stream-json and acp: seconds without a message after a turn before the conversation is closed (0 = 600); exported as HARNESS_CHAT_IDLE" }
+        harness_permissions: { type: string, enum: [allow, deny, ask], description: "acp: how the agent's permission requests are answered (absent = allow; ask: a person); exported as HARNESS_PERMISSIONS" }
+        harness_ask_timeout: { type: integer, description: "acp, permissions ask: seconds a request waits for a person (0 = 900); exported as HARNESS_ASK_TIMEOUT" }
+        harness_auth_method: { type: string, description: "acp: the authentication method the agent is told to use; exported as HARNESS_AUTH_METHOD" }
+        harness_mode: { type: string, description: "acp: the session mode the agent is put in after its session opens; exported as HARNESS_MODE" }
+        harness_mcp: { type: string, enum: [auto, always], description: "acp: when the agent gets the MCP servers (absent = auto); exported as HARNESS_MCP" }
+        harness_thought_level: { type: string, description: "acp: the reasoning level; exported as HARNESS_THOUGHT_LEVEL" }
+        harness_session_meta: { type: string, description: "acp: the _meta (JSON object) of every session request; exported as HARNESS_SESSION_META" }
+        harness_instructions: { type: string, description: "acp: how the agent gets the instructions (empty, file, env:NAME); exported as HARNESS_INSTRUCTIONS" }
         model: { type: string, description: "Exported as SANDBOX_MODEL and ANTHROPIC_MODEL" }
         instructions: { type: string, description: "Exported as SANDBOX_INSTRUCTIONS" }
         env: { type: object, additionalProperties: { type: string } }
@@ -2006,10 +2260,11 @@ components:
         at: { type: string, format: date-time }
     GitSyncError:
       type: object
-      description: A check or sync that did not succeed, with the record
+      description: A check or sync that did not succeed, with the record (not on a 500, which carries no record)
       properties:
         error: { type: string }
-        code: { type: string, enum: [unreachable, credential, invalid_plan, stopped, error] }
+        code: { type: string, enum: [unreachable, credential, invalid_plan, stopped, internal] }
+        request_id: { type: string }
         sync: { $ref: "#/components/schemas/GitSync" }
     Credential:
       type: object
@@ -2128,8 +2383,16 @@ components:
             command: { type: string }
             resume_command: { type: string, description: "Continues a session: $SANDBOX_SESSION, the message (or the rollout prompt) in $SANDBOX_RESUME_PROMPT" }
             resume_prompt: { type: string, description: "What a rollout resume tells the harness (default: continue the task)" }
-            input: { type: string, enum: [text, stream-json], description: "How messages reach the harness: a line on stdin, or Claude Code's streaming JSON input (keeps the conversation open)" }
-            chat_idle: { type: integer, minimum: 0, description: "stream-json: seconds without a message after a turn before the runner closes the conversation (0 = 600)" }
+            input: { type: string, enum: [text, stream-json, acp], description: "How messages reach the harness: a line on stdin, Claude Code's streaming JSON input (keeps the conversation open), or the Agent Client Protocol (the command is an ACP agent; every message is a prompt of the same session)" }
+            permissions: { type: string, enum: [allow, deny, ask], description: "input acp only: how the agent's permission requests are answered: allow (default), deny, or ask (a person, through POST /v1/sandboxes/{id}/requests/{request_id}; the agent may then also ask questions: forms, sign-in links); every request and decision is recorded in the run's output" }
+            ask_timeout: { type: integer, minimum: 0, maximum: 86400, description: "permissions ask only: seconds a request waits for a person before it is refused (0 = 900)" }
+            auth_method: { type: string, pattern: "^[A-Za-z0-9._:-]{1,64}$", description: "input acp only: the id of the authentication method the runner asks the agent to use (ACP authenticate; one of the agent's authMethods, e.g. codex-acp's api-key)" }
+            mode: { type: string, pattern: "^[A-Za-z0-9._:-]{1,64}$", description: "input acp only: the session mode the runner puts the agent in after the session opens (ACP session/set_mode, or the agent's config option of category mode), e.g. codex-acp's agent-full-access or OpenCode's build; an id the agent does not offer is reported in the run's output" }
+            thought_level: { type: string, pattern: "^[A-Za-z0-9._:-]{1,64}$", description: "input acp only: the reasoning level the runner selects through the agent's config option of category thought_level (codex-acp reasoning_effort, OpenCode effort, Hermes reasoning_effort); a level the agent does not offer is reported" }
+            session_meta: { type: object, additionalProperties: true, description: "input acp only: metadata (at most 16 KiB of JSON) every session request carries as _meta, e.g. claude-agent-acp's {claudeCode: {options: {maxTurns, maxBudgetUsd}}}. Configuration, not secrets" }
+            instructions: { type: string, pattern: "^(file|env:[A-Za-z_][A-Za-z0-9_]{0,127})$", description: "input acp only: how the agent gets the agent definition's instructions: absent (the session's system prompt when the agent declares it, else ahead of the first prompt), file ($HOME/.sandbox/instructions.md, $SANDBOX_INSTRUCTIONS_FILE, for a configuration that names it) or env:NAME (exported as NAME)" }
+            mcp: { type: string, enum: [auto, always], description: "input acp only: when the runner passes the sandbox's MCP servers in session/new: auto (default; when the agent declares MCP over HTTP) or always (an agent that takes them without declaring it, e.g. Hermes)" }
+            chat_idle: { type: integer, minimum: 0, description: "stream-json and acp: seconds without a message after a turn before the runner closes the conversation (0 = 600)" }
             files:
               type: object
               maxProperties: 16
@@ -2203,7 +2466,7 @@ components:
           type: object
           additionalProperties: { type: string }
           description: "Headers the gateway adds for agents using this connection. Values are templates: secret:NAME is resolved from the tenant's secrets at request time. A credential header (Authorization, Cookie, anything named like a key or token) must be a reference such as \"Bearer secret:NAME\"; a literal value is refused and never echoed"
-        upstream: { type: string, description: "Self-service hosts only: where the gateway sends the traffic (http(s) URL; default https://<host>). Every live connection for a host must agree" }
+        upstream: { type: string, pattern: "^https?://[^/?#@\\s{}]+$", example: "https://10.0.0.5:8443", description: "Self-service hosts only: where the gateway sends the traffic, scheme://host[:port] and nothing else (no path, query, fragment or user information; an IPv6 literal in brackets; not http on 443 or https on 80); default https://<host>. Every live connection for a host must agree" }
         upstream_host: { type: boolean, description: "Self-service hosts with an upstream only: send the upstream's own host[:port] as Host and verify its TLS certificate against that address (a server that answers only to its own address); default the connection's host name. Every live connection for a host must agree" }
         paths: { type: array, items: { type: string }, description: "Self-service hosts only: policy path patterns the agent may call (default /**)" }
         mcp:
@@ -2323,9 +2586,31 @@ components:
       properties:
         id: { type: integer, format: int64, description: "The event it came from (resume with ?after=)" }
         run_id: { type: string }
-        role: { type: string, enum: [user, assistant, tool, system, log] }
+        role: { type: string, enum: [user, assistant, tool, system, request, resolved, commands, log], description: "request: the agent asks the person something (answer: POST /requests/{request_id}); resolved: how a request was answered; commands: the slash commands the agent offers now" }
         text: { type: string }
         at: { type: string, format: date-time }
+        data: { type: object, additionalProperties: true, description: "request, resolved, commands: the runner's line (acp.request with request {request_id, kind, title, message, options[], schema, url} and diffs[]; acp.request_resolved {request_id, outcome, by}; acp.commands {commands[{name, description, hint}]}), docs/chat-and-files.md" }
+    FSRequest:
+      type: object
+      description: A file operation asked of the pod (the data of an fs.request event)
+      properties:
+        id: { type: string }
+        op: { type: string, enum: [list, read, write] }
+        path: { type: string, description: "Relative to /workspace" }
+        depth: { type: integer, description: "list: levels below path to include (1 = its entries)" }
+        blob: { type: string, description: "write: the blob holding the content (GET /agent/blobs/{name})" }
+    FSResult:
+      type: object
+      required: [request, ok]
+      properties:
+        request: { type: string, description: "The FSRequest id" }
+        ok: { type: boolean }
+        error: { type: string }
+        entries: { type: array, items: { $ref: "#/components/schemas/FSEntry" }, description: list }
+        truncated: { type: boolean, description: "list: more entries than the limit" }
+        blob: { type: string, description: "read: the blob holding the content (POST /agent/blobs)" }
+        size: { type: integer, format: int64, description: "read / write" }
+        content_type: { type: string, description: read }
     FSEntry:
       type: object
       properties:
@@ -2399,8 +2684,8 @@ components:
         tenant: { type: string }
         slug: { type: string }
         run_id: { type: string }
-        type: { type: string, enum: [status, run.queued, run.started, run.output, run.finished, run.cancel, input, egress.allow, egress.deny, rollout] }
-        data: { type: string, description: "status: new status; run.started: agent version; run.finished: final run status; egress.*: Egress JSON; rollout: {from, to, mode, run_id, resume_id}" }
+        type: { type: string, enum: [status, run.queued, run.started, run.output, run.finished, run.cancel, run.close, input, reply, fs.request, fs.result, egress.allow, egress.deny, rollout] }
+        data: { type: string, description: "status: new status; run.started: agent version; run.finished: final run status; reply: the answer to a request of the agent (JSON); fs.request: FSRequest JSON; fs.result: FSResult JSON; egress.*: Egress JSON; rollout: {from, to, mode, run_id, resume_id}" }
         at: { type: string, format: date-time }
     UsageTotals:
       type: object

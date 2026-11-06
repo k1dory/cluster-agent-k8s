@@ -34,7 +34,7 @@
           "inject": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Header → value; `secret:NAME` is resolved per tenant at the gateway." },
           "mcp": { "type": "object", "additionalProperties": false, "properties": { "read_only": { "type": "boolean"  },
               "tools": { "type": "array", "items": { "type": "string" }, "description": "read_only: globs of tool names tools/call may name (none = no tool calls). Enforced by sandboxd's MCP proxy on the JSON-RPC body." } } },
-          "upstream": { "type": "string", "pattern": "^https?://" }
+          "upstream": { "type": "string", "pattern": "^(?!http://[^/]*:443$)(?!https://[^/]*:80$)https?://([A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9_-]*[A-Za-z0-9])?)*\\.?|\\[[0-9A-Fa-f:.]+\\])(:[0-9]{1,5})?$", "description": "scheme://host[:port] only: no path, query, fragment or user information; an IPv6 literal in brackets; not http on 443 or https on 80. Default https://<host>." }
         }
       }
     }

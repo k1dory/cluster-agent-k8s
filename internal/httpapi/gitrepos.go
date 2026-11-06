@@ -50,9 +50,9 @@ func (p *Platform) gitSyncRepo(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, syncBodyLimit))
+	raw, err := readBody(w, r, syncBodyLimit)
 	if err != nil {
-		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("body: at most %d bytes", syncBodyLimit))
+		writeBodyErr(w, err) // 413 over the cap; a body that breaks off (a client gone) is 400
 		return
 	}
 	commit, err := parseSyncBody(raw)
@@ -112,23 +112,20 @@ func writeGitSync(w http.ResponseWriter, g *model.GitSync, err error) {
 		writeJSON(w, http.StatusOK, g)
 		return
 	}
-	code, label := 0, ""
 	switch {
 	case errors.Is(err, gitsync.ErrRead):
-		code, label = http.StatusBadGateway, "unreachable"
+		writeErrWith(w, http.StatusBadGateway, ErrorBody{Code: CodeUnreachable, Sync: g}, err)
 	case errors.Is(err, gitsync.ErrCredential):
-		code, label = http.StatusUnprocessableEntity, "credential"
+		writeErrWith(w, http.StatusUnprocessableEntity, ErrorBody{Code: CodeCredential, Sync: g}, err)
 	case errors.Is(err, gitsync.ErrInvalid):
-		code, label = http.StatusUnprocessableEntity, "invalid_plan"
+		writeErrWith(w, http.StatusUnprocessableEntity, ErrorBody{Code: CodeInvalidPlan, Sync: g}, err)
 	case errors.Is(err, gitsync.ErrStopped):
-		code, label = http.StatusConflict, "stopped"
+		writeErrWith(w, http.StatusConflict, ErrorBody{Code: CodeStopped, Sync: g}, err)
 	case errors.Is(err, resource.ErrNotFound), errors.Is(err, resource.ErrForbidden), errors.Is(err, resource.ErrInvalid), errors.Is(err, resource.ErrConflict):
 		writeResourceErr(w, err)
-		return
 	default:
-		code, label = http.StatusInternalServerError, "error"
+		writeErrWith(w, http.StatusInternalServerError, ErrorBody{Sync: g}, err)
 	}
-	writeJSON(w, code, map[string]any{"error": err.Error(), "code": label, "sync": g})
 }
 
 // hookBodyLimit bounds a webhook payload (GitHub's run to a few hundred KB).
@@ -148,9 +145,9 @@ func (p *Platform) gitHook(w http.ResponseWriter, r *http.Request) {
 	if tenant == "-" {
 		tenant = ""
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, hookBodyLimit))
+	body, err := readBody(w, r, hookBodyLimit)
 	if err != nil {
-		writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("body: at most %d bytes", hookBodyLimit))
+		writeBodyErr(w, err)
 		return
 	}
 	h, err := p.GitSync.Hook(r.Context(), tenant, r.PathValue("name"), r.Header, body)

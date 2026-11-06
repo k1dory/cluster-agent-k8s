@@ -31,12 +31,23 @@ multipart with `text` and `file` parts), `GET /v1/sandboxes/{id}/messages` (one 
 
 ## The conversation model
 
-A sandbox's conversation is a chain of runs that share one harness session. Three things make
-it continuous:
+A sandbox's conversation is a chain of runs that share one harness session. The main path, and the
+deployment's default harness (`claude-agent-acp`), is an ACP harness (`input: acp`,
+[below](#acp-harnesses)): one protocol for every agent, through which
+the runner sets the mode, the model and the system prompt, records diffs and permission
+decisions, counts usage per turn and continues the session in the next run. `text` and
+`stream-json` remain for harnesses that do not speak ACP. Three things make the conversation
+continuous:
 
 Choosing the run that carries a message and recording it happen under one lock per sandbox
 shared by every replica (an advisory lock in PostgreSQL), so two messages sent at the same
 moment join the same conversation instead of starting two.
+
+The rest of this section is the fallback for harnesses without ACP (`claude -p`, `codex exec`, a
+script). Claude is not one of them: run it as `claude-agent-acp` with `input: acp`. `claude -p` in
+a pod refuses every edit and non-read-only command since Claude Code 2.1.302 (nobody is there to
+approve them), and permission flags are no substitute for requests the profile's `permissions`
+answers and the run records.
 
 1. **A message reaches a run in progress as input — in stream-json mode.** `POST /messages` on a
    sandbox whose run is running (or queued) appends an `input` event; the runner hands it to the
@@ -44,7 +55,7 @@ moment join the same conversation instead of starting two.
 
    ```yaml
    harness:
-     command: 'claude -p --input-format stream-json --output-format stream-json --verbose'
+     command: 'claude -p --input-format stream-json --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
      input: stream-json      # one JSON user message per line; the conversation stays open
      chat_idle: 600          # seconds without a new message after a turn before it is closed
    ```
@@ -53,7 +64,7 @@ moment join the same conversation instead of starting two.
    message as another one, so the harness keeps its context and answers each in the same
    process. The delivery is reported as `input`.
 
-   A `text`-mode harness (the default) gets its task on stdin and then EOF: `claude -p` reads a
+   A `text`-mode harness (the default input of a profile that names its own command) gets its task on stdin and then EOF: `claude -p` reads a
    non-terminal stdin to its end before it starts. Its messages never become `input` events. A
    message for a run that is still queued joins that run's task (reported as `input`; the task
    is what the harness reads), and one sent while the run is executing is queued as the next run
@@ -68,7 +79,7 @@ moment join the same conversation instead of starting two.
 
    ```yaml
    harness:
-     resume_command: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose'
+     resume_command: 'claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose --permission-mode bypassPermissions --permission-prompts none'
    ```
 
    The delivery is reported as `resumed`. With no session to continue (a sandbox that never
@@ -80,10 +91,293 @@ moment join the same conversation instead of starting two.
    finishes with its exit code and usage. In `stream-json` mode the runner also closes the
    conversation by itself after `chat_idle` seconds without a message following a completed turn
    (default 10 minutes), so an idle chat does not hold a pod and a run open forever. The next
-   message resumes the session (point 2). Cancelling a run (`/cancel`) still kills the harness.
+   message resumes the session (point 2). Cancelling a run (`/cancel`) stops the harness and
+   everything it started (its process group): SIGINT first (`claude -p` completes its turn and
+   writes its result on it), SIGTERM 5 seconds later if it is still running. Whatever the harness
+   leaves running in its group when it exits gets SIGTERM, then SIGKILL 10 seconds later.
+
+   The deployment's default harness is not `claude -p` but Claude over ACP (`claude-agent-acp`,
+   `agent.harnessInput: acp` in the chart, `kube.harness_input` in sandboxd's configuration), and
+   every shipped Claude profile is ACP. A deployment that still runs `claude -p` as a fallback
+   needs `--permission-mode bypassPermissions --permission-prompts none`: since Claude Code 2.1.302 `-p` starts in a manual mode that refuses every
+   edit and non-read-only command nobody approves, and in a pod nobody does. The sandbox is the
+   boundary; for recorded per-request decisions use ACP. Its MCP configuration names the servers
+   by their gateway bridge URLs. A fallback `codex exec --json` gets its usage counted from each
+   `turn.completed`; in a pod it needs full access (`sandbox_mode = "danger-full-access"`,
+   `approval_policy = "never"`) and `--skip-git-repo-check`. Every shipped profile, Codex's
+   included, runs over ACP.
 
 Forced rollouts keep working on the same mechanism: the interrupted run is re-queued with
 `mode: resume` and the harness is told to continue where it left off.
+
+### ACP harnesses
+
+`input: acp` makes the profile's command an [Agent Client Protocol](https://agentclientprotocol.com)
+agent and agent-runner its client, over the agent's stdio (JSON-RPC). The image carries the
+adapters for both vendors and OpenCode, pinned in `hack/ci/versions.env`:
+
+```yaml
+harness:
+  command: claude-agent-acp        # or codex-acp, opencode acp, any agent that speaks ACP (gemini --experimental-acp…)
+  input: acp
+  permissions: allow               # allow (default) | deny | ask (a person answers)
+  # ask_timeout: 900               # with permissions ask: seconds a request waits for a person
+  mode: default                    # optional: the session mode (claude-agent-acp default, codex-acp agent-full-access, OpenCode build)
+  mcp: auto                        # auto (default) | always
+  thought_level: high              # optional: the reasoning level (config option of category thought_level)
+  instructions: file               # optional: file | env:NAME (default: system prompt, else a prefix)
+  session_meta:                    # optional: _meta of every session request (agent-specific options)
+    claudeCode: {options: {maxTurns: 200, promptSuggestions: false}}
+  auth_method: api-key             # optional: the agent's authentication method (ACP authenticate)
+```
+
+The ACP side of agent-runner is [`github.com/k1dory/acpx`](https://github.com/k1dory/acpx), the platform's client layer over acp-go-sdk
+v0.13.5: what the SDK does not type (the client system prompt, steering, notices, compaction
+updates, the client's session capabilities) is carried there at the JSON-RPC level, with ready
+calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
+
+- **One session per conversation.** The run's task is the first `session/prompt` of a new
+  session; every later message is the next prompt of the same session (a message sent while a
+  turn runs waits for it to end). A run that continues the conversation (the next message after
+  the run finished, a rollout) continues the session it reported: with `session/resume` when the
+  agent declares it (`sessionCapabilities.resume`; nothing is replayed), else with
+  `session/load` (the history the agent replays is not written again), else in a new session,
+  which the runner reports. `resume_command` is not used.
+- **Mode.** `mode` (`HARNESS_MODE`) is set right after the session opens, new or continued: through
+  the agent's configuration option of category `mode` when it has one, else `session/set_mode`.
+  The ids are the agent's own: claude-agent-acp `default` (its permission checks on, so requests
+  reach the runner), codex-acp `agent-full-access` (its default `agent` mode needs Codex's
+  bubblewrap sandbox, which does not start in a pod, and lets a reviewer model decide), OpenCode
+  `build`. A mode the agent does not offer is reported with the ones it does; the agent keeps
+  its own.
+- **Model.** The profile's `model.name` (`SANDBOX_MODEL`) is selected through the agent's
+  configuration option of category `model`: the same value, a provider-qualified one
+  (OpenCode's `anthropic/claude-…`) or an option of that name. An agent without such an option,
+  or without that model, is told nothing and the run says so; its own configuration decides
+  (`ANTHROPIC_MODEL`, Codex's `model`).
+- **Authentication.** An agent that refuses `session/new` with "Authentication required" names
+  its methods in `initialize` (`authMethods`); `auth_method` makes the runner `authenticate`
+  with one of them before the session (codex-acp: `api-key`, with the key in the environment).
+  Without it the runner reports the methods the agent offers. An adapter may also take the
+  choice from its own environment (codex-acp: `DEFAULT_AUTH_REQUEST`).
+- **MCP servers** of the agent's connections go into `session/new` (and load, resume) as HTTP
+  servers, by their gateway bridge URLs. With `mcp: auto` the agent must announce
+  `mcpCapabilities.http`, otherwise they are left out with a notice; `mcp: always` passes them
+  anyway, for an agent that takes them without saying so (Hermes).
+- **Instructions.** An agent that declares the client system prompt
+  (`sessionCapabilities.systemPrompt`: claude-agent-acp; codex-acp, which hands it to Codex as
+  `developer_instructions` after the config's own) gets the agent definition's
+  instructions as one, appended to its own, in `session/new` and again in a load or resume (a
+  system prompt is not part of the history): they survive the agent compacting its context. Any
+  other agent gets them ahead of the task in a new session's first prompt, in an
+  `<instructions>` block, unless the profile says where its configuration reads them
+  (`instructions`): `file` writes them to `~/.sandbox/instructions.md`
+  (`$SANDBOX_INSTRUCTIONS_FILE`) before the agent starts, which OpenCode's `instructions` names;
+  `env:NAME` exports them as `NAME` (Hermes's `HERMES_ENVIRONMENT_HINT`). Either way they are part
+  of the agent's system prompt and the first prompt carries no copy. (acp-go-sdk v0.13.5 has no
+  systemPrompt field: [`github.com/k1dory/acpx`](https://github.com/k1dory/acpx) adds it at the JSON-RPC level.)
+- **Reasoning level.** `thought_level` (`HARNESS_THOUGHT_LEVEL`) is selected like the model,
+  through the agent's configuration option of category `thought_level` (codex-acp
+  `reasoning_effort`, OpenCode `effort`, Hermes `reasoning_effort`), by value or display name.
+- **Session options.** `session_meta` (`HARNESS_SESSION_META`, at most 16 KiB of JSON) is the
+  `_meta` of every session request: claude-agent-acp takes `claudeCode.options` from it
+  (`maxTurns`, `maxBudgetUsd` — the turn ends with `budget_exhausted` —, `promptSuggestions`,
+  `fallbackModel`, `effort`). It is configuration: no secret goes there.
+- **Deadlines.** Each call that opens the session (`initialize`, `authenticate`,
+  `session/resume`, `session/load`, `session/new`, and each of the settings after them) has
+  `HARNESS_ACP_SETUP_TIMEOUT` seconds of its own to answer (default 300; `authenticate` gets
+  `ask_timeout` when that is longer and `permissions` is `ask`). What runs out of time is what
+  fails otherwise: a resume or a load that does not answer falls back (to a load, then to a new
+  session), a setting that does not answer is reported and the agent keeps its own, and
+  `initialize`, `authenticate` or `session/new` end the run (exit 1) with a notice. One prompt
+  may run for `HARNESS_TURN_TIMEOUT` seconds (default 7200); past it the runner cancels the
+  turn (`session/cancel`) and ends the run with exit 1 and a notice: the run is `failed`, not
+  `cancelled` (that is a person's `/cancel`). A call still stuck 5 seconds after its deadline
+  (an agent that stopped reading its input) has the agent's process group killed under it. Both
+  are set in the profile's `env`.
+- **Permissions.** `session/request_permission` is answered by `permissions`: the agent's
+  `allow_once` (else `allow_always`) option, or with `deny` its `reject_once` (else
+  `reject_always`). The sandbox, its policy and the gateway stay the boundary either way. Every
+  request and its decision is a line of the run's output, with the change's diff when the
+  request carries one (OpenCode and Hermes send it nowhere else).
+- **A person in the loop (`permissions: ask`).** The cloud works like an agent at a terminal: what
+  the agent asks a person reaches the person, and the turn waits for the answer.
+  - A permission request becomes an `acp.request` line with the agent's options and the
+    change's diff; the agent may also ask questions (ACP elicitation, which the runner then
+    offers): a form (Claude's AskUserQuestion, an MCP server's form) with its JSON Schema, or a
+    link to open (an MCP server's OAuth sign-in).
+  - In the conversation it is a `request` turn whose `data` is that line. The answer is
+    `POST /v1/sandboxes/{id}/requests/{request_id}` with the request turn's `run_id` (an answer
+    goes to the run that asked, never to a later one): `{"run_id": …, "option_id": …}` for a
+    permission, `{"run_id": …, "action": "accept", "content": {…}}` for a form (each answer of
+    its field's type and among its choices), `{"action": "accept"}` to consent to a link,
+    `{"action": "decline"}` / `"cancel"`. A link question is also answered when the agent reports
+    the interaction complete. It travels to the run as a `reply` input event; the
+    runner checks it against the request (an option offered, the form's required and known
+    fields) and answers the agent.
+  - The resolution is an `acp.request_resolved` line (a `resolved` turn): `outcome` (the
+    option's kind, `accept`, `decline`, `cancelled`, `not_waiting` for an answer to a request no
+    longer waiting) and `by` (`user`, `timeout`, `invalid`, `cancelled`). Unanswered within
+    `ask_timeout` (default 15 minutes), a permission is refused and a question cancelled.
+  - While the turn waits, the run is in progress: the sandbox does not go to sleep, and the
+    conversation's idle clock does not run.
+  - All of it is ACP: `session/request_permission` and `elicitation/create` are the agent's own
+    requests, relayed (`github.com/k1dory/acpx`: `Request`, `Pending`, `PermissionResponse`,
+    `ElicitationResponse`). Claude (claude-agent-acp: forms and links), Codex (codex-acp),
+    Hermes (forms) and OpenCode 2.x ask questions; every ACP agent asks permissions. Limit: with
+    OpenCode the agent can answer its own permission requests through OpenCode's API on loopback
+    (see OpenCode below).
+- **Messages.** A message sent while a turn runs joins that turn when the agent takes steering
+  (`_session/steering`, declared in initialize `_meta.steering.supported`: claude-agent-acp,
+  codex-acp), the run's output says so; otherwise it waits for the turn to end and is the next
+  prompt. Files a message attached (`attachments`, or uploaded with it) are listed after its text
+  for every harness; an ACP agent gets them as `resource_link` blocks of the prompt, so it sees
+  files, not words. A message that starts with `/` reaches the agent as a command only when the agent
+  advertised that command (`available_commands_update`: `/compact`, `/review`…); any other is
+  sent with a zero-width space ahead of it, so the agent reads it as text (OpenCode ends the turn
+  empty on an unknown command).
+- **End of the conversation.** The runner closes the session on the agent's side
+  (`session/close`, when declared) so the agent writes its state, then ends the agent: stdin
+  closed, a grace period, SIGTERM to its whole process group and SIGKILL to what is left. Helpers
+  an agent starts in the background (Hermes's gateway daemon) do not outlive the run.
+- **Output.** The runner writes what the agent reports as one JSON line each:
+
+  | `type`            | fields                                                    | transcript |
+  |-------------------|-----------------------------------------------------------|------------|
+  | `acp.session`     | `session_id`                                              | — (the run's session) |
+  | `acp.message`     | `text` (the agent's chunks of one message, joined)        | `assistant` |
+  | `acp.tool_call`   | `tool_call_id`, `title`, `kind`, `status`, `diffs[]` (`path`, `change`, `old_path`, `old_text`, `new_text`, `old_size`, `new_size`, `truncated`), `diffs_replace` | `tool` |
+  | `acp.tool_update` | `tool_call_id`, `status`, `diffs[]`, `diffs_replace`       | `log` |
+  | `acp.permission`  | `tool_call_id`, `title`, `decision`, `diffs[]`, `diffs_replace` | `log` |
+  | `acp.turn_end`    | `stop_reason`                                             | ends the turn (`chat_idle` counts from here) |
+  | `acp.thought`     | `text` (the agent's reasoning before a message, its chunks joined) | `log` |
+  | `acp.plan`        | `entries[]` (`content`, `status`, `priority`): the whole plan each time it changes | `log` |
+  | `acp.notice`      | `severity`, `title`, `text`: a notice for the user (a limit near, an error it recovered from) | `log` |
+  | `acp.compaction`  | `compaction_id`, `status` (`in_progress`, `completed`, `failed`, `cancelled`), `error`, `text` (its summary) | `log` |
+  | `acp.session_info`| `title`: the session's title as the agent names it        | `log` |
+  | `acp.request`     | `request` (`request_id`, `kind`: permission / form / url, `title`, `message`, `options[]` (`option_id`, `name`, `kind`), `schema`, `url`), `diffs[]` | `request` (with `data`) |
+  | `acp.request_resolved` | `request_id`, `outcome`, `by`                        | `resolved` (with `data`) |
+  | `acp.commands`    | `commands[]` (`name`, `description`, `hint`): the agent's slash commands, the whole list each time it changes | `commands` (with `data`) |
+
+  Notices and compaction updates come only to a client that advertises
+  `clientCapabilities.session.notices` / `.compaction`, which the runner does (the SDK cannot
+  express them; [`github.com/k1dory/acpx`](https://github.com/k1dory/acpx) adds and decodes them).
+
+  **The diffs of a tool call are those of its last line that has any.** A line repeats no diff
+  the call's previous line already carried; one with different diffs says `diffs_replace`
+  (Claude sends a preview in the tool call and the real hunks in an update; a permission
+  request's diff may be refined by the call's update). `change` is the kind of change when the
+  agent says it (codex-acp: `add`, `update`, `delete`, `rename` with `old_path`). A diff whose
+  texts exceed 128 KiB keeps its path and sizes and is marked `truncated` (the file is in the
+  workspace). Changes an agent makes through its shell (`sed -i`, a generator) come with no diff
+  from any agent. The agent's stderr is passed through as it is.
+- **Usage.** Each turn ends with one `{"type":"usage",…}` line the run's accounting adds up,
+  whatever the agent's own convention:
+
+  | agent | reports | recorded |
+  |---|---|---|
+  | claude-agent-acp | the turn's tokens; `usage_update.cost`, the session's cost so far | the tokens; the cost by what it grew since the previous turn (work the agent did in the background between turns included) |
+  | codex-acp | the turn's tokens, cached apart, reasoning inside the output | as reported |
+  | OpenCode | the last model call of the turn only; `usage_update.cost` | the last call's tokens (a turn of several calls is undercounted: the agent reports no more); the cost's growth |
+  | Hermes | the session's running total | the share since the previous turn, its last total kept on the workspace (`~/.sandbox-acp-usage/`) so the next run of the session continues from it |
+
+  Reasoning tokens (`thoughtTokens`) are added to the output only when the agent counts them
+  beside it (`totalTokens` includes them on top of input and output).
+- **Lost turns (Hermes).** When Hermes's gateway restarts in the middle of a turn, the session
+  refuses every prompt (`unknown_execution`) until the lost turn is discarded: the runner sends
+  the `/discard <id>` the refusal names and the prompt once more.
+- **Gateway bridge.** Every connection out of the pod ends at the gateway, which requires the
+  pod's client certificate (mTLS). Claude Code, git and curl present it from what agent-init
+  writes; most other harnesses cannot (OpenCode on Bun, Hermes on Python's httpx, Codex on Rust
+  read no client certificate from the environment). agent-runner therefore serves a bridge on
+  the pod's loopback, `http://127.0.0.1:4480/https/<host>/<path>` (`$SANDBOX_GATEWAY_BRIDGE`),
+  that forwards to `https://<host>/<path>` through the gateway with the certificate: headers and
+  bodies unchanged (the gateway still swaps placeholder credentials and applies the policy),
+  answers streamed, WebSocket upgrades carried. A profile points its harness's provider at it
+  (`ANTHROPIC_BASE_URL`, OpenCode's provider `baseURL`, Codex's `model_providers.<id>.base_url`;
+  Codex ignores `OPENAI_BASE_URL`), and the MCP servers an ACP
+  agent gets in `session/new` are already bridge URLs. It reaches nothing the pod could not:
+  the certificate is the pod's own and the network lock still admits only the gateway.
+- **OpenCode** (`command: opencode acp`, `examples/catalog/environment-opencode-acp.yaml`) is an
+  ACP agent itself: it loads sessions (a conversation continues across runs), takes the MCP
+  connections over HTTP and needs no `auth_method` with a provider key in its environment. Its
+  configuration is `OPENCODE_CONFIG_CONTENT` and its permission rules `OPENCODE_PERMISSION`, which
+  take precedence over an `opencode.json` in the repository (a harness file would not: a
+  repository could point the provider past the bridge or lift the rules). With the rules at
+  `ask`, every edit and shell command reaches `permissions` and the run's output; a `deny` profile
+  sets them to `deny`, since OpenCode ends the whole turn on the first rejected request.
+  `webfetch` and `websearch` are denied, and `autoupdate` off, `share` disabled,
+  `OPENCODE_DISABLE_MODELS_FETCH`, `OPENCODE_DISABLE_LSP_DOWNLOAD` and
+  `OPENCODE_DISABLE_CLAUDE_CODE` keep it from egress and configuration a pod has no use for.
+  The repository is code to work on, not configuration: `OPENCODE_DISABLE_PROJECT_CONFIG` keeps
+  its `opencode.json`, `.opencode/` (agents, plugins, commands) and instruction files out (its
+  `AGENTS.md` is named in `instructions` again, as text), `--pure` runs without external plugins.
+  **Limit:** `opencode acp` serves its own HTTP API on the pod's loopback without a password
+  (`OPENCODE_SERVER_PASSWORD` unset), and the agent's shell runs as the same user with the same
+  environment, so a password would not keep it out either: the agent can answer its own
+  permission requests there. With OpenCode, `permissions: deny` is not a boundary against the
+  agent itself; the pod, its policy and the gateway are.
+  After an approved edit OpenCode tells the client through `fs/write_text_file` although the
+  runner declares no file system: the runner answers success and writes nothing (the file is
+  already on disk). Its Anthropic provider's `baseURL` is the gateway bridge: OpenCode cannot
+  present the pod's client certificate itself.
+- **Hermes Agent** (`command: hermes acp`, `examples/catalog/environment-hermes-acp.yaml`) runs
+  from its own image, `agent-hermes`: the official Hermes image pinned by digest
+  (`HERMES_IMAGE` in `hack/ci/versions.env`) with agent-init, agent-runner, the network lock and
+  user 1000 added (`images/agent-hermes/Dockerfile`). Hermes ships as that image, not as a
+  package the default agent image could install. The admin publishes it as a version of the
+  agent catalogue (`agent.versions.hermes: …/agent-hermes:sha-…@sha256:…`) and the profile names
+  `image: hermes`. `HERMES_HOME` is `~/.hermes` on the workspace volume (config, sessions,
+  memory, skills survive restarts); its configuration is a harness file, `.hermes/config.yaml`:
+  `approvals.mode: off` with `permissions: allow` (its default, `smart`, lets a model decide, so a
+  deny profile would not be obeyed; a deny profile sets `manual`), the remote model catalogue,
+  lazy installs, adopting other agents' logins from the home directory (`auth.adopt_external_logins`),
+  LSP downloads, plugin update checks, remote connectors, password-manager vaults and the
+  toolsets that reach outside the pod or run in the background (web, browser, connections, cron,
+  kanban, media generation) off. Hermes takes MCP servers over HTTP without
+  declaring it: the profile says `mcp: always`. Hermes's own login is interactive and not used:
+  the provider key is a placeholder in `env`, and `ANTHROPIC_BASE_URL` (read from the environment
+  only) is the gateway bridge (Hermes's httpx client cannot present the pod's client certificate).
+- **Checked offline in CI.** `hack/ci/images.sh` runs the ACP smoke tests inside the built
+  images with no network: the shipped Codex, OpenCode and Hermes profiles open a session with
+  the real agent in the profile's mode (the agent must accept it), and OpenCode's and Hermes's
+  are loaded again by a second process (the next run); claude-agent-acp must take the
+  instructions as its system prompt and the profile's mode.
+  Each also makes a real model call through the runner against a test gateway that requires the
+  pod's client certificate: OpenCode's and Hermes's answers come back into the transcript,
+  Codex's request arrives at `/v1/responses` with the certificate. OpenCode's and Hermes's model
+  calls must carry the definition's instructions in their system prompt (file, environment hint)
+  and in none of their messages.
+- **Long lines.** For every harness, an output line over 1 MiB is replaced by a
+  `[agent-runner] dropped an output line …` notice and reading goes on, so the harness never
+  blocks on a reader that gave up.
+- **The runner offers no file system or terminal** to the agent (client capabilities have none):
+  the agent uses its own tools inside the pod, under the pod's network lock.
+- **Claude Code's hooks.** The agent image's managed settings
+  (`/etc/claude-code/managed-settings.json`, which no user or repository settings override) allow
+  only managed hooks: a repository's `.claude/settings.json` cannot run commands from hooks past
+  the permission requests the runner answers and records.
+
+### `/` and `@` in a client
+
+A web chat or another backend builds the same experience as an agent at a terminal from what the
+platform already sends; the platform has no completion endpoints (a picker would call them on
+every keystroke):
+
+- **`/`** lists the agent's commands from the latest `commands` turn (its `data.commands`: name,
+  description, hint for the argument) next to the client's own. A message `/compact` or
+  `/review main` reaches the agent as that command; any other text that starts with `/` reaches
+  it as text.
+- **`@`** picks a workspace file from `GET /v1/sandboxes/{id}/files` (search it as the user
+  types); the message is sent with the chosen paths in `attachments` (relative to `/workspace`).
+  The agent gets them as files (resource links).
+- **Requests** are `request` turns to show (options, a form from its schema, a link) and answer
+  with `POST /requests/{request_id}`; `resolved` turns close them.
+
+`sandboxctl chat` is the reference: `/` or `/help` lists both kinds of commands, `@path` in a
+message attaches that file, `/reply <number>` (a permission), `/reply field=value …` (a form),
+`/reply` (a link done), `/decline` and `/cancel` answer the latest open request (or
+`/reply req_… …` a given one).
 
 ### The transcript
 

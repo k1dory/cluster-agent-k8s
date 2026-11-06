@@ -1,3 +1,12 @@
+-- The schema, in ordered steps. Each step runs once, in its own transaction, and is recorded
+-- in schema_migrations; a database already at the latest step runs nothing at startup (the
+-- ALTER TABLE ... IF NOT EXISTS of a step take ACCESS EXCLUSIVE even when they change nothing).
+--
+-- Steps 1-7 are the schema as it stood when the version table came in. They stay idempotent:
+-- a database migrated before then has no schema_migrations row yet and runs them all again.
+-- A change is a new step appended at the end, never an edit of an applied one.
+
+-- step 1: sandboxes, runs, events, instances, idempotency
 CREATE TABLE IF NOT EXISTS sandboxes (
     id              text PRIMARY KEY,
     name            text NOT NULL,
@@ -104,6 +113,7 @@ CREATE TABLE IF NOT EXISTS idempotency (
 ALTER TABLE idempotency ADD COLUMN IF NOT EXISTS body_hash text NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency (created_at);
 
+-- step 2: agent versions, conversation mode, blobs, admin grant
 -- Agent versioning and optimistic locking (see model.Sandbox).
 ALTER TABLE sandboxes
     ADD COLUMN IF NOT EXISTS agent_version text NOT NULL DEFAULT '',
@@ -127,6 +137,7 @@ CREATE TABLE IF NOT EXISTS blobs (
 
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS admin_grant boolean NOT NULL DEFAULT false;
 
+-- step 3: catalogue
 -- Catalogue: AgentDefinition / EnvironmentProfile revisions (append-only, latest = current).
 CREATE TABLE IF NOT EXISTS catalog_items (
     kind        text NOT NULL,
@@ -157,6 +168,7 @@ ALTER TABLE runs
     ADD COLUMN IF NOT EXISTS environment_ref text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS environment_revision integer NOT NULL DEFAULT 0;
 
+-- step 4: applies, API keys, token uses
 -- Applies: one application of a bundle, continued by key, a step written with its item in
 -- one transaction (see store.Applies).
 CREATE TABLE IF NOT EXISTS applies (
@@ -187,6 +199,10 @@ CREATE TABLE IF NOT EXISTS api_keys (
 CREATE INDEX IF NOT EXISTS api_keys_tenant ON api_keys (tenant, created_at DESC);
 -- trust names the CITrust that issued a key to a CI job (short-lived; pruned once long expired).
 ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS trust text NOT NULL DEFAULT '';
+-- The key's expiry before its first rotation shortened it to the grace period ('infinity':
+-- none; NULL: never rotated, or rotated before this was kept): an omitted-TTL retry of the
+-- rotation gives the new key this lifetime, not the earlier successor's.
+ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS original_expires_at timestamptz;
 -- Tokens used once (a CI provider's ID token exchanged for a key), until they expire anyway.
 CREATE TABLE IF NOT EXISTS token_uses (
     id         text PRIMARY KEY,
@@ -195,6 +211,7 @@ CREATE TABLE IF NOT EXISTS token_uses (
 -- key_id: the key the token was exchanged for, written in the same transaction as the key.
 ALTER TABLE token_uses ADD COLUMN IF NOT EXISTS key_id text NOT NULL DEFAULT '';
 
+-- step 5: credentials, OAuth sign-ins
 -- Tenant-brought credentials (BYOK): ciphertext only; the server key never touches the database.
 CREATE TABLE IF NOT EXISTS credentials (
     tenant      text NOT NULL DEFAULT '',
@@ -236,6 +253,7 @@ CREATE TABLE IF NOT EXISTS oauth_credentials (
 );
 CREATE INDEX IF NOT EXISTS oauth_credentials_due ON oauth_credentials (next_at) WHERE status <> 'failed';
 
+-- step 6: git syncs
 -- Git repositories: the last check and the last sync of each GitRepository (model.GitSync);
 -- the applies and the revisions carry the history.
 CREATE TABLE IF NOT EXISTS git_syncs (
@@ -246,17 +264,7 @@ CREATE TABLE IF NOT EXISTS git_syncs (
     PRIMARY KEY (tenant, name)
 );
 
--- Records written before the record had two halves kept check and sync fields at the root.
--- Each half missing in the new form is built from those fields (a half already written in the
--- new form wins), then the root fields go. Idempotent: a converted record has no root field.
-UPDATE git_syncs SET doc =
-    (doc - 'tenant' - 'name' - 'head' - 'checked_at' - 'check_error' - 'commit' - 'bundles' - 'status' - 'error' - 'synced_at' - 'updated_at')
-    || CASE WHEN doc ? 'check' OR NOT (doc ? 'checked_at') THEN '{}'::jsonb
-            ELSE jsonb_build_object('check', jsonb_strip_nulls(jsonb_build_object('head', doc->'head', 'at', doc->'checked_at', 'error', doc->'check_error'))) END
-    || CASE WHEN doc ? 'sync' OR NOT (doc ? 'synced_at') THEN '{}'::jsonb
-            ELSE jsonb_build_object('sync', jsonb_strip_nulls(jsonb_build_object('commit', doc->'commit', 'bundles', doc->'bundles', 'status', doc->'status', 'error', doc->'error', 'at', doc->'synced_at'))) END
-WHERE doc ?| array['checked_at', 'synced_at', 'head', 'commit', 'status', 'bundles', 'check_error', 'tenant', 'name', 'updated_at'];
-
+-- step 7: git webhook jobs
 -- Webhook jobs (model.GitJob): an accepted delivery survives the replica that accepted it; one
 -- job per delivery; claimed under a lease by one replica at a time (store.GitJobs).
 CREATE TABLE IF NOT EXISTS git_jobs (
@@ -278,7 +286,105 @@ CREATE TABLE IF NOT EXISTS git_jobs (
 );
 CREATE INDEX IF NOT EXISTS git_jobs_waiting ON git_jobs (status, lease_until, created_at);
 -- run counts a job's executions for good (attempts starts over when a redelivery requeues
--- the job): the identity an execution's writes are fenced by. Rows from before carry their
--- attempts as the executions so far.
+-- the job): the identity an execution's writes are fenced by.
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS run integer NOT NULL DEFAULT 0;
+
+-- step 8: preview access generation
+-- Bumped when a preview is closed or its access level changes; preview sign-ins carry the
+-- generation they were issued under, and older ones are refused.
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS preview_gen bigint NOT NULL DEFAULT 0;
+
+-- step 9: run delivery
+-- attempt counts the times a run was handed to a runner; claimed_by/claim_acked let a claim
+-- whose response was lost be handed to the same instance again (and to no other).
+ALTER TABLE runs
+    ADD COLUMN IF NOT EXISTS attempt integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS claimed_by text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS claim_acked boolean NOT NULL DEFAULT false;
+-- The progress of each X-Batch-Id of a run's output: how many of its lines are stored, the
+-- running hash of those lines and whether they were the whole body, written in the
+-- transaction that stores them.
+CREATE TABLE IF NOT EXISTS run_output_batches (
+    run_id     text NOT NULL,
+    batch_id   text NOT NULL,
+    lines      integer NOT NULL,
+    hash       text NOT NULL,
+    complete   boolean NOT NULL DEFAULT true,
+    touched_at timestamptz NOT NULL DEFAULT now(), -- the last call under the id: retention counts from it
+    PRIMARY KEY (run_id, batch_id)
+);
+CREATE INDEX IF NOT EXISTS run_output_batches_touched ON run_output_batches (touched_at);
+
+-- step 10: event ids in commit order
+-- Readers page events by id, so an id must not become visible before a smaller one: a writer
+-- holding id N uncommitted while another commits N+1 makes a listener move past N for good.
+-- The id is drawn here, under a transaction-scoped lock held to the commit, so the next
+-- writer's id is drawn only after this one is visible. In the database, not in the Go code:
+-- during a rolling update the replicas of an older release keep sending a bare INSERT, and
+-- they must take the same lock. The column default has already drawn a value when a BEFORE
+-- trigger runs, outside the lock; it is replaced (the gap it leaves is harmless).
+CREATE OR REPLACE FUNCTION events_ordered_id() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('agent-sandbox:events'));
+    NEW.id := nextval(pg_get_serial_sequence('events', 'id'));
+    RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS events_ordered_id ON events;
+CREATE TRIGGER events_ordered_id BEFORE INSERT ON events FOR EACH ROW EXECUTE FUNCTION events_ordered_id();
+
+-- step 11: idempotency reservation owners and seeds
+-- token is the random owner of a reservation: finishing it (result or release) is conditional
+-- on it, and a token never repeats, so a handler that lost its reservation can never finish a
+-- later one. generation counts the attempts under the key. seed names what the keyed request
+-- creates and is kept by every later attempt with the same body, so one finds what an earlier
+-- one created. Rows of an older replica have no seed: an unfinished one is never run again
+-- (the resource it may have made has a random name nothing can find). created and said record
+-- what the seed's attempts did (the sandbox inserted, in the same transaction; a message's
+-- delivery): they live exactly as long as the reservation, and a deleted sandbox is not made
+-- again under its key.
+ALTER TABLE idempotency
+    ADD COLUMN IF NOT EXISTS generation integer NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS seed text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS token text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS created text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS said text NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idempotency_seed ON idempotency (seed) WHERE seed <> '';
+
+-- step 12: idempotency reservations outlive an older replica's cleanup
+-- An older replica deletes every unfinished reservation older than two minutes on each
+-- reservation it makes (it took one that old for abandoned). Under a seed that would drop the
+-- record of what an attempt created and the seed itself: the retry would draw a new seed and
+-- create a second sandbox or run. A seeded reservation is kept until its TTL (store
+-- IdempotencyTTL, 24 hours) whatever deletes it; the row is skipped, not the statement failed,
+-- so the rest of the older replica's cleanup (expired rows, its own legacy releases) goes on.
+-- In the database, as step 10's events trigger: the older replicas' SQL cannot be changed.
+CREATE OR REPLACE FUNCTION idempotency_keep_seeded() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.seed <> '' AND OLD.created_at >= now() - interval '24 hours' THEN
+        RETURN NULL;
+    END IF;
+    RETURN OLD;
+END
+$$;
+DROP TRIGGER IF EXISTS idempotency_keep_seeded ON idempotency;
+CREATE TRIGGER idempotency_keep_seeded BEFORE DELETE ON idempotency FOR EACH ROW EXECUTE FUNCTION idempotency_keep_seeded();
+
+-- every start: repairs of rows a replica of an older release may still write
+-- No DDL here: these run on every start, after the steps, because during a rolling update an
+-- older replica keeps writing the old form after the step that introduced the new one ran.
+
+-- Records written before the record had two halves kept check and sync fields at the root.
+-- Each half missing in the new form is built from those fields (a half already written in the
+-- new form wins), then the root fields go. Idempotent: a converted record has no root field.
+UPDATE git_syncs SET doc =
+    (doc - 'tenant' - 'name' - 'head' - 'checked_at' - 'check_error' - 'commit' - 'bundles' - 'status' - 'error' - 'synced_at' - 'updated_at')
+    || CASE WHEN doc ? 'check' OR NOT (doc ? 'checked_at') THEN '{}'::jsonb
+            ELSE jsonb_build_object('check', jsonb_strip_nulls(jsonb_build_object('head', doc->'head', 'at', doc->'checked_at', 'error', doc->'check_error'))) END
+    || CASE WHEN doc ? 'sync' OR NOT (doc ? 'synced_at') THEN '{}'::jsonb
+            ELSE jsonb_build_object('sync', jsonb_strip_nulls(jsonb_build_object('commit', doc->'commit', 'bundles', doc->'bundles', 'status', doc->'status', 'error', doc->'error', 'at', doc->'synced_at'))) END
+WHERE doc ?| array['checked_at', 'synced_at', 'head', 'commit', 'status', 'bundles', 'check_error', 'tenant', 'name', 'updated_at'];
+
+-- Rows from before git_jobs.run (or written by a replica that does not know it) carry their
+-- attempts as the executions so far.
 UPDATE git_jobs SET run = attempts WHERE run = 0 AND attempts > 0;

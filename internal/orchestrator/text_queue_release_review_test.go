@@ -10,8 +10,10 @@ import (
 	"agent-sandbox/internal/store"
 )
 
-// One storage interruption covers the session read and the compensating write.
-// No external database or process is affected by this fixture.
+// A storage interruption during the claim's session read. NextRun reads the predecessor's
+// session before its conditional claim (QueuedRun, then ClaimRun): a failed read must leave the
+// run queued, so the next poll claims it once the store answers. No external database or
+// process is affected by this fixture.
 type reviewSessionOutageStore struct {
 	store.Store
 	predecessor string
@@ -25,14 +27,7 @@ func (s *reviewSessionOutageStore) GetRun(ctx context.Context, id string) (*mode
 	return s.Store.GetRun(ctx, id)
 }
 
-func (s *reviewSessionOutageStore) ReleaseRun(ctx context.Context, id string) error {
-	if s.outage.Load() {
-		return errors.New("fixture: store still unavailable during release")
-	}
-	return s.Store.ReleaseRun(ctx, id)
-}
-
-func TestReviewTextResumeRemainsClaimableAfterReleaseFailure(t *testing.T) {
+func TestReviewTextResumeRemainsClaimableAfterSessionReadFailure(t *testing.T) {
 	ctx := t.Context()
 	st := &reviewSessionOutageStore{Store: store.NewMemory()}
 	o, sb := reviewTextQueueSandbox(t, st)

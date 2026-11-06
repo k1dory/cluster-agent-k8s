@@ -1,11 +1,10 @@
 package httpapi
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"path"
 	"regexp"
@@ -13,8 +12,11 @@ import (
 	"strings"
 	"time"
 
+	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/orchestrator"
+	"agent-sandbox/internal/store"
+	"github.com/k1dory/acpx"
 )
 
 // chatRoutes mounts the conversation and workspace endpoints of a sandbox.
@@ -23,14 +25,16 @@ import (
 //	GET  /v1/sandboxes/{id}/messages          the conversation after ?after (one page)
 //	GET  /v1/sandboxes/{id}/messages/stream   the conversation as SSE: replay, then live
 //	POST /v1/sandboxes/{id}/messages/close    end the open conversation (the run finishes)
+//	POST /v1/sandboxes/{id}/requests/{rid}    answer what the agent asks (a permission, a question)
 //	GET  /v1/sandboxes/{id}/files?path=&depth= list the workspace
 //	GET  /v1/sandboxes/{id}/files/content?path= read a file
 //	PUT  /v1/sandboxes/{id}/files/content?path= write a file (the body)
-func (p *Platform) chatRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /v1/sandboxes/{id}/messages", p.auth(p.idempotent(p.sendMessage)))
+func (p *Platform) chatRoutes(mux *routeMux) {
+	mux.HandleFunc("POST /v1/sandboxes/{id}/messages", p.auth(removeForm(p.idempotentUpload(p.sendMessage))))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/messages", p.auth(p.listMessages))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/messages/stream", p.auth(p.streamMessages))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/messages/close", p.auth(p.closeConversation))
+	mux.HandleFunc("POST /v1/sandboxes/{id}/requests/{request_id}", p.auth(p.idempotent(p.replyRequest)))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/files", p.auth(p.listFiles))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/files/content", p.auth(p.readFile))
 	mux.HandleFunc("PUT /v1/sandboxes/{id}/files/content", p.auth(p.writeFile))
@@ -62,14 +66,28 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req MessageRequest
 	var uploaded []string
-	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if ct == "multipart/form-data" {
-		if err := r.ParseMultipartForm(orchestrator.MaxFileBytes); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+	if isMultipart(r) {
+		// Capped as a whole (every file at its cap, see body.go), so what ParseMultipartForm
+		// spills to disk is bounded too; a form the idempotency middleware already parsed is
+		// not parsed again.
+		capBody(w, r, multipartBodyLimit)
+		if err := r.ParseMultipartForm(multipartMemory); err != nil {
+			writeBodyErr(w, err)
+			return
+		}
+		// The parser stops at the closing boundary; what follows (the epilogue) counts against
+		// the cap too, and is read to its end before anything is written or sent.
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			writeBodyErr(w, err)
 			return
 		}
 		req.Text = r.FormValue("text")
-		for _, fh := range r.MultipartForm.File["file"] {
+		files := r.MultipartForm.File["file"]
+		if len(files) > MaxUploadFiles {
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("at most %d files per message", MaxUploadFiles))
+			return
+		}
+		for _, fh := range files {
 			name := uploadNameRe.ReplaceAllString(path.Base(fh.Filename), "_")
 			if name == "" || name == "." || name == ".." {
 				writeErr(w, http.StatusBadRequest, fmt.Errorf("attachment %q has no usable name", fh.Filename))
@@ -95,8 +113,8 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Attachments = append(req.Attachments, uploaded...)
 	} else {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeBodyErr(w, err)
 			return
 		}
 	}
@@ -105,17 +123,17 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 		var paths []string
 		for _, a := range req.Attachments {
 			cp, err := orchestrator.CleanFSPath(a)
-			if err != nil || cp == "." {
+			if err != nil || cp == "." || !harness.AttachmentPath("/workspace/"+cp) {
 				writeErr(w, http.StatusBadRequest, fmt.Errorf("attachment path %q", a))
 				return
 			}
 			paths = append(paths, "/workspace/"+cp)
 		}
-		if text == "" {
-			text = "See the attached files."
-		}
-		text += "\n\nAttached files:\n- " + strings.Join(paths, "\n- ")
+		// Listed after the text (every harness reads it); an ACP agent gets them as resource links.
+		text = harness.WithAttachments(text, paths)
 	}
+	// Under an Idempotency-Key, Say delivers the message once for every attempt: a later one
+	// gets the earlier one's delivery (see Orchestrator.Say).
 	run, delivery, err := p.Orch.Say(r.Context(), id, text)
 	if err != nil {
 		writeOrchErr(w, err)
@@ -163,51 +181,14 @@ func (p *Platform) streamMessages(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, q.err)
 		return
 	}
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	ch, cancel := p.Hub.Subscribe(id)
-	defer cancel()
-	send := func(m model.Message) {
-		b, _ := json.Marshal(m)
-		fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", m.ID, m.Role, b)
-		fl.Flush()
-	}
-	for {
-		msgs, next, err := p.Orch.Messages(r.Context(), id, after, 500, raw)
-		if err != nil || next == after {
-			break
-		}
+	streamSSE(w, r, hubWake(p.Hub, id, model.EventRunQueued, model.EventInput, model.EventRunOutput, model.EventRunDone), 15*time.Second, after, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
+		msgs, next, err := p.Orch.Messages(ctx, id, after, ssePageSize, raw)
+		items := make([]sseItem, 0, len(msgs))
 		for _, m := range msgs {
-			send(m)
+			items = append(items, sseItem{ID: m.ID, Event: m.Role, Data: m})
 		}
-		after = next
-	}
-	keep := time.NewTicker(15 * time.Second)
-	defer keep.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case <-keep.C:
-			fmt.Fprint(w, ": keepalive\n\n")
-			fl.Flush()
-		case e := <-ch:
-			if e.ID <= after {
-				continue
-			}
-			after = e.ID
-			if m, ok := p.Orch.ToMessage(r.Context(), e, raw); ok {
-				send(m)
-			}
-		}
-	}
+		return items, next, err
+	})
 }
 
 // closeConversation ends the run in progress gracefully (its harness input is closed).
@@ -217,15 +198,20 @@ func (p *Platform) closeConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	run, err := p.Orch.Store.RunningRun(r.Context(), id)
-	if err != nil {
+	if errors.Is(err, store.ErrNotFound) {
 		writeErr(w, http.StatusConflict, errors.New("no conversation is open"))
 		return
 	}
-	if _, err := p.Orch.CloseRun(r.Context(), id, run.ID); err != nil {
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	closed, err := p.Orch.CloseRun(r.Context(), id, run.ID)
+	if err != nil {
 		writeOrchErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, run)
+	writeJSON(w, http.StatusOK, closed) // the run as it is now, not as it was before the close
 }
 
 func (p *Platform) closeRun(w http.ResponseWriter, r *http.Request) {
@@ -315,7 +301,7 @@ func (p *Platform) writeFile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, orchestrator.MaxFileBytes))
+	data, err := io.ReadAll(maxBytes(w, r.Body, orchestrator.MaxFileBytes))
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
@@ -377,4 +363,35 @@ func fsStatus(msg string) int {
 		return http.StatusBadRequest
 	}
 	return http.StatusBadGateway
+}
+
+// ReplyResponse names the run the reply went to.
+type ReplyResponse struct {
+	RunID     string `json:"run_id"`
+	RequestID string `json:"request_id"`
+}
+
+// replyRequest: JSON {run_id, option_id} for a permission, {run_id, action, content} for a
+// question; run_id is the request turn's (the run that asked). The runner answers the agent and
+// writes the resolution (role resolved in the conversation).
+func (p *Platform) replyRequest(w http.ResponseWriter, r *http.Request) {
+	if _, ok := p.sandbox(w, r); !ok {
+		return
+	}
+	var body struct {
+		acpx.Reply
+		RunID string `json:"run_id"`
+	}
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeBodyErr(w, err)
+		return
+	}
+	reply := body.Reply
+	reply.RequestID = r.PathValue("request_id")
+	run, err := p.Orch.Reply(r.Context(), r.PathValue("id"), body.RunID, reply)
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, ReplyResponse{RunID: run.ID, RequestID: reply.RequestID})
 }

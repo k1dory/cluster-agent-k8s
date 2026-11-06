@@ -1,0 +1,83 @@
+# EnvironmentProfile: Hermes Agent (Nous Research) as an ACP agent: `hermes acp` speaks the Agent
+# Client Protocol itself, agent-runner is its client. Hermes keeps its sessions, memory and
+# skills under $HERMES_HOME, which the agent-hermes image puts in the agent's home on the
+# workspace volume, so a conversation continues across runs and pod restarts (session/load).
+#
+# Image: `hermes` is a version of the deployment's agent catalogue (agent.versions in the Helm
+# values) that the admin points at the published agent-hermes image, by digest:
+#   agent.versions.hermes: ghcr.io/<org>/agent-sandbox/agent-hermes:sha-…@sha256:…
+# Hermes is not in the default agent image: it ships as its own image (Python 3.14, a pinned
+# SQLite, its package manager), which agent-hermes builds on (images/agent-hermes/Dockerfile).
+#
+# Configuration is a harness file, $HERMES_HOME/config.yaml: the Anthropic provider, telemetry,
+# update checks, the remote model catalogue and lazy package installs off (the gateway would
+# deny them anyway), the web and browser toolsets off (they would leave the pod past the bridge).
+# approvals.mode is `off` for `permissions: allow`: by default (`smart`) a model decides which
+# commands need approval, and a `deny` profile would not be obeyed. A deny profile sets
+# `manual`, so every approval reaches the runner. Hermes's own login (`--setup`) is interactive
+# and not used: the key comes from the environment as a placeholder the policy rule for
+# api.anthropic.com replaces (`x-api-key: secret:anthropic`, docs/self-service.md).
+#
+# Instructions: Hermes takes no ACP system prompt; harness.instructions `env:HERMES_ENVIRONMENT_HINT`
+# exports the agent definition's instructions as the hint Hermes adds to its system prompt for an
+# embedding platform. Hardening: no adopting other agents' logins found in the home directory, no
+# LSP downloads, plugin update checks, remote connectors or password-manager vaults, and the
+# toolsets that reach outside the pod or run in the background (web, browser, connectors, cron,
+# kanban, media generation) are off.
+#
+# Hermes takes the sandbox's MCP servers (over HTTP) without declaring it: `mcp: always` passes
+# them. A turn lost when Hermes's gateway restarts is discarded by the runner, which then sends
+# the prompt again; Hermes reports the session's running token total, which the runner turns
+# into each turn's share.
+# Apply:  sandboxctl apply -f examples/catalog/environment-hermes-acp.yaml
+kind: EnvironmentProfile
+name: hermes-acp
+description: Hermes Agent over ACP, the API key held by the gateway
+spec:
+  image: hermes
+  harness:
+    command: hermes acp
+    input: acp
+    permissions: allow
+    mcp: always
+    instructions: env:HERMES_ENVIRONMENT_HINT
+    files:
+      .hermes/config.yaml: |
+        model:
+          provider: anthropic
+          default: claude-sonnet-5-5
+        approvals:
+          mode: "off"
+        agent:
+          disabled_toolsets: [web, search, x_search, browser, connections, cronjob, kanban, image_gen, video_gen, tts, computer_use]
+        auth:
+          adopt_external_logins: false
+        lsp:
+          install_strategy: manual
+        plugins:
+          auto_update_check_hours: 0
+        tools:
+          connectors:
+            enabled: false
+        vault:
+          onepassword:
+            enabled: false
+          bitwarden:
+            enabled: false
+        model_catalog:
+          enabled: false
+        security:
+          allow_lazy_installs: false
+        telemetry:
+          shared_metrics:
+            enabled: false
+            send: false
+        updates:
+          check: false
+  env:
+    ANTHROPIC_API_KEY: placeholder-the-gateway-injects-the-real-key
+    # Hermes's Anthropic client (httpx) cannot present the pod's client certificate to the
+    # gateway: it goes through agent-runner's gateway bridge on loopback (docs/chat-and-files.md,
+    # "Gateway bridge"). The Anthropic SDK adds /v1 itself. Hermes reads the base URL from the
+    # environment only, not from config.yaml.
+    ANTHROPIC_BASE_URL: http://127.0.0.1:4480/https/api.anthropic.com

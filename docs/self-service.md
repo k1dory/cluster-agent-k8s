@@ -74,8 +74,11 @@ The policy injects it as the bearer, and nothing else
     Authorization: "Bearer secret:claude-oauth"
 ```
 
-The environment profile gives Claude Code a placeholder token and no API key
-([examples/catalog/environment-claude-subscription.yaml](../examples/catalog/environment-claude-subscription.yaml)):
+The environment profile runs Claude over ACP (`claude-agent-acp`, `input: acp`) and gives it a
+placeholder token and no API key
+([examples/catalog/environment-claude-subscription.yaml](../examples/catalog/environment-claude-subscription.yaml));
+the adapter passes its environment to the Claude Code it starts unchanged (it rewrites credentials
+only for a client-configured provider, which the runner never sets):
 
 ```yaml
 env:
@@ -127,10 +130,13 @@ from the ID token, so the policy injects both
     ChatGPT-Account-ID: "secret:chatgpt.account_id"
 ```
 
-Codex in the pod uses a provider pointed at the ChatGPT backend whose key is a placeholder
+Codex runs over ACP (`codex-acp`, mode `agent-full-access`) with a provider pointed at the
+ChatGPT backend through the gateway bridge, whose key is a placeholder
 ([examples/catalog/environment-codex-chatgpt.yaml](../examples/catalog/environment-codex-chatgpt.yaml),
 which writes `~/.codex/config.toml` through the harness files below), so neither the refresh
-token nor the access token is ever in the pod. A sign-in nobody approves within fifteen minutes,
+token nor the access token is ever in the pod. codex-acp wants an account before it opens a
+session: `DEFAULT_AUTH_REQUEST` logs it in with a placeholder API key, which is never sent to
+chatgpt.com (the requests carry the provider's placeholder, which the gateway replaces). A sign-in nobody approves within fifteen minutes,
 a denied one, and a refresh token the provider revokes, expires or finds reused end as `failed`
 with the reason: the gateway then answers 502 with it, and `oauth login` again is the fix. A
 provider outage keeps the sign-in and retries. The tokens are encrypted under
@@ -192,7 +198,7 @@ name: tools
 spec:
   type: mcp
   host: mcp.tools.example.com
-  upstream: https://10.0.0.5:8443            # optional: where the gateway sends it (default https://host)
+  upstream: https://10.0.0.5:8443            # optional: scheme://host[:port] only (default https://host)
   paths: ["/mcp", "/mcp/**"]                 # optional: what the agent may call (default /**)
   mcp: { read_only: true, tools: ["get_*", "list_*"] }   # optional: what the proxy lets through
   headers:
@@ -205,7 +211,9 @@ that inspects every JSON-RPC body. The connection is the rule for that host: onl
 carries the connection passes, only on its `paths`, with its `mcp` restriction, and with the
 headers it names, resolved from the tenant's secrets at request time. A connection for a host
 the tenant's settings do not list is refused (403) with the reason; two connections cannot send
-one host to two upstreams or make it both HTTP and MCP; deleting the connection withdraws the
+one host to two upstreams or make it both HTTP and MCP; an `upstream` with a path, query, user
+information or a scheme that contradicts its port (`http://…:443`, `https://…:80`) is refused,
+since Caddy would reject the whole gateway configuration with it; deleting the connection withdraws the
 host and the rule immediately. The admin's shared connections (`-tenant ""`) may name any host.
 
 An `upstream` behind a private CA is trusted once the operator names a ConfigMap of its PEM
@@ -239,14 +247,21 @@ sandboxctl run sb_1234 "add integration tests for the checkout flow"
 
 The sandbox records the agent's connections. Its pod gets `SANDBOX_MCP_SERVERS`, a JSON list of
 the MCP endpoints those connections give it (`[{"name":"tools","url":"https://mcp.tools.example.com/mcp"}]`);
-the runner writes them as a Claude Code MCP configuration (`$SANDBOX_MCP_CONFIG`) and the
-default harness command loads it with `--mcp-config`. A custom `harness.command` names
-`"$SANDBOX_MCP_CONFIG"` itself where it wants it. The gateway decides what each call may do; the
+an ACP harness (the default, Claude over ACP) gets them in its session (`session/new`, load,
+resume) by their gateway bridge URLs. For a non-ACP harness the runner writes them as a Claude
+Code MCP configuration (`$SANDBOX_MCP_CONFIG`) that a `claude` command loads with
+`--mcp-config`; another custom `harness.command` names `"$SANDBOX_MCP_CONFIG"` itself where it
+wants it. The gateway decides what each call may do; the
 configuration only tells the harness where the servers are.
 
-The definition's `instructions` reach the pod as `SANDBOX_INSTRUCTIONS`; for a claude harness the
-runner appends `--append-system-prompt "$SANDBOX_INSTRUCTIONS"` to the run and resume commands, so
-the agent reads them before the task. A custom command that names the variable, or sets a system
+An ACP agent (`harness.input: acp`, e.g. `command: claude-agent-acp` or `codex-acp`) gets the
+same servers in its `session/new` instead of a configuration file, and the definition's
+instructions ahead of its first prompt; see docs/chat-and-files.md, "ACP harnesses".
+
+A text-mode claude harness (`harness.input: text` or `stream-json`, a custom `claude -p ...`
+command) gets the definition's `instructions` from the pod's `SANDBOX_INSTRUCTIONS`: the runner
+appends `--append-system-prompt "$SANDBOX_INSTRUCTIONS"` to the run and resume commands, so the
+agent reads them before the task. A custom command that names the variable, or sets a system
 prompt of its own, is left alone; a harness that is not claude reads the variable itself.
 
 ## What stays with the operator

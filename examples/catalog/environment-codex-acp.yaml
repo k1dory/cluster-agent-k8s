@@ -1,0 +1,61 @@
+# EnvironmentProfile: Codex over the Agent Client Protocol. The command is the ACP adapter
+# (@agentclientprotocol/codex-acp, built on Codex's app-server, pinned in the agent image).
+# Unlike `codex exec`, a conversation stays open (messages are prompts of one session), file
+# changes come with their diffs and approvals reach `permissions`. docs/chat-and-files.md,
+# "ACP harnesses".
+#
+# Credentials: the pod holds a placeholder API key; the policy rule for api.openai.com injects
+# the tenant's key (docs/self-service.md). codex-acp refuses a session until it is told how to
+# authenticate: DEFAULT_AUTH_REQUEST selects its api-key method (the generic way for any ACP
+# agent is `harness.auth_method`, which the runner sends as ACP authenticate). NO_BROWSER keeps
+# the adapter from opening a login.
+#
+# Mode: codex-acp starts in `agent` (workspace-write, with a reviewer model deciding escalations
+# and Codex's bubblewrap sandbox, which does not start in a pod without capabilities).
+# `agent-full-access` runs commands directly: the pod is the sandbox, and every approval Codex
+# still asks for reaches `permissions`. The agent image sets CODEX_PATH, so the adapter runs the
+# codex pinned in the image instead of its own copy; analytics, feedback and OpenTelemetry export
+# are off.
+# Apply:  sandboxctl apply -f examples/catalog/environment-codex-acp.yaml
+kind: EnvironmentProfile
+name: codex-acp
+description: Codex over ACP, the API key held by the gateway
+spec:
+  image: stable
+  harness:
+    command: codex-acp
+    input: acp
+    permissions: allow
+    mode: agent-full-access
+    files:
+      # Codex cannot present the pod's client certificate to the gateway (and ignores
+      # OPENAI_BASE_URL): its provider points at agent-runner's gateway bridge on loopback
+      # (docs/chat-and-files.md, "Gateway bridge"). Written to $HOME/.codex/config.toml.
+      .codex/config.toml: |
+        # The deployment's model: also selected through the session's model option when it is
+        # spec.model.name.
+        model = "gpt-6-astra"
+        model_provider = "openai-gateway"
+
+        [model_providers.openai-gateway]
+        name = "OpenAI through the sandbox gateway"
+        base_url = "http://127.0.0.1:4480/https/api.openai.com/v1"
+        env_key = "OPENAI_API_KEY"
+        wire_api = "responses"
+
+        # The conversation lives in Codex's session (resume); no second copy of every prompt.
+        [history]
+        persistence = "none"
+
+        [analytics]
+        enabled = false
+
+        [feedback]
+        enabled = false
+
+        [otel]
+        exporter = "none"
+  env:
+    OPENAI_API_KEY: placeholder-the-gateway-injects-the-real-key
+    DEFAULT_AUTH_REQUEST: '{"methodId":"api-key"}'
+    NO_BROWSER: "1"

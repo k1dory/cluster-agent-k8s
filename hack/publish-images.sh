@@ -102,6 +102,7 @@ publish() {
     meta=$work/$name.json
     [ -n "$target" ] && args+=(--target "$target")
     [ "$name" = agent ] && read -r -a harness <<<"$("$ci_dir/versions.sh" build-args)" && args+=("${harness[@]}")
+    [ "$name" = agent-hermes ] && read -r -a harness <<<"$("$ci_dir/versions.sh" hermes-build-args)" && args+=("${harness[@]}")
     [ -n "${SOURCE_URL:-}" ] && args+=(--label "org.opencontainers.image.source=$SOURCE_URL")
     # ${args[@]+...}: an empty array is "unbound" to bash 3.2's set -u (macOS).
     docker buildx build --builder "$builder" --platform "$platform" -f "$file" ${args[@]+"${args[@]}"} \
@@ -123,11 +124,12 @@ publish() {
 publish sandboxd images/sandboxd/Dockerfile
 publish sandboxctl images/sandboxd/Dockerfile sandboxctl
 publish agent images/agent/Dockerfile
+publish agent-hermes images/agent-hermes/Dockerfile
 
 python3 - "$work/digests" "$manifest" "$IMAGE_REPO" "$tag" "$COMMIT" "$platform" "$created" "$signed" \
-  "$CLAUDE_CODE_VERSION" "$CODEX_VERSION" "$COSIGN_VERSION" <<'PY'
+  "$CLAUDE_CODE_VERSION" "$CODEX_VERSION" "$CLAUDE_AGENT_ACP_VERSION" "$CODEX_ACP_VERSION" "$OPENCODE_VERSION" "$HERMES_VERSION" "$COSIGN_VERSION" <<'PY'
 import json, sys
-digests, out, repo, tag, commit, platform, created, signed, claude, codex, cosign = sys.argv[1:]
+digests, out, repo, tag, commit, platform, created, signed, claude, codex, claude_acp, codex_acp, opencode, hermes, cosign = sys.argv[1:]
 images = []
 for line in open(digests):
     name, digest = line.split()
@@ -135,7 +137,9 @@ for line in open(digests):
                    "ref": f"{repo}/{name}@{digest}", "arch": platform})
 json.dump({"commit": commit, "tag": tag, "created": created, "repository": repo,
            "signed": signed == "true", "public_key": "cosign.pub", "cosign": cosign,
-           "harness": {"claude-code": claude, "codex": codex}, "images": images},
+           "harness": {"claude-code": claude, "codex": codex,
+                       "claude-agent-acp": claude_acp, "codex-acp": codex_acp, "opencode": opencode,
+                       "hermes": hermes}, "images": images},
           open(out, "w"), indent=2)
 PY
 rm -rf "$work"

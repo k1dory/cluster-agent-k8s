@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
+	"regexp"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -33,6 +34,16 @@ import (
 	res "agent-sandbox/internal/resource"
 	"agent-sandbox/internal/store"
 )
+
+// envNameRe is an environment variable name harness.instructions may export.
+var envNameRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
+
+// MaxSessionMetaSize bounds spec.harness.session_meta: it travels in the pod's environment.
+const MaxSessionMetaSize = 16 << 10
+
+// authMethodRe is what an ACP authentication method or session mode id may look like
+// (spec.harness.auth_method, spec.harness.mode).
+var authMethodRe = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`)
 
 // Errors the API maps to status codes (shared by every resource kind, see package resource).
 var (
@@ -60,13 +71,50 @@ type HarnessSpec struct {
 	Command       string `yaml:"command,omitempty" json:"command,omitempty"`
 	ResumeCommand string `yaml:"resume_command,omitempty" json:"resume_command,omitempty"`
 	ResumePrompt  string `yaml:"resume_prompt,omitempty" json:"resume_prompt,omitempty"`
-	// Input: "text" (default; a line on stdin) or "stream-json" (Claude Code's streaming
-	// input, which keeps the conversation open: follow-up messages reach the running harness).
+	// Input: "text" (default; a line on stdin), "stream-json" (Claude Code's streaming
+	// input, which keeps the conversation open: follow-up messages reach the running harness)
+	// or "acp" (the command is an Agent Client Protocol agent, e.g. claude-agent-acp or
+	// codex-acp: the runner drives it over JSON-RPC, follow-ups are prompts of the same session).
 	// ChatIdle: seconds without a new message after a turn before the runner closes an open
 	// conversation (0 = runtime default, 600). Between runs the conversation continues through
 	// ResumeCommand with $SANDBOX_SESSION and the message in $SANDBOX_RESUME_PROMPT.
 	Input    string `yaml:"input,omitempty" json:"input,omitempty"`
 	ChatIdle *int   `yaml:"chat_idle,omitempty" json:"chat_idle,omitempty"`
+	// Permissions answers the permission requests of an "acp" harness: "allow" (the default:
+	// the sandbox, its policy and the gateway are the boundary), "deny", or "ask": a person
+	// answers each one (and the questions the agent asks) through the API. Every request and
+	// the decision are recorded in the run's output.
+	Permissions string `yaml:"permissions,omitempty" json:"permissions,omitempty"`
+	// AskTimeout is how many seconds a request waits for a person with permissions "ask" before
+	// it is refused (a question: cancelled). 0: 900.
+	AskTimeout *int `yaml:"ask_timeout,omitempty" json:"ask_timeout,omitempty"`
+	// AuthMethod is the id of the authentication method an "acp" harness is told to use
+	// (ACP authenticate, one of the agent's advertised authMethods), e.g. codex-acp's api-key.
+	// Empty: the agent is not asked to authenticate.
+	AuthMethod string `yaml:"auth_method,omitempty" json:"auth_method,omitempty"`
+	// Mode is the session mode an "acp" harness is put in after its session opens (ACP
+	// session/set_mode, or the agent's config option of category mode): one of the ids the
+	// agent advertises, e.g. codex-acp's agent-full-access or OpenCode's build. Empty: the
+	// agent's own default. An id the agent does not offer is reported in the run's output.
+	Mode string `yaml:"mode,omitempty" json:"mode,omitempty"`
+	// MCP says when an "acp" harness gets the sandbox's MCP servers in session/new: "auto"
+	// (the default: when it declares MCP over HTTP) or "always" (for an agent that takes them
+	// without declaring it, such as Hermes).
+	MCP string `yaml:"mcp,omitempty" json:"mcp,omitempty"`
+	// ThoughtLevel is the reasoning level an "acp" harness is put on (the agent's config option
+	// of category thought_level: codex-acp reasoning_effort low…xhigh, OpenCode effort, Hermes
+	// reasoning_effort). Empty: the agent's default.
+	ThoughtLevel string `yaml:"thought_level,omitempty" json:"thought_level,omitempty"`
+	// SessionMeta is metadata every session request of an "acp" harness carries (_meta of
+	// session/new, load, resume): agent-specific options, e.g. claude-agent-acp's
+	// {"claudeCode":{"options":{"maxTurns":…,"maxBudgetUsd":…}}}. Configuration, not secrets.
+	SessionMeta map[string]any `yaml:"session_meta,omitempty" json:"session_meta,omitempty"`
+	// Instructions says how an "acp" harness gets the agent definition's instructions: empty (the
+	// session's system prompt when the agent takes one, else ahead of the first prompt), "file"
+	// (written to $HOME/.sandbox/instructions.md, $SANDBOX_INSTRUCTIONS_FILE, for a configuration
+	// that names it: OpenCode's `instructions`) or "env:NAME" (exported as NAME: Hermes's
+	// HERMES_ENVIRONMENT_HINT).
+	Instructions string `yaml:"instructions,omitempty" json:"instructions,omitempty"`
 	// Files are the harness's own configuration files, path (relative to the agent's home) →
 	// content: a Codex config.toml naming its provider, a Claude Code settings.json. The runner
 	// writes them before every run (SANDBOX_HARNESS_FILES). They are configuration, stored in
@@ -222,8 +270,80 @@ func (s *Service) validate(ctx context.Context, kind, tenant string, raw json.Ra
 		if err := validateResources(e.Resources); err != nil {
 			return nil, err
 		}
-		if e.Harness.Input != "" && e.Harness.Input != harness.InputText && e.Harness.Input != harness.InputStreamJSON {
-			return nil, fmt.Errorf("%w: spec.harness.input must be %s or %s", ErrInvalid, harness.InputText, harness.InputStreamJSON)
+		switch e.Harness.Input {
+		case "", harness.InputText, harness.InputStreamJSON, harness.InputACP:
+		default:
+			return nil, fmt.Errorf("%w: spec.harness.input must be %s, %s or %s", ErrInvalid, harness.InputText, harness.InputStreamJSON, harness.InputACP)
+		}
+		switch e.Harness.Permissions {
+		case "":
+		case harness.PermissionsAllow, harness.PermissionsDeny, harness.PermissionsAsk:
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.permissions applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+		default:
+			return nil, fmt.Errorf("%w: spec.harness.permissions must be %s, %s or %s", ErrInvalid, harness.PermissionsAllow, harness.PermissionsDeny, harness.PermissionsAsk)
+		}
+		if t := e.Harness.AskTimeout; t != nil {
+			if e.Harness.Permissions != harness.PermissionsAsk {
+				return nil, fmt.Errorf("%w: spec.harness.ask_timeout applies to permissions %s only", ErrInvalid, harness.PermissionsAsk)
+			}
+			if *t < 0 || *t > 86400 {
+				return nil, fmt.Errorf("%w: spec.harness.ask_timeout must be 0..86400 seconds", ErrInvalid)
+			}
+		}
+		if m := e.Harness.AuthMethod; m != "" {
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.auth_method applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+			if !authMethodRe.MatchString(m) {
+				return nil, fmt.Errorf("%w: spec.harness.auth_method must be an authentication method id (letters, digits, . _ : -, at most 64)", ErrInvalid)
+			}
+		}
+		if m := e.Harness.Mode; m != "" {
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.mode applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+			if !authMethodRe.MatchString(m) {
+				return nil, fmt.Errorf("%w: spec.harness.mode must be a session mode id (letters, digits, . _ : -, at most 64)", ErrInvalid)
+			}
+		}
+		switch e.Harness.MCP {
+		case "":
+		case harness.MCPAuto, harness.MCPAlways:
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.mcp applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+		default:
+			return nil, fmt.Errorf("%w: spec.harness.mcp must be %s or %s", ErrInvalid, harness.MCPAuto, harness.MCPAlways)
+		}
+		if l := e.Harness.ThoughtLevel; l != "" {
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.thought_level applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+			if !authMethodRe.MatchString(l) {
+				return nil, fmt.Errorf("%w: spec.harness.thought_level must be a value id (letters, digits, . _ : -, at most 64)", ErrInvalid)
+			}
+		}
+		if len(e.Harness.SessionMeta) > 0 {
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.session_meta applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+			if b, err := json.Marshal(e.Harness.SessionMeta); err != nil || len(b) > MaxSessionMetaSize {
+				return nil, fmt.Errorf("%w: spec.harness.session_meta must be a JSON object of at most %d bytes", ErrInvalid, MaxSessionMetaSize)
+			}
+		}
+		if m := e.Harness.Instructions; m != "" {
+			if e.Harness.Input != harness.InputACP {
+				return nil, fmt.Errorf("%w: spec.harness.instructions applies to input %s only", ErrInvalid, harness.InputACP)
+			}
+			name, isEnv := strings.CutPrefix(m, "env:")
+			switch {
+			case m == "file":
+			case isEnv && envNameRe.MatchString(name) && !model.PlatformEnv(name):
+			default:
+				return nil, fmt.Errorf("%w: spec.harness.instructions must be file or env:NAME (a variable the profile may set)", ErrInvalid)
+			}
 		}
 		if e.Harness.ChatIdle != nil && *e.Harness.ChatIdle < 0 {
 			return nil, fmt.Errorf("%w: spec.harness.chat_idle must be >= 0", ErrInvalid)
@@ -450,10 +570,23 @@ func (s *Service) Resolve(ctx context.Context, tenant, agentRef string, admin bo
 		Launch: model.Launch{
 			Image: image, HarnessCommand: es.Harness.Command, HarnessResumeCommand: es.Harness.ResumeCommand,
 			ResumePrompt: es.Harness.ResumePrompt, HarnessInput: es.Harness.Input, ChatIdle: intOf(es.Harness.ChatIdle),
-			Model: es.Model.Name, Instructions: as.Instructions, Env: envVars, HarnessFiles: es.Harness.Files,
+			HarnessPermissions: es.Harness.Permissions, HarnessAuthMethod: es.Harness.AuthMethod,
+			HarnessMode: es.Harness.Mode, HarnessMCP: es.Harness.MCP, HarnessThoughtLevel: es.Harness.ThoughtLevel,
+			HarnessSessionMeta: sessionMetaJSON(es.Harness.SessionMeta), HarnessInstructions: es.Harness.Instructions,
+			HarnessAskTimeout: intOf(es.Harness.AskTimeout),
+			Model:             es.Model.Name, Instructions: as.Instructions, Env: envVars, HarnessFiles: es.Harness.Files,
 			CPURequest: es.Resources.CPURequest, CPULimit: es.Resources.CPULimit,
 			MemoryRequest: es.Resources.MemoryRequest, MemoryLimit: es.Resources.MemoryLimit,
 			VolumeSize: es.Resources.VolumeSize, RuntimeClass: es.RuntimeClass,
 		},
 	}, nil
+}
+
+// sessionMetaJSON is spec.harness.session_meta as the pod gets it (HARNESS_SESSION_META).
+func sessionMetaJSON(meta map[string]any) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	b, _ := json.Marshal(meta)
+	return string(b)
 }

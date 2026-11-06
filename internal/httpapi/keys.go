@@ -1,11 +1,8 @@
 package httpapi
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"time"
 
@@ -19,28 +16,22 @@ import (
 // a team adds a key for a new pipeline, rotates it on a schedule and revokes a leaked one
 // without anyone touching the server's configuration. The secret appears once, in the
 // response that creates or rotates it.
-func (p *Platform) keyRoutes(mux *http.ServeMux) {
+func (p *Platform) keyRoutes(mux *routeMux) {
 	own := func(w http.ResponseWriter, r *http.Request) (string, bool) {
 		if p.Keys == nil {
 			writeErr(w, http.StatusServiceUnavailable, errors.New("api keys disabled"))
 			return "", false
 		}
-		pr := principalOf(r)
-		tenant := r.PathValue("tenant")
-		if tenant == "" {
-			writeErr(w, http.StatusBadRequest, errors.New("tenant is required"))
-			return "", false
-		}
-		if !pr.admin() && tenant != pr.Tenant {
-			writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.Tenant))
-			return "", false
-		}
-		return tenant, true
+		return scopeTenant(w, r, r.PathValue("tenant"), true)
 	}
 	// keyOf loads the key of the path and checks it belongs to the tenant of the path: another
 	// tenant's key is not found, never "forbidden" (ids are not enumerable either way).
 	keyOf := func(w http.ResponseWriter, r *http.Request, tenant string) (*model.APIKey, bool) {
 		k, err := p.Keys.Get(r.Context(), r.PathValue("id"))
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusInternalServerError, err) // the store failed: not a missing key
+			return nil, false
+		}
 		if err != nil || k.Tenant != tenant {
 			writeErr(w, http.StatusNotFound, store.ErrNotFound)
 			return nil, false
@@ -71,8 +62,8 @@ func (p *Platform) keyRoutes(mux *http.ServeMux) {
 			Name string `json:"name"`
 			TTL  string `json:"ttl"` // Go duration, e.g. "720h"; "" = no expiry (or the server's cap)
 		}
-		if err := decodeStrict(w, r, &req, bodyLimit); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+		if err := decodeStrict(w, r, &req, smallBodyLimit); err != nil {
+			writeBodyErr(w, err)
 			return
 		}
 		ttl, err := parseTTL(req.TTL)
@@ -110,8 +101,8 @@ func (p *Platform) keyRoutes(mux *http.ServeMux) {
 			Grace string `json:"grace"` // how long the old key keeps working; "" = revoked at once
 		}
 		if r.ContentLength != 0 {
-			if err := decodeStrict(w, r, &req, bodyLimit); err != nil {
-				writeErr(w, http.StatusBadRequest, err)
+			if err := decodeStrict(w, r, &req, smallBodyLimit); err != nil {
+				writeBodyErr(w, err)
 				return
 			}
 		}
@@ -155,33 +146,6 @@ type issued struct {
 	Secret   string `json:"secret"`
 	Replaces string `json:"replaces,omitempty"`
 }
-
-// decodeStrict reads exactly one JSON object of at most limit bytes into v: a body that is
-// not an object (null, a string, an array), unknown fields, a second document or trailing
-// garbage after the object are errors, so nothing is written on a body that was not what the
-// client meant to send. The stream is read to its end before the object is decoded.
-func decodeStrict(w http.ResponseWriter, r *http.Request, v any, limit int64) error {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
-	var raw json.RawMessage
-	if err := dec.Decode(&raw); err != nil {
-		return fmt.Errorf("body: %w", err)
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return errors.New("body: trailing data after the JSON object")
-	}
-	if b := bytes.TrimSpace(raw); len(b) == 0 || b[0] != '{' {
-		return errors.New("body: one JSON object is expected")
-	}
-	obj := json.NewDecoder(bytes.NewReader(raw))
-	obj.DisallowUnknownFields()
-	if err := obj.Decode(v); err != nil {
-		return fmt.Errorf("body: %w", err)
-	}
-	return nil
-}
-
-// bodyLimit bounds small JSON request bodies (keys, rotation).
-const bodyLimit = 1 << 16
 
 func parseTTL(s string) (time.Duration, error) {
 	if s == "" {

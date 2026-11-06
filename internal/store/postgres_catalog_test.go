@@ -162,14 +162,8 @@ func TestReviewPostgresCatalogMigrationAndSnapshots(t *testing.T) {
 			if err := p.CreateRun(ctx, run); err != nil {
 				t.Fatal(err)
 			}
-			claimed, err := p.ClaimQueuedRun(ctx, sb.ID, now)
-			if err != nil {
-				t.Fatal(err)
-			}
-			claimed.AgentRef, claimed.AgentRevision = sb.AgentRef, sb.AgentRevision
-			claimed.EnvironmentRef, claimed.EnvironmentRevision = sb.EnvironmentRef, sb.EnvironmentRevision
-			claimed.AgentVersion = sb.AgentVersion
-			if err := p.UpdateRun(ctx, claimed); err != nil {
+			if _, err := p.ClaimRun(ctx, run.ID, now, "", RunStamp{AgentVersion: sb.AgentVersion, AgentRef: sb.AgentRef, AgentRevision: sb.AgentRevision,
+				EnvironmentRef: sb.EnvironmentRef, EnvironmentRevision: sb.EnvironmentRevision}); err != nil {
 				t.Fatal(err)
 			}
 			// Close all original connections and rerun the migration on a fresh pool.

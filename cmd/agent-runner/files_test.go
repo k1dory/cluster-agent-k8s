@@ -111,19 +111,19 @@ func TestChatStateAndInput(t *testing.T) {
 		t.Fatalf("default chat idle: %v", chatIdle())
 	}
 	s := newChat("", 0)
-	if s.mode != "text" || s.idleFor() != 0 {
+	if _, waiting := s.idleFor(); s.mode != "text" || waiting {
 		t.Fatalf("defaults: %+v", s)
 	}
 	s.sawLine(`{"type":"assistant","message":{}}`)
-	if s.idleFor() != 0 {
+	if _, waiting := s.idleFor(); waiting {
 		t.Fatal("an assistant line is not a turn end")
 	}
 	s.sawLine(`{"type":"result","subtype":"success"}`)
-	if s.idleFor() <= 0 {
+	if _, waiting := s.idleFor(); !waiting {
 		t.Fatal("after a result the idle countdown runs")
 	}
 	s.sent()
-	if s.idleFor() != 0 {
+	if _, waiting := s.idleFor(); waiting {
 		t.Fatal("a message sent resets the countdown until the next turn ends")
 	}
 }

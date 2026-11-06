@@ -1,0 +1,63 @@
+# EnvironmentProfile: OpenCode (opencode-ai, pinned in the agent image) as an ACP agent:
+# `opencode acp` speaks the Agent Client Protocol itself, agent-runner is its client. A
+# conversation is one OpenCode session (the next run loads it), the sandbox's MCP connections
+# reach it in session/new, file edits come with their diffs. docs/chat-and-files.md, "ACP harnesses".
+#
+# Instructions: harness.instructions `file` writes the agent definition's instructions to
+# ~/.sandbox/instructions.md, which OpenCode's `instructions` names: they are part of its system
+# prompt (OpenCode takes no ACP system prompt). The repository's AGENTS.md is named there too.
+#
+# The repository is code to work on, not configuration: OPENCODE_DISABLE_PROJECT_CONFIG keeps its
+# opencode.json, .opencode/ (agents, plugins, commands) and instruction files out, `--pure` runs
+# without external plugins. Note: `opencode acp` serves its own API on the pod's loopback, without
+# a password, and the agent's shell runs as the same user: a `deny` profile is not a boundary
+# against the agent itself (the pod and the gateway are).
+#
+# The configuration is OPENCODE_CONFIG_CONTENT and the permission rules OPENCODE_PERMISSION:
+# both take precedence over an opencode.json in the repository, which as a harness file would not
+# (a repository could otherwise point the provider past the bridge or allow what the profile
+# does not). The rules are `ask` for edits and commands, so each reaches the runner as an ACP
+# permission request, decided by `permissions` and recorded in the run's output. A profile with
+# `permissions: deny` sets them to `deny` instead: OpenCode ends the whole turn on the first
+# rejected request. webfetch and websearch are denied: they would leave the pod past the bridge.
+# Off as well: self-update, sharing sessions to opencode.ai, the remote model catalogue, LSP
+# server downloads and Claude Code's files (~/.claude, CLAUDE.md), each an egress the policy
+# denies or configuration that is not the profile's. mode `build` is OpenCode's agent that edits.
+#
+# OpenCode (Bun) cannot present the pod's client certificate to the gateway: its Anthropic
+# provider points at agent-runner's gateway bridge on loopback (docs/chat-and-files.md,
+# "Gateway bridge"). Credentials: the pod holds a placeholder API key; the policy rule for
+# api.anthropic.com injects `x-api-key: secret:anthropic` (docs/self-service.md).
+# Apply:  sandboxctl apply -f examples/catalog/environment-opencode-acp.yaml
+kind: EnvironmentProfile
+name: opencode-acp
+description: OpenCode over ACP, the API key held by the gateway
+spec:
+  image: stable
+  harness:
+    command: opencode acp --pure
+    input: acp
+    permissions: allow
+    mode: build
+    instructions: file
+  model:
+    name: claude-sonnet-5-5
+  env:
+    ANTHROPIC_API_KEY: placeholder-the-gateway-injects-the-real-key
+    OPENCODE_CONFIG_CONTENT: |
+      {
+        "$schema": "https://opencode.ai/config.json",
+        "model": "anthropic/claude-sonnet-5-5",
+        "autoupdate": false,
+        "share": "disabled",
+        "instructions": ["~/.sandbox/instructions.md", "AGENTS.md"],
+        "provider": {
+          "anthropic": { "options": { "baseURL": "http://127.0.0.1:4480/https/api.anthropic.com/v1" } }
+        }
+      }
+    OPENCODE_PERMISSION: '{"edit":"ask","bash":"ask","webfetch":"deny","websearch":"deny"}'
+    OPENCODE_DISABLE_AUTOUPDATE: "1"
+    OPENCODE_DISABLE_MODELS_FETCH: "1"
+    OPENCODE_DISABLE_LSP_DOWNLOAD: "1"
+    OPENCODE_DISABLE_CLAUDE_CODE: "1"
+    OPENCODE_DISABLE_PROJECT_CONFIG: "1"

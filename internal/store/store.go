@@ -3,7 +3,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -96,7 +98,30 @@ type Idempotent struct {
 	Status    int
 	Body      []byte
 	CreatedAt time.Time
+	// Generation counts the attempts under the key: 1 for the first, one more for each that
+	// took over an abandoned or released reservation. An attempt with Generation > 1 may find
+	// what an earlier one created.
+	Generation int
+	// Seed is chosen when the key is first reserved and kept by every later attempt with the
+	// same body: what a keyed request creates is named from it, so a later attempt finds the
+	// resource an earlier one created instead of creating a second. Empty on a record written
+	// by a replica of an earlier release.
+	Seed string
+	// Token is the random owner of the reservation, new for every attempt. Finishing it
+	// (PutIdempotent, ReleaseIdempotent) is conditional on it; a token never repeats, so a
+	// handler that was slow, not dead, can neither overwrite nor drop a later attempt's
+	// reservation, even one made after a release.
+	Token string
+
+	// What the seed's attempts did (KeyedResults); the memory store keeps them here, Postgres
+	// in the row's columns. Neither is part of the record a reservation returns.
+	keyedCreated, keyedSaid string
 }
+
+// Legacy reports a reservation written by a replica of an earlier release (it has no seed).
+// Unfinished, it is never taken over: the resource it may have created has a random name
+// that a new attempt cannot find, so running the request again could create a second one.
+func (i *Idempotent) Legacy() bool { return i.Seed == "" }
 
 // InProgress reports a reserved key whose request has not finished.
 func (i *Idempotent) InProgress() bool { return i.Status == 0 }
@@ -110,6 +135,11 @@ type EventCount struct {
 
 // ErrNotFound is returned when a record does not exist.
 var ErrNotFound = errors.New("not found")
+
+// ErrDuplicate is returned when a write would give a record a value another record holds
+// where the value must be unique (UpdateSandbox: the preview host). Unlike ErrConflict it is
+// not resolved by reading again and retrying.
+var ErrDuplicate = errors.New("already taken")
 
 // ErrConflict is returned by UpdateSandbox when the row changed since it was read (the
 // revision in the record is stale), and by PutItem when the expected revision is not the
@@ -307,8 +337,13 @@ type Lease interface {
 // EventListener is implemented by stores that can tell this process about events other
 // processes appended (Postgres LISTEN/NOTIFY). fn is called for every new event, in id order,
 // until ctx ends. Replicas use it to feed their local event hub.
+//
+// ready is called once, as soon as the listener knows where its feed starts: every event
+// appended after that reaches fn. A replica must not serve requests before: an event appended
+// meanwhile (the answer to a request it is waiting for) would fall below the starting cursor
+// and never reach its hub, which then is the only way such events are published locally.
 type EventListener interface {
-	ListenEvents(ctx context.Context, fn func(e *model.Event))
+	ListenEvents(ctx context.Context, ready func(), fn func(e *model.Event))
 }
 
 // Store is the persistence interface. Postgres is the production implementation,
@@ -317,7 +352,8 @@ type Store interface {
 	// Ping reports whether the store answers: the readiness of a replica (a database it
 	// cannot reach makes it unready, so traffic goes to a replica that can).
 	Ping(ctx context.Context) error
-	// CreateSandbox inserts the record and sets its Revision to 1.
+	// CreateSandbox inserts the record and sets its Revision to 1; ErrConflict when the id
+	// exists or another sandbox holds its preview host.
 	CreateSandbox(ctx context.Context, s *model.Sandbox) error
 	GetSandbox(ctx context.Context, id string) (*model.Sandbox, error)
 	ListSandboxes(ctx context.Context) ([]*model.Sandbox, error)
@@ -326,7 +362,8 @@ type Store interface {
 	// CountSandboxes counts a tenant's sandboxes without paging; slug "" counts every slug.
 	CountSandboxes(ctx context.Context, tenant, slug string) (SandboxCounts, error)
 	// UpdateSandbox writes the record if its Revision still matches the stored one, then
-	// increments it (in the store and in s). ErrConflict otherwise.
+	// increments it (in the store and in s). ErrConflict otherwise; ErrDuplicate when another
+	// sandbox holds its preview host.
 	UpdateSandbox(ctx context.Context, s *model.Sandbox) error
 	// TouchSandbox records activity without bumping the revision: it happens on every allowed
 	// egress request and must never make another writer's update fail.
@@ -335,7 +372,8 @@ type Store interface {
 	SandboxByPreviewHost(ctx context.Context, host string) (*model.Sandbox, error)
 
 	// WithTenantLock runs fn while holding a lock shared by every replica for that tenant,
-	// so a quota check and the allocation it guards cannot interleave with another one.
+	// so a quota check and the allocation it guards cannot interleave with another one. A wait
+	// for the lock ends with ctx (its error is returned and fn does not run).
 	WithTenantLock(ctx context.Context, tenant string, fn func(ctx context.Context) error) error
 	// TryLead attempts to take the named leadership lock. held=false means another replica has it.
 	TryLead(ctx context.Context, name string) (lease Lease, held bool, err error)
@@ -350,51 +388,82 @@ type Store interface {
 	DeleteBlob(ctx context.Context, name string) error
 	DeleteBlobsBefore(ctx context.Context, prefix string, t time.Time) (int, error)
 
+	// CreateRun inserts the run; ErrConflict when the id exists.
 	CreateRun(ctx context.Context, r *model.Run) error
 	GetRun(ctx context.Context, id string) (*model.Run, error)
-	UpdateRun(ctx context.Context, r *model.Run) error
+	// Runs are never written back from a copy: every transition is one conditional write of the
+	// columns it owns, so a reader holding an older copy (an output line carrying usage, a cancel
+	// racing a finish) cannot put a settled run back to running or drop another writer's usage.
+	//
+	// RecordRunUsage adds u to the run's usage, or replaces it when total (the harness reported
+	// its own running total). It is accepted while the run is queued, running or cancelled (a
+	// cancelled harness spent those tokens before it saw run.cancel) and refused with
+	// ErrConflict once the run is done or failed: its final usage is recorded by then.
+	RecordRunUsage(ctx context.Context, id string, u model.Usage, total bool) error
+	// SetRunSession records the harness session id and touches nothing else. It is accepted in
+	// every status: the column decides no transition, and a message run queued behind a run
+	// that was cancelled still needs that run's session to continue the conversation.
+	SetRunSession(ctx context.Context, id, session string) error
+	// SettleRun moves a run from one of from to the final status to, with exit code, finish time
+	// and (when usage is not nil) the usage total, in one conditional write; ErrConflict when the
+	// run is no longer in one of from (another writer settled it first), ErrNotFound when absent.
+	SettleRun(ctx context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error)
 	ListRuns(ctx context.Context, sandboxID string) ([]*model.Run, error)
-	// QueryRuns returns runs matching f across sandboxes, oldest first.
+	// QueryRuns returns runs matching f across sandboxes, oldest first: at most f.Limit, or
+	// MaxRunsPerQuery when f.Limit is 0 or larger. A caller that needs them all pages with
+	// f.Cursor.
 	QueryRuns(ctx context.Context, f Filter) ([]*model.Run, error)
-	// ClaimQueuedRun atomically moves the oldest queued run of the sandbox to running and
-	// returns it; concurrent callers never get the same run. ErrNotFound when none is queued.
-	ClaimQueuedRun(ctx context.Context, sandboxID string, startedAt time.Time) (*model.Run, error)
 	// QueuedRun returns the oldest queued run of the sandbox (the one a claim takes next);
 	// ErrNotFound when none is queued.
 	QueuedRun(ctx context.Context, sandboxID string) (*model.Run, error)
-	// ClaimRun moves that run to running, recording session if the run has none yet, in one
-	// conditional write; ErrConflict when it is no longer queued (claimed or cancelled).
-	ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string) (*model.Run, error)
+	// ClaimRun moves that run to running, recording session if the run has none yet and the
+	// stamp of what executes it, in one conditional write; ErrConflict when it is no longer
+	// queued (claimed or cancelled).
+	ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, error)
 	RunningRun(ctx context.Context, sandboxID string) (*model.Run, error)
 	// AppendQueuedTask adds text to the task of a run that is still queued and returns the run;
 	// ErrConflict once it has been claimed (the harness may already have read its task).
 	AppendQueuedTask(ctx context.Context, runID, text string) (*model.Run, error)
-	// ReleaseRun puts a run the caller has just claimed back in the queue (running → queued,
-	// start time cleared), so a later claim gets it again; ErrConflict if it is not running.
-	ReleaseRun(ctx context.Context, runID string) error
 
+	// AppendEvent stores e and sets its ID. Ids grow in commit order: an event is visible to
+	// readers only after every event with a smaller id is, so a reader that pages by id
+	// (ListenEvents, a client's ?after=) never steps over one that commits late.
 	AppendEvent(ctx context.Context, e *model.Event) error
+	// ListEvents returns a sandbox's events after afterID, by id; at most limit, or
+	// DefaultEventLimit when limit is 0.
 	ListEvents(ctx context.Context, sandboxID string, afterID int64, limit int) ([]*model.Event, error)
-	// QueryEvents returns events matching f across sandboxes, by id ascending.
+	// QueryEvents returns events matching f across sandboxes, by id ascending; at most f.Limit,
+	// or DefaultEventLimit when it is 0.
 	QueryEvents(ctx context.Context, f Filter) ([]*model.Event, error)
 	// CountEvents groups matching events by tenant, slug, sandbox, run, type and day.
 	CountEvents(ctx context.Context, f Filter) ([]EventCount, error)
 
 	// NextInstance atomically allocates the next instance number.
 	NextInstance(ctx context.Context) (int, error)
+	// CreateInstance inserts the instance; ErrConflict when its number or serial exists.
 	CreateInstance(ctx context.Context, in *model.Instance) error
 	InstanceBySerial(ctx context.Context, serial string) (*model.Instance, error)
 	RetireInstance(ctx context.Context, n int) error
 	ListInstances(ctx context.Context, sandboxID string) ([]*model.Instance, error)
 
 	// ReserveIdempotent atomically claims key for this body. reserved=true means the caller
-	// owns the key and must finish with PutIdempotent or ReleaseIdempotent; otherwise existing
-	// is the earlier reservation or stored response.
-	ReserveIdempotent(ctx context.Context, key, bodyHash string) (existing *Idempotent, reserved bool, err error)
-	// PutIdempotent records the finished response under a reserved key.
+	// holds the reservation rec (its Token, Generation and Seed) and must finish it with
+	// PutIdempotent or ReleaseIdempotent; otherwise rec is the earlier reservation or stored
+	// response. A released reservation is taken over at once, one unfinished for
+	// IdempotencyStale by a request with the same body: a new Token, Generation+1, the Seed kept
+	// when the body is the same (a new one otherwise). A Legacy reservation is never taken over.
+	// A record older than IdempotencyTTL is gone.
+	ReserveIdempotent(ctx context.Context, key, bodyHash string) (rec *Idempotent, reserved bool, err error)
+	// PutIdempotent records the finished response. With rec.Token set it completes that
+	// reservation only: ErrConflict when the key is no longer reserved under it (taken over,
+	// released, or finished). An empty Token writes the record whatever is there (a key nobody
+	// reserves).
 	PutIdempotent(ctx context.Context, rec *Idempotent) error
-	// ReleaseIdempotent drops a reservation whose request failed, so a retry may run.
-	ReleaseIdempotent(ctx context.Context, key string) error
+	// ReleaseIdempotent gives up the reservation held under token, whose request failed, so a
+	// retry may run at once. The record and its seed stay (a later attempt with the same body
+	// finds what this one may have created); another token's reservation or a finished record
+	// is left alone.
+	ReleaseIdempotent(ctx context.Context, key, token string) error
 	GetIdempotent(ctx context.Context, key string) (*Idempotent, error)
 
 	// The catalogue uses only this part (see Catalog); the full Store embeds it for wiring.
@@ -406,8 +475,32 @@ type Store interface {
 	GitSyncs
 	GitJobs
 	TokenUses
+	Atomics
+	KeyedResults
+	RunDelivery
 
 	Close() error
+}
+
+// MaxRunsPerQuery caps one QueryRuns, on every store alike.
+const MaxRunsPerQuery = 100000
+
+// DefaultEventLimit is what one ListEvents or QueryEvents returns at most when the caller sets
+// no limit, on every store alike.
+const DefaultEventLimit = 1000
+
+// RunStamp is what a run records at its claim about what executes it: the agent image and the
+// catalogue revisions of the sandbox at that moment. It never changes afterwards.
+type RunStamp struct {
+	AgentVersion        string
+	AgentRef            string
+	AgentRevision       int
+	EnvironmentRef      string
+	EnvironmentRevision int
+	// Owner is the instance the run is handed to (its pod's identity number): a claim whose
+	// response is lost is handed to the same owner again (RunDelivery.ReclaimRun), never to
+	// another. "" for a caller that does not say (it is then never handed out again).
+	Owner string
 }
 
 // IdempotencyTTL is how long a stored response is replayed.
@@ -416,3 +509,132 @@ const IdempotencyTTL = 24 * time.Hour
 // IdempotencyStale is how long an unfinished reservation blocks retries before it is
 // considered abandoned (the process died mid-request) and may be taken over.
 const IdempotencyStale = 2 * time.Minute
+
+// NewIdempotencySeed is the Seed (and the Token) of a new reservation: random, 16 bytes in hex.
+func NewIdempotencySeed() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// Atomics are operations whose steps must happen together or not at all, across replicas.
+type Atomics interface {
+	// RotateAPIKey replaces key oldID with next in one transaction: when oldID was rotated
+	// before, its successor is withdrawn (revoked at `at`) if it was never used, and the
+	// rotation refused with *SuccessorInUseError if it was; next is inserted; oldID is retired
+	// to next (revoked at `at` when grace is 0, else expiring at `at`+grace or sooner).
+	// ErrNotFound for an unknown oldID, ErrKeyInactive when oldID is revoked or expired at
+	// `at`, ErrConflict when next.ID exists. On any error nothing changed.
+	//
+	// Any recorded revocation of oldID refuses the rotation whatever its time (a revocation
+	// that landed after `at` but before the lock still stands). With opts.InheritExpiry the new
+	// key expires when oldID did before its first rotation (or at next.ExpiresAt if sooner,
+	// the caller's cap); next.ExpiresAt is set to what was stored.
+	RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, opts RotateOptions) error
+	// LockedAPIKey reads a key under its row lock: it waits for a transaction holding the row
+	// (a rotation whose COMMIT is still completing) and returns what that left.
+	LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error)
+	// FirstUseAPIKey records a key's first use, only while it is still active at `at`:
+	// ErrKeyInactive otherwise (a rotation withdrew it meanwhile; the write waits for that
+	// rotation's row lock). Rotation treats a key without a recorded use as unused, so a
+	// first use must be durable before it is let through.
+	FirstUseAPIKey(ctx context.Context, id string, at time.Time) error
+	// SwapBlob replaces the blob under name with data only if it still holds old, and reports
+	// whether it did (false: another writer got there first). ErrNotFound when absent.
+	SwapBlob(ctx context.Context, name string, old, data []byte) (bool, error)
+	// BindInstance gives a pod its identity on a sandbox, in one transaction that serialises
+	// every bootstrap of the sandbox: the pod's live instance with serial b.Serial is reused
+	// (issue gets it), any other live instance of the pod is retired, else a new instance
+	// numbered from the sequence is made from what issue returns; the sandbox records the
+	// instance and, unless another pod is already current, the pod's name. issue runs inside
+	// the transaction (it signs; keep it short); its error aborts everything.
+	BindInstance(ctx context.Context, b InstanceBinding, issue func(n int, existing *model.Instance) (*model.Instance, error)) (*BoundInstance, error)
+}
+
+// RotateOptions: the grace period of the old key and how the new key's expiry is set.
+type RotateOptions struct {
+	Grace         time.Duration
+	InheritExpiry bool
+}
+
+// InstanceBinding names the pod and the serial its certificate carries.
+type InstanceBinding struct {
+	SandboxID, PodName, Serial string
+}
+
+// BoundInstance is what BindInstance did.
+type BoundInstance struct {
+	Instance *model.Instance
+	Reused   bool   // the pod's existing instance (a repeated bootstrap)
+	Retired  []int  // the pod's other live instances, now retired
+	Current  string // the sandbox's current pod after the call
+}
+
+// ErrKeyInactive: the key is revoked or expired.
+var ErrKeyInactive = errors.New("api key is revoked or expired")
+
+// SuccessorInUseError: the key was already rotated and its successor has been used or was
+// itself rotated: replacing it again would start a second live branch.
+type SuccessorInUseError struct{ ID string }
+
+func (e *SuccessorInUseError) Error() string {
+	return "api key already rotated to " + e.ID + ", which has been used or rotated on"
+}
+
+// EventHead is implemented by both stores: the id of the newest event appended so far (0 on
+// an empty log). A stream that replays a bounded window and then follows live reads it when it
+// subscribes: events up to it are history (the window applies), events after it are live.
+type EventHead interface {
+	LastEventID(ctx context.Context) (int64, error)
+}
+
+var (
+	_ EventHead = (*Memory)(nil)
+	_ EventHead = (*Postgres)(nil)
+)
+
+// CredentialNames keeps plain credentials and OAuth sign-ins in one namespace per scope: each
+// writes only while no credential of the other kind holds one of the names given, checked and
+// written atomically (one transaction holding the scope's lock on Postgres, the store's mutex
+// in memory). A check on one connection and a write on another could both pass for the two
+// kinds at once. The names are the caller's (a sign-in NAME also owns NAME.account_id).
+type CredentialNames interface {
+	// PutCredentialIfFree is PutCredential unless a sign-in holds one of signIns.
+	PutCredentialIfFree(ctx context.Context, c *model.Credential, ciphertext []byte, signIns []string) (created bool, err error)
+	// PutOAuthCredentialIfFree is PutOAuthCredential unless a plain credential holds one of plains.
+	PutOAuthCredentialIfFree(ctx context.Context, c *model.OAuthCredential, ciphertext []byte, plains []string) (created bool, err error)
+}
+
+// NameTakenError: a credential of the other kind holds Name in the scope.
+type NameTakenError struct{ Name string }
+
+func (e *NameTakenError) Error() string {
+	return fmt.Sprintf("%q is held by a credential of the other kind", e.Name)
+}
+
+var (
+	_ CredentialNames = (*Memory)(nil)
+	_ CredentialNames = (*Postgres)(nil)
+)
+
+// KeyedResults are what the attempts of one Idempotency-Key request did, recorded on its
+// reservation (found by its Seed) and gone with it: no attempt can ask once the key expired,
+// and while it lives they survive a takeover, a release and the deletion of what was created.
+type KeyedResults interface {
+	// CreateKeyedSandbox is CreateSandbox, and in the same transaction the reservation with
+	// that seed records the sandbox's id: an attempt that finds the record but not the sandbox
+	// knows it was created and deleted since, and does not create it again. It inserts only
+	// while that reservation is live, unfinished and has created nothing yet: ErrConflict
+	// otherwise, so an attempt that was superseded while it paused before the insert cannot
+	// make a sandbox a later attempt created and someone deleted since.
+	CreateKeyedSandbox(ctx context.Context, s *model.Sandbox, seed string) error
+	// KeyedResult returns what the seed's reservation recorded: the sandbox created, the
+	// delivery of a message (NoteKeyedSaid). ErrNotFound when no reservation has the seed.
+	KeyedResult(ctx context.Context, seed string) (created, said string, err error)
+	// NoteKeyedSaid records how the seed's message was delivered.
+	NoteKeyedSaid(ctx context.Context, seed, said string) error
+	// CreateKeyedRun is CreateRun and AppendEvent of e (the run's run.queued) in one
+	// transaction: a keyed run an attempt finds always has the event the conversation's user
+	// turn is read from, whatever became of the attempt that queued it. e.ID is set.
+	CreateKeyedRun(ctx context.Context, r *model.Run, e *model.Event) error
+}

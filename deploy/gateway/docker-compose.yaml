@@ -41,7 +41,9 @@ services:
       AGENT_IMAGE: ${AGENT_IMAGE:?set in .env}
       K8S_NAMESPACE: ${K8S_NAMESPACE:-agent-sandbox}
       NETWORK_ATTACHMENT: ${NETWORK_ATTACHMENT:-agent-sandbox/sandbox-vlan}
-      HARNESS_CMD: ${HARNESS_CMD:-claude -p "$$SANDBOX_TASK" --output-format stream-json --verbose}
+      HARNESS_CMD: ${HARNESS_CMD:-claude-agent-acp}
+      HARNESS_INPUT: ${HARNESS_INPUT-acp}
+      HARNESS_MODE: ${HARNESS_MODE-default}
       # external secret providers (sandboxd.yaml secrets.provider vault | infisical)
       VAULT_TOKEN: ${VAULT_TOKEN:-}
       INFISICAL_CLIENT_ID: ${INFISICAL_CLIENT_ID:-}

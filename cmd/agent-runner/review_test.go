@@ -31,7 +31,7 @@ func TestReviewFinishRetriesTransientFailure(t *testing.T) {
 	}))
 	defer server.Close()
 	c := &client{base: server.URL, http: server.Client()}
-	c.finish("run-review", 7)
+	c.finish(t.Context(), "run-review", 7)
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("finish calls=%d, want two with the same outcome", got)
 	}
@@ -44,7 +44,7 @@ func TestReviewFinishStopsForRetiredRun(t *testing.T) {
 		http.Error(w, "retired", http.StatusForbidden)
 	}))
 	defer server.Close()
-	(&client{base: server.URL, http: server.Client()}).finish("run-review", 0)
+	(&client{base: server.URL, http: server.Client()}).finish(t.Context(), "run-review", 0)
 	if calls.Load() != 1 {
 		t.Fatalf("a terminal authorization error was retried %d times", calls.Load())
 	}
@@ -110,7 +110,7 @@ func TestMCPServersBecomeAHarnessConfig(t *testing.T) {
 	var cfg struct {
 		Servers map[string]map[string]string `json:"mcpServers"`
 	}
-	if err := json.Unmarshal(b, &cfg); err != nil || len(cfg.Servers) != 2 || cfg.Servers["registry"]["url"] != "https://mcp.registry.example.com/mcp" || cfg.Servers["registry"]["type"] != "http" || cfg.Servers["shared/tools"]["url"] != "https://tools.example.com/rpc" {
+	if err := json.Unmarshal(b, &cfg); err != nil || len(cfg.Servers) != 2 || cfg.Servers["registry"]["url"] != "http://127.0.0.1:4480/https/mcp.registry.example.com/mcp" || cfg.Servers["registry"]["type"] != "http" || cfg.Servers["shared/tools"]["url"] != "http://127.0.0.1:4480/https/tools.example.com/rpc" {
 		t.Fatalf("config: %v %s", err, b)
 	}
 	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
@@ -118,27 +118,11 @@ func TestMCPServersBecomeAHarnessConfig(t *testing.T) {
 	}
 }
 
-// The chart ships explicit harness commands (run and resume); both must load the MCP
-// configuration like the built-in default does, and a command that is not claude must be
-// left alone.
+// A claude command (run or resume, however spelled) loads the MCP configuration; a command that
+// is not claude, or names the configuration itself, is left alone. (The chart's default harness
+// is ACP: its MCP servers go into the session, TestReviewShippedHarnessLoadsMCPOnStartAndResume.)
 func TestEveryClaudeCommandLoadsTheMCPConfig(t *testing.T) {
-	values, err := os.ReadFile("../../deploy/helm/agent-sandbox/values.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
 	var fromChart []string
-	for _, line := range strings.Split(string(values), "\n") {
-		line = strings.TrimSpace(line)
-		for _, key := range []string{"harnessCommand:", "harnessResumeCommand:"} {
-			if strings.HasPrefix(line, key) {
-				v := strings.TrimSpace(strings.TrimPrefix(line, key))
-				fromChart = append(fromChart, strings.Trim(v, `'"`))
-			}
-		}
-	}
-	if len(fromChart) != 2 {
-		t.Fatalf("values.yaml harness commands: %q", fromChart)
-	}
 	for _, cmd := range append(fromChart, `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose`, `ANTHROPIC_LOG=debug claude -p "$SANDBOX_TASK"`, `/usr/local/bin/claude -p "$SANDBOX_TASK"`) {
 		got := withMCPConfig(cmd)
 		if !strings.HasSuffix(got, ` --mcp-config "$SANDBOX_MCP_CONFIG"`) || !strings.HasPrefix(got, cmd) {
@@ -155,5 +139,36 @@ func TestEveryClaudeCommandLoadsTheMCPConfig(t *testing.T) {
 		if got := withMCPConfig(cmd); got != cmd {
 			t.Errorf("%q must be left alone, got %q", cmd, got)
 		}
+	}
+}
+
+// finish insists for a bounded budget, not forever: a control plane that never answers lets the
+// runner go on (the reconciler settles the run), and after SIGTERM only the shutdown grace is
+// spent on it.
+func TestReviewFinishIsBoundedAndStopsAfterSIGTERM(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	c := &client{base: server.URL, http: server.Client()}
+	oldBudget, oldShutdown := finishBudget, shutdownBudget
+	defer func() { finishBudget, shutdownBudget = oldBudget, oldShutdown }()
+
+	finishBudget, shutdownBudget = 1500*time.Millisecond, time.Hour
+	start := time.Now()
+	c.finish(t.Context(), "run-down", 1)
+	if d := time.Since(start); d > 5*time.Second || calls.Load() < 2 {
+		t.Fatalf("budget: returned after %s with %d attempts", d, calls.Load())
+	}
+
+	finishBudget, shutdownBudget = time.Hour, 300*time.Millisecond
+	ctx, sigterm := context.WithCancel(t.Context())
+	sigterm()
+	start = time.Now()
+	c.finish(ctx, "run-down", 1)
+	if d := time.Since(start); d > 3*time.Second {
+		t.Fatalf("after SIGTERM finish went on for %s", d)
 	}
 }

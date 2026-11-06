@@ -63,7 +63,7 @@ func TestReviewAcceptedMidRunMessageIsDeliveredOrQueued(t *testing.T) {
 			}))
 			defer server.Close()
 			input := &reviewMessageInput{}
-			forwardInput(ctx, &client{base: server.URL, http: server.Client()}, run.ID, input, cancel, newChat(mode, time.Minute))
+			forwardInput(ctx, &client{base: server.URL, http: server.Client()}, run.ID, stdinSink{input, mode}, cancel, newChat(mode, time.Minute))
 			if err := o.FinishRun(ctx, sb.ID, run.ID, 0, nil); err != nil {
 				t.Fatal(err)
 			}

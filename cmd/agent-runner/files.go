@@ -42,10 +42,9 @@ func serveFiles(ctx context.Context, c *client, root string) {
 		var evs []model.Event
 		_, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/agent/fs/requests?after=%d&wait=30s", after), nil, &evs)
 		if err != nil {
-			if ctx.Err() != nil {
+			if !sleepCtx(ctx, 5*time.Second) {
 				return
 			}
-			time.Sleep(5 * time.Second)
 			continue
 		}
 		for _, e := range evs {

@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"agent-sandbox/internal/model"
@@ -32,24 +33,50 @@ type Waker interface {
 	Touch(ctx context.Context, id string)
 }
 
+// PreviewLookup finds the sandbox a preview host belongs to: all the store access preview
+// traffic needs.
+type PreviewLookup interface {
+	SandboxByPreviewHost(ctx context.Context, host string) (*model.Sandbox, error)
+}
+
+var _ PreviewLookup = store.Store(nil)
+
 // Handler serves preview traffic.
 type Handler struct {
-	Store          store.Store
+	Store          PreviewLookup
 	Waker          Waker
 	AuthURL        string // where to send unauthenticated users; "" disables sso/members
 	TicketKey      []byte // HMAC key shared with your auth service
 	CookieTTL      time.Duration
 	HitsAsActivity bool
 	Log            *slog.Logger
+
+	// One transport for every proxied request: a transport per request never reused a
+	// connection and left each one's idle connections open until the backend closed them.
+	transportOnce sync.Once
+	transport     *http.Transport
 }
 
 const cookieName = "__Host-sandbox_pv"
 const callbackPath = "/__sandbox/auth"
 
+// ticket is what the sign-in ticket and the cookie carry. The host alone does not name a
+// sandbox for long: <name>-<owner> comes back when the sandbox is deleted and created again, so
+// the ticket also names the sandbox, its tenant and the access generation it was issued under
+// (bumped when the preview is closed or its access level changes). A ticket of an earlier
+// sandbox or generation is refused.
 type ticket struct {
-	Host string `json:"host"`
-	User string `json:"user"`
-	Exp  int64  `json:"exp"`
+	Host    string `json:"host"`
+	User    string `json:"user"`
+	Exp     int64  `json:"exp"`
+	Sandbox string `json:"sb"`
+	Tenant  string `json:"tenant"`
+	Gen     int64  `json:"gen"`
+}
+
+// grants reports whether the ticket was issued for this sandbox's preview as it is now.
+func (t *ticket) grants(sb *model.Sandbox) bool {
+	return sb.Preview != nil && t.Host == sb.Preview.Host && t.Sandbox == sb.ID && t.Tenant == sb.Tenant && t.Gen == sb.PreviewGen
 }
 
 // askPath is Caddy's on_demand_tls ask hook: 200 only for hosts that have a preview, so
@@ -116,10 +143,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			pr.Out.Host = target.Host
 			pr.SetXForwarded()
 		},
-		Transport: &http.Transport{
-			DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
-			ResponseHeaderTimeout: 60 * time.Second,
-		},
+		Transport: h.proxyTransport(),
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			http.Error(w, "application in sandbox is not answering on port "+strconv.Itoa(sb.Preview.Port), http.StatusBadGateway)
 		},
@@ -136,13 +160,13 @@ func (h *Handler) authorized(r *http.Request, sb *model.Sandbox) bool {
 	if err != nil {
 		return false
 	}
-	return t.Host == sb.Preview.Host
+	return t.grants(sb)
 }
 
 // callback receives ?ticket=<signed> from the auth service and sets the cookie.
 func (h *Handler) callback(w http.ResponseWriter, r *http.Request, sb *model.Sandbox) {
 	t, err := h.verify(r.URL.Query().Get("ticket"))
-	if err != nil || t.Host != sb.Preview.Host {
+	if err != nil || !t.grants(sb) {
 		http.Error(w, "bad ticket", http.StatusForbidden)
 		return
 	}
@@ -150,7 +174,9 @@ func (h *Handler) callback(w http.ResponseWriter, r *http.Request, sb *model.San
 	if ttl == 0 {
 		ttl = time.Hour
 	}
-	cookie := h.Sign(ticket{Host: t.Host, User: t.User, Exp: time.Now().Add(ttl).Unix()})
+	c := *t
+	c.Exp = time.Now().Add(ttl).Unix()
+	cookie := h.Sign(c)
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: cookie, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: int(ttl.Seconds())})
 	http.Redirect(w, r, safeNext(r.URL.Query().Get("next")), http.StatusFound)
 }
@@ -164,9 +190,14 @@ func (h *Handler) Sign(t ticket) string {
 	return b + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-// SignTicket is the exported helper used by the platform API to mint a ticket for a user.
-func (h *Handler) SignTicket(host, user string, ttl time.Duration) string {
-	return h.Sign(ticket{Host: host, User: user, Exp: time.Now().Add(ttl).Unix()})
+// SignTicket is the exported helper used by the platform API to mint a ticket for a user, for
+// the sandbox's preview as it is now (see ticket).
+func (h *Handler) SignTicket(sb *model.Sandbox, user string, ttl time.Duration) string {
+	t := ticket{User: user, Exp: time.Now().Add(ttl).Unix(), Sandbox: sb.ID, Tenant: sb.Tenant, Gen: sb.PreviewGen}
+	if sb.Preview != nil {
+		t.Host = sb.Preview.Host
+	}
+	return h.Sign(t)
 }
 
 func (h *Handler) verify(s string) (*ticket, error) {
@@ -212,4 +243,23 @@ func safeNext(next string) string {
 		return "/"
 	}
 	return next
+}
+
+// proxyTransport is the transport every proxied request shares, created on first use.
+func (h *Handler) proxyTransport() *http.Transport {
+	h.transportOnce.Do(func() {
+		h.transport = &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			ResponseHeaderTimeout: 60 * time.Second,
+			MaxIdleConns:          256,
+			MaxIdleConnsPerHost:   8,
+			IdleConnTimeout:       90 * time.Second,
+		}
+	})
+	return h.transport
+}
+
+// Close drops the idle connections to sandboxes; called when the ingress server shuts down.
+func (h *Handler) Close() {
+	h.proxyTransport().CloseIdleConnections()
 }
