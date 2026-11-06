@@ -52,10 +52,26 @@ func messageBodyLimit(r *http.Request) int64 {
 	return jsonBodyLimit
 }
 
+// maxBytes is http.MaxBytesReader on the server's own ResponseWriter. Over the limit it tells
+// net/http to close the connection rather than read the rest of the body first; it can tell
+// only the server's writer (an unexported method, not reached through Unwrap), so the
+// middleware's wrappers are peeled off. Through a wrapper a chunked client that sends one byte
+// too many and then stalls would hold the request open, unanswered, for good.
+func maxBytes(w http.ResponseWriter, body io.ReadCloser, limit int64) io.ReadCloser {
+	for {
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		w = u.Unwrap()
+	}
+	return http.MaxBytesReader(w, body, limit)
+}
+
 // capBody puts the request body under limit bytes. Capping twice is harmless: the smaller
 // cap wins.
 func capBody(w http.ResponseWriter, r *http.Request, limit int64) {
-	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	r.Body = maxBytes(w, r.Body, limit)
 }
 
 // bodyTooLarge reports whether err comes from a body over its cap.
@@ -94,7 +110,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) error {
 // garbage after the object are errors, so nothing is written on a body that was not what the
 // client meant to send. The stream is read to its end before the object is decoded.
 func decodeStrict(w http.ResponseWriter, r *http.Request, v any, limit int64) error {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, limit))
+	dec := json.NewDecoder(maxBytes(w, r.Body, limit))
 	var raw json.RawMessage
 	if err := dec.Decode(&raw); err != nil {
 		return fmt.Errorf("body: %w", err)

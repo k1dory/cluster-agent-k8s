@@ -165,7 +165,7 @@ func (g *Gateway) appendOutput(w http.ResponseWriter, r *http.Request, id *ident
 			_ = g.Orch.Store.PutIdempotent(r.Context(), &store.Idempotent{Key: batchKey, Status: n, Body: []byte{}})
 		}
 	}
-	sc := bufio.NewScanner(http.MaxBytesReader(w, r.Body, MaxBodyBytes))
+	sc := bufio.NewScanner(maxBytes(w, r.Body, MaxBodyBytes))
 	sc.Buffer(make([]byte, 0, 64<<10), MaxLineBytes)
 	for sc.Scan() {
 		line := sc.Text()
@@ -316,7 +316,7 @@ func (g *Gateway) fsResult(w http.ResponseWriter, r *http.Request, id *identity.
 
 // putBlob stores file content the pod read, under a name confined to its sandbox.
 func (g *Gateway) putBlob(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
-	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, orchestrator.MaxFileBytes))
+	data, err := io.ReadAll(maxBytes(w, r.Body, orchestrator.MaxFileBytes))
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {

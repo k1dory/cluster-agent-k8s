@@ -1,16 +1,19 @@
 package httpapi
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"agent-sandbox/internal/orchestrator"
 )
@@ -331,6 +334,41 @@ func TestReviewMultipartEpilogueCountsAgainstTheCap(t *testing.T) {
 		wantErr(t, fmt.Sprintf("keyed=%v epilogue over the cap", keyed), resp, body, 413, CodeTooLarge)
 		if len(files) > 0 {
 			t.Fatalf("keyed=%v: a file was written before the body was refused: %v", keyed, files)
+		}
+	}
+}
+
+// Over the cap, the answer comes at once and the connection closes: a chunked client that
+// sends cap+1 bytes and then stalls is not waited for. MaxBytesReader can only tell net/http
+// so through the server's own ResponseWriter, not through the middleware's wrappers.
+func TestReviewOverTheCapAnswersWithoutWaitingForTheRest(t *testing.T) {
+	s := newStack(t)
+	addr := strings.TrimPrefix(s.platform.URL, "http://")
+	for _, c := range []struct{ what, path string }{
+		{"strict JSON (decodeStrict)", "/v1/rollouts"},
+		{"keyed JSON (idempotency hash)", "/v1/sandboxes"},
+	} {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer t0k\r\nIdempotency-Key: stall\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n", c.path)
+		fmt.Fprintf(conn, "%x\r\n%s\r\n", len(`{"version":"`), `{"version":"`) // valid JSON up to the cap
+		chunk := bytes.Repeat([]byte("a"), 64<<10)
+		for sent := 0; sent <= jsonBodyLimit+len(chunk); sent += len(chunk) {
+			fmt.Fprintf(conn, "%x\r\n%s\r\n", len(chunk), chunk)
+		}
+		// No terminating chunk: the client stalls here.
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		if err != nil {
+			conn.Close()
+			t.Fatalf("%s: no answer while the client stalls: %v", c.what, err)
+		}
+		resp.Body.Close()
+		conn.Close()
+		if resp.StatusCode != 413 {
+			t.Fatalf("%s: %d", c.what, resp.StatusCode)
 		}
 	}
 }
