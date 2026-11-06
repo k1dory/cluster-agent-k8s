@@ -41,10 +41,25 @@ func TestStopAdapterEndsAWriterWithAScrubbedEnvironment(t *testing.T) {
 	}
 	pgid := cmd.Process.Pid
 	var writer int
+	// Independent of the helper under test: when the assertion fails, the writer must be gone
+	// before the TempDir is removed, and a signal sent is not a process ended.
 	t.Cleanup(func() {
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
-		if writer > 0 {
-			_ = syscall.Kill(writer, syscall.SIGKILL)
+		until := time.Now().Add(2 * time.Second)
+		for time.Now().Before(until) {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			if writer > 0 {
+				_ = syscall.Kill(writer, syscall.SIGKILL)
+			}
+			var ws syscall.WaitStatus
+			for {
+				if pid, err := syscall.Wait4(-pgid, &ws, syscall.WNOHANG, nil); pid <= 0 || err != nil {
+					break
+				}
+			}
+			if !groupAlive(pgid) && (writer <= 0 || !processAlive(writer)) {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
 	})
 	deadline := time.Now().Add(5 * time.Second)
