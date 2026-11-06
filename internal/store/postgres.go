@@ -33,11 +33,16 @@ type Postgres struct {
 // OpenPostgres connects and applies the schema (idempotent). Unless the URL sets pool_max_conns,
 // the pool holds up to 16 connections; the leadership lease and the event listener use
 // dedicated connections outside the pool.
-func OpenPostgres(ctx context.Context, url string) (*Postgres, error) {
+func OpenPostgres(ctx context.Context, url string, opts ...PostgresOption) (*Postgres, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, err
 	}
+	tracer := &pgTracer{}
+	for _, o := range opts {
+		o(tracer)
+	}
+	cfg.ConnConfig.Tracer = tracer // spans and store metrics per query (pgtrace.go)
 	if !strings.Contains(url, "pool_max_conns") && cfg.MaxConns < 16 {
 		cfg.MaxConns = 16
 	}
@@ -2564,3 +2569,32 @@ func (p *Postgres) CreateKeyedRun(ctx context.Context, r *model.Run, e *model.Ev
 // keyedRunHook, when set (tests), runs in CreateKeyedRun's transaction between the run's
 // insert and its event's.
 var keyedRunHook func(ctx context.Context, tx pgx.Tx)
+
+// CountByStatus is StatusCounter: two grouped counts, the runs' limited to the unfinished
+// statuses (see status_counts.go).
+func (p *Postgres) CountByStatus(ctx context.Context) (sandboxes, runs map[string]int, err error) {
+	sandboxes, runs = zeroCounts()
+	count := func(into map[string]int, sql string, args ...any) error {
+		rows, err := p.pool.Query(ctx, sql, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var st string
+			var n int
+			if err := rows.Scan(&st, &n); err != nil {
+				return err
+			}
+			into[st] = n
+		}
+		return rows.Err()
+	}
+	if err := count(sandboxes, `SELECT status, count(*) FROM sandboxes GROUP BY status`); err != nil {
+		return nil, nil, err
+	}
+	if err := count(runs, `SELECT status, count(*) FROM runs WHERE status = ANY($1) GROUP BY status`, []string{string(model.RunQueued), string(model.RunRunning)}); err != nil {
+		return nil, nil, err
+	}
+	return sandboxes, runs, nil
+}
