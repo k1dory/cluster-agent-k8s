@@ -945,6 +945,7 @@ paths:
           description: The key, its secret (shown once), the trust that matched and the token's subject
           content: { application/json: { schema: { $ref: "#/components/schemas/CIGrant" } } }
         "400": { description: "The body is not one JSON object with `token`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { description: "The body is over its limit (32 KiB; code `too_large`)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { description: "No CITrust accepts the token (unknown issuer, another audience, claims that match no trust, expired, already exchanged, two tenants' trusts matching)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "429": { $ref: "#/components/responses/RateLimited" }
         "503": { description: "CI authentication is disabled, or the issuer's keys could not be fetched", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
@@ -1231,9 +1232,10 @@ paths:
       responses:
         "200": { description: Replaced, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
         "201": { description: Added, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
-        "400": { description: "Malformed JSON, unknown field, trailing data, or a body over the limit (the value itself may be up to 65536 bytes)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "400": { description: "Malformed JSON, unknown field or trailing data", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "413": { description: "The body is over its limit (code `too_large`): 6 × 65536 + 1024 bytes of JSON, room for a value of 65536 bytes however it is escaped", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "422": { description: "Bad name or empty / oversized value", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/CredentialsDisabled" }
     delete:
