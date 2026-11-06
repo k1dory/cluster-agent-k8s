@@ -385,7 +385,7 @@ paths:
         - { name: after, in: query, schema: { type: integer, format: int64 } }
         - { name: raw, in: query, schema: { type: boolean, default: false } }
       responses:
-        "200": { description: "text/event-stream; event = role, id = event id, data = Message" }
+        "200": { description: "text/event-stream; event = role, id = event id, data = Message; a final `event: error` frame (an Error body) when the log cannot be read: reconnect with Last-Event-ID" }
   /v1/sandboxes/{id}/messages/close:
     parameters: [{ $ref: "#/components/parameters/id" }]
     post:
@@ -491,6 +491,8 @@ paths:
       description: |
         Default: `text/event-stream`, each message is `id: <event id>`, `event: <type>`, `data: <Event JSON>`.
         Pass `after` (or the `Last-Event-ID` header) to replay from the persisted log, `run` to see one run only.
+        Frames are read from the log, so a slow client gets every event late rather than losing any; if the
+        log cannot be read the stream ends with an `event: error` frame (an `Error` body): reconnect with `Last-Event-ID`.
         With `stream=false` the same filter returns a JSON array (up to `limit`, default 1000) and closes;
         a full page carries `X-Next-Cursor` (the last event id) for the next `after`.
       parameters:
@@ -1597,7 +1599,8 @@ paths:
         lifecycle, user input and every gateway decision (`egress.allow` / `egress.deny`, data is
         an `Egress` object). `run.output` is excluded unless `type` lists it or is `all`.
         `stream=true` switches to SSE and keeps following live events after the replay;
-        reconnect with `Last-Event-ID`.
+        reconnect with `Last-Event-ID`. A stream that cannot read the log ends with an
+        `event: error` frame (an `Error` body).
       parameters:
         - { name: tenant, in: query, schema: { type: string } }
         - { name: slug, in: query, schema: { type: string } }
