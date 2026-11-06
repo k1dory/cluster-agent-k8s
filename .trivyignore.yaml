@@ -1,0 +1,11 @@
+# Findings ci-scan and ci-images accept on purpose (hack/ci/lib.sh ci_trivy_scan). Every entry
+# names the vulnerability, why it does not apply or is accepted, and when the acceptance
+# expires: after expired_at Trivy reports it again and the check fails, so an acceptance is
+# reviewed rather than forgotten. Keep it short; a bump in go.mod or versions.env is the fix.
+#
+# vulnerabilities:
+#   - id: CVE-2025-00000
+#     paths: ["usr/local/lib/node_modules/**"]   # optional
+#     statement: the vulnerable function is not reachable (why)
+#     expired_at: 2026-12-31
+vulnerabilities: []

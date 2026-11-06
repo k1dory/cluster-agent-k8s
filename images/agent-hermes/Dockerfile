@@ -24,9 +24,12 @@ LABEL io.agent-sandbox.harness.hermes.version="${HERMES_VERSION}" \
       io.agent-sandbox.harness.hermes.image="${HERMES_IMAGE}"
 USER root
 # nftables: the netlock init container runs from this image too. Hermes's image keeps its own
-# user (hermes, 10000); the pod runs as 1000, the `agent` of every agent-sandbox image.
+# user (hermes, 10000); the pod runs as 1000, the `agent` of every agent-sandbox image. Its
+# Debian packages are upgraded at build time (the pinned digest lags the security updates;
+# ci-images scans the result).
 RUN { test -n "${HERMES_VERSION}" || { echo "build arg HERMES_VERSION is required (hack/ci/versions.sh hermes-build-args)" >&2; exit 1; }; } \
- && apt-get -o Acquire::Retries=3 update && apt-get -o Acquire::Retries=3 install -y --no-install-recommends nftables jq ripgrep \
+ && apt-get -o Acquire::Retries=3 update && apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends \
+ && apt-get -o Acquire::Retries=3 install -y --no-install-recommends nftables jq ripgrep \
  && rm -rf /var/lib/apt/lists/* \
  && useradd -m -u 1000 -s /bin/bash agent
 COPY --from=build /out/agent-init /out/agent-runner /usr/local/bin/

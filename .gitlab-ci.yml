@@ -41,6 +41,11 @@ unit:
     - make ci-unit
     - make ci-policy
 
+scan:
+  stage: check
+  script:
+    - make ci-scan
+
 postgres:
   stage: check
   services:
