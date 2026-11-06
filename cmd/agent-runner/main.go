@@ -35,6 +35,22 @@ import (
 type client struct {
 	base string
 	http *http.Client
+	// attempts: run id → the attempt the control plane handed the run out under, sent back as
+	// X-Run-Attempt with every call about the run, so a run handed out again (this runner's
+	// claim response was lost) refuses whatever still acts on the earlier attempt.
+	attempts sync.Map
+}
+
+// stampRun adds X-Run-Attempt to a call about a run this runner holds (/agent/runs/{id}/...).
+func (c *client) stampRun(req *http.Request) {
+	rest, ok := strings.CutPrefix(req.URL.Path, "/agent/runs/")
+	if !ok {
+		return
+	}
+	id, _, _ := strings.Cut(rest, "/")
+	if n, ok := c.attempts.Load(id); ok {
+		req.Header.Set("X-Run-Attempt", fmt.Sprint(n))
+	}
 }
 
 func newClient() (*client, error) {
@@ -58,6 +74,7 @@ func (c *client) do(ctx context.Context, method, path string, body []byte, out a
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	c.stampRun(req)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return 0, err
@@ -117,6 +134,9 @@ func serveRuns(ctx context.Context, c *client) {
 		if code == http.StatusNoContent {
 			continue
 		}
+		if run.Attempt > 0 {
+			c.attempts.Store(run.ID, run.Attempt)
+		}
 		exit := execute(ctx, c, &run)
 		// A result that was not acknowledged within the budget stays pending: the run is still
 		// `running` on the control plane, and while the pod is healthy nothing else settles it. No
@@ -127,6 +147,7 @@ func serveRuns(ctx context.Context, c *client) {
 			}
 			fmt.Fprintf(os.Stderr, "agent-runner: the result of run %s is still pending: no new run is taken until it is acknowledged\n", run.ID)
 		}
+		c.attempts.Delete(run.ID)
 	}
 }
 
@@ -615,7 +636,12 @@ func watchCancel(ctx context.Context, c *client, runID string) *runWatch {
 		var after int64
 		for watch.Err() == nil {
 			var evs []model.Event
-			_, err := c.do(watch, http.MethodGet, fmt.Sprintf("/agent/runs/%s/input?after=%d&wait=30s", runID, after), nil, &evs)
+			code, err := c.do(watch, http.MethodGet, fmt.Sprintf("/agent/runs/%s/input?after=%d&wait=30s", runID, after), nil, &evs)
+			if code == http.StatusConflict {
+				fmt.Println("agent-runner: the run was handed out again: this attempt stops")
+				cancel(errRunCancelled)
+				return
+			}
 			if err != nil {
 				if !sleepCtx(watch, 2*time.Second) {
 					return
@@ -847,7 +873,13 @@ func forwardInput(ctx context.Context, c *client, runID string, w inputSink, can
 			}
 		}
 		var evs []model.Event
-		_, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/agent/runs/%s/input?after=%d&wait=%s", runID, after, wait.Round(time.Second)), nil, &evs)
+		code, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/agent/runs/%s/input?after=%d&wait=%s", runID, after, wait.Round(time.Second)), nil, &evs)
+		if code == http.StatusConflict {
+			// Another attempt holds the run now (409 X-Run-Attempt): this one must not go on.
+			fmt.Println("agent-runner: the run was handed out again: this attempt stops")
+			cancelRun()
+			return
+		}
 		if err != nil {
 			if !sleepCtx(ctx, 2*time.Second) {
 				return

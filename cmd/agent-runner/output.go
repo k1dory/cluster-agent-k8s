@@ -438,6 +438,7 @@ func (c *client) postBatch(ctx context.Context, runID string, lines []string) er
 		}
 		req.Header.Set("Content-Type", "text/plain")
 		req.Header.Set("X-Batch-Id", batch) // same id on every retry: the server skips lines it already stored
+		c.stampRun(req)
 		resp, err := c.http.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -472,7 +473,10 @@ func (c *client) postBatch(ctx context.Context, runID string, lines []string) er
 				return nil
 			}
 			return c.postBatch(ctx, runID, rest)
-		case resp.StatusCode == http.StatusForbidden, resp.StatusCode == http.StatusNotFound:
+		case resp.StatusCode == http.StatusForbidden, resp.StatusCode == http.StatusNotFound,
+			// 409: the run was handed out again past this attempt; 422: the batch id was used for
+			// another body. Sending it again cannot change either.
+			resp.StatusCode == http.StatusConflict, resp.StatusCode == http.StatusUnprocessableEntity:
 			fmt.Fprintf(os.Stderr, "agent-runner: post output: %s: %s\n", resp.Status, strings.TrimSpace(string(data)))
 			return nil
 		default:
