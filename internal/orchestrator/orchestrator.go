@@ -757,20 +757,23 @@ func (o *Orchestrator) Sleep(ctx context.Context, id string, force bool) (*model
 	case model.StatusCreating, model.StatusStopping, model.StatusDeleting:
 		return nil, fmt.Errorf("%w: sandbox is %s", ErrConflict, sb.Status)
 	}
-	if !force {
-		if _, err := o.Store.RunningRun(ctx, id); err == nil {
-			return nil, fmt.Errorf("%w: a run is in progress", ErrConflict)
-		}
-	}
-	return o.stopPod(ctx, id, model.StatusSleeping)
+	// Without force, "no run in progress" is decided under the claim lock, together with the move
+	// to stopping (see stopPodIf).
+	return o.stopPodIf(ctx, id, model.StatusSleeping, !force)
 }
 
-// stopPod takes a pod down (status stopping → final), retires its identity and cancels a run
-// that was executing. final is sleeping, or waking when a new pod follows at once.
+// stopPod takes a pod down whatever it is executing; see stopPodIf.
 func (o *Orchestrator) stopPod(ctx context.Context, id string, final model.SandboxStatus) (*model.Sandbox, error) {
+	return o.stopPodIf(ctx, id, final, false)
+}
+
+// stopPodIf takes a pod down (status stopping → final), retires its identity and cancels a run
+// that was executing. final is sleeping, or waking when a new pod follows at once. With idle,
+// the stop happens only while no run executes (errRunInProgress otherwise).
+func (o *Orchestrator) stopPodIf(ctx context.Context, id string, final model.SandboxStatus, idle bool) (*model.Sandbox, error) {
 	// Only a sandbox that has (or is getting) a pod can be stopped, and only by one writer: a
 	// second stopper, or a stop racing a sleep on another replica, gets ErrConflict here.
-	sb, err := o.setStatusFrom(ctx, id, []model.SandboxStatus{model.StatusRunning, model.StatusWaking, model.StatusError}, model.StatusStopping, nil)
+	sb, err := o.toStopping(ctx, id, idle)
 	if err != nil {
 		return nil, err
 	}
@@ -1075,7 +1078,10 @@ func (o *Orchestrator) claim(ctx context.Context, sandboxID string, stamp store.
 				return nil, fmt.Errorf("session of run %s: %w", q.ResumeOf, err)
 			}
 		}
-		r, err := o.Store.ClaimRun(ctx, q.ID, time.Now(), session, stamp)
+		r, err := o.claimAwake(ctx, sandboxID, q.ID, session, stamp)
+		if errors.Is(err, errNotAwake) {
+			return nil, store.ErrNotFound // stopping or gone: the poll waits for a running pod
+		}
 		if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
 			continue // claimed by another poller or cancelled meanwhile: the next one in line
 		}
@@ -1199,11 +1205,14 @@ func (o *Orchestrator) applyPending(ctx context.Context, id string) {
 	if err != nil || sb.DesiredVersion == "" || sb.Status != model.StatusRunning {
 		return
 	}
-	if _, err := o.Store.RunningRun(ctx, id); err == nil {
+	if _, err := o.Store.RunningRun(ctx, id); !errors.Is(err, store.ErrNotFound) {
+		if err != nil {
+			o.Log.Error("deferred rollout: read running run", "id", id, "err", err)
+		}
 		return
 	}
 	o.Log.Info("applying deferred rollout", "id", id, "from", sb.AgentVersion, "to", sb.DesiredVersion)
-	if _, err := o.stopPod(ctx, id, model.StatusWaking); err != nil && !errors.Is(err, ErrConflict) {
+	if _, err := o.stopPodIf(ctx, id, model.StatusWaking, true); err != nil && !errors.Is(err, ErrConflict) {
 		o.Log.Error("deferred rollout", "id", id, "err", err)
 	}
 }
@@ -1397,12 +1406,29 @@ func (o *Orchestrator) rolloutOne(ctx context.Context, sb *model.Sandbox, versio
 		return item
 	}
 	r, err := o.Store.RunningRun(ctx, sb.ID)
-	if err != nil {
-		record(model.RolloutNow, "", "")
-		if _, err := o.stopPod(ctx, sb.ID, model.StatusWaking); err != nil {
-			item.Reason = "restart failed: " + err.Error()
-		}
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		// Not knowing whether a run executes is not "idle": the desired version stays set and the
+		// reconciler applies it once the store answers.
+		record(model.RolloutDeferred, "", "")
+		item.Reason = "cannot tell whether a run is in progress: " + err.Error()
 		return item
+	}
+	if err != nil {
+		// Idle when read; the restart decides again, under the claim lock, before it stops anything.
+		_, err := o.stopPodIf(ctx, sb.ID, model.StatusWaking, true)
+		if !errors.Is(err, errRunInProgress) {
+			record(model.RolloutNow, "", "")
+			if err != nil {
+				item.Reason = "restart failed: " + err.Error()
+			}
+			return item
+		}
+		// A run was claimed between the read and the restart: go on as if it had been read.
+		if r, err = o.Store.RunningRun(ctx, sb.ID); err != nil {
+			record(model.RolloutDeferred, "", "")
+			item.Reason = "run in progress; applied when it finishes"
+			return item
+		}
 	}
 	if !force {
 		record(model.RolloutDeferred, r.ID, "")
@@ -1723,4 +1749,68 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			o.Log.Error("idle sleep", "id", sb.ID, "err", err)
 		}
 	}
+}
+
+// errRunInProgress: a stop that must leave running work alone found a run executing.
+var errRunInProgress = fmt.Errorf("%w: a run is in progress", ErrConflict)
+
+// errNotAwake: a claim found the sandbox not running (stopping, replaced, gone).
+var errNotAwake = errors.New("sandbox is not running")
+
+// claimLock names the lock, shared by every replica, under which a run is claimed and under
+// which a stop that spares running work decides that none runs. Without it the two interleave:
+// the stop reads "no run", NextRun (having read "running") claims, the stop moves the sandbox
+// to stopping, and the run just handed out dies with its pod. With it, whichever goes second
+// sees the other's write: the claim sees stopping and leaves the run queued, or the stop sees
+// the running run and does not happen.
+func claimLock(sandboxID string) string { return "claim:" + sandboxID }
+
+// toStopping moves the sandbox to stopping from a status that has (or is getting) a pod. With
+// idle, only while no run executes, decided under claimLock; a failed read of the running run is
+// an error, never taken for "no run".
+func (o *Orchestrator) toStopping(ctx context.Context, id string, idle bool) (*model.Sandbox, error) {
+	from := []model.SandboxStatus{model.StatusRunning, model.StatusWaking, model.StatusError}
+	if !idle {
+		return o.setStatusFrom(ctx, id, from, model.StatusStopping, nil)
+	}
+	var sb *model.Sandbox
+	err := o.Store.WithTenantLock(ctx, claimLock(id), func(ctx context.Context) error {
+		_, err := o.Store.RunningRun(ctx, id)
+		if err == nil {
+			return errRunInProgress
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("read running run: %w", err)
+		}
+		sb, err = o.setStatusFrom(ctx, id, from, model.StatusStopping, nil)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sb, nil
+}
+
+// claimAwake claims a queued run under claimLock, only while the sandbox is running: a pod that
+// is being stopped or replaced must not pick up work. errNotAwake otherwise.
+func (o *Orchestrator) claimAwake(ctx context.Context, sandboxID, runID, session string, stamp store.RunStamp) (*model.Run, error) {
+	var r *model.Run
+	err := o.Store.WithTenantLock(ctx, claimLock(sandboxID), func(ctx context.Context) error {
+		sb, err := o.Store.GetSandbox(ctx, sandboxID)
+		if errors.Is(err, store.ErrNotFound) {
+			return errNotAwake
+		}
+		if err != nil {
+			return err
+		}
+		if sb.Status != model.StatusRunning {
+			return errNotAwake
+		}
+		r, err = o.Store.ClaimRun(ctx, runID, time.Now(), session, stamp)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
 }
