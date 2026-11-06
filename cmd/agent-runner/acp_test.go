@@ -501,7 +501,7 @@ func openRealACP(t *testing.T, isolate []string, agent, home string, env []strin
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer stopAdapter(stdin, cancel, cmd)
+	defer stopAdapter(stdin, cancel, cmd, home)
 	emit := func(l string) {
 		if strings.HasPrefix(l, "[agent-runner] ") { // a notice; ACP lines (acp.commands…) are output
 			notices = append(notices, l)
@@ -541,7 +541,7 @@ func noNetwork(t *testing.T) []string {
 // stopAdapter ends an agent process as the runner does (executeACP): end of input, a grace period
 // to exit on its own, then the process group. An agent killed at once can leave helpers that
 // keep writing into its home (hermes), which then outlives the test's temporary directory.
-func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd) {
+func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd, home string) {
 	_ = stdin.Close()
 	exited := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(exited) }()
@@ -550,5 +550,41 @@ func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd) {
 	case <-time.After(5 * time.Second):
 		cancel()
 		<-exited
+	}
+	endProcessGroup(cmd.Process.Pid, home)
+}
+
+// endProcessGroup ends what the adapter left behind and returns when none of it is alive, or
+// after a bound. The adapter leaving on its own does not end what it started — Hermes keeps
+// children writing under $HERMES_HOME, some in sessions of their own — and the test's
+// directories are removed as soon as the test returns: a survivor makes that removal fail
+// ("directory not empty") or outlives the test. Two sweeps: the adapter's process group (it is
+// the group's leader, Setpgid), then, where /proc tells, every process whose environment names
+// the test's home (the adapter's env, inherited by all its descendants, detached or not). Alive
+// is what counts: a zombie writes nothing, and whether it gets reaped is PID 1's business (in
+// the image's check that is this binary; the zombies go when it exits). Only what is ours is
+// reaped here, without waiting.
+func endProcessGroup(pgid int, home string) {
+	deadline := time.Now().Add(5 * time.Second)
+	reap := func(pid int) {
+		for {
+			var ws syscall.WaitStatus
+			if p, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil); p <= 0 || err != nil {
+				return
+			}
+		}
+	}
+	for {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		reap(-pgid)
+		strays := processesWithEnv(home)
+		for _, pid := range strays {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			reap(pid)
+		}
+		if (!groupAlive(pgid) && len(strays) == 0) || time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
