@@ -1490,7 +1490,11 @@ paths:
           `force` → `forced`: the run is cancelled, the pod replaced, and (unless `resume: false`) a
           new run with `resume_of` and the captured harness `session` is queued so the agent
           continues the conversation on the new version;
-        * creating / waking / stopping → `deferred`; deleting → `skipped`.
+        * creating / waking / stopping → `deferred`; deleting → `skipped`;
+        * running, but whether a run is in progress cannot be read (the database did not answer), or
+          the restart could not begin (the sandbox moved meanwhile) → `deferred` with that `reason`:
+          nothing was stopped, the version stays pending and the reconciler applies it once the
+          sandbox is running and idle.
 
         Tenants may only name versions from the catalogue (`GET /v1/version`); the admin may pass
         any image reference. Every decision is a `rollout` event in the sandbox's trace.

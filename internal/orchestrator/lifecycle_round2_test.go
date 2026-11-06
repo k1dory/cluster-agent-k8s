@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -112,6 +113,11 @@ func TestRound2SleepDoesNotRaceAClaim(t *testing.T) {
 		if got, _ := st.GetSandbox(ctx, sb.ID); got.Status != model.StatusSleeping {
 			t.Fatalf("sandbox after sleep: %s", got.Status)
 		}
+		return
+	}
+	// The claim went first: the sleep is refused as a conflict, nothing else.
+	if res.err != nil || !errors.Is(sleepErr, errRunInProgress) {
+		t.Fatalf("sleep: %v; claim: %v", sleepErr, res.err)
 	}
 }
 
@@ -135,11 +141,13 @@ func TestRound2ConcurrentSleepAndClaim(t *testing.T) {
 		go func() { defer wg.Done(); _, sleepErr = o.Sleep(ctx, sb.ID, false) }()
 		wg.Wait()
 		got, _ := st.GetRun(ctx, run.ID)
-		if claimErr == nil && sleepErr == nil {
-			t.Fatalf("iteration %d: run handed out (now %s) and the sandbox put to sleep", i, got.Status)
-		}
-		if got.Status == model.RunCancelled {
-			t.Fatalf("iteration %d: an idle sleep cancelled a run", i)
+		cur, _ := st.GetSandbox(ctx, sb.ID)
+		// Exactly one of two outcomes: the sleep first (run queued, sandbox asleep, nothing
+		// claimed) or the claim first (run running on a running sandbox, sleep refused).
+		sleptFirst := sleepErr == nil && errors.Is(claimErr, store.ErrNotFound) && got.Status == model.RunQueued && cur.Status == model.StatusSleeping
+		claimedFirst := claimErr == nil && errors.Is(sleepErr, errRunInProgress) && got.Status == model.RunRunning && cur.Status == model.StatusRunning
+		if !sleptFirst && !claimedFirst {
+			t.Fatalf("iteration %d: sleep %v, claim %v, run %s, sandbox %s", i, sleepErr, claimErr, got.Status, cur.Status)
 		}
 	}
 }
@@ -227,5 +235,95 @@ func TestRound2RolloutDoesNotRaceAClaim(t *testing.T) {
 	}
 	if item.Mode != model.RolloutNow || got.Status != model.RunQueued {
 		t.Fatalf("refused claim, run %s, rollout %+v", got.Status, item)
+	}
+}
+
+// lifecycleLockReleaseFails runs fn under the real lock and then reports a failure to release
+// it, for the claim lock only: on Postgres the lock is a transaction of its own while the writes
+// under it commit through the pool, so its commit can fail after they are durable.
+type lifecycleLockReleaseFails struct{ store.Store }
+
+func (s *lifecycleLockReleaseFails) WithTenantLock(ctx context.Context, key string, fn func(context.Context) error) error {
+	err := s.Store.WithTenantLock(ctx, key, fn)
+	if err == nil && strings.HasPrefix(key, "claim:") {
+		return errors.New("commit lock transaction: connection reset")
+	}
+	return err
+}
+
+// A claim committed under the lock was turned into an error when the lock's transaction then
+// failed to commit: the runner got an error and the run stayed running with no executor,
+// blocking idle sleep and deferred rollouts. Now a committed claim is handed out, and a
+// committed move to stopping is carried through, whatever the lock's release says.
+func TestRound2CommittedClaimSurvivesALockReleaseFailure(t *testing.T) {
+	ctx := context.Background()
+	rt := NewFakeRuntime()
+	st := &lifecycleLockReleaseFails{Store: store.NewMemory()}
+	sb := lifecycleRunningSandbox(t, st, rt, "sb_lockrel")
+	o := New(st, rt, nil, events.New(), Config{StopTimeout: time.Second}, nil)
+	run, err := o.CreateRun(ctx, sb.ID, "task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := o.NextRun(ctx, sb.ID, 0)
+	if err != nil || got == nil || got.ID != run.ID {
+		t.Fatalf("claim with a failing lock release: %+v %v", got, err)
+	}
+	if r, _ := st.GetRun(ctx, run.ID); r.Status != model.RunRunning {
+		t.Fatalf("claimed run: %s", r.Status)
+	}
+	if err := o.FinishRun(ctx, sb.ID, run.ID, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := o.Sleep(ctx, sb.ID, false); err != nil {
+		t.Fatalf("idle sleep with a failing lock release: %v", err)
+	}
+	if cur, _ := st.GetSandbox(ctx, sb.ID); cur.Status != model.StatusSleeping {
+		t.Fatalf("sandbox after the sleep: %s (a committed move to stopping was abandoned)", cur.Status)
+	}
+}
+
+// lifecycleRunningRunSeq answers the i-th RunningRun with errs[i] when it is set, else reads.
+type lifecycleRunningRunSeq struct {
+	store.Store
+	mu   sync.Mutex
+	n    int
+	errs []error
+}
+
+func (s *lifecycleRunningRunSeq) RunningRun(ctx context.Context, sandboxID string) (*model.Run, error) {
+	s.mu.Lock()
+	i := s.n
+	s.n++
+	s.mu.Unlock()
+	if i < len(s.errs) && s.errs[i] != nil {
+		return nil, s.errs[i]
+	}
+	return s.Store.RunningRun(ctx, sandboxID)
+}
+
+// The rollout read "idle" and the locked re-check then failed to read the runs: nothing was
+// stopped and the version stays pending, but the item said "now" and "restart failed". It is
+// deferred now, with the reason, and the sandbox keeps running its version.
+func TestRound2RolloutDefersWhenTheLockedRecheckFails(t *testing.T) {
+	ctx := context.Background()
+	rt := NewFakeRuntime()
+	st := &lifecycleRunningRunSeq{Store: store.NewMemory(), errs: []error{nil, errors.New("connection refused")}}
+	sb := lifecycleRunningSandbox(t, st, rt, "sb_rorecheck")
+	o := New(st, rt, nil, events.New(), Config{StopTimeout: time.Second}, nil)
+	res, err := o.Rollout(ctx, RolloutRequest{Sandbox: sb.ID, Version: "img:2", Admin: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := res.Items[0]
+	if item.Mode != model.RolloutDeferred || !strings.Contains(item.Reason, "cannot tell whether a run is in progress") {
+		t.Fatalf("rollout whose locked re-check failed: %+v", item)
+	}
+	got, _ := st.GetSandbox(ctx, sb.ID)
+	if got.Status != model.StatusRunning || got.AgentVersion != "img:1" || got.DesiredVersion != "img:2" {
+		t.Fatalf("sandbox: %s agent=%s desired=%q", got.Status, got.AgentVersion, got.DesiredVersion)
+	}
+	if _, _, err := rt.PodStatus(ctx, got); err != nil {
+		t.Fatalf("pod: %v", err)
 	}
 }

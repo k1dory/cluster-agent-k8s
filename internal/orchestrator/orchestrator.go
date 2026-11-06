@@ -395,6 +395,7 @@ func (o *Orchestrator) checkQuota(ctx context.Context, tenant, slug string, newR
 func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox, error) {
 	var sb *model.Sandbox
 	var from string
+	var volErr error
 	tenant := o.metaOf(ctx, id).tenant
 	err := o.Store.WithTenantLock(ctx, tenant, func(ctx context.Context) error {
 		// Writers that do not take the lock can still move the record between the read and the
@@ -411,8 +412,20 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 			if errors.Is(err, errRetryStart) {
 				return fmt.Errorf("%w: sandbox %s kept changing", ErrConflict, id)
 			}
-			return err
+			if err != nil {
+				return err
+			}
+			break
 		}
+		// Every pod start ensures the volume (idempotent): a sandbox whose first provisioning
+		// failed would otherwise get a pod bound to a claim that does not exist, on every wake. It
+		// is done under this lock, which markDeleting also takes: a Delete either ran before (the
+		// transition above saw it) or runs after and removes this volume, never in between
+		// leaving a volume created for a record that is gone.
+		vctx, vcancel := o.detached(ctx)
+		defer vcancel()
+		volErr = o.Runtime.EnsureVolume(vctx, sb)
+		return nil
 	})
 	if errors.Is(err, errAlreadyStarted) {
 		return sb, nil
@@ -427,11 +440,9 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 	// because the client went away, or the record stays waking with nothing behind it.
 	ctx, cancel := o.detached(ctx)
 	defer cancel()
-	// Every pod start ensures the volume first (idempotent): a sandbox whose first provisioning
-	// failed would otherwise get a pod bound to a claim that does not exist, on every wake.
-	if err := o.Runtime.EnsureVolume(ctx, sb); err != nil {
-		o.fail(ctx, id, model.StatusWaking, "volume: "+err.Error())
-		return nil, fmt.Errorf("%w: volume: %v", ErrRuntime, err)
+	if volErr != nil {
+		o.fail(ctx, id, model.StatusWaking, "volume: "+volErr.Error())
+		return nil, fmt.Errorf("%w: volume: %v", ErrRuntime, volErr)
 	}
 	pod, err := o.Runtime.CreatePod(ctx, sb)
 	if err != nil {
@@ -775,7 +786,7 @@ func (o *Orchestrator) stopPodIf(ctx context.Context, id string, final model.San
 	// second stopper, or a stop racing a sleep on another replica, gets ErrConflict here.
 	sb, err := o.toStopping(ctx, id, idle)
 	if err != nil {
-		return nil, err
+		return nil, stopNotBegun{err}
 	}
 	o.mu.Lock()
 	o.stopping[id] = true
@@ -1416,6 +1427,14 @@ func (o *Orchestrator) rolloutOne(ctx context.Context, sb *model.Sandbox, versio
 	if err != nil {
 		// Idle when read; the restart decides again, under the claim lock, before it stops anything.
 		_, err := o.stopPodIf(ctx, sb.ID, model.StatusWaking, true)
+		var notBegun stopNotBegun
+		if !errors.Is(err, errRunInProgress) && errors.As(err, &notBegun) {
+			// Nothing was stopped (the locked re-check could not read the runs, or another writer
+			// moved the sandbox): the desired version stays set, applied when running and idle.
+			record(model.RolloutDeferred, "", "")
+			item.Reason = "restart not begun: " + err.Error() + "; applied when the sandbox is running and idle"
+			return item
+		}
 		if !errors.Is(err, errRunInProgress) {
 			record(model.RolloutNow, "", "")
 			if err != nil {
@@ -1774,21 +1793,30 @@ func (o *Orchestrator) toStopping(ctx context.Context, id string, idle bool) (*m
 		return o.setStatusFrom(ctx, id, from, model.StatusStopping, nil)
 	}
 	var sb *model.Sandbox
+	moved := false
 	err := o.Store.WithTenantLock(ctx, claimLock(id), func(ctx context.Context) error {
 		_, err := o.Store.RunningRun(ctx, id)
 		if err == nil {
 			return errRunInProgress
 		}
 		if !errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("read running run: %w", err)
+			return fmt.Errorf("%w: %w", errRunUnknown, err)
 		}
-		sb, err = o.setStatusFrom(ctx, id, from, model.StatusStopping, nil)
-		return err
+		if sb, err = o.setStatusFrom(ctx, id, from, model.StatusStopping, nil); err != nil {
+			return err
+		}
+		moved = true
+		return nil
 	})
-	if err != nil {
-		return nil, err
+	if moved {
+		// The move is committed (it does not go through the lock's transaction): a failure to
+		// release the lock afterwards must not leave the sandbox stopping with nobody stopping it.
+		if err != nil {
+			o.Log.Warn("claim lock released with an error after the move to stopping", "id", id, "err", err)
+		}
+		return sb, nil
 	}
-	return sb, nil
+	return nil, err
 }
 
 // claimAwake claims a queued run under claimLock, only while the sandbox is running: a pod that
@@ -1809,8 +1837,24 @@ func (o *Orchestrator) claimAwake(ctx context.Context, sandboxID, runID, session
 		r, err = o.Store.ClaimRun(ctx, runID, time.Now(), session, stamp)
 		return err
 	})
-	if err != nil {
-		return nil, err
+	if r != nil {
+		// The claim is committed (it does not go through the lock's transaction): a failure to
+		// release the lock afterwards must not turn it into an error, or the run stays running
+		// with no runner that knows it has it.
+		if err != nil {
+			o.Log.Warn("claim lock released with an error after a claim", "sandbox", sandboxID, "run", r.ID, "err", err)
+		}
+		return r, nil
 	}
-	return r, nil
+	return nil, err
 }
+
+// errRunUnknown: a stop that must leave running work alone could not read whether a run executes.
+var errRunUnknown = errors.New("cannot tell whether a run is in progress")
+
+// stopNotBegun wraps an error of stopPodIf returned before the sandbox moved to stopping: nothing
+// was changed, so a rollout is still pending rather than failed.
+type stopNotBegun struct{ err error }
+
+func (e stopNotBegun) Error() string { return e.err.Error() }
+func (e stopNotBegun) Unwrap() error { return e.err }

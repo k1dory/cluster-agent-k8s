@@ -19,6 +19,14 @@ import (
 // lifecycleRound2Postgres opens a store on a schema of its own, dropped after the test.
 func lifecycleRound2Postgres(t *testing.T) *store.Postgres {
 	t.Helper()
+	return lifecycleRound2Open(t, lifecycleRound2Schema(t))
+}
+
+// lifecycleRound2Schema creates a schema of its own, dropped after the test, and returns the URL
+// of a connection to it: every store opened on it is a separate replica (own pool, own lock
+// limiter) of one database.
+func lifecycleRound2Schema(t *testing.T) string {
+	t.Helper()
 	dsn := os.Getenv("SANDBOX_TEST_POSTGRES_URL")
 	if dsn == "" {
 		t.Skip("set SANDBOX_TEST_POSTGRES_URL to run the PostgreSQL lifecycle regressions")
@@ -50,7 +58,15 @@ func lifecycleRound2Postgres(t *testing.T) *store.Postgres {
 	q := u.Query()
 	q.Set("search_path", schema)
 	u.RawQuery = q.Encode()
-	pg, err := store.OpenPostgres(ctx, u.String())
+	return u.String()
+}
+
+// lifecycleRound2Open opens a store on the URL; it is closed before the schema is dropped.
+func lifecycleRound2Open(t *testing.T, dsn string) *store.Postgres {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	pg, err := store.OpenPostgres(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}

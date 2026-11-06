@@ -385,7 +385,8 @@ sandboxctl rollout -version stable -all -force                     # admin: ever
 
 Per sandbox the mode is `wake` (asleep: applied on the next wake), `now` (running and idle: the pod
 is replaced, the identity retired and reissued), `deferred` (a run is in progress: applied when it
-finishes) or, with `-force`, `forced`: the run is cancelled, the pod replaced and a resume run is
+finishes; also when the runs could not be read or the restart could not begin, with that reason,
+applied by the reconciler once the sandbox is running and idle) or, with `-force`, `forced`: the run is cancelled, the pod replaced and a resume run is
 queued that carries the harness session id captured from the output stream (Claude Code
 `session_id`, Codex `thread_id`). The runner continues it with `harness_resume_command`
 (default `claude --resume`; for Codex `codex exec resume "$SANDBOX_SESSION" ...`). The workspace
