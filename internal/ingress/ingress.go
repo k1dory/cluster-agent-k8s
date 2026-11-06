@@ -33,9 +33,17 @@ type Waker interface {
 	Touch(ctx context.Context, id string)
 }
 
+// PreviewLookup finds the sandbox a preview host belongs to: all the store access preview
+// traffic needs.
+type PreviewLookup interface {
+	SandboxByPreviewHost(ctx context.Context, host string) (*model.Sandbox, error)
+}
+
+var _ PreviewLookup = store.Store(nil)
+
 // Handler serves preview traffic.
 type Handler struct {
-	Store          store.Store
+	Store          PreviewLookup
 	Waker          Waker
 	AuthURL        string // where to send unauthenticated users; "" disables sso/members
 	TicketKey      []byte // HMAC key shared with your auth service

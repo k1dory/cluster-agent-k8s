@@ -43,9 +43,9 @@ var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 type Service struct {
 	Store  store.Credentials
 	sealer *Sealer
-	// signIns is the OAuth sign-ins' store once NewOAuth wired them: Put refuses a name a
-	// sign-in holds.
-	signIns store.OAuthCredentials
+	// names writes both kinds in the scope's one namespace: the check that the other kind
+	// does not hold the name and the write are one atomic store operation.
+	names store.CredentialNames
 }
 
 // New returns a service encrypting under key (32 bytes: AES-256-GCM).
@@ -54,7 +54,11 @@ func New(st store.Credentials, key []byte) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{Store: st, sealer: sl}, nil
+	names, ok := st.(store.CredentialNames)
+	if !ok {
+		return nil, fmt.Errorf("credentials: the store keeps no single credential namespace (store.CredentialNames)")
+	}
+	return &Service{Store: st, sealer: sl, names: names}, nil
 }
 
 // Sealer encrypts other server-side secrets at rest under credentials.key (the agent and
@@ -128,18 +132,15 @@ func (s *Service) Put(ctx context.Context, tenant, name, value, by string) (*mod
 	if len(value) > MaxValue {
 		return nil, false, fmt.Errorf("%w: value is larger than %d bytes", ErrInvalid, MaxValue)
 	}
-	// One name, one kind: `secret:NAME` must not mean a sign-in to one reader and a plain
-	// credential to another.
-	if s.signIns != nil {
-		if _, _, err := s.signIns.GetOAuthCredential(ctx, tenant, name); err == nil {
-			return nil, false, fmt.Errorf("%w: %q is an OAuth sign-in in this scope; remove it first", ErrInvalid, name)
-		} else if !errors.Is(err, store.ErrNotFound) {
-			return nil, false, err
-		}
-	}
 	ciphertext := s.seal(tenant, name, []byte(value))
 	c := &model.Credential{Tenant: tenant, Name: name, Fingerprint: fingerprint(value), CreatedBy: by}
-	created, err := s.Store.PutCredential(ctx, c, ciphertext)
+	// One name, one kind: `secret:NAME` must not mean a sign-in to one reader and a plain
+	// credential to another. NAME.account_id is the sign-in NAME's too.
+	base, _ := strings.CutSuffix(name, AccountSuffix)
+	created, err := s.names.PutCredentialIfFree(ctx, c, ciphertext, []string{base})
+	if taken := (*store.NameTakenError)(nil); errors.As(err, &taken) {
+		return nil, false, fmt.Errorf("%w: %q is an OAuth sign-in in this scope; remove it first", ErrInvalid, taken.Name)
+	}
 	if err != nil {
 		return nil, false, err
 	}

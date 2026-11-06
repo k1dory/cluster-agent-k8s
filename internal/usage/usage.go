@@ -113,8 +113,18 @@ func (d dims) key(by string, day time.Time) string {
 	return ""
 }
 
+// Reader is what a report reads: runs and the event log. A report never writes, so it is
+// handed this rather than the whole store.Store.
+type Reader interface {
+	QueryRuns(ctx context.Context, f store.Filter) ([]*model.Run, error)
+	QueryEvents(ctx context.Context, f store.Filter) ([]*model.Event, error)
+	CountEvents(ctx context.Context, f store.Filter) ([]store.EventCount, error)
+}
+
+var _ Reader = store.Store(nil)
+
 // Build computes the report.
-func Build(ctx context.Context, st store.Store, q Query, pr Pricing, now time.Time) (*Report, error) {
+func Build(ctx context.Context, st Reader, q Query, pr Pricing, now time.Time) (*Report, error) {
 	switch q.GroupBy {
 	case "", ByTenant, BySlug, BySandbox, ByRun, ByDay:
 	default:
@@ -187,7 +197,11 @@ func Build(ctx context.Context, st store.Store, q Query, pr Pricing, now time.Ti
 
 	// Pod time comes from status transitions; it is a property of the sandbox, not of a run.
 	if q.GroupBy != ByRun && q.RunID == "" {
-		for sb, secs := range podSeconds(ctx, st, f, now) {
+		pods, err := podSeconds(ctx, st, f, now)
+		if err != nil {
+			return nil, err
+		}
+		for sb, secs := range pods {
 			for _, s := range secs {
 				rowFor(dims{sb.tenant, sb.slug, sb.sandbox, ""}, s.start).add(Totals{PodSeconds: s.seconds})
 			}
@@ -212,14 +226,12 @@ type span struct {
 	seconds float64
 }
 
-// podSeconds sums the intervals during which each sandbox had a pod, clipped to the window.
-// A pod is up from the `waking` status until `stopping`, `sleeping`, `error` or `deleting`.
 // runPage is how many runs one query returns while the report walks the window.
 const runPage = 1000
 
 // allRuns returns every run matching f, page by page: a store caps a query without a limit
 // (store.MaxRunsPerQuery), and a report built from one capped query would silently under-count.
-func allRuns(ctx context.Context, st store.Store, f store.Filter) ([]*model.Run, error) {
+func allRuns(ctx context.Context, st Reader, f store.Filter) ([]*model.Run, error) {
 	f.Limit, f.Cursor = runPage, store.Cursor{}
 	var out []*model.Run
 	for {
@@ -236,7 +248,11 @@ func allRuns(ctx context.Context, st store.Store, f store.Filter) ([]*model.Run,
 	}
 }
 
-func podSeconds(ctx context.Context, st store.Store, f store.Filter, now time.Time) map[dims][]span {
+// podSeconds sums the intervals during which each sandbox had a pod, clipped to the window.
+// A pod is up from the `waking` status until `stopping`, `sleeping`, `error` or `deleting`.
+// A failed read of the log is an error of the report: a report built without it would show
+// zero compute as if no pod had run.
+func podSeconds(ctx context.Context, st Reader, f store.Filter, now time.Time) (map[dims][]span, error) {
 	// Status events before the window matter: a pod that woke yesterday is still up today.
 	// The store caps a page (Postgres: 1000 rows), so the log is walked page by page.
 	sf := store.Filter{Tenant: f.Tenant, Slug: f.Slug, SandboxID: f.SandboxID, Types: []string{model.EventStatus}, To: f.To, Limit: 1000}
@@ -244,7 +260,7 @@ func podSeconds(ctx context.Context, st store.Store, f store.Filter, now time.Ti
 	for {
 		page, err := st.QueryEvents(ctx, sf)
 		if err != nil {
-			return nil
+			return nil, fmt.Errorf("usage: pod time: %w", err)
 		}
 		evs = append(evs, page...)
 		if len(page) < sf.Limit {
@@ -261,8 +277,15 @@ func podSeconds(ctx context.Context, st store.Store, f store.Filter, now time.Ti
 		if to.After(f.To) {
 			to = f.To
 		}
-		if to.After(from) {
-			out[d] = append(out[d], span{start: from, seconds: to.Sub(from).Seconds()})
+		// Split at UTC midnights: a day row gets the part of the interval that fell on that
+		// day, not the whole interval on the day it started.
+		for to.After(from) {
+			end := from.UTC().Truncate(24 * time.Hour).Add(24 * time.Hour)
+			if end.After(to) {
+				end = to
+			}
+			out[d] = append(out[d], span{start: from, seconds: end.Sub(from).Seconds()})
+			from = end
 		}
 	}
 	for _, e := range evs {
@@ -286,5 +309,5 @@ func podSeconds(ctx context.Context, st store.Store, f store.Filter, now time.Ti
 	for d, start := range open {
 		clip(d, start, end)
 	}
-	return out
+	return out, nil
 }

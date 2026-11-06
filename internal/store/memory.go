@@ -1252,6 +1252,10 @@ type memCredential struct {
 func (m *Memory) PutCredential(_ context.Context, c *model.Credential, ciphertext []byte) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.putCredential(c, ciphertext), nil
+}
+
+func (m *Memory) putCredential(c *model.Credential, ciphertext []byte) bool {
 	key := c.Tenant + "|" + c.Name
 	now := time.Now()
 	cur, ok := m.creds[key]
@@ -1261,7 +1265,7 @@ func (m *Memory) PutCredential(_ context.Context, c *model.Credential, ciphertex
 		c.Version, c.CreatedAt, c.UpdatedAt = 1, now, now
 	}
 	m.creds[key] = &memCredential{meta: *c, ciphertext: append([]byte(nil), ciphertext...)}
-	return !ok, nil
+	return !ok
 }
 
 func (m *Memory) GetCredential(_ context.Context, tenant, name string) (*model.Credential, []byte, error) {
@@ -1322,6 +1326,10 @@ func cloneOAuth(c *model.OAuthCredential) *model.OAuthCredential {
 func (m *Memory) PutOAuthCredential(_ context.Context, c *model.OAuthCredential, ciphertext []byte) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.putOAuthCredential(c, ciphertext), nil
+}
+
+func (m *Memory) putOAuthCredential(c *model.OAuthCredential, ciphertext []byte) bool {
 	key := c.Tenant + "|" + c.Name
 	now := time.Now()
 	cur, ok := m.oauth[key]
@@ -1331,7 +1339,7 @@ func (m *Memory) PutOAuthCredential(_ context.Context, c *model.OAuthCredential,
 	}
 	c.LeaseOwner, c.LeaseUntil = "", nil
 	m.oauth[key] = &memOAuth{meta: *cloneOAuth(c), ciphertext: append([]byte(nil), ciphertext...)}
-	return !ok, nil
+	return !ok
 }
 
 func (m *Memory) GetOAuthCredential(_ context.Context, tenant, name string) (*model.OAuthCredential, []byte, error) {
@@ -1820,6 +1828,38 @@ var (
 	_ Store = (*Memory)(nil)
 	_ Store = (*Postgres)(nil)
 )
+
+// LastEventID implements EventHead.
+func (m *Memory) LastEventID(context.Context) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.nextEvent, nil
+}
+
+// PutCredentialIfFree implements CredentialNames: the check and the write under one hold of
+// the store's mutex.
+func (m *Memory) PutCredentialIfFree(_ context.Context, c *model.Credential, ciphertext []byte, signIns []string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, n := range slices.Sorted(slices.Values(signIns)) {
+		if _, ok := m.oauth[c.Tenant+"|"+n]; ok {
+			return false, &NameTakenError{Name: n}
+		}
+	}
+	return m.putCredential(c, ciphertext), nil
+}
+
+// PutOAuthCredentialIfFree implements CredentialNames.
+func (m *Memory) PutOAuthCredentialIfFree(_ context.Context, c *model.OAuthCredential, ciphertext []byte, plains []string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, n := range slices.Sorted(slices.Values(plains)) {
+		if _, ok := m.creds[c.Tenant+"|"+n]; ok {
+			return false, &NameTakenError{Name: n}
+		}
+	}
+	return m.putOAuthCredential(c, ciphertext), nil
+}
 
 // idemBySeed is the live reservation with seed; lock held.
 func (m *Memory) idemBySeed(seed string) *Idempotent {

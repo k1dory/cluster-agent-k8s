@@ -396,7 +396,7 @@ paths:
         - { name: after, in: query, schema: { type: integer, format: int64 } }
         - { name: raw, in: query, schema: { type: boolean, default: false } }
       responses:
-        "200": { description: "text/event-stream; event = role, id = event id, data = Message" }
+        "200": { description: "text/event-stream; event = role, id = event id, data = Message; a final `event: error` frame (an Error body) when the log cannot be read: reconnect with Last-Event-ID" }
   /v1/sandboxes/{id}/messages/close:
     parameters: [{ $ref: "#/components/parameters/id" }]
     post:
@@ -502,6 +502,8 @@ paths:
       description: |
         Default: `text/event-stream`, each message is `id: <event id>`, `event: <type>`, `data: <Event JSON>`.
         Pass `after` (or the `Last-Event-ID` header) to replay from the persisted log, `run` to see one run only.
+        Frames are read from the log, so a slow client gets every event late rather than losing any; if the
+        log cannot be read the stream ends with an `event: error` frame (an `Error` body): reconnect with `Last-Event-ID`.
         With `stream=false` the same filter returns a JSON array (up to `limit`, default 1000) and closes;
         a full page carries `X-Next-Cursor` (the last event id) for the next `after`.
       parameters:
@@ -861,6 +863,9 @@ paths:
         may). Syncing the same commit again finds the same applies and writes nothing; a sync whose
         apply stopped is continued by syncing that commit again. The record comes back with the
         outcome and one entry per bundle (apply id, status, changes).
+        The files read are bounded: 1 MiB per file, 256 files, 16 MiB together. Sizes are read
+        before any content; a set over a bound is refused before anything is applied (422,
+        `invalid_plan`, error `… too large: …`).
       requestBody:
         required: false
         content:
@@ -879,7 +884,7 @@ paths:
         "409": { description: "An apply did not finish (failed or conflict; code `stopped`, with the record): sync the same commit again once the cause is fixed", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
         "413": { description: "Body over the limit (4096 bytes; code `too_large`)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "422":
-          description: "A bundle is not valid, nothing of it written (code `invalid_plan`, with the record); the credential is not available (code `credential`, with the record); or `commit` is not a 40-digit SHA (code `invalid`, no record)"
+          description: "A bundle is not valid or the files are over the size bounds, nothing of it written (code `invalid_plan`, with the record); the credential is not available (code `credential`, with the record); or `commit` is not a 40-digit SHA (code `invalid`, no record)"
           content:
             application/json:
               schema:
@@ -1614,7 +1619,13 @@ paths:
         lifecycle, user input and every gateway decision (`egress.allow` / `egress.deny`, data is
         an `Egress` object). `run.output` is excluded unless `type` lists it or is `all`.
         `stream=true` switches to SSE and keeps following live events after the replay;
-        reconnect with `Last-Event-ID`.
+        reconnect with `Last-Event-ID`. A stream that cannot read the log ends with an
+        `event: error` frame (an `Error` body). With `to`, the replay keeps the window up to the
+        newest event when the stream began and everything after that is followed live; such a
+        stream's frames are named `<event id>:<boundary>`, and `Last-Event-ID` takes that value
+        back as sent, so a resume keeps the boundary of the stream it continues. Such a stream
+        opens with an `event: checkpoint` frame that has an id (`<cursor>:<boundary>`) and no
+        data: it is no event, only the cursor to resume with when no event has arrived yet.
       parameters:
         - { name: tenant, in: query, schema: { type: string } }
         - { name: slug, in: query, schema: { type: string } }
