@@ -36,6 +36,7 @@ type Memory struct {
 	oauth     map[string]*memOAuth      // tenant|name
 	nextInst  int
 	nextEvent int64
+	batches   map[string]memBatch // run|batch id → progress (Postgres: run_output_batches)
 }
 
 // NewMemory returns an empty in-memory store.
@@ -427,22 +428,8 @@ func (m *Memory) SetRunSession(_ context.Context, id, session string) error {
 	return nil
 }
 
-func (m *Memory) SettleRun(_ context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	r, ok := m.runs[id]
-	if !ok {
-		return nil, ErrNotFound
-	}
-	if !slices.Contains(from, r.Status) {
-		return nil, ErrConflict
-	}
-	r.Status, r.ExitCode, r.FinishedAt = to, exitCode, &finishedAt
-	if usage != nil {
-		r.Usage = *usage
-	}
-	out := *r
-	return &out, nil
+func (m *Memory) SettleRun(ctx context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error) {
+	return m.SettleRunWithEvents(ctx, Settle{RunID: id, From: from, To: to, ExitCode: exitCode, FinishedAt: finishedAt, Usage: usage})
 }
 
 func (m *Memory) runsOf(sandboxID string) []*model.Run {
@@ -470,6 +457,7 @@ func (m *Memory) ClaimQueuedRun(_ context.Context, sandboxID string, startedAt t
 		if c.Status == model.RunQueued {
 			r := m.runs[c.ID]
 			r.Status, r.StartedAt = model.RunRunning, &startedAt
+			r.Attempt++
 			out := *r
 			return &out, nil
 		}
@@ -528,6 +516,7 @@ func (m *Memory) ClaimRun(_ context.Context, runID string, startedAt time.Time, 
 		return nil, ErrConflict
 	}
 	r.Status, r.StartedAt = model.RunRunning, &startedAt
+	r.Attempt, r.ClaimedBy, r.ClaimAcked = r.Attempt+1, stamp.Owner, false
 	if r.Session == "" {
 		r.Session = session
 	}
@@ -1744,6 +1733,275 @@ var (
 	_ Store = (*Memory)(nil)
 	_ Store = (*Postgres)(nil)
 )
+
+type memBatch struct {
+	batchProgress
+	at time.Time
+}
+
+// appendEventLocked is AppendEvent under the lock already held.
+func (m *Memory) appendEventLocked(e *model.Event) {
+	m.nextEvent++
+	e.ID = m.nextEvent
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
+	c := *e
+	m.events = append(m.events, &c)
+}
+
+// memUndo restores what a RunDelivery write changed when it fails at its fault point: the memory
+// store's form of a rolled-back transaction.
+type memUndo struct {
+	m         *Memory
+	events    int
+	nextEvent int64
+	run       *model.Run
+	saved     model.Run
+	batchKey  string
+	batch     memBatch
+	hadBatch  bool
+	idemKey   string
+	idem      *Idempotent
+}
+
+func (m *Memory) undoFor(r *model.Run, batchKey string) *memUndo {
+	u := &memUndo{m: m, events: len(m.events), nextEvent: m.nextEvent, run: r, saved: *r, batchKey: batchKey}
+	if batchKey != "" {
+		u.batch, u.hadBatch = m.batches[batchKey]
+	}
+	return u
+}
+
+// withIdem makes the undo restore the idempotency record key too.
+func (u *memUndo) withIdem(key string) *memUndo {
+	u.idemKey, u.idem = key, u.m.idem[key]
+	return u
+}
+
+func (u *memUndo) rollback() {
+	u.m.events, u.m.nextEvent = u.m.events[:u.events], u.nextEvent
+	*u.run = u.saved
+	if u.batchKey != "" {
+		if u.hadBatch {
+			u.m.batches[u.batchKey] = u.batch
+		} else {
+			delete(u.m.batches, u.batchKey)
+		}
+	}
+	if u.idemKey != "" {
+		if u.idem != nil {
+			u.m.idem[u.idemKey] = u.idem
+		} else {
+			delete(u.m.idem, u.idemKey)
+		}
+	}
+}
+
+func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResult, error) {
+	chain := outputChain(b.Lines)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[b.RunID]
+	if !ok || r.SandboxID != b.SandboxID {
+		return nil, ErrNotFound
+	}
+	if b.Attempt > 0 && b.Attempt != r.Attempt {
+		return nil, ErrStaleAttempt
+	}
+	res := &OutputResult{}
+	key := ""
+	prevComplete := false // of the batch's progress still in retention
+	if b.BatchID != "" {
+		key = b.RunID + "|" + b.BatchID
+		// Each record counts only within its retention, checked here and not left to a cleanup
+		// that other traffic happens to trigger (as in the Postgres store).
+		now := time.Now()
+		var rec *batchProgress
+		if v, ok := m.batches[key]; ok && !v.at.Before(now.Add(-outputBatchTTL)) {
+			rec = &v.batchProgress
+		}
+		legacy := -1 // a batch an older release stored or continued
+		if v, ok := m.idem[legacyBatchKey(b.RunID, b.BatchID)]; ok && !v.CreatedAt.Before(now.Add(-IdempotencyTTL)) {
+			legacy = v.Status
+		}
+		n, err := batchResume(rec, legacy, b, chain)
+		if err != nil {
+			return nil, err
+		}
+		res.Skipped = n
+		if rec != nil {
+			prevComplete = rec.complete
+		}
+	}
+	undo := m.undoFor(r, key)
+	if key != "" {
+		undo.withIdem(legacyBatchKey(b.RunID, b.BatchID))
+	}
+	rest := b.Lines[res.Skipped:]
+	at := time.Now()
+	for _, l := range rest {
+		e := &model.Event{SandboxID: b.SandboxID, Tenant: r.Tenant, Slug: r.Slug, RunID: b.RunID, Type: model.EventRunOutput, Data: l.Data, At: at}
+		m.appendEventLocked(e)
+		res.Events = append(res.Events, e)
+	}
+	if u, replace, ok := batchUsage(rest); ok && r.Status != model.RunDone && r.Status != model.RunFailed {
+		if replace {
+			r.Usage = u
+		} else {
+			r.Usage.Add(u)
+		}
+	}
+	if s := batchSession(rest); s != "" {
+		r.Session = s
+	}
+	if key != "" {
+		if m.batches == nil {
+			m.batches = map[string]memBatch{}
+		}
+		for k, v := range m.batches {
+			if v.at.Before(at.Add(-outputBatchTTL)) {
+				delete(m.batches, k)
+			}
+		}
+		m.batches[key] = memBatch{batchProgress: batchProgress{lines: len(b.Lines), hash: chain[len(b.Lines)], complete: prevComplete || !b.Partial}, at: at}
+		// The form an older release reads (see legacyBatchKey).
+		lk := legacyBatchKey(b.RunID, b.BatchID)
+		m.idem[lk] = &Idempotent{Key: lk, Status: len(b.Lines), Body: []byte{}, CreatedAt: at}
+	}
+	if err := faultAt(m, FaultOutput); err != nil {
+		undo.rollback()
+		return nil, err
+	}
+	res.Accepted = len(rest)
+	return res, nil
+}
+
+func (m *Memory) SettleRunWithEvents(_ context.Context, s Settle) (*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// The fence first, as in the Postgres store: a caller acting on a stale observation must
+	// learn that it is stale even when the run was settled meanwhile too. A plain ErrConflict
+	// would read as "settled elsewhere, carry on" and let it retire identities or move the
+	// sandbox on the strength of what it saw.
+	if f := s.Sandbox; f != nil {
+		if sb, ok := m.sandboxes[f.ID]; !ok || sb.Status != f.Status || f.Revision != 0 && sb.Revision != f.Revision {
+			return nil, ErrFenced
+		}
+	}
+	r, ok := m.runs[s.RunID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if s.Attempt > 0 && s.Attempt != r.Attempt {
+		return nil, ErrStaleAttempt
+	}
+	if !slices.Contains(s.From, r.Status) {
+		return nil, ErrConflict
+	}
+	undo := m.undoFor(r, "")
+	r.Status, r.ExitCode, r.FinishedAt = s.To, s.ExitCode, &s.FinishedAt
+	if s.Usage != nil {
+		r.Usage = *s.Usage
+	}
+	for _, e := range s.Events {
+		if e.Tenant == "" && e.Slug == "" {
+			e.Tenant, e.Slug = r.Tenant, r.Slug
+		}
+		m.appendEventLocked(e)
+	}
+	if err := faultAt(m, FaultSettle); err != nil {
+		undo.rollback()
+		for _, e := range s.Events {
+			e.ID = 0
+		}
+		return nil, err
+	}
+	out := *r
+	return &out, nil
+}
+
+func (m *Memory) ReclaimRun(ctx context.Context, sandboxID, owner string) (*model.Run, error) {
+	r, _, err := m.ClaimRunFor(ctx, sandboxID, "", time.Time{}, "", RunStamp{Owner: owner})
+	return r, err
+}
+
+func (m *Memory) ClaimRunFor(_ context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, *model.Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if stamp.Owner != "" {
+		busy := false
+		for _, c := range m.runsOf(sandboxID) {
+			if c.Status != model.RunRunning || c.ClaimedBy != stamp.Owner {
+				continue
+			}
+			if !c.ClaimAcked {
+				r := m.runs[c.ID]
+				r.Attempt++
+				out := *r
+				return &out, nil, nil
+			}
+			busy = true
+		}
+		if busy {
+			return nil, nil, ErrOwnerBusy
+		}
+	}
+	if runID == "" {
+		return nil, nil, ErrNotFound
+	}
+	r, ok := m.runs[runID]
+	if !ok || r.SandboxID != sandboxID {
+		return nil, nil, ErrNotFound
+	}
+	if r.Status != model.RunQueued {
+		return nil, nil, ErrConflict
+	}
+	r.Status, r.StartedAt = model.RunRunning, &startedAt
+	r.Attempt, r.ClaimedBy, r.ClaimAcked = r.Attempt+1, stamp.Owner, false
+	if r.Session == "" {
+		r.Session = session
+	}
+	r.AgentVersion, r.AgentRef, r.AgentRevision = stamp.AgentVersion, stamp.AgentRef, stamp.AgentRevision
+	r.EnvironmentRef, r.EnvironmentRevision = stamp.EnvironmentRef, stamp.EnvironmentRevision
+	start := &model.Event{SandboxID: sandboxID, Tenant: r.Tenant, Slug: r.Slug, RunID: r.ID, Type: model.EventRunStart, Data: r.AgentVersion}
+	m.appendEventLocked(start)
+	out := *r
+	return &out, start, nil
+}
+
+func (m *Memory) AckRunClaim(_ context.Context, runID string, attempt int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[runID]
+	if !ok {
+		return ErrNotFound
+	}
+	if r.Attempt != attempt {
+		return ErrStaleAttempt
+	}
+	r.ClaimAcked = true
+	return nil
+}
+
+func (m *Memory) EnsureRunEvent(_ context.Context, e *model.Event) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[e.RunID]
+	if !ok {
+		return false, ErrNotFound
+	}
+	for _, x := range m.events {
+		if x.SandboxID == e.SandboxID && x.RunID == e.RunID && x.Type == e.Type {
+			return false, nil
+		}
+	}
+	if e.Tenant == "" && e.Slug == "" {
+		e.Tenant, e.Slug = r.Tenant, r.Slug
+	}
+	m.appendEventLocked(e)
+	return true, nil
+}
 
 // LastEventID implements EventHead.
 func (m *Memory) LastEventID(context.Context) (int64, error) {
