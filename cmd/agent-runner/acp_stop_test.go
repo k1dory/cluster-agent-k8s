@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -20,11 +21,15 @@ func TestStopAdapterEndsWhatTheAdapterLeftBehind(t *testing.T) {
 	state := filepath.Join(home, ".state")
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
-	// The child keeps the pipes closed (so Wait does not hang on them) and keeps writing; where
-	// setsid exists (Linux) it also leaves the adapter's session and group, as Hermes's detached
-	// children do, so only the /proc sweep can reach it.
+	// The child keeps the pipes closed (so Wait does not hang on them) and keeps writing; on Linux
+	// it also leaves the adapter's session and group (setsid), as Hermes's detached children do,
+	// so only the /proc sweep can reach it. Elsewhere there is no /proc to sweep, and the group
+	// is all stopAdapter has.
 	detach := ""
-	if _, err := exec.LookPath("setsid"); err == nil {
+	if runtime.GOOS == "linux" {
+		if _, err := exec.LookPath("setsid"); err != nil {
+			t.Skip("no setsid here; the detached writer cannot be set up")
+		}
 		detach = "setsid "
 	}
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c",
@@ -38,23 +43,24 @@ func TestStopAdapterEndsWhatTheAdapterLeftBehind(t *testing.T) {
 		t.Fatal(err)
 	}
 	pgid := cmd.Process.Pid
-	// Independent of the helper under test: when the assertion below fails, the writer must not
-	// outlive the test and race the TempDir's removal. Runs before the TempDir cleanup (LIFO).
+	// Independent of the helper under test: when an assertion below fails, the writer must not
+	// outlive the test and race the TempDir's removal. Runs before the TempDir cleanup (LIFO);
+	// the writer's pid is known once it has written its pid file.
+	var writer int
 	t.Cleanup(func() {
 		until := time.Now().Add(2 * time.Second)
 		for time.Now().Before(until) {
 			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			if writer > 0 {
+				_ = syscall.Kill(writer, syscall.SIGKILL)
+			}
 			var ws syscall.WaitStatus
 			for {
 				if pid, err := syscall.Wait4(-pgid, &ws, syscall.WNOHANG, nil); pid <= 0 || err != nil {
 					break
 				}
 			}
-			for _, pid := range processesWithEnv(home) {
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-				_, _ = syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
-			}
-			if !groupAlive(pgid) && len(processesWithEnv(home)) == 0 {
+			if !groupAlive(pgid) && (writer <= 0 || !processAlive(writer)) {
 				return
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -74,7 +80,7 @@ func TestStopAdapterEndsWhatTheAdapterLeftBehind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	writer, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
+	writer, _ = strconv.Atoi(strings.TrimSpace(string(raw)))
 	stopAdapter(stdin, cancel, cmd, home) // the adapter (cat) leaves on EOF; the child stays unless ended
 	if groupAlive(pgid) {
 		t.Fatal("the adapter's process group is still alive after stopAdapter")
