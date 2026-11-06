@@ -20,9 +20,9 @@ import (
 // client shares one bucket, so a proxy deployment either keeps the address (PROXY protocol,
 // a direct listener) or turns the limit off and limits at the proxy.
 type RateLimit struct {
-	Off   bool
-	Burst int           // default 30
-	Every time.Duration // default 1s
+	Off   bool          `yaml:"off"`
+	Burst int           `yaml:"burst"` // default 30
+	Every time.Duration `yaml:"every"` // default 1s
 }
 
 func (c RateLimit) withDefaults() RateLimit {

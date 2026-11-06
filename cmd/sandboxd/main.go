@@ -393,6 +393,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 		Keys: &apikeys.Service{Store: st, MaxTTL: cfg.APIKeys.MaxTTL}, Credentials: creds, OAuth: oauth,
 		Pricing: usage.Pricing{PodHourUSD: cfg.Accounting.PodHourUSD}, Build: buildVersion(), Replica: replicaName(), Log: log.With("log", "api")}
 	services.Install(platform)
+	platform.AuthLimit = cfg.AuthLimit // per-address limit on CI exchanges and failed bearer tokens
 	// CI jobs trade their provider's ID token for a key of the trusting tenant.
 	platform.CIAuth = &ciauth.Service{Trusts: st, Keys: platform.Keys, Uses: st, MaxTTL: cfg.CIAuth.MaxTTL, Log: log.With("log", "ci-auth")}
 	if cfg.OIDC != nil {

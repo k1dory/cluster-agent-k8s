@@ -423,6 +423,10 @@ request looks the key up, so revocation needs no restart and no cache to expire.
 caps the lifetime a key may be issued with; an expiring key bounds the sandboxes it creates like an
 expiring OIDC token does. `GET /v1/whoami` shows `subject: key:<id>`.
 
+Failed bearer tokens and `POST /v1/auth/ci` are rate limited per client address (`auth_limit`:
+`burst` 30 attempts at once, then one per `every`, 1s; `off: true` behind a proxy that hides client
+addresses). Over the budget every token from that address is 429 with `Retry-After`, unchecked.
+
 
 ```yaml
 oidc:

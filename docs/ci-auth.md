@@ -90,15 +90,20 @@ the `SANDBOXD_URL` variable, are then all the repository needs.
   none) fetches the set again, at most once a minute, so a rotation never needs a restart.
   Each issuer is fetched under its own lock: a slow issuer delays its own tokens and no other.
 - Exchanges are rate limited per source address, as are failed bearer tokens on every route:
-  30 at once, then one per second, per replica; over that is 429 with `Retry-After`. The
-  address is the connection's, so behind a proxy that hides it every job shares one budget:
-  keep the client address at the listener or limit at the proxy.
+  30 at once, then one per second, per replica (`auth_limit` below); over that is 429 with
+  `Retry-After`. The address is the connection's, so behind a proxy that hides it every job
+  shares one budget: keep the client address at the listener, or set `auth_limit.off` and
+  limit at the proxy.
 
 ## Server configuration
 
 ```yaml
 ci_auth:
   max_ttl: 1h     # caps spec.ttl of every trust (default 1h)
+auth_limit:       # per client address: CI exchanges and failed bearer tokens
+  burst: 30       # attempts at once (default 30)
+  every: 1s       # one more per interval (default 1s)
+  off: false      # true behind a proxy that hides client addresses
 ```
 
 CI authentication needs the key service (`api_keys`), which is always on. The exchange route
