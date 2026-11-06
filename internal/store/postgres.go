@@ -1426,10 +1426,14 @@ func scanCredential(row pgx.Row) (*model.Credential, error) {
 }
 
 func (p *Postgres) PutCredential(ctx context.Context, c *model.Credential, ciphertext []byte) (bool, error) {
+	return putCredential(ctx, p.pool, c, ciphertext)
+}
+
+func putCredential(ctx context.Context, q rowQuerier, c *model.Credential, ciphertext []byte) (bool, error) {
 	// One statement: an insert, or on conflict a replacement that bumps the version and keeps
 	// who created it and when. xmax = 0 tells an insert from an update.
 	var created bool
-	err := p.pool.QueryRow(ctx, `INSERT INTO credentials (tenant, name, version, fingerprint, ciphertext, created_by, created_at, updated_at)
+	err := q.QueryRow(ctx, `INSERT INTO credentials (tenant, name, version, fingerprint, ciphertext, created_by, created_at, updated_at)
 		VALUES ($1,$2,1,$3,$4,$5,now(),now())
 		ON CONFLICT (tenant, name) DO UPDATE SET version=credentials.version+1, fingerprint=EXCLUDED.fingerprint, ciphertext=EXCLUDED.ciphertext, updated_at=now()
 		RETURNING version, created_by, created_at, updated_at, (xmax = 0)`,
@@ -1495,11 +1499,15 @@ func scanOAuth(row pgx.Row, extra ...any) (*model.OAuthCredential, error) {
 }
 
 func (p *Postgres) PutOAuthCredential(ctx context.Context, c *model.OAuthCredential, ciphertext []byte) (bool, error) {
+	return putOAuthCredential(ctx, p.pool, c, ciphertext)
+}
+
+func putOAuthCredential(ctx context.Context, q rowQuerier, c *model.OAuthCredential, ciphertext []byte) (bool, error) {
 	// One statement: a new sign-in, or the old row replaced whole (the generation bumped so a
 	// replica still polling or refreshing the old one cannot save over it, the lease dropped,
 	// the creation kept). xmax = 0 tells an insert from an update.
 	var created bool
-	err := p.pool.QueryRow(ctx, `INSERT INTO oauth_credentials (tenant, name, provider, status, generation, verification_url, user_code,
+	err := q.QueryRow(ctx, `INSERT INTO oauth_credentials (tenant, name, provider, status, generation, verification_url, user_code,
 			login_expires_at, account_id, expires_at, refreshed_at, next_at, error, ciphertext, created_by, created_at, updated_at, lease_owner, lease_until)
 		VALUES ($1,$2,$3,$4,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,now(),now(),'',NULL)
 		ON CONFLICT (tenant, name) DO UPDATE SET provider=EXCLUDED.provider, status=EXCLUDED.status, generation=oauth_credentials.generation+1,
@@ -2360,4 +2368,72 @@ func (p *Postgres) EnsureRunEvent(ctx context.Context, e *model.Event) (bool, er
 		return insertEventsTx(ctx, tx, tenant, slug, []*model.Event{e})
 	})
 	return added && err == nil, err
+}
+
+// LastEventID implements EventHead: the newest visible id. It is a safe boundary because ids
+// follow commit order (AppendEvent draws its id under eventsLockSQL, held to the commit): when
+// N is visible, every id below N is committed or never will be, and an insert still in flight
+// takes an id above N, so it is never mistaken for history. Without that lock a smaller id
+// could commit after N and fall below a cursor already past it.
+func (p *Postgres) LastEventID(ctx context.Context) (int64, error) {
+	var id int64
+	err := p.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM events`).Scan(&id)
+	return id, err
+}
+
+// rowQuerier is what a single-statement write needs: the pool, or a transaction.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// PutCredentialIfFree implements CredentialNames.
+func (p *Postgres) PutCredentialIfFree(ctx context.Context, c *model.Credential, ciphertext []byte, signIns []string) (bool, error) {
+	var created bool
+	err := p.credentialNames(ctx, c.Tenant, "oauth_credentials", signIns, func(tx pgx.Tx) (err error) {
+		created, err = putCredential(ctx, tx, c, ciphertext)
+		return err
+	})
+	return created, err
+}
+
+// PutOAuthCredentialIfFree implements CredentialNames.
+func (p *Postgres) PutOAuthCredentialIfFree(ctx context.Context, c *model.OAuthCredential, ciphertext []byte, plains []string) (bool, error) {
+	var created bool
+	err := p.credentialNames(ctx, c.Tenant, "credentials", plains, func(tx pgx.Tx) (err error) {
+		created, err = putOAuthCredential(ctx, tx, c, ciphertext)
+		return err
+	})
+	return created, err
+}
+
+// credentialNamesHook, when set (tests), runs between the check and the write.
+var credentialNamesHook func(ctx context.Context, tx pgx.Tx)
+
+// credentialNames checks that none of names is in the other table and writes, in one
+// transaction holding the scope's lock: replicas writing the two kinds at once serialise on
+// it, and a connection lost after the check takes its write down with it (nothing commits).
+func (p *Postgres) credentialNames(ctx context.Context, tenant, other string, names []string, write func(tx pgx.Tx) error) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "credentials:"+tenant); err != nil {
+		return err
+	}
+	var held string
+	err = tx.QueryRow(ctx, `SELECT name FROM `+other+` WHERE tenant=$1 AND name = ANY($2) ORDER BY name LIMIT 1`, tenant, names).Scan(&held)
+	if err == nil {
+		return &NameTakenError{Name: held}
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+	if credentialNamesHook != nil {
+		credentialNamesHook(ctx, tx)
+	}
+	if err := write(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }

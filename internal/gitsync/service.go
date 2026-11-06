@@ -288,6 +288,12 @@ func (s *Service) sync(ctx context.Context, it *model.CatalogItem, sp gitrepo.Sp
 	}
 	files, err := s.Fetch.Files(ctx, r, commit, sp.Paths)
 	if err != nil {
+		// Bundles over the size bounds are the repository's content, not its reachability:
+		// refused before anything is applied, as an invalid bundle (422, recorded invalid, a
+		// push job not retried: the same commit is as large next time), not a read (502).
+		if errors.Is(err, ErrTooLarge) {
+			return finish(model.GitSyncInvalid, fmt.Errorf("%w: %v", ErrInvalid, err))
+		}
 		return finish(model.GitSyncError, fmt.Errorf("%w: %v", ErrRead, err))
 	}
 	// The documents are applied with the repository's authority, never the caller's: a tenant's

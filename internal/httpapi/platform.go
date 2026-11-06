@@ -15,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -868,54 +869,12 @@ func (p *Platform) events(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, evs)
 		return
 	}
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-
-	ch, cancel := p.Hub.Subscribe(id)
-	defer cancel()
-	send := func(e model.Event) {
-		b, _ := json.Marshal(e)
-		fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Type, b)
-		fl.Flush()
-	}
-	// Replay, then live. Events published during replay are buffered in the channel.
-	for {
-		f.Limit = 500
-		evs, err := p.Orch.Store.QueryEvents(r.Context(), f)
-		if err != nil || len(evs) == 0 {
-			break
-		}
-		for _, e := range evs {
-			send(*e)
-			f.AfterID = e.ID
-		}
-	}
-	after := f.AfterID
-	keepalive := time.NewTicker(20 * time.Second)
-	defer keepalive.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case e := <-ch:
-			if e.ID > after {
-				if f.RunID == "" || e.RunID == f.RunID {
-					send(e)
-				}
-				after = e.ID
-			}
-		case <-keepalive.C:
-			fmt.Fprint(w, ": keepalive\n\n")
-			fl.Flush()
-		}
-	}
+	streamSSE(w, r, hubWake(p.Hub, id), 20*time.Second, f.AfterID, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
+		g := f
+		g.AfterID, g.Limit = after, ssePageSize
+		evs, err := p.Orch.Store.QueryEvents(ctx, g)
+		return eventItems(evs), lastID(evs, after), err
+	})
 }
 
 func (p *Platform) setPreview(w http.ResponseWriter, r *http.Request) {
@@ -1008,13 +967,28 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		from = now.Add(-d)
 	}
 	after := q.int64("after", 0)
+	// A bounded stream's frames carry `<event id>:<replay boundary>`: a resume keeps the
+	// boundary of the stream it resumes, so what that stream followed live past ?to is not
+	// re-judged by the window against a newer head (which would skip it for good).
+	resumeHead := int64(-1)
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
-		n, err := strconv.ParseInt(v, 10, 64)
+		id, head, bounded := strings.Cut(v, ":")
+		n, err := strconv.ParseInt(id, 10, 64)
+		var h int64
+		if err == nil && bounded {
+			h, err = strconv.ParseInt(head, 10, 64)
+			if err == nil && h < 0 {
+				err = errors.New("negative")
+			}
+		}
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, errors.New("Last-Event-ID must be an integer"))
+			writeErr(w, http.StatusBadRequest, errors.New("Last-Event-ID must be an event id, or <event id>:<boundary> as a bounded trace sends it"))
 			return
 		}
 		after = n
+		if bounded {
+			resumeHead = h
+		}
 	}
 	limit := q.limit(500, 5000)
 	stream := q.boolean("stream", false)
@@ -1053,55 +1027,106 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, evs)
 		return
 	}
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
-		return
-	}
-	want := func(e *model.Event) bool {
-		g := f
-		g.Limit, g.To = 0, time.Time{}
-		return matches(g, e)
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	ch, cancel := p.Hub.Subscribe(events.All)
-	defer cancel()
-	send := func(e model.Event) {
-		b, _ := json.Marshal(e)
-		fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Type, b)
-		fl.Flush()
-	}
-	for {
-		g := f
-		g.AfterID, g.Limit = after, 500
-		evs, err := p.Orch.Store.QueryEvents(r.Context(), g)
-		if err != nil || len(evs) == 0 {
-			break
+	// The replay keeps the window; what is appended after the stream subscribed is followed
+	// live past any ?to (as it always has); ?from applies to both. The head is read before the
+	// subscription and the first read of the log comes after it: an event appended in between
+	// has an id above the head, so it is live, read by that first drain. Read after the
+	// subscription instead, the head took such an event in, the window excluded it and the
+	// cursor moved past it. A failed head read is the stream's error frame, as a failed read
+	// of the log is: the client reconnects from its cursor.
+	var head int64
+	live := f
+	live.To = time.Time{}
+	// bounded names a bounded stream's frames by event id and boundary (see resumeHead).
+	bounded := func(items []sseItem) []sseItem {
+		if f.To.IsZero() || head == math.MaxInt64 {
+			return items
 		}
-		for _, e := range evs {
-			send(*e)
-			after = e.ID
+		for i := range items {
+			items[i].Cursor = fmt.Sprintf("%d:%d", items[i].ID, head)
 		}
+		return items
 	}
-	keepalive := time.NewTicker(20 * time.Second)
-	defer keepalive.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case e := <-ch:
-			if e.ID > after && want(&e) {
-				send(e)
-				after = e.ID
+	open := func(ctx context.Context) (<-chan struct{}, func(), string, error) {
+		var err error
+		if resumeHead >= 0 && !f.To.IsZero() {
+			head = resumeHead
+		} else if head, err = p.traceHead(ctx, f); err != nil {
+			return nil, nil, "", err
+		}
+		wake, cancel := p.Hub.Wake(events.All, f.Types...)
+		// The boundary reaches the client before any event does: a bounded stream with no
+		// matching history would otherwise give it none, and its resume would capture a new
+		// head, re-apply the window to it and skip what was committed meanwhile.
+		checkpoint := ""
+		if !f.To.IsZero() && head < math.MaxInt64 {
+			checkpoint = fmt.Sprintf("%d:%d", after, head)
+		}
+		return wake, cancel, checkpoint, nil
+	}
+	streamSSE(w, r, open, 20*time.Second, after, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
+		if after >= head {
+			g := live
+			g.AfterID, g.Limit = after, ssePageSize
+			evs, err := p.Orch.Store.QueryEvents(ctx, g)
+			return bounded(eventItems(evs)), lastID(evs, after), err
+		}
+		// The replay: the window, and ids up to the head only. An event above the head is
+		// live whatever its time, and ids and times disagree across replicas: H+1 outside the
+		// window, H+2 inside it, a replay that sent H+2 moved the cursor past H+1 for good.
+		// The page is in id order, so cutting it at the head is exact.
+		g := f
+		g.AfterID, g.Limit = after, ssePageSize
+		evs, err := p.Orch.Store.QueryEvents(ctx, g)
+		if err != nil {
+			return nil, after, err
+		}
+		n := len(evs)
+		for i, e := range evs {
+			if e.ID > head {
+				n = i
+				break
 			}
-		case <-keepalive.C:
-			fmt.Fprint(w, ": keepalive\n\n")
-			fl.Flush()
 		}
+		next := lastID(evs[:n], after)
+		if (n < len(evs) || len(evs) < g.Limit) && head < math.MaxInt64 {
+			// The window holds nothing more up to the head: live from the head on.
+			next = head
+		}
+		return bounded(eventItems(evs[:n])), next, nil
+	})
+}
+
+// traceHead is where a trace stream's bounded replay ends and live following begins: the
+// newest event id just before the stream subscribes (store.EventHead: ids follow commits).
+// Without ?to there is no window and the stream follows the log from the start (0); a store
+// that cannot tell its head keeps the window for the whole stream (MaxInt64).
+func (p *Platform) traceHead(ctx context.Context, f store.Filter) (int64, error) {
+	if f.To.IsZero() {
+		return 0, nil
 	}
+	h, ok := p.Orch.Store.(store.EventHead)
+	if !ok {
+		return math.MaxInt64, nil
+	}
+	return h.LastEventID(ctx)
+}
+
+// eventItems turns a page of the log into SSE frames named by event type.
+func eventItems(evs []*model.Event) []sseItem {
+	items := make([]sseItem, 0, len(evs))
+	for _, e := range evs {
+		items = append(items, sseItem{ID: e.ID, Event: e.Type, Data: e})
+	}
+	return items
+}
+
+// lastID is the cursor after a page: its last event, or after when it is empty.
+func lastID(evs []*model.Event, after int64) int64 {
+	if len(evs) == 0 {
+		return after
+	}
+	return evs[len(evs)-1].ID
 }
 
 // matches applies a store.Filter to one live event (same semantics as the store query).

@@ -1899,44 +1899,69 @@ func (c *cli) chat(id string, raw bool) error {
 
 // followMessages prints the conversation as it grows (SSE, reconnecting with Last-Event-ID).
 func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bool, state *chatState) {
+	var retry backoff
+	var cursor string
+	if after > 0 {
+		cursor = strconv.FormatInt(after, 10)
+	}
 	for ctx.Err() == nil {
 		req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/sandboxes/%s/messages/stream?raw=%v", c.base, id, raw), nil)
 		req.Header.Set("Authorization", "Bearer "+c.token)
 		req.Header.Set("Accept", "text/event-stream")
-		if after > 0 {
-			req.Header.Set("Last-Event-ID", fmt.Sprint(after))
+		if cursor != "" {
+			req.Header.Set("Last-Event-ID", cursor)
 		}
 		resp, err := (&http.Client{}).Do(req)
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || !retry.wait(ctx) {
 				return
 			}
-			time.Sleep(2 * time.Second)
 			continue
 		}
 		if resp.StatusCode != 200 {
 			resp.Body.Close()
+			if transientStatus(resp.StatusCode) {
+				fmt.Fprintln(os.Stderr, "chat: stream:", resp.Status, "(retrying)")
+				if !retry.wait(ctx) {
+					return
+				}
+				continue
+			}
 			fmt.Fprintln(os.Stderr, "chat: stream:", resp.Status)
 			return
 		}
-		sc := bufio.NewScanner(resp.Body)
-		sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
-		for sc.Scan() {
-			line := sc.Text()
-			if !strings.HasPrefix(line, "data: ") {
-				continue
+		rerr := readSSE(resp.Body, func(f sseFrame) bool {
+			if msg, ok := streamError(f); ok {
+				fmt.Fprintln(os.Stderr, "chat: stream:", msg, "(reconnecting)")
+				return false
+			}
+			if checkpoint(f) {
+				if f.ID != "" {
+					cursor = f.ID
+				}
+				return true
 			}
 			var m model.Message
-			if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) != nil {
-				continue
+			if json.Unmarshal([]byte(f.Data), &m) != nil {
+				return true
 			}
-			after = m.ID
+			retry.reset()
+			cursor = frameCursor(f, m.ID)
 			state.observe(m)
 			if m.Role != model.RoleUser { // what you typed is already on your screen
 				printMessage(m)
 			}
-		}
+			return true
+		})
 		resp.Body.Close()
+		// The server never ends a stream on its own: an error frame, a reset or a truncated
+		// body alike are a reconnect from the cursor after the backoff, never at once.
+		if rerr != nil && ctx.Err() == nil {
+			fmt.Fprintln(os.Stderr, "chat: stream:", rerr, "(reconnecting)")
+		}
+		if !retry.wait(ctx) {
+			return
+		}
 	}
 }
 
@@ -1945,11 +1970,12 @@ func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bo
 func (c *cli) follow(path string, raw bool, print func(model.Event) bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	var after int64
+	var cursor string
+	var retry backoff
 	for ctx.Err() == nil {
 		req, _ := http.NewRequestWithContext(ctx, "GET", c.base+path, nil)
-		if after > 0 {
-			req.Header.Set("Last-Event-ID", fmt.Sprint(after))
+		if cursor != "" {
+			req.Header.Set("Last-Event-ID", cursor)
 		}
 		req.Header.Set("Authorization", "Bearer "+c.token)
 		req.Header.Set("Accept", "text/event-stream")
@@ -1959,43 +1985,61 @@ func (c *cli) follow(path string, raw bool, print func(model.Event) bool) error 
 				return nil
 			}
 			fmt.Fprintln(os.Stderr, "watch:", err, "(retrying)")
-			time.Sleep(2 * time.Second)
+			retry.wait(ctx)
 			continue
 		}
 		if resp.StatusCode != 200 {
-			b, _ := io.ReadAll(resp.Body)
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
+			if transientStatus(resp.StatusCode) {
+				// The server or its database is down for now (a 5xx before the stream began):
+				// the same cursor again later, as after an error frame.
+				fmt.Fprintln(os.Stderr, "watch:", resp.Status, "(retrying)")
+				retry.wait(ctx)
+				continue
+			}
 			return fmt.Errorf("events: %s: %s", resp.Status, strings.TrimSpace(string(b)))
 		}
-		sc := bufio.NewScanner(resp.Body)
-		sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
-		for sc.Scan() {
-			line := sc.Text()
-			if !strings.HasPrefix(line, "data: ") {
-				continue
+		done := false
+		rerr := readSSE(resp.Body, func(f sseFrame) bool {
+			// The error frame is not an event: taken for one, its id 0 became the cursor and
+			// the reconnect replayed everything already shown.
+			if msg, ok := streamError(f); ok {
+				fmt.Fprintln(os.Stderr, "watch:", msg, "(reconnecting)")
+				return false
+			}
+			if checkpoint(f) {
+				if f.ID != "" {
+					cursor = f.ID
+				}
+				return true
 			}
 			var e model.Event
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &e); err != nil {
-				continue
+			if err := json.Unmarshal([]byte(f.Data), &e); err != nil {
+				return true
 			}
-			after = e.ID
-			if raw {
-				fmt.Println(strings.TrimPrefix(line, "data: "))
-				continue
-			}
-			if print == nil {
+			retry.reset()
+			cursor = frameCursor(f, e.ID)
+			switch {
+			case raw:
+				fmt.Println(f.Data)
+			case print == nil:
 				printTrace(e)
-				continue
+			case print(e):
+				done = true
+				return false
 			}
-			if print(e) {
-				resp.Body.Close()
-				return nil
-			}
-		}
+			return true
+		})
 		resp.Body.Close()
-		if ctx.Err() == nil {
-			time.Sleep(time.Second)
+		if done {
+			return nil
 		}
+		// An error frame, a reset or a truncated body: the same cursor after the backoff.
+		if rerr != nil && ctx.Err() == nil {
+			fmt.Fprintln(os.Stderr, "watch:", rerr, "(reconnecting)")
+		}
+		retry.wait(ctx)
 	}
 	return nil
 }
