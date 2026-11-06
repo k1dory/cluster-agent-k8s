@@ -151,7 +151,7 @@ func Build(ctx context.Context, st store.Store, q Query, pr Pricing, now time.Ti
 		return r
 	}
 
-	runs, err := st.QueryRuns(ctx, f)
+	runs, err := allRuns(ctx, st, f)
 	if err != nil {
 		return nil, err
 	}
@@ -214,6 +214,28 @@ type span struct {
 
 // podSeconds sums the intervals during which each sandbox had a pod, clipped to the window.
 // A pod is up from the `waking` status until `stopping`, `sleeping`, `error` or `deleting`.
+// runPage is how many runs one query returns while the report walks the window.
+const runPage = 1000
+
+// allRuns returns every run matching f, page by page: a store caps a query without a limit
+// (store.MaxRunsPerQuery), and a report built from one capped query would silently under-count.
+func allRuns(ctx context.Context, st store.Store, f store.Filter) ([]*model.Run, error) {
+	f.Limit, f.Cursor = runPage, store.Cursor{}
+	var out []*model.Run
+	for {
+		page, err := st.QueryRuns(ctx, f)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, page...)
+		if len(page) < f.Limit {
+			return out, nil
+		}
+		last := page[len(page)-1]
+		f.Cursor = store.Cursor{At: last.CreatedAt, ID: last.ID}
+	}
+}
+
 func podSeconds(ctx context.Context, st store.Store, f store.Filter, now time.Time) map[dims][]span {
 	// Status events before the window matter: a pod that woke yesterday is still up today.
 	// The store caps a page (Postgres: 1000 rows), so the log is walked page by page.

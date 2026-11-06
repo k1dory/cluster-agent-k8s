@@ -293,8 +293,11 @@ func serve(cfgPath string, log *slog.Logger) error {
 	// Events appended by any replica (this one included) reach the SSE clients through the store,
 	// so the orchestrator does not publish locally as well.
 	listener, hasListener := st.(store.EventListener)
+	listening := make(chan struct{})
 	if hasListener {
-		go listener.ListenEvents(ctx, func(e *model.Event) { hub.Publish(*e) })
+		go listener.ListenEvents(ctx, func() { close(listening) }, func(e *model.Event) { hub.Publish(*e) })
+	} else {
+		close(listening)
 	}
 	// The environment version: everything that shapes a pod besides the task. A change here
 	// shows as drift between a sandbox's env_version and GET /v1/version.
@@ -327,11 +330,6 @@ func serve(cfgPath string, log *slog.Logger) error {
 		DefaultHarnessInput: cfg.Kube.HarnessInput,
 	}, log)
 	orch.ListenerPublishes = hasListener
-	orchDone := make(chan struct{})
-	go func() { // reconciler on the replica holding the lease
-		orch.Run(ctx)
-		close(orchDone)
-	}()
 
 	var secretProvider secrets.Provider = secrets.Static{}
 	switch cfg.Secrets.Provider {
@@ -379,10 +377,19 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	// The configuration services: ownership guard, quotas, connections, catalogue (one wiring
 	// for sandboxd and the integration tests, see internal/app).
-	services, err := app.Wire(ctx, app.Deps{Store: st, Policies: pols, Secrets: secretProvider, Orch: orch, Log: log, CITrustMaxTTL: cfg.CIAuth.MaxTTL})
+	services, err := app.Wire(ctx, app.Deps{Store: st, Policies: pols, Secrets: secretProvider, Orch: orch, Log: log, Replica: replicaName(), CITrustMaxTTL: cfg.CIAuth.MaxTTL})
 	if err != nil {
 		return err
 	}
+	// The reconciler starts only now: Wire installs the ownership guard and the quotas on the
+	// orchestrator, and a replica that wins the lease reconciles at once. Started earlier, the
+	// first pass ran without them (revoked slugs kept running) and Wire wrote both fields under
+	// a goroutine already reading them.
+	orchDone := make(chan struct{})
+	go func() { // reconciler on the replica holding the lease
+		orch.Run(ctx)
+		close(orchDone)
+	}()
 	services.Watch(ctx, log)
 	if startSyncer != nil {
 		startSyncer(services.Guard, services.Connections)
@@ -432,6 +439,13 @@ func serve(cfgPath string, log *slog.Logger) error {
 	}
 	if ing != nil {
 		servers = append(servers, &http.Server{Addr: cfg.Listen.Ingress, Handler: ing, ReadHeaderTimeout: 10 * time.Second})
+	}
+	// No request before the event listener knows where its feed starts: an event appended earlier
+	// would fall below its cursor and never reach this replica's hub (see store.EventListener).
+	select {
+	case <-listening:
+	case <-ctx.Done():
+		servers = nil // shutting down before serving: straight to the lease hand-over below
 	}
 	errCh := make(chan error, len(servers))
 	for _, s := range servers {

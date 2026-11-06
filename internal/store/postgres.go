@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,11 +51,57 @@ func OpenPostgres(ctx context.Context, url string) (*Postgres, error) {
 	return &Postgres{pool: pool, lockers: make(chan struct{}, max(1, int(cfg.MaxConns)/2))}, nil
 }
 
-// migrate applies the schema under an advisory lock: replicas start together (a rollout
-// recreates them at once), and CREATE ... IF NOT EXISTS is not safe against itself on a fresh
-// database (two creators of one type collide on pg_type's unique index). One replica
-// migrates, the others wait and find everything in place.
+// migration is one step of migrations.sql.
+type migration struct {
+	version int
+	name    string
+	sql     string
+}
+
+var (
+	stepRe   = regexp.MustCompile(`(?m)^-- step (\d+): (.+)$`)
+	alwaysRe = regexp.MustCompile(`(?m)^-- every start: .+$`)
+)
+
+// parseMigrations splits the schema file at its "-- step N: name" lines, and returns the
+// "-- every start:" section that follows the last step separately. Steps must be numbered
+// 1, 2, 3... in order: a gap or a duplicate is a mistake in the file, not something to skip.
+func parseMigrations(src string) (steps []migration, always string, err error) {
+	if loc := alwaysRe.FindStringIndex(src); loc != nil {
+		src, always = src[:loc[0]], src[loc[1]:]
+		if stepRe.MatchString(always) {
+			return nil, "", fmt.Errorf("migrations: a step after the every-start section")
+		}
+	}
+	locs := stepRe.FindAllStringSubmatchIndex(src, -1)
+	if len(locs) == 0 {
+		return nil, "", fmt.Errorf("migrations: no step markers")
+	}
+	for i, l := range locs {
+		v, _ := strconv.Atoi(src[l[2]:l[3]])
+		if v != i+1 {
+			return nil, "", fmt.Errorf("migrations: step %d where step %d was expected", v, i+1)
+		}
+		end := len(src)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		steps = append(steps, migration{version: v, name: strings.TrimSpace(src[l[4]:l[5]]), sql: src[l[1]:end]})
+	}
+	return steps, always, nil
+}
+
+// migrate applies the steps a database has not recorded yet, under an advisory lock: replicas
+// start together (a rollout recreates them at once), and CREATE ... IF NOT EXISTS is not safe
+// against itself on a fresh database (two creators of one type collide on pg_type's unique
+// index). One replica migrates, the others wait and find the steps recorded. A database at the
+// latest step runs no DDL at all (only the every-start row repairs); one written by a newer release (a step this binary does not
+// know) is left alone, so an older replica still starts during a rolling update.
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	steps, always, err := parseMigrations(migrations)
+	if err != nil {
+		return err
+	}
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return err
@@ -62,11 +110,58 @@ func migrate(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock(hashtext('agent-sandbox:migrations'))`); err != nil {
 		return err
 	}
-	_, merr := conn.Exec(ctx, migrations)
+	merr := applySteps(ctx, conn.Conn(), steps)
+	if merr == nil && strings.TrimSpace(always) != "" {
+		if _, err := conn.Exec(ctx, always); err != nil {
+			merr = fmt.Errorf("migrations, every-start repairs: %w", err)
+		}
+	}
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_unlock(hashtext('agent-sandbox:migrations'))`); err != nil && merr == nil {
 		return err
 	}
 	return merr
+}
+
+func applySteps(ctx context.Context, conn *pgx.Conn, steps []migration) error {
+	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version    integer PRIMARY KEY,
+		name       text NOT NULL,
+		applied_at timestamptz NOT NULL DEFAULT now())`); err != nil {
+		return err
+	}
+	applied := map[int]bool{}
+	rows, err := conn.Query(ctx, `SELECT version FROM schema_migrations`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return err
+		}
+		applied[v] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, st := range steps {
+		if applied[st.version] {
+			continue
+		}
+		err := pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, st.sql); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO schema_migrations (version, name) VALUES ($1, $2)`, st.version, st.name)
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("migration %d (%s): %w", st.version, st.name, err)
+		}
+	}
+	return nil
 }
 
 // dedicated opens a connection outside the pool for long-held session state (locks, LISTEN).
@@ -275,16 +370,49 @@ const eventsChannel = "agent_sandbox_events"
 
 // ListenEvents feeds events appended by any replica to fn, in id order, until ctx ends.
 // NOTIFY wakes the loop; the query by id guarantees nothing is skipped or duplicated even
-// when notifications coalesce or the connection is replaced.
-func (p *Postgres) ListenEvents(ctx context.Context, fn func(e *model.Event)) {
-	var last int64
-	_ = p.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM events`).Scan(&last)
+// when notifications coalesce or the connection is replaced. ready is called once the starting
+// cursor is known (see EventListener).
+func (p *Postgres) ListenEvents(ctx context.Context, ready func(), fn func(e *model.Event)) {
+	listenLoop(ctx, func(ctx context.Context) (int64, error) {
+		var id int64
+		err := p.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM events`).Scan(&id)
+		return id, err
+	}, ready, func(ctx context.Context, last *int64) error { return p.listenOnce(ctx, last, fn) }, 2*time.Second)
+}
+
+// listenLoop is ListenEvents without the database: the cursor read, the readiness signal and
+// one listening session, retried every wait until ctx ends.
+func listenLoop(ctx context.Context, read func(context.Context) (int64, error), ready func(), once func(context.Context, *int64) error, wait time.Duration) {
+	last, ok := listenStart(ctx, read, wait)
+	if !ok {
+		return
+	}
+	if ready != nil {
+		ready()
+	}
 	for ctx.Err() == nil {
-		if err := p.listenOnce(ctx, &last, fn); err != nil && ctx.Err() == nil {
+		if err := once(ctx, &last); err != nil && ctx.Err() == nil {
 			select {
 			case <-ctx.Done():
-			case <-time.After(2 * time.Second):
+			case <-time.After(wait):
 			}
+		}
+	}
+}
+
+// listenStart reads where the feed begins (the newest event now: older ones were published by
+// whoever appended them), retrying until it succeeds. Starting from 0 after a failed read would
+// replay the whole events table into the hub. ok=false when ctx ended first.
+func listenStart(ctx context.Context, read func(context.Context) (int64, error), wait time.Duration) (int64, bool) {
+	for {
+		last, err := read(ctx)
+		if err == nil {
+			return last, true
+		}
+		select {
+		case <-ctx.Done():
+			return 0, false
+		case <-time.After(wait):
 		}
 	}
 }
@@ -495,13 +623,38 @@ func (p *Postgres) GetRun(ctx context.Context, id string) (*model.Run, error) {
 	return scanRun(p.pool.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE id=$1`, id))
 }
 
-func (p *Postgres) UpdateRun(ctx context.Context, r *model.Run) error {
-	u := r.Usage
-	tag, err := p.pool.Exec(ctx, `UPDATE runs SET status=$2, exit_code=$3, started_at=$4, finished_at=$5,
-		model=$6, input_tokens=$7, output_tokens=$8, cache_read_tokens=$9, cache_write_tokens=$10, cost_usd=$11, turns=$12,
-		agent_version=$13, session=$14, agent_ref=$15, agent_revision=$16, environment_ref=$17, environment_revision=$18 WHERE id=$1`,
-		r.ID, r.Status, r.ExitCode, r.StartedAt, r.FinishedAt, u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
-		r.AgentVersion, r.Session, r.AgentRef, r.AgentRevision, r.EnvironmentRef, r.EnvironmentRevision)
+// runExists turns "no row matched the condition" into ErrNotFound or ErrConflict.
+func (p *Postgres) runExists(ctx context.Context, id string) error {
+	if _, err := p.GetRun(ctx, id); err != nil {
+		return err
+	}
+	return ErrConflict
+}
+
+func (p *Postgres) RecordRunUsage(ctx context.Context, id string, u model.Usage, total bool) error {
+	// Add mirrors model.Usage.Add (an empty model keeps the recorded one); total replaces.
+	tag, err := p.pool.Exec(ctx, `UPDATE runs SET
+		model = CASE WHEN $2 THEN $3 WHEN $3 = '' THEN model ELSE $3 END,
+		input_tokens = CASE WHEN $2 THEN 0 ELSE input_tokens END + $4,
+		output_tokens = CASE WHEN $2 THEN 0 ELSE output_tokens END + $5,
+		cache_read_tokens = CASE WHEN $2 THEN 0 ELSE cache_read_tokens END + $6,
+		cache_write_tokens = CASE WHEN $2 THEN 0 ELSE cache_write_tokens END + $7,
+		cost_usd = CASE WHEN $2 THEN 0 ELSE cost_usd END + $8,
+		turns = CASE WHEN $2 THEN 0 ELSE turns END + $9
+		WHERE id=$1 AND status <> ALL($10)`,
+		id, total, u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
+		[]string{string(model.RunDone), string(model.RunFailed)})
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return p.runExists(ctx, id)
+	}
+	return nil
+}
+
+func (p *Postgres) SetRunSession(ctx context.Context, id, session string) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE runs SET session=$2 WHERE id=$1`, id, session)
 	if err != nil {
 		return err
 	}
@@ -509,6 +662,32 @@ func (p *Postgres) UpdateRun(ctx context.Context, r *model.Run) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (p *Postgres) SettleRun(ctx context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error) {
+	states := make([]string, len(from))
+	for i, f := range from {
+		states[i] = string(f)
+	}
+	var u model.Usage
+	if usage != nil {
+		u = *usage
+	}
+	r, err := scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, exit_code=$4, finished_at=$5,
+		model = CASE WHEN $6 THEN $7 ELSE model END,
+		input_tokens = CASE WHEN $6 THEN $8 ELSE input_tokens END,
+		output_tokens = CASE WHEN $6 THEN $9 ELSE output_tokens END,
+		cache_read_tokens = CASE WHEN $6 THEN $10 ELSE cache_read_tokens END,
+		cache_write_tokens = CASE WHEN $6 THEN $11 ELSE cache_write_tokens END,
+		cost_usd = CASE WHEN $6 THEN $12 ELSE cost_usd END,
+		turns = CASE WHEN $6 THEN $13 ELSE turns END
+		WHERE id=$1 AND status = ANY($2) RETURNING `+runCols,
+		id, states, to, exitCode, finishedAt, usage != nil,
+		u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns))
+	if errors.Is(err, ErrNotFound) {
+		return nil, p.runExists(ctx, id)
+	}
+	return r, err
 }
 
 func (p *Postgres) queryRuns(ctx context.Context, q string, args ...any) ([]*model.Run, error) {
@@ -573,10 +752,12 @@ func (p *Postgres) QueuedRun(ctx context.Context, sandboxID string) (*model.Run,
 		ORDER BY created_at, id LIMIT 1`, sandboxID, model.RunQueued))
 }
 
-func (p *Postgres) ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string) (*model.Run, error) {
+func (p *Postgres) ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, error) {
 	r, err := scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4,
-		session = CASE WHEN session = '' THEN $5 ELSE session END
-		WHERE id=$1 AND status=$2 RETURNING `+runCols, runID, model.RunQueued, model.RunRunning, startedAt, session))
+		session = CASE WHEN session = '' THEN $5 ELSE session END,
+		agent_version=$6, agent_ref=$7, agent_revision=$8, environment_ref=$9, environment_revision=$10
+		WHERE id=$1 AND status=$2 RETURNING `+runCols, runID, model.RunQueued, model.RunRunning, startedAt, session,
+		stamp.AgentVersion, stamp.AgentRef, stamp.AgentRevision, stamp.EnvironmentRef, stamp.EnvironmentRevision))
 	if errors.Is(err, ErrNotFound) {
 		if _, gerr := p.GetRun(ctx, runID); gerr != nil {
 			return nil, gerr
@@ -693,7 +874,7 @@ func limitClause(n, def int) string {
 
 func (p *Postgres) QueryRuns(ctx context.Context, f Filter) ([]*model.Run, error) {
 	w, args := f.where("id", "created_at", false)
-	return p.queryRuns(ctx, `SELECT `+runCols+` FROM runs`+w+` ORDER BY created_at, id`+limitClause(f.Limit, 100000), args...)
+	return p.queryRuns(ctx, `SELECT `+runCols+` FROM runs`+w+` ORDER BY created_at, id`+limitClause(min(f.Limit, MaxRunsPerQuery), MaxRunsPerQuery), args...)
 }
 
 func (p *Postgres) QueryEvents(ctx context.Context, f Filter) ([]*model.Event, error) {

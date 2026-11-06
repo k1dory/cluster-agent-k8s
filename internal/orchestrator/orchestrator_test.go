@@ -104,8 +104,12 @@ func (revokeAll) Revoked(string, string, bool) bool { return true }
 
 func TestVersionsAndRollouts(t *testing.T) {
 	ctx := context.Background()
+	// The test needs the lease (FinishRun applies a deferred rollout right away on the leader),
+	// not periodic passes: a pass racing a rollout's stop → wake on a slow runner could settle
+	// the sandbox as sleeping between the wake's read and its transition, and the rolled-out
+	// sandbox stayed asleep. One pass at startup, the next an hour away.
 	o := New(store.NewMemory(), NewFakeRuntime(), nil, events.New(), Config{
-		PreviewDomain: "preview.test", IdleCheckEvery: 10 * time.Millisecond,
+		PreviewDomain: "preview.test", IdleCheckEvery: time.Hour,
 		DefaultAgentVersion: "registry/agent:1.0", Versions: map[string]string{"stable": "registry/agent:1.0", "canary": "registry/agent:1.1"},
 		EnvVersion: func(sb *model.Sandbox) string { return "env-" + sb.AgentVersion },
 	}, nil)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -397,15 +398,51 @@ func (m *Memory) GetRun(_ context.Context, id string) (*model.Run, error) {
 	return &c, nil
 }
 
-func (m *Memory) UpdateRun(_ context.Context, r *model.Run) error {
+func (m *Memory) RecordRunUsage(_ context.Context, id string, u model.Usage, total bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.runs[r.ID]; !ok {
+	r, ok := m.runs[id]
+	if !ok {
 		return ErrNotFound
 	}
-	c := *r
-	m.runs[r.ID] = &c
+	if r.Status == model.RunDone || r.Status == model.RunFailed {
+		return ErrConflict
+	}
+	if total {
+		r.Usage = u
+	} else {
+		r.Usage.Add(u)
+	}
 	return nil
+}
+
+func (m *Memory) SetRunSession(_ context.Context, id, session string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	r.Session = session
+	return nil
+}
+
+func (m *Memory) SettleRun(_ context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if !slices.Contains(from, r.Status) {
+		return nil, ErrConflict
+	}
+	r.Status, r.ExitCode, r.FinishedAt = to, exitCode, &finishedAt
+	if usage != nil {
+		r.Usage = *usage
+	}
+	out := *r
+	return &out, nil
 }
 
 func (m *Memory) runsOf(sandboxID string) []*model.Run {
@@ -480,7 +517,7 @@ func (m *Memory) QueuedRun(_ context.Context, sandboxID string) (*model.Run, err
 	return nil, ErrNotFound
 }
 
-func (m *Memory) ClaimRun(_ context.Context, runID string, startedAt time.Time, session string) (*model.Run, error) {
+func (m *Memory) ClaimRun(_ context.Context, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.runs[runID]
@@ -494,6 +531,8 @@ func (m *Memory) ClaimRun(_ context.Context, runID string, startedAt time.Time, 
 	if r.Session == "" {
 		r.Session = session
 	}
+	r.AgentVersion, r.AgentRef, r.AgentRevision = stamp.AgentVersion, stamp.AgentRef, stamp.AgentRevision
+	r.EnvironmentRef, r.EnvironmentRevision = stamp.EnvironmentRef, stamp.EnvironmentRevision
 	out := *r
 	return &out, nil
 }
@@ -771,6 +810,10 @@ func (m *Memory) QueryRuns(_ context.Context, f Filter) ([]*model.Run, error) {
 		}
 		return all[i].CreatedAt.Before(all[j].CreatedAt)
 	})
+	limit := f.Limit
+	if limit <= 0 || limit > MaxRunsPerQuery {
+		limit = MaxRunsPerQuery // as Postgres does
+	}
 	var out []*model.Run
 	for _, r := range all {
 		if !f.Cursor.after(r.CreatedAt, r.ID) {
@@ -778,7 +821,7 @@ func (m *Memory) QueryRuns(_ context.Context, f Filter) ([]*model.Run, error) {
 		}
 		c := *r
 		out = append(out, &c)
-		if f.Limit > 0 && len(out) >= f.Limit {
+		if len(out) >= limit {
 			break
 		}
 	}
