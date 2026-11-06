@@ -3,6 +3,7 @@
 package ca
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -13,6 +14,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"net/url"
 	"os"
@@ -143,6 +145,12 @@ type SignRequest struct {
 	URIs     []*url.URL
 	TTL      time.Duration
 	NotAfter time.Time // optional hard cap
+	// Serial and NotBefore, when set, are used as given: a certificate issued again for the
+	// same identity and key (a repeated bootstrap) carries the same serial and validity as
+	// the first, so either copy is the same certificate to whoever checks it. NotAfter is then
+	// taken as is too.
+	Serial    *big.Int
+	NotBefore time.Time
 }
 
 // Sign issues a client certificate. The CSR's own names are ignored: identity comes
@@ -151,14 +159,21 @@ func (c *CA) Sign(req SignRequest) (*x509.Certificate, []byte, error) {
 	if err := req.CSR.CheckSignature(); err != nil {
 		return nil, nil, fmt.Errorf("csr signature: %w", err)
 	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))
-	if err != nil {
-		return nil, nil, err
+	serial := req.Serial
+	if serial == nil {
+		var err error
+		if serial, err = rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127)); err != nil {
+			return nil, nil, err
+		}
 	}
 	now := time.Now()
+	notBefore := now.Add(-5 * time.Minute)
 	notAfter := now.Add(req.TTL)
 	if !req.NotAfter.IsZero() && req.NotAfter.Before(notAfter) {
 		notAfter = req.NotAfter
+	}
+	if !req.NotBefore.IsZero() {
+		notBefore, notAfter = req.NotBefore, req.NotAfter
 	}
 	if notAfter.After(c.Cert.NotAfter) {
 		notAfter = c.Cert.NotAfter
@@ -167,7 +182,7 @@ func (c *CA) Sign(req SignRequest) (*x509.Certificate, []byte, error) {
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: req.CN},
 		URIs:         req.URIs,
-		NotBefore:    now.Add(-5 * time.Minute),
+		NotBefore:    notBefore,
 		NotAfter:     notAfter,
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
@@ -266,9 +281,73 @@ func ParseBundle(b []byte) (*CA, error) {
 	return Parse(certPEM, keyPEM)
 }
 
-// Blobs is where a shared CA lives (the store's GetOrCreateBlob).
+// Blobs is where a shared CA lives (the store's GetOrCreateBlob, GetBlob and SwapBlob).
 type Blobs interface {
 	GetOrCreateBlob(ctx context.Context, name string, create func() ([]byte, error)) ([]byte, error)
+	GetBlob(ctx context.Context, name string) ([]byte, error)
+	SwapBlob(ctx context.Context, name string, old, data []byte) (bool, error)
+}
+
+// KeySealer encrypts the CA key before it reaches the database (credentials.Sealer, under
+// credentials.key). The aad binds the ciphertext to the blob it is stored under.
+type KeySealer interface {
+	Seal(aad string, plain []byte) []byte
+	Open(aad string, sealed []byte) ([]byte, error)
+}
+
+// sealedKeyType is the PEM type of a CA key encrypted with a KeySealer: the block's bytes are
+// the sealed DER of the EC key. Not a standard type on purpose: nothing should mistake it for
+// a usable key.
+const sealedKeyType = "AGENT-SANDBOX SEALED EC PRIVATE KEY"
+
+func sealAAD(name string) string { return "ca:" + name }
+
+// SealedBundle is Bundle with the key encrypted by sl under aad sealAAD(name).
+func (c *CA) SealedBundle(sl KeySealer, name string) ([]byte, error) {
+	keyDER, err := x509.MarshalECPrivateKey(c.key.(*ecdsa.PrivateKey))
+	if err != nil {
+		return nil, err
+	}
+	return append(append([]byte{}, c.pem...), pem.EncodeToMemory(&pem.Block{Type: sealedKeyType, Bytes: sl.Seal(sealAAD(name), keyDER)})...), nil
+}
+
+// BundleSealed reports whether a stored bundle holds an encrypted key.
+func BundleSealed(b []byte) bool {
+	return bytes.Contains(b, []byte("-----BEGIN "+sealedKeyType+"-----"))
+}
+
+// ParseSealedBundle reads a bundle stored under name: a sealed one with sl, a legacy plaintext
+// one as is.
+func ParseSealedBundle(b []byte, sl KeySealer, name string) (*CA, error) {
+	if !BundleSealed(b) {
+		return ParseBundle(b)
+	}
+	if sl == nil {
+		return nil, fmt.Errorf("ca %s: the key in the database is encrypted and credentials.key is not set", name)
+	}
+	var certPEM []byte
+	var sealed []byte
+	for rest := b; ; {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		switch blk.Type {
+		case "CERTIFICATE":
+			certPEM = pem.EncodeToMemory(blk)
+		case sealedKeyType:
+			sealed = blk.Bytes
+		}
+	}
+	if certPEM == nil || sealed == nil {
+		return nil, errors.New("ca bundle: certificate or key missing")
+	}
+	keyDER, err := sl.Open(sealAAD(name), sealed)
+	if err != nil {
+		return nil, fmt.Errorf("ca %s: key: %w", name, err)
+	}
+	return Parse(certPEM, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
 }
 
 // BlobName is the store key of the shared agent CA.
@@ -276,23 +355,66 @@ const BlobName = "agent-ca"
 
 // LoadOrCreateShared returns the agent CA every replica shares: generated once by whoever gets
 // to the store first, read by everyone else.
-func LoadOrCreateShared(ctx context.Context, st Blobs) (*CA, error) {
-	return LoadOrCreateSharedNamed(ctx, st, BlobName, "agent-sandbox agent CA")
+func LoadOrCreateShared(ctx context.Context, st Blobs, sl KeySealer, log *slog.Logger) (*CA, error) {
+	return LoadOrCreateSharedNamed(ctx, st, BlobName, "agent-sandbox agent CA", sl, log)
 }
 
 // LoadOrCreateSharedNamed is LoadOrCreateShared for any CA kept under blob name with cn.
-func LoadOrCreateSharedNamed(ctx context.Context, st Blobs, name, cn string) (*CA, error) {
+//
+// With a sealer (credentials.key set) the key is stored encrypted: a new CA is only ever
+// created sealed, and a legacy plaintext bundle is read, stored again sealed and logged once.
+// Without one the key is stored in clear as before (sandboxd warns at startup), and a sealed
+// bundle is refused rather than replaced.
+func LoadOrCreateSharedNamed(ctx context.Context, st Blobs, name, cn string, sl KeySealer, log *slog.Logger) (*CA, error) {
 	data, err := st.GetOrCreateBlob(ctx, name, func() ([]byte, error) {
 		c, err := Generate(cn, 10*365*24*time.Hour)
 		if err != nil {
 			return nil, err
+		}
+		if sl != nil {
+			return c.SealedBundle(sl, name)
 		}
 		return c.Bundle()
 	})
 	if err != nil {
 		return nil, err
 	}
-	return ParseBundle(data)
+	c, err := ParseSealedBundle(data, sl, name)
+	if err != nil {
+		return nil, err
+	}
+	if sl != nil && !BundleSealed(data) {
+		sealed, err := c.SealedBundle(sl, name)
+		if err != nil {
+			return nil, err
+		}
+		// Only over the plaintext this replica read: replicas starting together race to
+		// upgrade, and a blind write would let one with another credentials.key replace a
+		// sealed bundle the others already use. The loser reads the winner's and must be
+		// able to open it, which is the check that every replica has the same key.
+		swapped, err := st.SwapBlob(ctx, name, data, sealed)
+		if err != nil {
+			return nil, fmt.Errorf("ca %s: storing the key encrypted: %w", name, err)
+		}
+		if !swapped {
+			now, err := st.GetBlob(ctx, name)
+			if err != nil {
+				return nil, fmt.Errorf("ca %s: %w", name, err)
+			}
+			won, err := ParseSealedBundle(now, sl, name)
+			if err != nil {
+				return nil, err
+			}
+			if !won.Cert.Equal(c.Cert) {
+				return nil, fmt.Errorf("ca %s: the stored CA changed while it was being upgraded", name)
+			}
+			return won, nil
+		}
+		if log != nil {
+			log.Warn("CA key found in clear in the database: stored it again encrypted under credentials.key", "blob", name)
+		}
+	}
+	return c, nil
 }
 
 // WriteTo stores the CA as <dir>/<base>.crt and <dir>/<base>.key for a program that reads

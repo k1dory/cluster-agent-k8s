@@ -7,6 +7,9 @@ import (
 	"net/http"
 	"testing"
 
+	"agent-sandbox/internal/ca"
+	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/registrar"
 	"agent-sandbox/internal/store"
 )
 
@@ -49,5 +52,27 @@ func TestReadinessFollowsTheStoreAndVersionNamesTheReplica(t *testing.T) {
 	}
 	if err := json.Unmarshal(body, &v); resp.StatusCode != 200 || err != nil || v.Replica != "sandboxd-0" || v.Leader == nil {
 		t.Fatalf("version: %d %s %v", resp.StatusCode, body, err)
+	}
+}
+
+type bootstrapStoreDown struct {
+	store.Store
+}
+
+func (bootstrapStoreDown) GetSandbox(context.Context, string) (*model.Sandbox, error) {
+	return nil, errors.New("dial tcp: connection refused")
+}
+
+// A bootstrap the platform could not complete on its own side (the store did not answer) is a
+// 503, which agent-init retries; a 400 would make the init container exit on an outage that
+// is not the pod's.
+func TestBootstrapStoreOutageIsRetryable(t *testing.T) {
+	s := newStack(t)
+	s.tokens["pod-token"] = registrar.PodInfo{Name: "agent-x", SandboxID: "sb_missing_store", Slug: "backend-dev", Tenant: "alice"}
+	s.reg.Store = bootstrapStoreDown{Store: s.reg.Store}
+	_, csr, _ := ca.NewCSR("backend-dev")
+	resp, body := call(t, "POST", s.gateway.URL+"/bootstrap", "pod-token", registrar.BootstrapRequest{CSR: string(csr)}, nil)
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("bootstrap during a store outage: %d %s, want 503", resp.StatusCode, body)
 	}
 }

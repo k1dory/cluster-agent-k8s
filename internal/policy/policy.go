@@ -280,8 +280,10 @@ func (p *Policy) Validate() error {
 		if strings.ContainsAny(r.Host, "*/: ") {
 			return fmt.Errorf("allow[%d]: host %q must be a plain DNS name (the gateway issues one certificate per name)", i, r.Host)
 		}
-		if r.Upstream != "" && !strings.HasPrefix(r.Upstream, "https://") && !strings.HasPrefix(r.Upstream, "http://") {
-			return fmt.Errorf("allow[%d] (%s): upstream must start with http:// or https://", i, r.Host)
+		if r.Upstream != "" {
+			if err := ValidateUpstream(r.Upstream); err != nil {
+				return fmt.Errorf("allow[%d] (%s): %w", i, r.Host, err)
+			}
 		}
 		for _, m := range r.Methods {
 			if m != strings.ToUpper(m) {
@@ -479,7 +481,7 @@ func hostsOf(bySlug map[string]*Policy) ([]Host, error) {
 				return nil, fmt.Errorf("host %s has conflicting upstreams %q and %q (slug %s)", name, h.Upstream, up, p.Slug)
 			}
 			for hdr := range r.Inject {
-				h.Injected = appendUnique(h.Injected, http.CanonicalHeaderKey(hdr))
+				h.Injected = AppendUnique(h.Injected, http.CanonicalHeaderKey(hdr))
 			}
 			if r.MCP != nil {
 				h.MCP = true
@@ -493,15 +495,6 @@ func hostsOf(bySlug map[string]*Policy) ([]Host, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out, nil
-}
-
-func appendUnique(xs []string, x string) []string {
-	for _, y := range xs {
-		if y == x {
-			return xs
-		}
-	}
-	return append(xs, x)
 }
 
 // Fingerprint changes whenever the loaded policies change (used to re-sync the gateway).

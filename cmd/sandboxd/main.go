@@ -125,11 +125,27 @@ func serve(cfgPath string, log *slog.Logger) error {
 	go pols.Watch(ctx.Done(), 5*time.Second, func(err error) { log.Error("policy reload rejected, keeping previous policies", "err", err) })
 
 	var agentCA *ca.CA
+	// CA keys kept in the database are encrypted under credentials.key, the key the tenants'
+	// credentials use; without it they are stored in clear, as before.
+	var caSealer ca.KeySealer
 	if cfg.CA.Source == "db" {
-		if agentCA, err = ca.LoadOrCreateShared(ctx, st); err != nil {
+		key, err := credentials.ParseKey(cfg.Credentials.Key)
+		if err != nil {
+			return fmt.Errorf("credentials: %w", err)
+		}
+		if key != nil {
+			sl, err := credentials.NewSealer(key)
+			if err != nil {
+				return fmt.Errorf("credentials: %w", err)
+			}
+			caSealer = sl
+		} else {
+			log.Warn("no credentials.key: the CA private keys in the database (agent CA, gateway root) are stored in clear; set credentials.key to encrypt them")
+		}
+		if agentCA, err = ca.LoadOrCreateShared(ctx, st, caSealer, log); err != nil {
 			return fmt.Errorf("ca (db): %w", err)
 		}
-		log.Info("agent CA loaded from the database (shared by replicas)")
+		log.Info("agent CA loaded from the database (shared by replicas)", "encrypted", caSealer != nil)
 	} else if agentCA, err = ca.LoadOrCreate(cfg.CA.Dir); err != nil {
 		return fmt.Errorf("ca: %w", err)
 	}
@@ -141,7 +157,7 @@ func serve(cfgPath string, log *slog.Logger) error {
 	if cfg.CA.Source == "db" && cfg.Gateway.RootDir != "" {
 		// One gateway root for every replica: Caddy signs its site certificates under it, so an
 		// agent bootstrapped through one replica trusts the others.
-		root, err := ca.LoadOrCreateSharedNamed(ctx, st, "gateway-ca", "agent-sandbox gateway root")
+		root, err := ca.LoadOrCreateSharedNamed(ctx, st, "gateway-ca", "agent-sandbox gateway root", caSealer, log)
 		if err != nil {
 			return fmt.Errorf("gateway root (db): %w", err)
 		}

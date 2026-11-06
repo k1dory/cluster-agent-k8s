@@ -403,6 +403,11 @@ behind) runs on the replica holding the leadership lease, and events appended by
 the SSE clients of the others through `LISTEN/NOTIFY`. Each replica drives its own Caddy and DNS,
 so in the node layout you label several gateway nodes and put a VIP or DNS round-robin in front
 (`gateway.replicas` in the chart, which refuses more than one replica without `ca.source: db`).
+With `credentials.key` set the CA private keys are stored in the database encrypted under it
+(a database written before that is upgraded in place on the next start); without it they are
+stored in clear and sandboxd warns at startup. Keep `credentials.key` with the database dump:
+it now unlocks the CA as well as the tenants' credentials, and a replica started with a
+different key refuses to start rather than mint a new CA.
 
 ### Authentication: tenant API keys, static tokens or OIDC
 

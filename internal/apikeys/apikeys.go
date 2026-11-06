@@ -37,9 +37,17 @@ const MaxNameLen = 64
 
 var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$`)
 
+// Store is what the service needs: the key table and its atomic rotation.
+type Store interface {
+	store.APIKeys
+	RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, opts store.RotateOptions) error
+	LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error)
+	FirstUseAPIKey(ctx context.Context, id string, at time.Time) error
+}
+
 // MaxTTL caps a key's lifetime when the caller names one longer; 0 = no cap.
 type Service struct {
-	Store  store.APIKeys
+	Store  Store
 	MaxTTL time.Duration
 	Now    func() time.Time
 	// TouchEvery bounds how often a use is recorded (last_used_at): one write per key per
@@ -110,6 +118,13 @@ func (s *Service) build(tenant, name string, ttl time.Duration, by, trust string
 // Rotate issues a replacement for key id (same tenant and name, a fresh expiry of ttl; 0
 // keeps the old key's remaining lifetime) and retires the old one: at once when grace is 0,
 // else after grace, so a pipeline can switch over without a gap.
+//
+// The replacement, the old key's retirement and, for a key rotated before, the withdrawal of
+// its earlier successor are one store transaction (store.RotateAPIKey): on an error nothing
+// changed. A rotate repeated on a key already rotated (the response with the secret was lost)
+// withdraws the earlier successor if it was never used and issues a new one; the earlier
+// secret cannot be returned, only its hash is stored. A successor already in use is not
+// touched and the rotation is refused: rotate that one instead.
 func (s *Service) Rotate(ctx context.Context, id string, ttl, grace time.Duration, by string) (*model.APIKey, string, error) {
 	old, err := s.Store.GetAPIKey(ctx, id)
 	if err != nil {
@@ -122,18 +137,40 @@ func (s *Service) Rotate(ctx context.Context, id string, ttl, grace time.Duratio
 	if grace < 0 || ttl < 0 {
 		return nil, "", fmt.Errorf("%w: ttl and grace must not be negative", ErrInvalid)
 	}
-	if ttl == 0 && old.ExpiresAt != nil {
-		ttl = old.ExpiresAt.Sub(now)
-	}
-	next, secret, err := s.Create(ctx, old.Tenant, old.Name, ttl, by)
+	// ttl 0: the new key expires when the old one did before its first rotation, which the
+	// store recorded then (an earlier successor's lifetime may have been chosen shorter).
+	// MaxTTL still caps it: build sets that cap as the new key's expiry.
+	next, secret, err := s.build(old.Tenant, old.Name, ttl, by, "")
 	if err != nil {
 		return nil, "", err
 	}
-	// One atomic store operation; a revocation that landed meanwhile stands.
-	if err := s.Store.RetireAPIKey(ctx, old.ID, next.ID, now, grace); err != nil {
+	err = s.Store.RotateAPIKey(ctx, old.ID, next, now, store.RotateOptions{Grace: grace, InheritExpiry: ttl == 0})
+	var inUse *store.SuccessorInUseError
+	switch {
+	case err == nil:
+		return next, secret, nil
+	case errors.As(err, &inUse):
+		return nil, "", fmt.Errorf("%w: key %s was already rotated to %s, which has been used or rotated on: rotate the newest key instead", ErrInvalid, id, inUse.ID)
+	case errors.Is(err, store.ErrKeyInactive):
+		return nil, "", fmt.Errorf("%w: key %s is revoked or expired; create a new one", ErrInvalid, id)
+	case errors.Is(err, store.ErrNotFound):
 		return nil, "", err
 	}
-	return next, secret, nil
+	// The transaction may have committed with the acknowledgement lost, or still be
+	// committing. Ask under the old key's row lock, on a context of its own (the request's may
+	// be what failed): the read waits for that transaction, and the old key names its
+	// successor only if it committed. If the answer does not come in time the outcome stays
+	// unknown. Nothing is ever deleted: the transaction left either everything or nothing.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	cur, gerr := s.Store.LockedAPIKey(rctx, old.ID)
+	switch {
+	case gerr != nil:
+		return nil, "", fmt.Errorf("rotating key %s: %w (whether it took effect is unknown: %v; GET the key: rotated_to says)", old.ID, err, gerr)
+	case cur.RotatedTo == next.ID:
+		return next, secret, nil
+	}
+	return nil, "", fmt.Errorf("rotating key %s: %w (nothing changed; retry)", old.ID, err)
 }
 
 // Revoke ends a key now. Revoking an already revoked key is fine (the earlier time stands).
@@ -184,9 +221,24 @@ func (s *Service) Authenticate(ctx context.Context, token string) (*model.APIKey
 	if every == 0 {
 		every = time.Minute
 	}
-	if k.LastUsedAt == nil || now.Sub(*k.LastUsedAt) >= every {
+	if k.LastUsedAt == nil {
+		// The first use is recorded before it is let through: a rotation repeated on the
+		// parent key withdraws a successor with no recorded use, so an unrecorded use would
+		// have its working key revoked. The write succeeds only while the key is still active
+		// (it waits for such a rotation); a failure fails the request.
+		switch err := s.Store.FirstUseAPIKey(ctx, k.ID, now); {
+		case errors.Is(err, store.ErrKeyInactive), errors.Is(err, store.ErrNotFound):
+			return nil, ErrBadKey
+		case err != nil:
+			return nil, fmt.Errorf("recording the key's first use: %w", err)
+		}
+		k.LastUsedAt = &now
+		return k, nil
+	}
+	if now.Sub(*k.LastUsedAt) >= every {
 		// Only the use is recorded, never the record we read: a revocation that landed between
-		// our read and this write is not undone. A lost touch is not an authentication failure.
+		// our read and this write is not undone. A lost later touch is not an authentication
+		// failure.
 		if err := s.Store.TouchAPIKey(ctx, k.ID, now); err == nil {
 			k.LastUsedAt = &now
 		}

@@ -406,6 +406,7 @@ type Store interface {
 	GitSyncs
 	GitJobs
 	TokenUses
+	Atomics
 
 	Close() error
 }
@@ -416,3 +417,67 @@ const IdempotencyTTL = 24 * time.Hour
 // IdempotencyStale is how long an unfinished reservation blocks retries before it is
 // considered abandoned (the process died mid-request) and may be taken over.
 const IdempotencyStale = 2 * time.Minute
+
+// Atomics are operations whose steps must happen together or not at all, across replicas.
+type Atomics interface {
+	// RotateAPIKey replaces key oldID with next in one transaction: when oldID was rotated
+	// before, its successor is withdrawn (revoked at `at`) if it was never used, and the
+	// rotation refused with *SuccessorInUseError if it was; next is inserted; oldID is retired
+	// to next (revoked at `at` when grace is 0, else expiring at `at`+grace or sooner).
+	// ErrNotFound for an unknown oldID, ErrKeyInactive when oldID is revoked or expired at
+	// `at`, ErrConflict when next.ID exists. On any error nothing changed.
+	//
+	// Any recorded revocation of oldID refuses the rotation whatever its time (a revocation
+	// that landed after `at` but before the lock still stands). With opts.InheritExpiry the new
+	// key expires when oldID did before its first rotation (or at next.ExpiresAt if sooner,
+	// the caller's cap); next.ExpiresAt is set to what was stored.
+	RotateAPIKey(ctx context.Context, oldID string, next *model.APIKey, at time.Time, opts RotateOptions) error
+	// LockedAPIKey reads a key under its row lock: it waits for a transaction holding the row
+	// (a rotation whose COMMIT is still completing) and returns what that left.
+	LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error)
+	// FirstUseAPIKey records a key's first use, only while it is still active at `at`:
+	// ErrKeyInactive otherwise (a rotation withdrew it meanwhile; the write waits for that
+	// rotation's row lock). Rotation treats a key without a recorded use as unused, so a
+	// first use must be durable before it is let through.
+	FirstUseAPIKey(ctx context.Context, id string, at time.Time) error
+	// SwapBlob replaces the blob under name with data only if it still holds old, and reports
+	// whether it did (false: another writer got there first). ErrNotFound when absent.
+	SwapBlob(ctx context.Context, name string, old, data []byte) (bool, error)
+	// BindInstance gives a pod its identity on a sandbox, in one transaction that serialises
+	// every bootstrap of the sandbox: the pod's live instance with serial b.Serial is reused
+	// (issue gets it), any other live instance of the pod is retired, else a new instance
+	// numbered from the sequence is made from what issue returns; the sandbox records the
+	// instance and, unless another pod is already current, the pod's name. issue runs inside
+	// the transaction (it signs; keep it short); its error aborts everything.
+	BindInstance(ctx context.Context, b InstanceBinding, issue func(n int, existing *model.Instance) (*model.Instance, error)) (*BoundInstance, error)
+}
+
+// RotateOptions: the grace period of the old key and how the new key's expiry is set.
+type RotateOptions struct {
+	Grace         time.Duration
+	InheritExpiry bool
+}
+
+// InstanceBinding names the pod and the serial its certificate carries.
+type InstanceBinding struct {
+	SandboxID, PodName, Serial string
+}
+
+// BoundInstance is what BindInstance did.
+type BoundInstance struct {
+	Instance *model.Instance
+	Reused   bool   // the pod's existing instance (a repeated bootstrap)
+	Retired  []int  // the pod's other live instances, now retired
+	Current  string // the sandbox's current pod after the call
+}
+
+// ErrKeyInactive: the key is revoked or expired.
+var ErrKeyInactive = errors.New("api key is revoked or expired")
+
+// SuccessorInUseError: the key was already rotated and its successor has been used or was
+// itself rotated: replacing it again would start a second live branch.
+type SuccessorInUseError struct{ ID string }
+
+func (e *SuccessorInUseError) Error() string {
+	return "api key already rotated to " + e.ID + ", which has been used or rotated on"
+}

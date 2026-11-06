@@ -2,10 +2,13 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -45,6 +48,7 @@ type Config struct {
 	// Credentials: secrets tenants bring through the API (PUT /v1/credentials/{name}), encrypted
 	// at rest under key (64 hex characters or the base64 of 32 bytes; `openssl rand -hex 32`).
 	// Empty disables the API; `secret:NAME` then resolves from the secrets provider alone.
+	// With ca.source db the key also encrypts the CA private keys in the database.
 	//
 	// OAuth: the providers a tenant may sign in to with the device flow (POST
 	// /v1/oauth-credentials/{name}/login), sandboxd then keeping the access token fresh.
@@ -197,7 +201,14 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	var c Config
-	if err := yaml.Unmarshal([]byte(expandEnv(string(raw))), &c); err != nil {
+	// Strict: a misspelt key (sync_evrey, credentails) fails at startup instead of leaving the
+	// setting at its default without a word.
+	dec := yaml.NewDecoder(strings.NewReader(expandEnv(string(raw))))
+	dec.KnownFields(true)
+	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := negativeDurations(reflect.ValueOf(c), ""); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if c.Listen.API == "" {
@@ -359,4 +370,54 @@ func loopbackFor(listen string) string {
 		host = "127.0.0.1"
 	}
 	return net.JoinHostPort(host, port)
+}
+
+// negativeDurations refuses a negative duration anywhere in the configuration: none has a
+// meaning (a negative TTL, interval or timeout), and several would turn into a busy loop or an
+// instantly expired credential. path is the YAML path for the message.
+func negativeDurations(v reflect.Value, path string) error {
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		if v.IsNil() {
+			return nil
+		}
+		return negativeDurations(v.Elem(), path)
+	case reflect.Struct:
+		t := v.Type()
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if !f.IsExported() {
+				continue
+			}
+			name := strings.Split(f.Tag.Get("yaml"), ",")[0]
+			if name == "" || name == "-" {
+				name = strings.ToLower(f.Name)
+			}
+			p := name
+			if path != "" {
+				p = path + "." + name
+			}
+			if err := negativeDurations(v.Field(i), p); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		iter := v.MapRange()
+		for iter.Next() {
+			if err := negativeDurations(iter.Value(), fmt.Sprintf("%s.%v", path, iter.Key())); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			if err := negativeDurations(v.Index(i), fmt.Sprintf("%s[%d]", path, i)); err != nil {
+				return err
+			}
+		}
+	case reflect.Int64:
+		if v.Type() == reflect.TypeOf(time.Duration(0)) && v.Int() < 0 {
+			return fmt.Errorf("%s: %v is negative", path, time.Duration(v.Int()))
+		}
+	}
+	return nil
 }

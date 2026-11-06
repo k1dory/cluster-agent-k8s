@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -26,6 +27,7 @@ type Memory struct {
 	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
 	applies   map[string]*model.Apply
 	apiKeys   map[string]*model.APIKey
+	keyOrigin map[string]*time.Time // api key id → its original_expires_at (Postgres: a column)
 	tokenUses map[string]tokenUse
 	gitSyncs  map[string]*model.GitSync
 	gitJobs   map[string]*model.GitJob
@@ -1050,6 +1052,7 @@ func (m *Memory) DeleteAPIKey(_ context.Context, id string) error {
 		return ErrNotFound
 	}
 	delete(m.apiKeys, id)
+	delete(m.keyOrigin, id)
 	return nil
 }
 
@@ -1060,6 +1063,7 @@ func (m *Memory) PruneTrustedAPIKeys(_ context.Context, before time.Time) (int, 
 	for id, k := range m.apiKeys {
 		if k.Trust != "" && k.ExpiresAt != nil && k.ExpiresAt.Before(before) {
 			delete(m.apiKeys, id)
+			delete(m.keyOrigin, id)
 			n++
 		}
 	}
@@ -1488,3 +1492,204 @@ func (m *Memory) GetGitJobByDelivery(_ context.Context, tenant, name, delivery s
 	}
 	return nil, ErrNotFound
 }
+
+// RotateAPIKey: see Atomics. Every check happens before the first change, under one lock.
+func (m *Memory) RotateAPIKey(_ context.Context, oldID string, next *model.APIKey, at time.Time, opts RotateOptions) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old, ok := m.apiKeys[oldID]
+	if !ok {
+		return ErrNotFound
+	}
+	if old.RevokedAt != nil || !old.Active(at) {
+		return ErrKeyInactive
+	}
+	if _, dup := m.apiKeys[next.ID]; dup {
+		return fmt.Errorf("%w: api key %s exists", ErrConflict, next.ID)
+	}
+	var withdraw *model.APIKey
+	if prev, ok := m.apiKeys[old.RotatedTo]; ok && old.RotatedTo != "" {
+		switch {
+		case prev.LastUsedAt != nil || prev.RotatedTo != "":
+			// Used, or rotated on in turn: the branch is taken, even if no longer active.
+			return &SuccessorInUseError{ID: prev.ID}
+		case prev.RevokedAt == nil && prev.Active(at):
+			withdraw = prev
+		}
+	}
+	orig, recorded := memKeyOrigin(m, oldID)
+	if !recorded && old.RotatedTo == "" {
+		orig, recorded = old.ExpiresAt, true
+	}
+	if opts.InheritExpiry {
+		exp := old.ExpiresAt
+		if recorded {
+			exp = orig
+		}
+		if exp != nil && !exp.After(at) {
+			return ErrKeyInactive
+		}
+		next.ExpiresAt = earliest(exp, next.ExpiresAt)
+	}
+	if withdraw != nil {
+		t := at
+		withdraw.RevokedAt = &t
+	}
+	if next.CreatedAt.IsZero() {
+		next.CreatedAt = at
+	}
+	m.apiKeys[next.ID] = cloneKey(next)
+	if recorded {
+		setMemKeyOrigin(m, oldID, orig)
+	}
+	old.RotatedTo = next.ID
+	if opts.Grace <= 0 {
+		if old.RevokedAt == nil {
+			t := at
+			old.RevokedAt = &t
+		}
+		return nil
+	}
+	if end := at.Add(opts.Grace); old.ExpiresAt == nil || end.Before(*old.ExpiresAt) {
+		old.ExpiresAt = &end
+	}
+	return nil
+}
+
+// LockedAPIKey: see Atomics (the store lock serialises it with every write).
+func (m *Memory) LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error) {
+	return m.GetAPIKey(ctx, id)
+}
+
+// earliest of two optional times (nil: none).
+func earliest(a, b *time.Time) *time.Time {
+	switch {
+	case a == nil:
+		return b
+	case b == nil || a.Before(*b):
+		t := *a
+		return &t
+	}
+	t := *b
+	return &t
+}
+
+// memKeyOrigin and setMemKeyOrigin read and write the original_expires_at a rotation kept;
+// m.mu held. The entry goes with the key (DeleteAPIKey, PruneTrustedAPIKeys), as the column
+// goes with the row.
+func memKeyOrigin(m *Memory, id string) (*time.Time, bool) {
+	t, ok := m.keyOrigin[id]
+	return t, ok
+}
+
+func setMemKeyOrigin(m *Memory, id string, t *time.Time) {
+	if m.keyOrigin == nil {
+		m.keyOrigin = map[string]*time.Time{}
+	}
+	m.keyOrigin[id] = t
+}
+
+// FirstUseAPIKey: see Atomics.
+func (m *Memory) FirstUseAPIKey(_ context.Context, id string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.apiKeys[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if k.RevokedAt != nil || !k.Active(at) {
+		return ErrKeyInactive
+	}
+	t := at
+	k.LastUsedAt = &t
+	return nil
+}
+
+// SwapBlob: see Atomics.
+func (m *Memory) SwapBlob(_ context.Context, name string, old, data []byte) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.blobs[name]
+	if !ok {
+		return false, ErrNotFound
+	}
+	if !bytes.Equal(cur, old) {
+		return false, nil
+	}
+	m.blobs[name] = append([]byte(nil), data...)
+	return true, nil
+}
+
+// BindInstance: see Atomics. issue runs under the store lock, as it runs inside the
+// transaction in Postgres.
+func (m *Memory) BindInstance(_ context.Context, b InstanceBinding, issue func(n int, existing *model.Instance) (*model.Instance, error)) (*BoundInstance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sb, ok := m.sandboxes[b.SandboxID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	var reuse *model.Instance
+	var others []*model.Instance
+	for _, in := range m.instances {
+		if in.SandboxID != b.SandboxID || in.PodName != b.PodName || in.RetiredAt != nil {
+			continue
+		}
+		if in.Serial == b.Serial && (reuse == nil || in.N > reuse.N) {
+			reuse = in
+		}
+	}
+	for _, in := range m.instances {
+		if in.SandboxID == b.SandboxID && in.PodName == b.PodName && in.RetiredAt == nil && in != reuse {
+			others = append(others, in)
+		}
+	}
+	n := 0
+	var existing *model.Instance
+	if reuse != nil {
+		n, existing = reuse.N, cloneInstance(reuse)
+	} else {
+		n = m.nextInst + 1
+	}
+	in, err := issue(n, existing)
+	if err != nil {
+		return nil, err
+	}
+	if reuse == nil {
+		for _, o := range m.instances {
+			if o.Serial == in.Serial {
+				return nil, fmt.Errorf("%w: serial %s is issued", ErrConflict, in.Serial)
+			}
+		}
+		m.nextInst = n
+		in.N = n
+		m.instances[n] = cloneInstance(in)
+	}
+	out := &BoundInstance{Reused: reuse != nil}
+	now := time.Now()
+	for _, o := range others {
+		t := now
+		o.RetiredAt = &t
+		out.Retired = append(out.Retired, o.N)
+	}
+	sort.Ints(out.Retired)
+	c := cloneSandbox(sb)
+	c.Instance = n
+	if c.PodName == "" {
+		c.PodName = b.PodName
+	}
+	c.Revision++
+	m.sandboxes[b.SandboxID] = c
+	out.Instance, out.Current = cloneInstance(m.instances[n]), c.PodName
+	return out, nil
+}
+
+func cloneInstance(in *model.Instance) *model.Instance {
+	c := *in
+	return &c
+}
+
+var (
+	_ Store = (*Memory)(nil)
+	_ Store = (*Postgres)(nil)
+)

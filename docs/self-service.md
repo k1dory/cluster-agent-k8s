@@ -198,7 +198,7 @@ name: tools
 spec:
   type: mcp
   host: mcp.tools.example.com
-  upstream: https://10.0.0.5:8443            # optional: where the gateway sends it (default https://host)
+  upstream: https://10.0.0.5:8443            # optional: scheme://host[:port] only (default https://host)
   paths: ["/mcp", "/mcp/**"]                 # optional: what the agent may call (default /**)
   mcp: { read_only: true, tools: ["get_*", "list_*"] }   # optional: what the proxy lets through
   headers:
@@ -211,7 +211,9 @@ that inspects every JSON-RPC body. The connection is the rule for that host: onl
 carries the connection passes, only on its `paths`, with its `mcp` restriction, and with the
 headers it names, resolved from the tenant's secrets at request time. A connection for a host
 the tenant's settings do not list is refused (403) with the reason; two connections cannot send
-one host to two upstreams or make it both HTTP and MCP; deleting the connection withdraws the
+one host to two upstreams or make it both HTTP and MCP; an `upstream` with a path, query, user
+information or a scheme that contradicts its port (`http://…:443`, `https://…:80`) is refused,
+since Caddy would reject the whole gateway configuration with it; deleting the connection withdraws the
 host and the rule immediately. The admin's shared connections (`-tenant ""`) may name any host.
 
 An `upstream` behind a private CA is trusted once the operator names a ConfigMap of its PEM

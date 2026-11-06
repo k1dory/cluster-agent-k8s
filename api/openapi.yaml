@@ -1376,7 +1376,16 @@ paths:
       description: |
         Issues a new key with the same tenant and name and retires this one: at once when `grace`
         is empty, else after `grace` so the holder can switch over. `ttl` is the new key's
-        lifetime (empty: this key's remaining one). A revoked or expired key cannot be rotated.
+        lifetime (empty: this key's remaining one, as it was before any earlier rotation). A
+        revoked or expired key cannot be rotated. The rotation is one transaction: on an error
+        nothing changed and a retry is safe.
+
+        Rotating a key that was already rotated (a retry after the response with the secret was
+        lost) withdraws the earlier successor if it has never been used and issues a new one;
+        the earlier secret cannot be shown again. If the earlier successor has been used, the
+        rotation is refused with 422: rotate that key instead. A rotation whose outcome the
+        server could not establish (the database stopped answering mid-commit) is a 500 that
+        says so: GET the old key, its `rotated_to` tells whether it took effect.
       requestBody:
         required: false
         content:
@@ -1390,10 +1399,11 @@ paths:
       responses:
         "201": { description: The new key with its secret; `replaces` names the old one, content: { application/json: { schema: { $ref: "#/components/schemas/IssuedKey" } } } }
         "400": { description: "Malformed JSON, unknown field, trailing data or a bad duration", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "422": { description: "The key is revoked or expired, ttl or grace is negative, or the key was already rotated to a successor that is in use", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "500": { description: "The rotation failed, or its outcome is unknown (the message says which)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/ScopeForbidden" }
         "404": { $ref: "#/components/responses/Error" }
-        "422": { description: "The key is revoked or expired, or a duration is negative", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/KeysDisabled" }
   /v1/whoami:
     get:
@@ -1687,6 +1697,10 @@ paths:
       tags: [gateway]
       security: [{ bootstrapToken: [] }]
       summary: Issue the agent identity (called once by the init container)
+      description: |
+        Idempotent per pod and key: repeating the request with the same CSR (a retry after a
+        lost response) returns the same instance with the same serial and validity. A new key
+        from the same pod replaces its earlier identity.
       requestBody:
         required: true
         content:
@@ -1712,7 +1726,9 @@ paths:
                   ca: { type: string, description: PEM agent CA root }
                   gateway_ca: { type: string, description: PEM root to trust for TLS to the gateway }
                   not_after: { type: string, format: date-time }
+        "400": { description: "The CSR is malformed, or the pod's labels do not match its sandbox (slug, tenant): not retried", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Error" }
+        "503": { description: "The platform could not complete the issuance on its side (the database did not answer): retry the same request", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /authz:
     get:
       tags: [gateway]
@@ -2252,7 +2268,7 @@ components:
           type: object
           additionalProperties: { type: string }
           description: "Headers the gateway adds for agents using this connection. Values are templates: secret:NAME is resolved from the tenant's secrets at request time. A credential header (Authorization, Cookie, anything named like a key or token) must be a reference such as \"Bearer secret:NAME\"; a literal value is refused and never echoed"
-        upstream: { type: string, description: "Self-service hosts only: where the gateway sends the traffic (http(s) URL; default https://<host>). Every live connection for a host must agree" }
+        upstream: { type: string, pattern: "^https?://[^/?#@\\s{}]+$", example: "https://10.0.0.5:8443", description: "Self-service hosts only: where the gateway sends the traffic, scheme://host[:port] and nothing else (no path, query, fragment or user information; an IPv6 literal in brackets; not http on 443 or https on 80); default https://<host>. Every live connection for a host must agree" }
         upstream_host: { type: boolean, description: "Self-service hosts with an upstream only: send the upstream's own host[:port] as Host and verify its TLS certificate against that address (a server that answers only to its own address); default the connection's host name. Every live connection for a host must agree" }
         paths: { type: array, items: { type: string }, description: "Self-service hosts only: policy path patterns the agent may call (default /**)" }
         mcp:
