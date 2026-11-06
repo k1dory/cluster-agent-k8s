@@ -65,6 +65,11 @@ func TestReviewCancelDuringOutputStaysCancelled(t *testing.T) {
 	if err := o.Output(ctx, sb.ID, run.ID, `{"type":"usage","output_tokens":7}`); err != nil {
 		t.Fatal(err)
 	}
+	// Output no longer reads the run before writing (the line and its usage are one store
+	// write), so the window is gone: the cancel lands right after it instead, if it has not.
+	if h := st.hook.Swap(nil); h != nil {
+		(*h)()
+	}
 	got, err := o.Store.GetRun(ctx, run.ID)
 	if err != nil || got.Status != model.RunCancelled || got.FinishedAt == nil {
 		t.Fatalf("run after cancel during output: %v %+v", err, got)
