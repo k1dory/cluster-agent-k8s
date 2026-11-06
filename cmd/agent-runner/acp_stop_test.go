@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -55,7 +54,7 @@ func TestStopAdapterEndsWhatTheAdapterLeftBehind(t *testing.T) {
 				_ = syscall.Kill(pid, syscall.SIGKILL)
 				_, _ = syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
 			}
-			if errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) && len(processesWithEnv(home)) == 0 {
+			if !groupAlive(pgid) && len(processesWithEnv(home)) == 0 {
 				return
 			}
 			time.Sleep(20 * time.Millisecond)
@@ -77,11 +76,11 @@ func TestStopAdapterEndsWhatTheAdapterLeftBehind(t *testing.T) {
 	}
 	writer, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
 	stopAdapter(stdin, cancel, cmd, home) // the adapter (cat) leaves on EOF; the child stays unless ended
-	if err := syscall.Kill(-pgid, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("the adapter's process group is still there after stopAdapter (kill 0: %v)", err)
+	if groupAlive(pgid) {
+		t.Fatal("the adapter's process group is still alive after stopAdapter")
 	}
-	if err := syscall.Kill(writer, 0); !errors.Is(err, syscall.ESRCH) {
-		t.Fatalf("the writer (pid %d, detached: %v) is still there after stopAdapter (kill 0: %v)", writer, detach != "", err)
+	if processAlive(writer) {
+		t.Fatalf("the writer (pid %d, detached: %v) is still alive after stopAdapter", writer, detach != "")
 	}
 	if err := os.RemoveAll(state); err != nil {
 		t.Fatalf("the home cannot be removed after stopAdapter: %v", err)
