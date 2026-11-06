@@ -259,7 +259,22 @@ func (o *Orchestrator) KeyedSandbox(ctx context.Context) (sb *model.Sandbox, gon
 	if err != nil {
 		return nil, false, false, err
 	}
-	return nil, created == id, created == id, nil
+	if created != id {
+		return nil, false, false, nil
+	}
+	// The record says the sandbox was created, but the first read may have come before that
+	// creation committed: a slow attempt's insert (sandbox and record, one transaction) can
+	// land between the two reads. Read again: the record is written with the sandbox, and a
+	// keyed sandbox once created is never inserted again, so absent now means deleted.
+	sb, err = o.Store.GetSandbox(ctx, id)
+	switch {
+	case err == nil:
+		return sb, false, true, nil
+	case errors.Is(err, store.ErrNotFound):
+		return nil, true, true, nil
+	default:
+		return nil, false, false, err
+	}
 }
 
 // ResumeKeyedCreate finishes the provisioning of a sandbox an earlier attempt of the keyed

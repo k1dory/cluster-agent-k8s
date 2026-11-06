@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/orchestrator"
 	"agent-sandbox/internal/store"
 )
 
@@ -1068,4 +1069,65 @@ func (s *round5Store) KeyedResult(ctx context.Context, seed string) (string, str
 		return "", "", errors.New("fixture: store unavailable")
 	}
 	return s.idemFaultStore.KeyedResult(ctx, seed)
+}
+
+// round6Store runs beforeResult ahead of each KeyedResult: another replica's write landing
+// between a recovery's two reads.
+type round6Store struct {
+	store.Store
+	beforeResult hook
+}
+
+func (s *round6Store) KeyedResult(ctx context.Context, seed string) (string, string, error) {
+	s.beforeResult.run()
+	return s.Store.KeyedResult(ctx, seed)
+}
+
+// Review round 6 of #32: attempt B's recovery reads no sandbox; before it reads the key's
+// record, the slow attempt A commits its insert (sandbox and record). B finds the live
+// sandbox, not "created and deleted since", and finishes its provisioning, as A died right
+// after the commit. Both stores.
+func TestRound6CreationBetweenTheRecoveryReadsIsNotADeletion(t *testing.T) {
+	for _, backend := range []string{"memory", "postgres"} {
+		t.Run(backend, func(t *testing.T) {
+			s := newStack(t)
+			base := s.orch.Store
+			if backend == "postgres" {
+				base = reviewPostgres(t)
+			}
+			fs := &round6Store{Store: base}
+			s.orch.Store = fs
+			ctx := context.Background()
+			res, reserved, err := fs.ReserveIdempotent(ctx, "alice|POST /v1/sandboxes|between", "h")
+			if err != nil || !reserved {
+				t.Fatalf("reserve: %v %v", reserved, err)
+			}
+			id := orchestrator.KeyedID(res.Seed, "sb")
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			fs.beforeResult.set(func() {
+				fs.beforeResult.set(nil)
+				// A's insert commits, and A dies: the sandbox stays creating.
+				sb := &model.Sandbox{ID: id, Name: "between", Slug: "backend-dev", Owner: "alice", Tenant: "alice",
+					Status: model.StatusCreating, CreatedAt: now, LastActivity: now}
+				if err := base.CreateKeyedSandbox(ctx, sb, res.Seed); err != nil {
+					t.Errorf("A's insert: %v", err)
+				}
+			})
+			kctx := orchestrator.WithKeyedIDs(ctx, res.Seed)
+			sb, gone, found, err := s.orch.KeyedSandbox(kctx)
+			if err != nil || gone || !found || sb == nil || sb.ID != id {
+				t.Fatalf("recovery around a concurrent creation: sb=%v gone=%v found=%v err=%v", sb, gone, found, err)
+			}
+			if sb, err = s.orch.ResumeKeyedCreate(kctx, sb); err != nil || sb.Status == model.StatusCreating {
+				t.Fatalf("provisioning not resumed: %+v %v", sb, err)
+			}
+			// Gone stays gone: deleted after the insert, it reads as deleted, not as absent.
+			if err := s.orch.Delete(ctx, id); err != nil {
+				t.Fatal(err)
+			}
+			if _, gone, found, err := s.orch.KeyedSandbox(kctx); err != nil || !gone || !found {
+				t.Fatalf("after the delete: gone=%v found=%v err=%v", gone, found, err)
+			}
+		})
+	}
 }
