@@ -2121,8 +2121,12 @@ func (p *Postgres) AppendRunOutput(ctx context.Context, b *OutputBatch) (*Output
 			}
 		}
 		if b.BatchID != "" {
-			if _, err := tx.Exec(ctx, `INSERT INTO run_output_batches (run_id, batch_id, lines, hash, complete, created_at) VALUES ($1,$2,$3,$4,$5,now())
-				ON CONFLICT (run_id, batch_id) DO UPDATE SET lines=EXCLUDED.lines, hash=EXCLUDED.hash, complete=EXCLUDED.complete`,
+			// Every call under the id, a retry that stores nothing included, keeps its progress for
+			// another outputBatchTTL: a runner retries for as long as its harness lives. Once whole,
+			// a batch stays whole.
+			if _, err := tx.Exec(ctx, `INSERT INTO run_output_batches (run_id, batch_id, lines, hash, complete, touched_at) VALUES ($1,$2,$3,$4,$5,now())
+				ON CONFLICT (run_id, batch_id) DO UPDATE SET lines=EXCLUDED.lines, hash=EXCLUDED.hash,
+					complete = run_output_batches.complete OR EXCLUDED.complete, touched_at=now()`,
 				b.RunID, b.BatchID, len(b.Lines), chain[len(b.Lines)], !b.Partial); err != nil {
 				return err
 			}
@@ -2143,7 +2147,7 @@ func (p *Postgres) AppendRunOutput(ctx context.Context, b *OutputBatch) (*Output
 	}
 	if b.BatchID != "" && res.Skipped == 0 && res.Accepted > 0 {
 		// A new batch makes room for itself: progress older than any retry is dropped.
-		_, _ = p.pool.Exec(ctx, `DELETE FROM run_output_batches WHERE created_at < now() - $1::interval`, outputBatchTTL.String())
+		_, _ = p.pool.Exec(ctx, `DELETE FROM run_output_batches WHERE touched_at < now() - $1::interval`, outputBatchTTL.String())
 	}
 	return res, nil
 }
@@ -2215,16 +2219,43 @@ func (p *Postgres) ClaimRunFor(ctx context.Context, sandboxID, runID string, sta
 			return err
 		}
 		if stamp.Owner != "" {
-			r, err := scanRun(tx.QueryRow(ctx, `UPDATE runs SET attempt=attempt+1 WHERE id = (
-					SELECT id FROM runs WHERE sandbox_id=$1 AND status=$2 AND claimed_by=$3 AND NOT claim_acked
-					ORDER BY created_at, id LIMIT 1)
-				RETURNING `+runCols, sandboxID, model.RunRunning, stamp.Owner))
-			if err == nil {
+			// The owner's running runs are locked before anything is decided: an acknowledgement
+			// or a settle holding a row's lock is waited for, and the row is read again after it
+			// (Read Committed re-checks a locked row), so a claim confirmed or settled meanwhile
+			// is never handed out again under a new attempt.
+			rows, err := tx.Query(ctx, `SELECT id, claim_acked FROM runs WHERE sandbox_id=$1 AND status=$2 AND claimed_by=$3
+				ORDER BY created_at, id FOR UPDATE`, sandboxID, model.RunRunning, stamp.Owner)
+			if err != nil {
+				return err
+			}
+			unacked, busy := "", false
+			for rows.Next() {
+				var id string
+				var acked bool
+				if err := rows.Scan(&id, &acked); err != nil {
+					rows.Close()
+					return err
+				}
+				if !acked && unacked == "" {
+					unacked = id
+				}
+				busy = busy || acked
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			if unacked != "" {
+				r, err := scanRun(tx.QueryRow(ctx, `UPDATE runs SET attempt=attempt+1
+					WHERE id=$1 AND status=$2 AND claimed_by=$3 AND NOT claim_acked RETURNING `+runCols, unacked, model.RunRunning, stamp.Owner))
+				if err != nil {
+					return err
+				}
 				out, reclaimed = r, true
 				return nil
 			}
-			if !errors.Is(err, ErrNotFound) {
-				return err
+			if busy {
+				return ErrOwnerBusy
 			}
 		}
 		if runID == "" {

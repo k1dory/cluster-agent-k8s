@@ -38,8 +38,9 @@ type RunDelivery interface {
 	// with no run to fall back to.
 	ReclaimRun(ctx context.Context, sandboxID, owner string) (*model.Run, error)
 	// ClaimRunFor is the whole claim decision of one /agent/runs/next, serialised per sandbox:
-	// the run stamp.Owner claimed and never confirmed, handed out again (reclaimed true), or
-	// else ClaimRun of runID (the oldest queued run the caller read). Decided apart, a retry
+	// the run stamp.Owner claimed and never confirmed, handed out again (reclaimed true);
+	// ErrOwnerBusy while the owner executes a run it confirmed; or else ClaimRun of runID (the
+	// oldest queued run the caller read). Decided apart, a retry
 	// overlapping the request whose response was lost could miss the claim being made and take
 	// the next queued run, executing a continuation before the run it continues. ErrConflict
 	// when runID is no longer queued, ErrNotFound when it is absent, not the sandbox's, or "".
@@ -52,6 +53,12 @@ type RunDelivery interface {
 	// repair of a command whose event a replica of an older release, or a crash, failed to write.
 	EnsureRunEvent(ctx context.Context, e *model.Event) (bool, error)
 }
+
+// ErrOwnerBusy: the owner is executing a run it confirmed (ClaimRunFor): it gets no other run
+// until that one is settled. A request of it that was delayed past its own retry would
+// otherwise start the next run (a continuation, before the session it continues is known). It
+// is an ErrNotFound: there is no work for the owner now.
+var ErrOwnerBusy = fmt.Errorf("%w: the owner is executing a run it confirmed", ErrNotFound)
 
 // ErrBatchMismatch: the X-Batch-Id was already used for a different body.
 var ErrBatchMismatch = errors.New("batch id was already used with a different body")
@@ -88,9 +95,10 @@ type batchProgress struct {
 }
 
 // resume is how many lines of b were stored already under its id, or ErrBatchMismatch when b
-// is not that batch again: another body, fewer lines, or more lines than a batch stored whole.
+// is not that batch again: another body, fewer lines, or, against a batch stored whole, any
+// body but the same whole one (more lines, or a cut-off one: a 413 must not reopen it).
 func (rec batchProgress) resume(b *OutputBatch, chain []string) (int, error) {
-	if rec.lines > len(b.Lines) || chain[rec.lines] != rec.hash || rec.complete && len(b.Lines) != rec.lines {
+	if rec.lines > len(b.Lines) || chain[rec.lines] != rec.hash || rec.complete && (b.Partial || len(b.Lines) != rec.lines) {
 		return 0, ErrBatchMismatch
 	}
 	return rec.lines, nil
@@ -158,8 +166,9 @@ func batchSession(lines []OutputLine) string {
 	return s
 }
 
-// outputBatchTTL is how long a batch's progress is kept: a runner retries a batch for minutes,
-// never for a day.
+// outputBatchTTL is how long a batch's progress is kept after the last call under its id. A
+// runner retries a batch for as long as its harness lives, with at most 30 s between attempts
+// (postBackoffMax in cmd/agent-runner), so every retry renews it long before it runs out.
 const outputBatchTTL = IdempotencyTTL
 
 // Fault points of the RunDelivery transactions: the last step before the commit, after every

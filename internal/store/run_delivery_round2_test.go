@@ -582,3 +582,186 @@ func TestRound2EventIdsBecomeVisibleInCommitOrder(t *testing.T) {
 		}
 	}
 }
+
+// Codex round 2 of #31, finding 1: the reclaim chose its candidate in a subquery and updated it
+// by id. Under Read Committed a reclaim that waited on an acknowledgement (or a settle) holding
+// the row then bumped the attempt of the row as committed, confirmed (or done): the executing
+// runner was fenced out. The candidates are locked and read again before deciding.
+func TestRound2ReclaimWaitsForTheRowItDecidesOn(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, sql string
+		want      model.RunStatus
+		acked     bool
+	}{
+		{"acknowledgement", `UPDATE runs SET claim_acked=true WHERE id=$1`, model.RunRunning, true},
+		{"settle", `UPDATE runs SET status='done', finished_at=now() WHERE id=$1`, model.RunDone, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := round2Run(t, p, "dl-lock-"+tc.name)
+			if _, err := p.ClaimRun(ctx, r.ID, time.Now(), "", RunStamp{Owner: "1"}); err != nil {
+				t.Fatal(err)
+			}
+			tx, err := p.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx)
+			if _, err := tx.Exec(ctx, tc.sql, r.ID); err != nil {
+				t.Fatal(err)
+			}
+			type result struct {
+				r   *model.Run
+				err error
+			}
+			done := make(chan result, 1)
+			go func() {
+				got, err := p.ReclaimRun(ctx, r.SandboxID, "1")
+				done <- result{got, err}
+			}()
+			select {
+			case res := <-done:
+				t.Fatalf("the reclaim did not wait for the open %s: %+v %v", tc.name, res.r, res.err)
+			case <-time.After(300 * time.Millisecond):
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			res := <-done
+			if !errors.Is(res.err, ErrNotFound) {
+				t.Fatalf("a reclaim after the %s committed: %+v %v", tc.name, res.r, res.err)
+			}
+			got, _ := p.GetRun(ctx, r.ID)
+			if got.Attempt != 1 || got.Status != tc.want || got.ClaimAcked != tc.acked {
+				t.Fatalf("the run after a reclaim raced the %s: %+v", tc.name, got)
+			}
+		})
+	}
+}
+
+// Codex round 2 of #31, finding 4 (store side): an owner executing a confirmed run is busy.
+func TestRound2ConfirmedRunMakesItsOwnerBusy(t *testing.T) {
+	bothStores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		r := round2Run(t, s, "dl-busy")
+		c, err := s.ClaimRun(ctx, r.ID, time.Now(), "", RunStamp{Owner: "1"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AckRunClaim(ctx, r.ID, c.Attempt); err != nil {
+			t.Fatal(err)
+		}
+		next := &model.Run{ID: "dl-busy-2", SandboxID: r.SandboxID, Tenant: "acme", Slug: "dev", Task: "t", Status: model.RunQueued, CreatedAt: time.Now()}
+		if err := s.CreateRun(ctx, next); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.ClaimRunFor(ctx, r.SandboxID, next.ID, time.Now(), "", RunStamp{Owner: "1"}); !errors.Is(err, ErrOwnerBusy) || !errors.Is(err, ErrNotFound) {
+			t.Fatalf("a claim of a busy owner: %v", err)
+		}
+		if got, _ := s.GetRun(ctx, next.ID); got.Status != model.RunQueued {
+			t.Fatalf("the busy owner's claim took the run: %+v", got)
+		}
+		if _, _, err := s.ClaimRunFor(ctx, r.SandboxID, next.ID, time.Now(), "", RunStamp{Owner: "2"}); err != nil {
+			t.Fatalf("another owner: %v", err)
+		}
+	})
+}
+
+// Codex round 2 of #31, finding 3: a body cut off by a 413 under the id of a batch stored whole
+// was accepted as its prefix and reset the batch to partial, so a third body extended it. A
+// batch stored whole stays whole and takes only the same whole body.
+func TestRound2CutBodyCannotReopenAWholeBatch(t *testing.T) {
+	bothStores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		r := round2Run(t, s, "dl-reopen")
+		if _, err := s.ClaimRun(ctx, r.ID, time.Now(), "", RunStamp{}); err != nil {
+			t.Fatal(err)
+		}
+		post := func(partial bool, lines []OutputLine) error {
+			_, err := s.AppendRunOutput(ctx, &OutputBatch{SandboxID: r.SandboxID, RunID: r.ID, BatchID: "B", Lines: lines, Partial: partial})
+			return err
+		}
+		if err := post(false, round2Lines("a")); err != nil {
+			t.Fatal(err)
+		}
+		if err := post(true, round2Lines("a")); !errors.Is(err, ErrBatchMismatch) { // "a" + an oversized line
+			t.Fatalf("a cut body under a whole batch's id: %v", err)
+		}
+		withUsage := round2Lines("a", "u")
+		withUsage[1].Usage = &model.Usage{InputTokens: 10, CostUSD: 0.5}
+		if err := post(false, withUsage); !errors.Is(err, ErrBatchMismatch) {
+			t.Fatalf("the third body: %v", err)
+		}
+		if err := post(false, round2Lines("a")); err != nil {
+			t.Fatalf("the same whole body again: %v", err)
+		}
+		got, _ := s.GetRun(ctx, r.ID)
+		if out := round2Outputs(t, s, r); len(out) != 1 || got.Usage.CostUSD != 0 {
+			t.Fatalf("outputs=%v usage=%+v", out, got.Usage)
+		}
+	})
+}
+
+// ageBatch moves the last call under a batch id d into the past.
+func ageBatch(t *testing.T, s Store, runID, batchID string, d time.Duration) {
+	t.Helper()
+	switch st := s.(type) {
+	case *Memory:
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		k := runID + "|" + batchID
+		v, ok := st.batches[k]
+		if !ok {
+			t.Fatalf("no batch %s", k)
+		}
+		v.at = v.at.Add(-d)
+		st.batches[k] = v
+	case *Postgres:
+		tag, err := st.pool.Exec(context.Background(), `UPDATE run_output_batches SET touched_at = touched_at - $3::interval WHERE run_id=$1 AND batch_id=$2`,
+			runID, batchID, d.String())
+		if err != nil || tag.RowsAffected() != 1 {
+			t.Fatalf("age batch: %v %v", err, tag)
+		}
+	default:
+		t.Fatalf("store %T", s)
+	}
+}
+
+// Codex round 2 of #31, finding 5: Postgres counted a batch's retention from its first call,
+// memory from its last. A batch retried for longer than the retention (lost acknowledgements
+// for a day) was dropped by another batch's cleanup on Postgres, and its next retry stored the
+// lines and usage again. Both stores count from the last call now.
+func TestRound2BatchRetentionIsRenewedByItsRetries(t *testing.T) {
+	bothStores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		r := round2Run(t, s, "dl-ttl")
+		if _, err := s.ClaimRun(ctx, r.ID, time.Now(), "", RunStamp{}); err != nil {
+			t.Fatal(err)
+		}
+		lines := round2Lines("a", "u")
+		lines[1].Usage = &model.Usage{InputTokens: 10, CostUSD: 0.5}
+		post := func(id string, l []OutputLine) *OutputResult {
+			res, err := s.AppendRunOutput(ctx, &OutputBatch{SandboxID: r.SandboxID, RunID: r.ID, BatchID: id, Lines: l})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return res
+		}
+		post("B", lines)
+		almost := outputBatchTTL - time.Hour
+		ageBatch(t, s, r.ID, "B", almost)
+		post("B", lines) // a retry (its acknowledgement was lost again)
+		ageBatch(t, s, r.ID, "B", almost)
+		post("C", round2Lines("c")) // another batch: its cleanup drops expired progress
+		if res := post("B", lines); res.Skipped != 2 || res.Accepted != 0 {
+			t.Fatalf("a batch retried within the retention was dropped: %+v", res)
+		}
+		// Not retried for longer than the retention: dropped on both stores alike.
+		ageBatch(t, s, r.ID, "B", outputBatchTTL+time.Hour)
+		post("D", round2Lines("d"))
+		if res := post("B", lines); res.Skipped != 0 {
+			t.Fatalf("an expired batch was kept: %+v", res)
+		}
+	})
+}

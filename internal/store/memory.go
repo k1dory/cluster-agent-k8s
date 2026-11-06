@@ -1825,7 +1825,8 @@ func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResu
 				delete(m.batches, k)
 			}
 		}
-		m.batches[key] = memBatch{batchProgress: batchProgress{lines: len(b.Lines), hash: chain[len(b.Lines)], complete: !b.Partial}, at: at}
+		prev := m.batches[key]
+		m.batches[key] = memBatch{batchProgress: batchProgress{lines: len(b.Lines), hash: chain[len(b.Lines)], complete: prev.complete || !b.Partial}, at: at}
 	}
 	if err := faultAt(m, FaultOutput); err != nil {
 		undo.rollback()
@@ -1879,13 +1880,21 @@ func (m *Memory) ClaimRunFor(_ context.Context, sandboxID, runID string, started
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if stamp.Owner != "" {
+		busy := false
 		for _, c := range m.runsOf(sandboxID) {
-			if c.Status == model.RunRunning && c.ClaimedBy == stamp.Owner && !c.ClaimAcked {
+			if c.Status != model.RunRunning || c.ClaimedBy != stamp.Owner {
+				continue
+			}
+			if !c.ClaimAcked {
 				r := m.runs[c.ID]
 				r.Attempt++
 				out := *r
 				return &out, true, nil
 			}
+			busy = true
+		}
+		if busy {
+			return nil, false, ErrOwnerBusy
 		}
 	}
 	if runID == "" {

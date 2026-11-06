@@ -310,10 +310,10 @@ CREATE TABLE IF NOT EXISTS run_output_batches (
     lines      integer NOT NULL,
     hash       text NOT NULL,
     complete   boolean NOT NULL DEFAULT true,
-    created_at timestamptz NOT NULL DEFAULT now(),
+    touched_at timestamptz NOT NULL DEFAULT now(), -- the last call under the id: retention counts from it
     PRIMARY KEY (run_id, batch_id)
 );
-CREATE INDEX IF NOT EXISTS run_output_batches_created ON run_output_batches (created_at);
+CREATE INDEX IF NOT EXISTS run_output_batches_touched ON run_output_batches (touched_at);
 
 -- every start: repairs of rows a replica of an older release may still write
 -- No DDL here: these run on every start, after the steps, because during a rolling update an
