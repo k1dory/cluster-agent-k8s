@@ -327,3 +327,63 @@ func TestRound2RolloutDefersWhenTheLockedRecheckFails(t *testing.T) {
 		t.Fatalf("pod: %v", err)
 	}
 }
+
+// lifecycleEventsRespectCancel refuses AppendEvent on a cancelled context, as Postgres does.
+type lifecycleEventsRespectCancel struct{ store.Store }
+
+func (s *lifecycleEventsRespectCancel) AppendEvent(ctx context.Context, e *model.Event) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.Store.AppendEvent(ctx, e)
+}
+
+// lifecycleDeleteHook runs hook inside the next DeletePod, once armed.
+type lifecycleDeleteHook struct {
+	*FakeRuntime
+	mu   sync.Mutex
+	hook func()
+}
+
+func (r *lifecycleDeleteHook) DeletePod(ctx context.Context, sb *model.Sandbox) error {
+	r.mu.Lock()
+	hook := r.hook
+	r.hook = nil
+	r.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return r.FakeRuntime.DeletePod(ctx, sb)
+}
+
+// The idle rollout records its decision after the restart, which runs detached; the record
+// used the request's context, so a client that hung up during the pod deletion lost the
+// `rollout` event of a version change that went through. It is recorded on a detached context.
+func TestRound2RolloutTraceSurvivesAClientGoneDuringTheRestart(t *testing.T) {
+	rt := &lifecycleDeleteHook{FakeRuntime: NewFakeRuntime()}
+	st := &lifecycleEventsRespectCancel{Store: store.NewMemory()}
+	sb := lifecycleRunningSandbox(t, st, rt.FakeRuntime, "sb_rotrace")
+	o := New(st, rt, nil, events.New(), Config{ReadyTimeout: 5 * time.Second, StopTimeout: 5 * time.Second}, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt.mu.Lock()
+	rt.hook = cancel
+	rt.mu.Unlock()
+	res, err := o.Rollout(ctx, RolloutRequest{Sandbox: sb.ID, Version: "img:2", Admin: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Items[0].Mode != model.RolloutNow {
+		t.Fatalf("rollout of an idle sandbox: %+v", res.Items[0])
+	}
+	evs, err := st.ListEvents(context.Background(), sb.ID, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range evs {
+		if e.Type == model.EventRollout && strings.Contains(e.Data, `"mode":"now"`) {
+			return
+		}
+	}
+	t.Fatalf("no rollout event after a restart whose client went away: %+v", evs)
+}

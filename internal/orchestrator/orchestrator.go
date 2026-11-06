@@ -1395,6 +1395,10 @@ func (o *Orchestrator) rolloutOne(ctx context.Context, sb *model.Sandbox, versio
 	record := func(mode string, runID, resumeID string) {
 		item.Mode, item.RunID, item.ResumeID = mode, runID, resumeID
 		b, _ := json.Marshal(model.Rollout{From: sb.AgentVersion, To: version, Mode: mode, RunID: runID, ResumeID: resumeID})
+		// Recorded after a restart that runs detached: a client that hung up meanwhile must not
+		// lose the trace of a version change that went through.
+		ctx, cancel := o.detached(ctx)
+		defer cancel()
 		o.emit(ctx, model.Event{SandboxID: sb.ID, RunID: runID, Type: model.EventRollout, Data: string(b)})
 	}
 	setDesired := func() error {
