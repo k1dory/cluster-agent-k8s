@@ -28,6 +28,7 @@ func TestRealCaddyAgreesWithTheUpstreamValidator(t *testing.T) {
 	bin := caddyBin(t)
 	for _, up := range []string{
 		"https://10.0.0.5:8443", "http://10.0.0.5", "https://netbox.example.com", "https://[fd00::5]:8443",
+		"http://[::ffff:10.0.0.5]:8080", "https://[::ffff:a00:5]",
 		"http://h.example.com:80", "https://h.example.com:443", "http://h.example.com:8080",
 		"http://h.example.com:443", "https://h.example.com:80", "https://10.0.0.5:8443/api", "https://10.0.0.5/",
 		"https://h.example.com?x=1", "https://user:pw@h.example.com",

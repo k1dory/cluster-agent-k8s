@@ -9,6 +9,7 @@ func TestReviewValidateUpstream(t *testing.T) {
 	for _, ok := range []string{
 		"https://10.0.0.5:8443", "http://10.0.0.5", "https://netbox.example.com", "https://[fd00::5]:8443",
 		"https://[2001:db8::1]", "https://svc.internal.:443", "https://my_host.local",
+		"http://[::ffff:10.0.0.5]:8080", "https://[::ffff:a00:5]",
 	} {
 		if err := ValidateUpstream(ok); err != nil {
 			t.Errorf("%s: %v", ok, err)
@@ -18,7 +19,7 @@ func TestReviewValidateUpstream(t *testing.T) {
 		"https://10.0.0.5:8443/api", "https://10.0.0.5/", "https://h.example.com?x=1", "https://h.example.com#f",
 		"https://user:pw@h.example.com", "ftp://h.example.com", "https://", "https://{env.X}", "https://h.example.com {",
 		"https://h}.example.com", "https://h.example.com:0", "https://h.example.com:99999", "https://h.example.com:",
-		"https://[10.0.0.5]", "https://-bad.example.com", "10.0.0.5:8443", "https:h.example.com", "https://h .com",
+		"https://[10.0.0.5]", "https://[fe80::1%25eth0]:8443", "https://-bad.example.com", "10.0.0.5:8443", "https:h.example.com", "https://h .com",
 		"https://h.example.com\n}", "", "http://h.example.com:443", "https://h.example.com:80", "http://[fd00::1]:443", "HTTPS://10.0.0.5:8443", "Http://h.example.com",
 	} {
 		if err := ValidateUpstream(bad); err == nil {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -59,8 +60,9 @@ func ValidateUpstream(s string) error {
 		}
 	}
 	if strings.HasPrefix(u.Host, "[") {
-		// A bracketed literal must be an IPv6 address (the zone form is meaningless here).
-		if ip := net.ParseIP(host); ip == nil || ip.To4() != nil {
+		// A bracketed literal must be an IPv6 address, IPv4-mapped ones (::ffff:10.0.0.5)
+		// included; a zone (fe80::1%eth0) means nothing to the gateway's host.
+		if a, err := netip.ParseAddr(host); err != nil || !a.Is6() || a.Zone() != "" {
 			return fmt.Errorf("upstream %q: %q is not an IPv6 address", s, host)
 		}
 		return nil
