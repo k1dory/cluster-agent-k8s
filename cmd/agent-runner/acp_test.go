@@ -436,7 +436,7 @@ func TestACPRealAdapterOpensASession(t *testing.T) {
 	}
 	isolate := noNetwork(t)
 	home := t.TempDir()
-	t.Cleanup(func() { logSurvivors(t, home) })
+	t.Cleanup(func() { logSurvivors(t, home); removeHomeFirst(t, home) })
 	t.Setenv("HARNESS_AUTH_METHOD", os.Getenv("ACP_REAL_AUTH_METHOD"))
 	t.Setenv("SANDBOX_MCP_SERVERS", "")
 	t.Setenv("PWD", home)
