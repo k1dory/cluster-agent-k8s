@@ -52,10 +52,23 @@ type Handler struct {
 const cookieName = "__Host-sandbox_pv"
 const callbackPath = "/__sandbox/auth"
 
+// ticket is what the sign-in ticket and the cookie carry. The host alone does not name a
+// sandbox for long: <name>-<owner> comes back when the sandbox is deleted and created again, so
+// the ticket also names the sandbox, its tenant and the access generation it was issued under
+// (bumped when the preview is closed or its access level changes). A ticket of an earlier
+// sandbox or generation is refused.
 type ticket struct {
-	Host string `json:"host"`
-	User string `json:"user"`
-	Exp  int64  `json:"exp"`
+	Host    string `json:"host"`
+	User    string `json:"user"`
+	Exp     int64  `json:"exp"`
+	Sandbox string `json:"sb"`
+	Tenant  string `json:"tenant"`
+	Gen     int64  `json:"gen"`
+}
+
+// grants reports whether the ticket was issued for this sandbox's preview as it is now.
+func (t *ticket) grants(sb *model.Sandbox) bool {
+	return sb.Preview != nil && t.Host == sb.Preview.Host && t.Sandbox == sb.ID && t.Tenant == sb.Tenant && t.Gen == sb.PreviewGen
 }
 
 // askPath is Caddy's on_demand_tls ask hook: 200 only for hosts that have a preview, so
@@ -139,13 +152,13 @@ func (h *Handler) authorized(r *http.Request, sb *model.Sandbox) bool {
 	if err != nil {
 		return false
 	}
-	return t.Host == sb.Preview.Host
+	return t.grants(sb)
 }
 
 // callback receives ?ticket=<signed> from the auth service and sets the cookie.
 func (h *Handler) callback(w http.ResponseWriter, r *http.Request, sb *model.Sandbox) {
 	t, err := h.verify(r.URL.Query().Get("ticket"))
-	if err != nil || t.Host != sb.Preview.Host {
+	if err != nil || !t.grants(sb) {
 		http.Error(w, "bad ticket", http.StatusForbidden)
 		return
 	}
@@ -153,7 +166,9 @@ func (h *Handler) callback(w http.ResponseWriter, r *http.Request, sb *model.San
 	if ttl == 0 {
 		ttl = time.Hour
 	}
-	cookie := h.Sign(ticket{Host: t.Host, User: t.User, Exp: time.Now().Add(ttl).Unix()})
+	c := *t
+	c.Exp = time.Now().Add(ttl).Unix()
+	cookie := h.Sign(c)
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: cookie, Path: "/", Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: int(ttl.Seconds())})
 	http.Redirect(w, r, safeNext(r.URL.Query().Get("next")), http.StatusFound)
 }
@@ -167,9 +182,14 @@ func (h *Handler) Sign(t ticket) string {
 	return b + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 }
 
-// SignTicket is the exported helper used by the platform API to mint a ticket for a user.
-func (h *Handler) SignTicket(host, user string, ttl time.Duration) string {
-	return h.Sign(ticket{Host: host, User: user, Exp: time.Now().Add(ttl).Unix()})
+// SignTicket is the exported helper used by the platform API to mint a ticket for a user, for
+// the sandbox's preview as it is now (see ticket).
+func (h *Handler) SignTicket(sb *model.Sandbox, user string, ttl time.Duration) string {
+	t := ticket{User: user, Exp: time.Now().Add(ttl).Unix(), Sandbox: sb.ID, Tenant: sb.Tenant, Gen: sb.PreviewGen}
+	if sb.Preview != nil {
+		t.Host = sb.Preview.Host
+	}
+	return h.Sign(t)
 }
 
 func (h *Handler) verify(s string) (*ticket, error) {

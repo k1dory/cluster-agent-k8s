@@ -1445,6 +1445,10 @@ func (o *Orchestrator) SetPreview(ctx context.Context, id string, port int, acce
 		return nil, fmt.Errorf("%w: access must be link, sso or members", ErrBadRequest)
 	}
 	return o.mutate(ctx, id, func(sb *model.Sandbox) error {
+		// Closing the preview or changing who may see it revokes every sign-in issued so far.
+		if sb.Preview != nil && (port == 0 || sb.Preview.Access != access) {
+			sb.PreviewGen++
+		}
 		if port == 0 {
 			sb.Preview = nil
 			return nil
