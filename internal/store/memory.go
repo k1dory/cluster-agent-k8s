@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -24,7 +25,7 @@ type Memory struct {
 	idem      map[string]*Idempotent
 	blobs     map[string][]byte
 	blobAt    map[string]time.Time
-	tenants   map[string]*sync.Mutex
+	tenants   map[string]chan struct{}        // a one-slot semaphore per tenant: a wait can give up with its ctx
 	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
 	applies   map[string]*model.Apply
 	apiKeys   map[string]*model.APIKey
@@ -36,6 +37,16 @@ type Memory struct {
 	oauth     map[string]*memOAuth      // tenant|name
 	nextInst  int
 	nextEvent int64
+	// idemNow is the clock of Idempotency-Key reservations (time.Now; tests move it to age one).
+	idemNow func() time.Time
+}
+
+// SetIdempotencyClock replaces the clock reservations are dated and aged by (tests: a
+// reservation abandoned IdempotencyStale ago without waiting that long).
+func (m *Memory) SetIdempotencyClock(now func() time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.idemNow = now
 }
 
 // NewMemory returns an empty in-memory store.
@@ -47,7 +58,7 @@ func NewMemory() *Memory {
 		idem:      map[string]*Idempotent{},
 		blobs:     map[string][]byte{},
 		blobAt:    map[string]time.Time{},
-		tenants:   map[string]*sync.Mutex{},
+		tenants:   map[string]chan struct{}{},
 		catalog:   map[string][]*model.CatalogItem{},
 		applies:   map[string]*model.Apply{},
 		apiKeys:   map[string]*model.APIKey{},
@@ -56,6 +67,7 @@ func NewMemory() *Memory {
 		gitJobs:   map[string]*model.GitJob{},
 		creds:     map[string]*memCredential{},
 		oauth:     map[string]*memOAuth{},
+		idemNow:   time.Now,
 	}
 }
 
@@ -199,17 +211,22 @@ func (m *Memory) DeleteItem(_ context.Context, kind, tenant, name string) error 
 	return nil
 }
 
-// WithTenantLock serialises per tenant within this process (one process is all a memory store has).
+// WithTenantLock serialises per tenant within this process (one process is all a memory store
+// has). A wait ends with ctx, as the advisory lock's query does on Postgres.
 func (m *Memory) WithTenantLock(ctx context.Context, tenant string, fn func(ctx context.Context) error) error {
 	m.mu.Lock()
 	l, ok := m.tenants[tenant]
 	if !ok {
-		l = &sync.Mutex{}
+		l = make(chan struct{}, 1)
 		m.tenants[tenant] = l
 	}
 	m.mu.Unlock()
-	l.Lock()
-	defer l.Unlock()
+	select {
+	case l <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-l }()
 	return fn(ctx)
 }
 
@@ -276,6 +293,8 @@ func (m *Memory) DeleteBlobsBefore(_ context.Context, prefix string, t time.Time
 	return n, nil
 }
 
+// cloneSandbox copies every map, slice and pointer of the record: neither the caller's input
+// nor what a read returns shares memory with what the store holds (Postgres serialises both).
 func cloneSandbox(s *model.Sandbox) *model.Sandbox {
 	c := *s
 	if s.Preview != nil {
@@ -284,21 +303,47 @@ func cloneSandbox(s *model.Sandbox) *model.Sandbox {
 	}
 	if s.Launch != nil {
 		l := *s.Launch
-		if s.Launch.Env != nil {
-			l.Env = map[string]string{}
-			for k, v := range s.Launch.Env {
-				l.Env[k] = v
-			}
-		}
+		l.Env = maps.Clone(s.Launch.Env)
+		l.HarnessFiles = maps.Clone(s.Launch.HarnessFiles)
+		l.MCPServers = slices.Clone(s.Launch.MCPServers)
 		c.Launch = &l
 	}
+	c.ExpiresAt = cloneTime(s.ExpiresAt)
 	c.Connections = append([]string(nil), s.Connections...)
 	return &c
+}
+
+// cloneTime copies an optional time.
+func cloneTime(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	return &c
+}
+
+// previewTaken reports another sandbox holding host (the unique index on preview_host); lock held.
+func (m *Memory) previewTaken(s *model.Sandbox) bool {
+	if s.Preview == nil {
+		return false
+	}
+	for id, o := range m.sandboxes {
+		if id != s.ID && o.Preview != nil && o.Preview.Host == s.Preview.Host {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Memory) CreateSandbox(_ context.Context, s *model.Sandbox) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, dup := m.sandboxes[s.ID]; dup {
+		return fmt.Errorf("%w: sandbox %s exists", ErrConflict, s.ID)
+	}
+	if m.previewTaken(s) {
+		return fmt.Errorf("%w: preview host %s is taken", ErrConflict, s.Preview.Host)
+	}
 	s.Revision = 1
 	m.sandboxes[s.ID] = cloneSandbox(s)
 	return nil
@@ -334,6 +379,9 @@ func (m *Memory) UpdateSandbox(_ context.Context, s *model.Sandbox) error {
 	}
 	if cur.Revision != s.Revision {
 		return ErrConflict
+	}
+	if m.previewTaken(s) {
+		return fmt.Errorf("%w: preview host %s", ErrDuplicate, s.Preview.Host)
 	}
 	s.Revision++
 	c := cloneSandbox(s)
@@ -379,11 +427,20 @@ func (m *Memory) SandboxByPreviewHost(_ context.Context, host string) (*model.Sa
 	return nil, ErrNotFound
 }
 
+// cloneRun copies the run with its optional times.
+func cloneRun(r *model.Run) *model.Run {
+	c := *r
+	c.StartedAt, c.FinishedAt = cloneTime(r.StartedAt), cloneTime(r.FinishedAt)
+	return &c
+}
+
 func (m *Memory) CreateRun(_ context.Context, r *model.Run) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	c := *r
-	m.runs[r.ID] = &c
+	if _, dup := m.runs[r.ID]; dup {
+		return fmt.Errorf("%w: run %s exists", ErrConflict, r.ID)
+	}
+	m.runs[r.ID] = cloneRun(r)
 	return nil
 }
 
@@ -394,8 +451,7 @@ func (m *Memory) GetRun(_ context.Context, id string) (*model.Run, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	c := *r
-	return &c, nil
+	return cloneRun(r), nil
 }
 
 func (m *Memory) RecordRunUsage(_ context.Context, id string, u model.Usage, total bool) error {
@@ -441,16 +497,14 @@ func (m *Memory) SettleRun(_ context.Context, id string, from []model.RunStatus,
 	if usage != nil {
 		r.Usage = *usage
 	}
-	out := *r
-	return &out, nil
+	return cloneRun(r), nil
 }
 
 func (m *Memory) runsOf(sandboxID string) []*model.Run {
 	var out []*model.Run
 	for _, r := range m.runs {
 		if r.SandboxID == sandboxID {
-			c := *r
-			out = append(out, &c)
+			out = append(out, cloneRun(r))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
@@ -461,20 +515,6 @@ func (m *Memory) ListRuns(_ context.Context, sandboxID string) ([]*model.Run, er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.runsOf(sandboxID), nil
-}
-
-func (m *Memory) ClaimQueuedRun(_ context.Context, sandboxID string, startedAt time.Time) (*model.Run, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, c := range m.runsOf(sandboxID) {
-		if c.Status == model.RunQueued {
-			r := m.runs[c.ID]
-			r.Status, r.StartedAt = model.RunRunning, &startedAt
-			out := *r
-			return &out, nil
-		}
-	}
-	return nil, ErrNotFound
 }
 
 func (m *Memory) AppendQueuedTask(_ context.Context, runID, text string) (*model.Run, error) {
@@ -488,22 +528,7 @@ func (m *Memory) AppendQueuedTask(_ context.Context, runID, text string) (*model
 		return nil, ErrConflict
 	}
 	r.Task += text
-	out := *r
-	return &out, nil
-}
-
-func (m *Memory) ReleaseRun(_ context.Context, runID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	r, ok := m.runs[runID]
-	if !ok {
-		return ErrNotFound
-	}
-	if r.Status != model.RunRunning {
-		return ErrConflict
-	}
-	r.Status, r.StartedAt = model.RunQueued, nil
-	return nil
+	return cloneRun(r), nil
 }
 
 func (m *Memory) QueuedRun(_ context.Context, sandboxID string) (*model.Run, error) {
@@ -533,8 +558,7 @@ func (m *Memory) ClaimRun(_ context.Context, runID string, startedAt time.Time, 
 	}
 	r.AgentVersion, r.AgentRef, r.AgentRevision = stamp.AgentVersion, stamp.AgentRef, stamp.AgentRevision
 	r.EnvironmentRef, r.EnvironmentRevision = stamp.EnvironmentRef, stamp.EnvironmentRevision
-	out := *r
-	return &out, nil
+	return cloneRun(r), nil
 }
 
 func (m *Memory) RunningRun(_ context.Context, sandboxID string) (*model.Run, error) {
@@ -564,12 +588,15 @@ func (m *Memory) AppendEvent(_ context.Context, e *model.Event) error {
 func (m *Memory) ListEvents(_ context.Context, sandboxID string, afterID int64, limit int) ([]*model.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if limit <= 0 {
+		limit = DefaultEventLimit
+	}
 	var out []*model.Event
 	for _, e := range m.events {
 		if e.SandboxID == sandboxID && e.ID > afterID {
 			c := *e
 			out = append(out, &c)
-			if limit > 0 && len(out) >= limit {
+			if len(out) >= limit {
 				break
 			}
 		}
@@ -587,8 +614,15 @@ func (m *Memory) NextInstance(_ context.Context) (int, error) {
 func (m *Memory) CreateInstance(_ context.Context, in *model.Instance) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	c := *in
-	m.instances[in.N] = &c
+	if _, dup := m.instances[in.N]; dup {
+		return fmt.Errorf("%w: instance %d exists", ErrConflict, in.N)
+	}
+	for _, o := range m.instances {
+		if o.Serial == in.Serial {
+			return fmt.Errorf("%w: serial %s is issued", ErrConflict, in.Serial)
+		}
+	}
+	m.instances[in.N] = cloneInstance(in)
 	return nil
 }
 
@@ -597,8 +631,7 @@ func (m *Memory) InstanceBySerial(_ context.Context, serial string) (*model.Inst
 	defer m.mu.Unlock()
 	for _, in := range m.instances {
 		if in.Serial == serial {
-			c := *in
-			return &c, nil
+			return cloneInstance(in), nil
 		}
 	}
 	return nil, ErrNotFound
@@ -624,46 +657,70 @@ func (m *Memory) ListInstances(_ context.Context, sandboxID string) ([]*model.In
 	var out []*model.Instance
 	for _, in := range m.instances {
 		if in.SandboxID == sandboxID {
-			c := *in
-			out = append(out, &c)
+			out = append(out, cloneInstance(in))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].N < out[j].N })
 	return out, nil
 }
 
+func cloneIdem(v *Idempotent) *Idempotent {
+	c := *v
+	c.Body = append([]byte(nil), v.Body...)
+	return &c
+}
+
 func (m *Memory) ReserveIdempotent(_ context.Context, key, bodyHash string) (*Idempotent, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now := time.Now()
+	now := m.idemNow()
 	for k, v := range m.idem {
-		if v.CreatedAt.Before(now.Add(-IdempotencyTTL)) || v.InProgress() && v.CreatedAt.Before(now.Add(-IdempotencyStale)) {
+		if v.CreatedAt.Before(now.Add(-IdempotencyTTL)) {
 			delete(m.idem, k)
 		}
 	}
-	if v, ok := m.idem[key]; ok {
-		c := *v
-		return &c, false, nil
+	v, ok := m.idem[key]
+	if !ok {
+		v = &Idempotent{Key: key, BodyHash: bodyHash, CreatedAt: now, Generation: 1, Seed: NewIdempotencySeed()}
+		m.idem[key] = v
+		return cloneIdem(v), true, nil
 	}
-	m.idem[key] = &Idempotent{Key: key, BodyHash: bodyHash, CreatedAt: now}
-	return nil, true, nil
+	if v.InProgress() && v.BodyHash == bodyHash && v.CreatedAt.Before(now.Add(-IdempotencyStale)) {
+		// Abandoned: taken over, with the seed, so the resource it may have created is found.
+		v.Generation++
+		v.CreatedAt = now
+		if v.Seed == "" {
+			v.Seed = NewIdempotencySeed()
+		}
+		return cloneIdem(v), true, nil
+	}
+	return cloneIdem(v), false, nil
 }
 
 func (m *Memory) PutIdempotent(_ context.Context, rec *Idempotent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	c := *rec
+	c := cloneIdem(rec)
 	if c.CreatedAt.IsZero() {
-		c.CreatedAt = time.Now()
+		c.CreatedAt = m.idemNow()
 	}
-	m.idem[rec.Key] = &c
+	if rec.Generation > 0 {
+		cur, ok := m.idem[rec.Key]
+		if !ok || !cur.InProgress() || cur.Generation != rec.Generation {
+			return fmt.Errorf("%w: idempotency key is no longer reserved under generation %d", ErrConflict, rec.Generation)
+		}
+		c.Seed = cur.Seed
+	}
+	m.idem[rec.Key] = c
 	return nil
 }
 
-func (m *Memory) ReleaseIdempotent(_ context.Context, key string) error {
+func (m *Memory) ReleaseIdempotent(_ context.Context, key string, generation int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.idem, key)
+	if cur, ok := m.idem[key]; ok && cur.InProgress() && cur.Generation == generation {
+		delete(m.idem, key)
+	}
 	return nil
 }
 
@@ -671,11 +728,10 @@ func (m *Memory) GetIdempotent(_ context.Context, key string) (*Idempotent, erro
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	v, ok := m.idem[key]
-	if !ok || v.CreatedAt.Before(time.Now().Add(-IdempotencyTTL)) {
+	if !ok || v.CreatedAt.Before(m.idemNow().Add(-IdempotencyTTL)) {
 		return nil, ErrNotFound
 	}
-	c := *v
-	return &c, nil
+	return cloneIdem(v), nil
 }
 
 func (m *Memory) Close() error { return nil }
@@ -819,8 +875,7 @@ func (m *Memory) QueryRuns(_ context.Context, f Filter) ([]*model.Run, error) {
 		if !f.Cursor.after(r.CreatedAt, r.ID) {
 			continue
 		}
-		c := *r
-		out = append(out, &c)
+		out = append(out, cloneRun(r))
 		if len(out) >= limit {
 			break
 		}
@@ -831,12 +886,16 @@ func (m *Memory) QueryRuns(_ context.Context, f Filter) ([]*model.Run, error) {
 func (m *Memory) QueryEvents(_ context.Context, f Filter) ([]*model.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultEventLimit
+	}
 	var out []*model.Event
 	for _, e := range m.events {
 		if f.matchEvent(e) {
 			c := *e
 			out = append(out, &c)
-			if f.Limit > 0 && len(out) >= f.Limit {
+			if len(out) >= limit {
 				break
 			}
 		}
@@ -876,9 +935,10 @@ func cloneApply(a *model.Apply) *model.Apply {
 	c := *a
 	c.Steps = append([]model.ApplyStep(nil), a.Steps...)
 	c.Documents = append(json.RawMessage(nil), a.Documents...)
-	if a.LeaseUntil != nil {
-		t := *a.LeaseUntil
-		c.LeaseUntil = &t
+	c.LeaseUntil = cloneTime(a.LeaseUntil)
+	if a.Source != nil {
+		src := *a.Source
+		c.Source = &src
 	}
 	return &c
 }
@@ -998,7 +1058,10 @@ func (m *Memory) ListApplies(_ context.Context, tenant string, limit int) ([]*mo
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
-	if limit > 0 && len(out) > limit {
+	if limit <= 0 {
+		limit = 100 // as Postgres does
+	}
+	if len(out) > limit {
 		out = out[:limit]
 	}
 	return out, nil
@@ -1232,8 +1295,15 @@ type memOAuth struct {
 }
 
 func (o *memOAuth) copyOut() (*model.OAuthCredential, []byte) {
-	meta := o.meta
-	return &meta, append([]byte(nil), o.ciphertext...)
+	return cloneOAuth(&o.meta), append([]byte(nil), o.ciphertext...)
+}
+
+// cloneOAuth copies the sign-in with its optional times.
+func cloneOAuth(c *model.OAuthCredential) *model.OAuthCredential {
+	out := *c
+	out.LoginExpiresAt, out.ExpiresAt, out.RefreshedAt = cloneTime(c.LoginExpiresAt), cloneTime(c.ExpiresAt), cloneTime(c.RefreshedAt)
+	out.LeaseUntil = cloneTime(c.LeaseUntil)
+	return &out
 }
 
 func (m *Memory) PutOAuthCredential(_ context.Context, c *model.OAuthCredential, ciphertext []byte) (bool, error) {
@@ -1247,7 +1317,7 @@ func (m *Memory) PutOAuthCredential(_ context.Context, c *model.OAuthCredential,
 		c.Generation, c.CreatedAt = cur.meta.Generation+1, cur.meta.CreatedAt
 	}
 	c.LeaseOwner, c.LeaseUntil = "", nil
-	m.oauth[key] = &memOAuth{meta: *c, ciphertext: append([]byte(nil), ciphertext...)}
+	m.oauth[key] = &memOAuth{meta: *cloneOAuth(c), ciphertext: append([]byte(nil), ciphertext...)}
 	return !ok, nil
 }
 
@@ -1292,11 +1362,11 @@ func (m *Memory) DueOAuthCredentials(_ context.Context, now time.Time, limit int
 	defer m.mu.Unlock()
 	var out []*model.OAuthCredential
 	for _, o := range m.oauth {
-		c := o.meta
+		c := cloneOAuth(&o.meta)
 		if c.Status == model.OAuthFailed || c.NextAt.After(now) || leaseHeld(c.LeaseOwner, c.LeaseUntil, "", now) {
 			continue
 		}
-		out = append(out, &c)
+		out = append(out, c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NextAt.Before(out[j].NextAt) })
 	if limit > 0 && len(out) > limit {
@@ -1331,7 +1401,7 @@ func (m *Memory) SaveOAuthCredential(_ context.Context, c *model.OAuthCredential
 	next := *c
 	next.Provider, next.CreatedBy, next.CreatedAt = cur.meta.Provider, cur.meta.CreatedBy, cur.meta.CreatedAt
 	next.UpdatedAt, next.LeaseOwner, next.LeaseUntil = time.Now(), "", nil
-	m.oauth[c.Tenant+"|"+c.Name] = &memOAuth{meta: next, ciphertext: append([]byte(nil), ciphertext...)}
+	m.oauth[c.Tenant+"|"+c.Name] = &memOAuth{meta: *cloneOAuth(&next), ciphertext: append([]byte(nil), ciphertext...)}
 	*c = next
 	return nil
 }
@@ -1729,6 +1799,7 @@ func (m *Memory) BindInstance(_ context.Context, b InstanceBinding, issue func(n
 
 func cloneInstance(in *model.Instance) *model.Instance {
 	c := *in
+	c.RetiredAt = cloneTime(in.RetiredAt)
 	return &c
 }
 
