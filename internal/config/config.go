@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -184,6 +185,24 @@ type Config struct {
 		CookieTTL      time.Duration `yaml:"cookie_ttl"`
 		HitsAsActivity bool          `yaml:"hits_as_activity"`
 	} `yaml:"preview"`
+	// Metrics: Prometheus /metrics on a listener of its own. listen defaults to ":9090"; ""
+	// disables it. Never the API, gateway or ingress address: the endpoint has no
+	// authentication, so keep it on the cluster network (docs/observability.md).
+	Metrics struct {
+		Listen *string `yaml:"listen"`
+	} `yaml:"metrics"`
+	// Tracing: OpenTelemetry spans over OTLP (off by default). endpoint is the collector URL
+	// (http://tempo:4318 for http, http://collector:4317 for grpc); empty leaves it to the
+	// standard OTEL_EXPORTER_OTLP_* variables. protocol http (default) or grpc. sampler_ratio
+	// (default 1) is the share of traces kept, decided per trace id. record_statements puts
+	// each query's SQL on its span (off: no SQL leaves sandboxd).
+	Tracing struct {
+		Enabled          bool     `yaml:"enabled"`
+		Endpoint         string   `yaml:"endpoint"`
+		Protocol         string   `yaml:"protocol"`
+		SamplerRatio     *float64 `yaml:"sampler_ratio"`
+		RecordStatements bool     `yaml:"record_statements"`
+	} `yaml:"tracing"`
 }
 
 // expandEnv is os.ExpandEnv except for the agent's own SANDBOX_* variables (Load).
@@ -318,6 +337,9 @@ func Load(path string) (*Config, error) {
 	default:
 		return nil, fmt.Errorf("%s: accounting.egress_trace must be all, denied or off", path)
 	}
+	if err := c.observability(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
 	g := &c.Gateway
 	if g.APIHost == "" {
 		g.APIHost = "api.sandbox.internal"
@@ -429,4 +451,54 @@ func negativeDurations(v reflect.Value, path string) error {
 		}
 	}
 	return nil
+}
+
+// observability defaults and checks the metrics: and tracing: blocks.
+func (c *Config) observability() error {
+	if c.Metrics.Listen == nil {
+		l := ":9090"
+		c.Metrics.Listen = &l
+	}
+	if l := *c.Metrics.Listen; l != "" {
+		if _, _, err := net.SplitHostPort(l); err != nil {
+			return fmt.Errorf("metrics.listen %q: %w", l, err)
+		}
+		for name, other := range map[string]string{"listen.api": c.Listen.API, "listen.gateway": c.Listen.Gateway, "listen.ingress": c.Listen.Ingress} {
+			if other != "" && samePort(l, other) {
+				return fmt.Errorf("metrics.listen %q is the port of %s: /metrics has no authentication and needs a listener of its own", l, name)
+			}
+		}
+	}
+	t := &c.Tracing
+	if t.SamplerRatio == nil {
+		one := 1.0
+		t.SamplerRatio = &one
+	}
+	if r := *t.SamplerRatio; r < 0 || r > 1 || r != r {
+		return fmt.Errorf("tracing.sampler_ratio must be between 0 and 1, not %v", r)
+	}
+	switch t.Protocol {
+	case "", "http", "grpc":
+	default:
+		return fmt.Errorf("tracing.protocol must be http or grpc, not %q", t.Protocol)
+	}
+	if t.Endpoint != "" {
+		u, err := url.Parse(t.Endpoint)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("tracing.endpoint %q must be an http(s) URL such as http://tempo:4318", t.Endpoint)
+		}
+	}
+	return nil
+}
+
+// samePort: two listen addresses that would collide (same port, and a host in common or a
+// wildcard on either side).
+func samePort(a, b string) bool {
+	ha, pa, err1 := net.SplitHostPort(a)
+	hb, pb, err2 := net.SplitHostPort(b)
+	if err1 != nil || err2 != nil || pa != pb {
+		return false
+	}
+	wild := func(h string) bool { return h == "" || h == "0.0.0.0" || h == "::" }
+	return ha == hb || wild(ha) || wild(hb)
 }

@@ -178,3 +178,27 @@ policies: {}
 #    allow: [...]
 
 tolerations: []
+
+# Observability (docs/observability.md). The gateway pod uses the node's network, so the
+# metrics port is open on the node's addresses: /metrics has no authentication, keep the port
+# closed to anything but your Prometheus (the agent pods' firewall already keeps them off it).
+metrics:
+  enabled: true
+  port: 9090
+  # prometheus.io/scrape, /port and /path on the pod, for a Prometheus that discovers pods by
+  # annotation rather than through the operator.
+  podAnnotations: true
+  # A ServiceMonitor for the Prometheus operator; rendered only when its CRD
+  # (monitoring.coreos.com/v1) is installed in the cluster.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    labels: {}            # e.g. release: kube-prometheus-stack, to match the operator's selector
+# OpenTelemetry tracing over OTLP: endpoint is the collector (Tempo, Jaeger, an OTel Collector),
+# e.g. http://tempo.monitoring:4318 for protocol http, http://otel-collector.monitoring:4317 for grpc.
+tracing:
+  enabled: false
+  endpoint: ""
+  protocol: http
+  samplerRatio: 1         # share of traces kept (0..1), decided per trace id
+  recordStatements: false # put each query's SQL on its span

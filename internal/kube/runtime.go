@@ -225,6 +225,7 @@ func NewClient(kubeconfig string) (kubernetes.Interface, error) {
 	if err != nil {
 		return nil, err
 	}
+	observe(cfg) // metrics and spans per API call (observe.go)
 	return kubernetes.NewForConfig(cfg)
 }
 

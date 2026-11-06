@@ -522,6 +522,17 @@ from the harness (Claude Code's stream-json `result` line is understood; others 
 `{"type":"usage",...}` lines or send a total with `/finish`); compute is `pod_seconds` priced with
 `accounting.pod_hour_usd` in the config.
 
+## Metrics and tracing
+
+sandboxd serves Prometheus metrics on a listener of its own (`metrics.listen`, default `:9090`,
+unauthenticated: keep it on the cluster network): requests by route pattern, store queries by
+operation, Kubernetes API calls, sandboxes and unfinished runs by status, the reconciler, the
+gateway sync. With `tracing.enabled` it exports OpenTelemetry spans over OTLP to Tempo, Jaeger or
+a collector: one trace per API request across Postgres, the Kubernetes API and Caddy, and one per
+agent run (the runner sends the run's traceparent on every call). A request's log line carries
+its `trace_id` next to `rid`. The Helm chart has `metrics.*` (with a ServiceMonitor) and
+`tracing.*`; see [docs/observability.md](docs/observability.md).
+
 ## Run locally (no Kubernetes)
 
 Build and test changes follow the [shared CI contract](docs/ci-contract.md): checks are

@@ -32,7 +32,8 @@ type Gateway struct {
 
 // Routes builds the gateway mux.
 func (g *Gateway) Routes() http.Handler {
-	return logRequests(g.Log, g.routes().ServeMux)
+	mux := g.routes().ServeMux
+	return observed("gateway", mux, g.Log, mux)
 }
 
 func (g *Gateway) routes() *routeMux {
@@ -108,6 +109,7 @@ func (g *Gateway) agent(next agentHandler) http.HandlerFunc {
 			writeErr(w, http.StatusForbidden, errors.New("certificate has no sandbox SAN"))
 			return
 		}
+		agentSpan(r, id.SandboxID)
 		next(w, r, id)
 	}
 }

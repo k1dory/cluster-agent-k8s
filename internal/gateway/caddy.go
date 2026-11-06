@@ -25,7 +25,11 @@ import (
 	"text/template"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"agent-sandbox/internal/policy"
+	"agent-sandbox/internal/telemetry"
 )
 
 // Config describes the gateway sandboxd drives.
@@ -377,6 +381,10 @@ var adminClient = &http.Client{
 	},
 }
 
+// adminTraced is adminClient through the same transport, a call made inside a trace (a sync
+// under its span) being a client span of it.
+var adminTraced = &http.Client{Transport: telemetry.Transport(adminClient.Transport, true)}
+
 // adminTimeout bounds one admin call; a /load provisions every site, so it is generous. A
 // variable so tests need not wait it out.
 var adminTimeout = 30 * time.Second
@@ -390,7 +398,7 @@ func Push(ctx context.Context, adminURL, caddyfile string) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "text/caddyfile")
-	resp, err := adminClient.Do(req)
+	resp, err := adminTraced.Do(req)
 	if err != nil {
 		return fmt.Errorf("caddy admin: %w", err)
 	}
@@ -410,7 +418,7 @@ func FetchRoot(ctx context.Context, adminURL string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := adminClient.Do(req)
+	resp, err := adminTraced.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("caddy admin: %w", err)
 	}
@@ -513,6 +521,7 @@ func (s *Syncer) SyncOnce(ctx context.Context, force bool) error {
 			// nothing to load, and the failure it left behind is over. LastSync stays the
 			// time that configuration was loaded.
 			s.tried = fp
+			observeSync(nil)
 			s.mu.Lock()
 			s.clearFailure()
 			s.status.Skipped = append([]string(nil), s.acceptedSkipped...)
@@ -522,7 +531,10 @@ func (s *Syncer) SyncOnce(ctx context.Context, force bool) error {
 		return nil
 	}
 	s.tried = fp
+	ctx, span := telemetry.Tracer().Start(ctx, "gateway.Sync", trace.WithAttributes(attribute.Int("hosts", len(hs))))
 	err := s.syncOnce(ctx, hs, fp)
+	telemetry.End(span, err)
+	observeSync(err)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err == nil {
@@ -543,6 +555,16 @@ func (s *Syncer) SyncOnce(ctx context.Context, force bool) error {
 		s.status.Host = ""
 	}
 	return err
+}
+
+// observeSync records an attempt in the gateway sync metrics.
+func observeSync(err error) {
+	if err != nil {
+		telemetry.GatewaySyncStatus.WithLabelValues().Set(0)
+		telemetry.GatewaySyncFailures.Inc()
+		return
+	}
+	telemetry.GatewaySyncStatus.WithLabelValues().Set(1)
 }
 
 // clearFailure resets the failure fields; s.mu held.

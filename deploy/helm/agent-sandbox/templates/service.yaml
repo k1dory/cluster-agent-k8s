@@ -10,4 +10,7 @@ spec:
   selector: {{- include "agent-sandbox.selector" . | nindent 4 }}
   ports:
     - { name: api, port: 8080, targetPort: {{ .Values.gateway.apiPort }} }
+    {{- if .Values.metrics.enabled }}
+    - { name: metrics, port: {{ .Values.metrics.port }}, targetPort: metrics }
+    {{- end }}
 {{- end }}

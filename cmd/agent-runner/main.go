@@ -28,6 +28,8 @@ import (
 	"syscall"
 	"time"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 )
@@ -39,9 +41,12 @@ type client struct {
 	// X-Run-Attempt with every call about the run, so a run handed out again (this runner's
 	// claim response was lost) refuses whatever still acts on the earlier attempt.
 	attempts sync.Map
+	// traces: run id → the run's span (trace.go), sent as traceparent with every call about it.
+	traces sync.Map
 }
 
-// stampRun adds X-Run-Attempt to a call about a run this runner holds (/agent/runs/{id}/...).
+// stampRun adds X-Run-Attempt and the run's traceparent to a call about a run this runner
+// holds (/agent/runs/{id}/...).
 func (c *client) stampRun(req *http.Request) {
 	rest, ok := strings.CutPrefix(req.URL.Path, "/agent/runs/")
 	if !ok {
@@ -50,6 +55,9 @@ func (c *client) stampRun(req *http.Request) {
 	id, _, _ := strings.Cut(rest, "/")
 	if n, ok := c.attempts.Load(id); ok {
 		req.Header.Set("X-Run-Attempt", fmt.Sprint(n))
+	}
+	if sc, ok := c.traces.Load(id); ok {
+		injectTrace(req, sc.(trace.SpanContext))
 	}
 }
 
@@ -137,6 +145,7 @@ func serveRuns(ctx context.Context, c *client) {
 		if run.Attempt > 0 {
 			c.attempts.Store(run.ID, run.Attempt)
 		}
+		c.traces.Store(run.ID, newRunTrace())
 		exit := execute(ctx, c, &run)
 		// A result that was not acknowledged within the budget stays pending: the run is still
 		// `running` on the control plane, and while the pod is healthy nothing else settles it. No
@@ -148,6 +157,7 @@ func serveRuns(ctx context.Context, c *client) {
 			fmt.Fprintf(os.Stderr, "agent-runner: the result of run %s is still pending: no new run is taken until it is acknowledged\n", run.ID)
 		}
 		c.attempts.Delete(run.ID)
+		c.traces.Delete(run.ID)
 	}
 }
 
