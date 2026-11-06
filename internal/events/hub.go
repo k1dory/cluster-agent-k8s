@@ -120,3 +120,10 @@ func (h *Hub) Wake(sandboxID string, types ...string) (<-chan struct{}, func()) 
 		h.mu.Unlock()
 	}
 }
+
+// Waiting is how many Wake subscriptions key has: streams following it right now.
+func (h *Hub) Waiting(key string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.wakes[key])
+}

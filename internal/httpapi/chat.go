@@ -179,9 +179,7 @@ func (p *Platform) streamMessages(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, q.err)
 		return
 	}
-	wake, cancel := p.Hub.Wake(id, model.EventRunQueued, model.EventInput, model.EventRunOutput, model.EventRunDone)
-	defer cancel()
-	streamSSE(w, r, wake, 15*time.Second, after, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
+	streamSSE(w, r, hubWake(p.Hub, id, model.EventRunQueued, model.EventInput, model.EventRunOutput, model.EventRunDone), 15*time.Second, after, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
 		msgs, next, err := p.Orch.Messages(ctx, id, after, ssePageSize, raw)
 		items := make([]sseItem, 0, len(msgs))
 		for _, m := range msgs {

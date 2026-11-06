@@ -869,9 +869,7 @@ func (p *Platform) events(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, evs)
 		return
 	}
-	wake, cancel := p.Hub.Wake(id)
-	defer cancel()
-	streamSSE(w, r, wake, 20*time.Second, f.AfterID, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
+	streamSSE(w, r, hubWake(p.Hub, id), 20*time.Second, f.AfterID, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
 		g := f
 		g.AfterID, g.Limit = after, ssePageSize
 		evs, err := p.Orch.Store.QueryEvents(ctx, g)
@@ -1015,17 +1013,24 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The replay keeps the window; what is appended after the stream subscribed is followed
-	// live past any ?to (as it always has); ?from applies to both.
-	wake, cancel := p.Hub.Wake(events.All, f.Types...)
-	defer cancel()
-	head, err := p.traceHead(r.Context(), f)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, err)
-		return
-	}
+	// live past any ?to (as it always has); ?from applies to both. The head is read before the
+	// subscription and the first read of the log comes after it: an event appended in between
+	// has an id above the head, so it is live, read by that first drain. Read after the
+	// subscription instead, the head took such an event in, the window excluded it and the
+	// cursor moved past it. A failed head read is the stream's error frame, as a failed read
+	// of the log is: the client reconnects from its cursor.
+	var head int64
 	live := f
 	live.To = time.Time{}
-	streamSSE(w, r, wake, 20*time.Second, after, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
+	open := func(ctx context.Context) (<-chan struct{}, func(), error) {
+		var err error
+		if head, err = p.traceHead(ctx, f); err != nil {
+			return nil, nil, err
+		}
+		wake, cancel := p.Hub.Wake(events.All, f.Types...)
+		return wake, cancel, nil
+	}
+	streamSSE(w, r, open, 20*time.Second, after, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
 		g := live
 		if after < head {
 			g = f
@@ -1041,7 +1046,7 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 }
 
 // traceHead is where a trace stream's bounded replay ends and live following begins: the
-// newest event id when the stream subscribed (read after Wake, so nothing falls between).
+// newest event id just before the stream subscribes (store.EventHead: ids follow commits).
 // Without ?to there is no window and the stream follows the log from the start (0); a store
 // that cannot tell its head keeps the window for the whole stream (MaxInt64).
 func (p *Platform) traceHead(ctx context.Context, f store.Filter) (int64, error) {

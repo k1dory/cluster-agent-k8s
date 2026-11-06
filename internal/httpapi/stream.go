@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"agent-sandbox/internal/events"
 )
 
 // sseItem is one frame of a stream: its id (the event id a client resumes from with
@@ -22,6 +24,18 @@ type sseItem struct {
 // next == after means the log has nothing more for now.
 type ssePage func(ctx context.Context, after int64) (items []sseItem, next int64, err error)
 
+// sseOpen subscribes a stream to its wake-ups (and does whatever must precede that, such as
+// reading a replay boundary). An error ends the stream with the error frame.
+type sseOpen func(ctx context.Context) (wake <-chan struct{}, cancel func(), err error)
+
+// hubWake is the sseOpen of a stream that only needs the hub's wake-ups.
+func hubWake(h *events.Hub, key string, types ...string) sseOpen {
+	return func(context.Context) (<-chan struct{}, func(), error) {
+		wake, cancel := h.Wake(key, types...)
+		return wake, cancel, nil
+	}
+}
+
 // ssePageSize is how many events one read of the log takes.
 const ssePageSize = 500
 
@@ -29,13 +43,13 @@ const ssePageSize = 500
 // from the durable log from the cursor of the last frame sent, and the hub only says when to
 // look again. A client too slow to keep up therefore only gets its frames later, never loses
 // them, and a reconnect with Last-Event-ID resumes exactly where the last frame left off.
-// wake must be subscribed before the call: an event appended between the first read and the
+// open subscribes before the first read: an event appended between the first read and the
 // wait is then still a pending wake-up. The keepalive tick reads the log too, so a wake-up
 // missed elsewhere (a listener reconnecting) delays frames by one tick at most.
 //
-// A failed read ends the stream with an error frame (the client reconnects from its last id);
+// A failed open or read ends the stream with an error frame (the client reconnects from its last id);
 // a failed write ends it silently, the client is gone.
-func streamSSE(w http.ResponseWriter, r *http.Request, wake <-chan struct{}, keepalive time.Duration, after int64, page ssePage) {
+func streamSSE(w http.ResponseWriter, r *http.Request, open sseOpen, keepalive time.Duration, after int64, page ssePage) {
 	fl, ok := w.(http.Flusher)
 	if !ok {
 		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
@@ -81,6 +95,12 @@ func streamSSE(w http.ResponseWriter, r *http.Request, wake <-chan struct{}, kee
 		fmt.Fprintf(w, "event: error\ndata: %s\n\n", b)
 		fl.Flush()
 	}
+	wake, cancel, err := open(ctx)
+	if err != nil {
+		fail(err)
+		return
+	}
+	defer cancel()
 	if err := drain(); err != nil {
 		fail(err)
 		return
