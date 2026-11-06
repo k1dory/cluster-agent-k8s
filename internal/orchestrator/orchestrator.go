@@ -1743,19 +1743,27 @@ func (o *Orchestrator) forgetStop(id string) {
 
 // failRun settles a run whose executor is gone: status failed, the reason in the output, the
 // usual run.finished event. Clients watching the run see it end instead of hanging forever.
-func (o *Orchestrator) failRun(ctx context.Context, sandboxID string, r *model.Run, reason string) error {
+//
+// sb is the sandbox as the caller observed it when it concluded the run was lost; the settle
+// commits only while the sandbox is still in that status. Another replica may have woken the
+// sandbox meanwhile and started a run in the new pod: RunningRun then returns that run, and
+// failing it would kill healthy work. A sandbox that moved on makes the cleanup obsolete
+// (ErrFenced, nothing to do). Status is enough: the sandbox only comes back to sleeping or
+// error through a stop or a lost pod, and both settle the newer run themselves first.
+func (o *Orchestrator) failRun(ctx context.Context, sb *model.Sandbox, r *model.Run, reason string) error {
 	// The status, the reason and run.finished are one write.
 	evs := []*model.Event{
-		{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunOutput, Data: "[control plane] run lost: " + reason},
-		{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunDone, Data: string(model.RunFailed)},
+		{SandboxID: sb.ID, RunID: r.ID, Type: model.EventRunOutput, Data: "[control plane] run lost: " + reason},
+		{SandboxID: sb.ID, RunID: r.ID, Type: model.EventRunDone, Data: string(model.RunFailed)},
 	}
 	if _, err := o.Store.SettleRunWithEvents(ctx, store.Settle{RunID: r.ID, From: []model.RunStatus{model.RunRunning},
-		To: model.RunFailed, ExitCode: -1, FinishedAt: time.Now(), Events: evs}); err != nil {
+		To: model.RunFailed, ExitCode: -1, FinishedAt: time.Now(), Events: evs,
+		Sandbox: &store.SandboxFence{ID: sb.ID, Status: sb.Status}}); err != nil {
 		if !errors.Is(err, store.ErrConflict) {
 			o.Log.Error("fail run", "run", r.ID, "err", err)
 			return err
 		}
-		return nil // settled by its runner or a cancel meanwhile
+		return nil // settled by its runner or a cancel meanwhile, or the sandbox moved on (ErrFenced)
 	}
 	o.publish(evs)
 	return nil
@@ -1819,7 +1827,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			// A run marked running while the sandbox has no pod is a leftover of a lost pod or a
 			// crashed replica: nobody will ever finish it.
 			if r, err := o.Store.RunningRun(ctx, sb.ID); err == nil {
-				_ = o.failRun(ctx, sb.ID, r, "sandbox is "+string(sb.Status)+" while the run was executing") // retried next pass; Wake settles it first
+				_ = o.failRun(ctx, sb, r, "sandbox is "+string(sb.Status)+" while the run was executing") // retried next pass; Wake settles it first
 			}
 			continue
 		}
@@ -1835,7 +1843,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			}
 			o.Log.Warn("running sandbox lost its pod", "id", sb.ID, "pod", sb.PodName, "reason", reason)
 			if r, err := o.Store.RunningRun(ctx, sb.ID); err == nil {
-				if err := o.failRun(ctx, sb.ID, r, reason); err != nil {
+				if err := o.failRun(ctx, sb, r, reason); err != nil {
 					// The sandbox stays running (a wake is a no-op) until the run is settled: in
 					// error it could be woken, and with a healthy new pod nothing would settle
 					// the old run. The next pass sees the pod gone again and retries.
@@ -2049,5 +2057,5 @@ func (o *Orchestrator) settleLeftoverRun(ctx context.Context, sb *model.Sandbox)
 	if err != nil {
 		return err
 	}
-	return o.failRun(ctx, sb.ID, r, "sandbox is "+string(sb.Status)+" while the run was executing")
+	return o.failRun(ctx, sb, r, "sandbox is "+string(sb.Status)+" while the run was executing")
 }
