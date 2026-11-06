@@ -9,15 +9,18 @@ import (
 
 // Hub is a per-sandbox broadcast channel set.
 type Hub struct {
-	mu   sync.Mutex
-	subs map[string]map[chan model.Event]filter
+	mu    sync.Mutex
+	subs  map[string]map[chan model.Event]filter
+	wakes map[string]map[chan struct{}]filter
 }
 
 // filter is the set of event types a subscriber takes; nil takes every type.
 type filter map[string]bool
 
 // New returns an empty hub.
-func New() *Hub { return &Hub{subs: map[string]map[chan model.Event]filter{}} }
+func New() *Hub {
+	return &Hub{subs: map[string]map[chan model.Event]filter{}, wakes: map[string]map[chan struct{}]filter{}}
+}
 
 // All is the subscription key that receives every sandbox's events (tenant-wide traces).
 const All = "*"
@@ -73,5 +76,47 @@ func (h *Hub) Publish(e model.Event) {
 			default:
 			}
 		}
+		for ch, f := range h.wakes[key] {
+			if f != nil && !f[e.Type] {
+				continue
+			}
+			select {
+			case ch <- struct{}{}:
+			default: // a wake-up is already pending: the reader will see this event too
+			}
+		}
+	}
+}
+
+// Wake returns a channel signalled when an event for sandboxID (or All) of one of types
+// (none: every type) is published, and a cancel func. It carries no events: a stream reads
+// them from the durable log from its own cursor. Signals coalesce in a one-slot buffer, so a
+// burst is one wake-up and none is lost however slow the reader is; Subscribe's buffer, by
+// contrast, drops events on a stalled reader, and a stream that sent from it skipped them
+// for good (the client's Last-Event-ID moved past the gap).
+func (h *Hub) Wake(sandboxID string, types ...string) (<-chan struct{}, func()) {
+	var f filter
+	if len(types) > 0 {
+		f = filter{}
+		for _, t := range types {
+			f[t] = true
+		}
+	}
+	ch := make(chan struct{}, 1)
+	h.mu.Lock()
+	if h.wakes[sandboxID] == nil {
+		h.wakes[sandboxID] = map[chan struct{}]filter{}
+	}
+	h.wakes[sandboxID][ch] = f
+	h.mu.Unlock()
+	return ch, func() {
+		h.mu.Lock()
+		if m := h.wakes[sandboxID]; m != nil {
+			delete(m, ch)
+			if len(m) == 0 {
+				delete(h.wakes, sandboxID)
+			}
+		}
+		h.mu.Unlock()
 	}
 }

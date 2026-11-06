@@ -868,54 +868,14 @@ func (p *Platform) events(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, evs)
 		return
 	}
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-
-	ch, cancel := p.Hub.Subscribe(id)
+	wake, cancel := p.Hub.Wake(id)
 	defer cancel()
-	send := func(e model.Event) {
-		b, _ := json.Marshal(e)
-		fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Type, b)
-		fl.Flush()
-	}
-	// Replay, then live. Events published during replay are buffered in the channel.
-	for {
-		f.Limit = 500
-		evs, err := p.Orch.Store.QueryEvents(r.Context(), f)
-		if err != nil || len(evs) == 0 {
-			break
-		}
-		for _, e := range evs {
-			send(*e)
-			f.AfterID = e.ID
-		}
-	}
-	after := f.AfterID
-	keepalive := time.NewTicker(20 * time.Second)
-	defer keepalive.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case e := <-ch:
-			if e.ID > after {
-				if f.RunID == "" || e.RunID == f.RunID {
-					send(e)
-				}
-				after = e.ID
-			}
-		case <-keepalive.C:
-			fmt.Fprint(w, ": keepalive\n\n")
-			fl.Flush()
-		}
-	}
+	streamSSE(w, r, wake, 20*time.Second, f.AfterID, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
+		g := f
+		g.AfterID, g.Limit = after, ssePageSize
+		evs, err := p.Orch.Store.QueryEvents(ctx, g)
+		return eventItems(evs), lastID(evs, after), err
+	})
 }
 
 func (p *Platform) setPreview(w http.ResponseWriter, r *http.Request) {
@@ -1053,55 +1013,33 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, evs)
 		return
 	}
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
-		return
-	}
-	want := func(e *model.Event) bool {
-		g := f
-		g.Limit, g.To = 0, time.Time{}
-		return matches(g, e)
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	ch, cancel := p.Hub.Subscribe(events.All)
+	// The stream follows the log live, past any ?to (as it always has); ?from still applies.
+	f.To = time.Time{}
+	wake, cancel := p.Hub.Wake(events.All, f.Types...)
 	defer cancel()
-	send := func(e model.Event) {
-		b, _ := json.Marshal(e)
-		fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", e.ID, e.Type, b)
-		fl.Flush()
-	}
-	for {
+	streamSSE(w, r, wake, 20*time.Second, after, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
 		g := f
-		g.AfterID, g.Limit = after, 500
-		evs, err := p.Orch.Store.QueryEvents(r.Context(), g)
-		if err != nil || len(evs) == 0 {
-			break
-		}
-		for _, e := range evs {
-			send(*e)
-			after = e.ID
-		}
+		g.AfterID, g.Limit = after, ssePageSize
+		evs, err := p.Orch.Store.QueryEvents(ctx, g)
+		return eventItems(evs), lastID(evs, after), err
+	})
+}
+
+// eventItems turns a page of the log into SSE frames named by event type.
+func eventItems(evs []*model.Event) []sseItem {
+	items := make([]sseItem, 0, len(evs))
+	for _, e := range evs {
+		items = append(items, sseItem{ID: e.ID, Event: e.Type, Data: e})
 	}
-	keepalive := time.NewTicker(20 * time.Second)
-	defer keepalive.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case e := <-ch:
-			if e.ID > after && want(&e) {
-				send(e)
-				after = e.ID
-			}
-		case <-keepalive.C:
-			fmt.Fprint(w, ": keepalive\n\n")
-			fl.Flush()
-		}
+	return items
+}
+
+// lastID is the cursor after a page: its last event, or after when it is empty.
+func lastID(evs []*model.Event, after int64) int64 {
+	if len(evs) == 0 {
+		return after
 	}
+	return evs[len(evs)-1].ID
 }
 
 // matches applies a store.Filter to one live event (same semantics as the store query).

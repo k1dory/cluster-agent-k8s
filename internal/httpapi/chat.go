@@ -1,7 +1,7 @@
 package httpapi
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -179,51 +179,16 @@ func (p *Platform) streamMessages(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, q.err)
 		return
 	}
-	fl, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, http.StatusInternalServerError, errors.New("streaming unsupported"))
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	ch, cancel := p.Hub.Subscribe(id)
+	wake, cancel := p.Hub.Wake(id, model.EventRunQueued, model.EventInput, model.EventRunOutput, model.EventRunDone)
 	defer cancel()
-	send := func(m model.Message) {
-		b, _ := json.Marshal(m)
-		fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", m.ID, m.Role, b)
-		fl.Flush()
-	}
-	for {
-		msgs, next, err := p.Orch.Messages(r.Context(), id, after, 500, raw)
-		if err != nil || next == after {
-			break
-		}
+	streamSSE(w, r, wake, 15*time.Second, after, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
+		msgs, next, err := p.Orch.Messages(ctx, id, after, ssePageSize, raw)
+		items := make([]sseItem, 0, len(msgs))
 		for _, m := range msgs {
-			send(m)
+			items = append(items, sseItem{ID: m.ID, Event: m.Role, Data: m})
 		}
-		after = next
-	}
-	keep := time.NewTicker(15 * time.Second)
-	defer keep.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case <-keep.C:
-			fmt.Fprint(w, ": keepalive\n\n")
-			fl.Flush()
-		case e := <-ch:
-			if e.ID <= after {
-				continue
-			}
-			after = e.ID
-			if m, ok := p.Orch.ToMessage(r.Context(), e, raw); ok {
-				send(m)
-			}
-		}
-	}
+		return items, next, err
+	})
 }
 
 // closeConversation ends the run in progress gracefully (its harness input is closed).
