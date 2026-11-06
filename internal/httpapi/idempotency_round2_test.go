@@ -1131,3 +1131,53 @@ func TestRound6CreationBetweenTheRecoveryReadsIsNotADeletion(t *testing.T) {
 		})
 	}
 }
+
+// round7Store is the memory store with a hook after a keyed insert, and nothing else changed:
+// its tenant lock refuses an ended context and its reads ignore one, as the real memory store
+// does (idemFaultStore makes both fail, which hides this path).
+type round7Store struct {
+	*store.Memory
+	afterInsert hook
+}
+
+func (s *round7Store) CreateKeyedSandbox(ctx context.Context, sb *model.Sandbox, seed string) error {
+	err := s.Memory.CreateKeyedSandbox(ctx, sb, seed)
+	if err == nil {
+		s.afterInsert.run()
+	}
+	return err
+}
+
+// Review round 7 of #32: on the memory store the client hangs up right after the keyed insert.
+// startPod's tenant lock refuses the ended context while the re-read still returns the
+// sandbox, creating: Create returns it with the error. That is not a success to store (every
+// retry would replay a sandbox nothing provisions): the handler finishes the provisioning on
+// its detached recovery, and the answer stored and replayed is a provisioned sandbox.
+func TestRound7CancelledMemoryCreateIsProvisionedBeforeItIsStored(t *testing.T) {
+	s := newStack(t)
+	fs := &round7Store{Memory: s.orch.Store.(*store.Memory)}
+	s.orch.Store = fs
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fs.afterInsert.set(cancel)
+	raw, _ := json.Marshal(round2CreateBody)
+	req := httptest.NewRequest("POST", "/v1/sandboxes", bytes.NewReader(append(raw, '\n'))).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer t0k")
+	req.Header.Set("Idempotency-Key", "cancelled-memory-create")
+	w := httptest.NewRecorder()
+	s.p.Routes().ServeHTTP(w, req)
+	fs.afterInsert.set(nil)
+	var first model.Sandbox
+	_ = json.Unmarshal(w.Body.Bytes(), &first)
+	if w.Code == 201 && first.Status == model.StatusCreating {
+		t.Fatalf("the cancelled create answered 201 for a sandbox still creating: %s", w.Body)
+	}
+	code, id, _ := round2Create(t, s, "cancelled-memory-create")
+	if code != 201 || id == "" {
+		t.Fatalf("retry: %d (first attempt %d %s)", code, w.Code, w.Body)
+	}
+	round2Provisioned(t, s, id)
+	if n := round2Count(t, s); n != 1 {
+		t.Fatalf("%d sandboxes for one key", n)
+	}
+}

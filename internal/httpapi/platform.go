@@ -688,6 +688,13 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sb, err := p.Orch.Create(r.Context(), req)
+	// A keyed create that failed with its sandbox still creating (the start never began: on the
+	// memory store a cancelled lock wait, whose re-read ignores the cancellation) is not the
+	// sandbox's outcome to report: the success stored for every retry would be one nothing
+	// provisions. The recovery provisions it, or answers as failed and releases the key.
+	if err != nil && sb != nil && sb.Status == model.StatusCreating && p.keyedSandbox(w, r, true) {
+		return
+	}
 	if err != nil && sb == nil {
 		if p.keyedSandbox(w, r, true) {
 			return
