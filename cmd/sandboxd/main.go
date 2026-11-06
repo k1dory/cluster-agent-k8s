@@ -120,8 +120,8 @@ func serve(cfgPath string, log *slog.Logger) error {
 			}
 		}()
 		// Every outbound client on the default transport (Git providers, IdP discovery, OAuth,
-		// Vault, Infisical, MCP upstreams) gets a client span inside a trace; no trace context
-		// goes out to those third parties.
+		// Vault, Infisical, MCP upstreams) gets a client span inside a trace: method, host and
+		// status, never the URL, and no trace context goes out to those third parties.
 		http.DefaultTransport = telemetry.Transport(http.DefaultTransport, false)
 		log.Info("tracing enabled", "endpoint", cfg.Tracing.Endpoint, "protocol", telemetry.Protocol(cfg.Tracing.Protocol), "sampler_ratio", *cfg.Tracing.SamplerRatio)
 	}

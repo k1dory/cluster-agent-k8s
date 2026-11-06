@@ -139,21 +139,25 @@ func Resource(ctx context.Context, version string) (*resource.Resource, error) {
 // Transport wraps base (nil: http.DefaultTransport) with a client span per request made
 // under a span of ours (a request, an orchestrator operation, a reconciler pass); a call from
 // a background loop with no trace to join goes straight to base rather than start a trace of
-// its own every few seconds. inject says whether the trace context goes out with the request:
-// yes to a peer of ours (the Kubernetes API, Caddy), no to third parties (Git providers, IdPs,
-// OAuth providers, MCP upstreams), which have no use for our trace ids.
-func Transport(base http.RoundTripper, inject bool) http.RoundTripper {
+// its own every few seconds.
+//
+// peer says who is called. A peer of ours (the Kubernetes API, Caddy) gets the full client
+// span (otelhttp: the URL, the trace context sent on, so it can join). A third party (Git
+// providers, IdPs, OAuth providers, Vault, Infisical, MCP upstreams) gets a span with the
+// method, host and status only and no trace context: their URLs can carry what is not ours
+// to export (a key in a query, a token in a path), and our trace ids are of no use to them.
+func Transport(base http.RoundTripper, peer bool) http.RoundTripper {
 	if base == nil {
 		base = http.DefaultTransport
 	}
 	if t, ok := base.(*joinTransport); ok {
 		base = t.base // wrapped once
 	}
-	opts := []otelhttp.Option{otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string { return "HTTP " + r.Method })}
-	if !inject {
-		opts = append(opts, otelhttp.WithPropagators(propagation.NewCompositeTextMapPropagator()))
+	var traced http.RoundTripper = &opaqueTransport{base: base}
+	if peer {
+		traced = otelhttp.NewTransport(base, otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string { return "HTTP " + Method(r.Method) }))
 	}
-	return &joinTransport{base: base, traced: otelhttp.NewTransport(base, opts...)}
+	return &joinTransport{base: base, traced: traced}
 }
 
 type joinTransport struct{ base, traced http.RoundTripper }
@@ -163,6 +167,25 @@ func (t *joinTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return t.traced.RoundTrip(r)
 	}
 	return t.base.RoundTrip(r)
+}
+
+// opaqueTransport is the third-party client span: no URL, no headers, nothing sent on. It
+// ends when the response headers arrive.
+type opaqueTransport struct{ base http.RoundTripper }
+
+func (t *opaqueTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	_, span := Tracer().Start(r.Context(), "HTTP "+Method(r.Method), trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(attribute.String("http.request.method", Method(r.Method)), attribute.String("server.address", r.URL.Hostname())))
+	resp, err := t.base.RoundTrip(r)
+	if err != nil {
+		return resp, End(span, err)
+	}
+	span.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
+	if resp.StatusCode >= 500 {
+		span.SetStatus(codes.Error, resp.Status)
+	}
+	span.End()
+	return resp, nil
 }
 
 // End ends span, recording err (nil: success) as its status. Returns err for the caller's return.

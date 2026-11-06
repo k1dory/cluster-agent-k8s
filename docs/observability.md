@@ -79,7 +79,9 @@ What is traced:
   recorded only with `record_statements`, and the arguments never are.
 - **Kubernetes API, Caddy admin and other outbound calls.** The Kubernetes API and Caddy calls are
   client spans that send `traceparent` on, so the API server joins the trace when its own tracing
-  is on. Git providers, IdPs, OAuth, Vault and MCP upstreams get a span but no trace context.
+  is on. Git providers, IdPs, OAuth, Vault, Infisical and MCP upstreams get a span with the method,
+  host and status only. Their URL is left out, since a query or path can carry a key, and no trace
+  context is sent to them.
 
 A query or outbound call made outside any trace is counted in the metrics but gets no span. This
 covers the background loops: leases, listeners, the OAuth and Git job pollers. A trace for each
