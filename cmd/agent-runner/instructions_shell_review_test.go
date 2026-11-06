@@ -39,6 +39,9 @@ func TestInstructionsRespectShellSyntax(t *testing.T) {
 		{`claude -p -- "$SANDBOX_TASK"`, `claude -p` + flag + ` -- "$SANDBOX_TASK"`},
 		{`claude -- "$SANDBOX_TASK" --system-prompt x`, `claude` + flag + ` -- "$SANDBOX_TASK" --system-prompt x`},
 		{`claude -p "a -- b" x`, `claude -p "a -- b" x` + flag},
+		{`claude --model $( (cat /etc/model || echo sonnet) | tr -d '[:space:]') -p "$SANDBOX_TASK"`, `claude --model $( (cat /etc/model || echo sonnet) | tr -d '[:space:]') -p "$SANDBOX_TASK"` + flag},
+		{`claude -p "--" "$SANDBOX_TASK"`, `claude -p` + flag + ` "--" "$SANDBOX_TASK"`},
+		{`claude -p '--' "$SANDBOX_TASK" --system-prompt x`, `claude -p` + flag + ` '--' "$SANDBOX_TASK" --system-prompt x`},
 	} {
 		if got := withInstructions(tc.in); got != tc.want {
 			t.Errorf("%q\n got %q\nwant %q", tc.in, got, tc.want)
@@ -98,6 +101,9 @@ func TestInstructionsRewriteRunsInTheShell(t *testing.T) {
 		`claude -p "$(printf "Task: %s; context: %s" "$SANDBOX_TASK" context)"`,
 		`claude -p "$SANDBOX_TASK" >| "$SANDBOX_REVIEW_ARGS.log"`,
 		`claude -p -- "$SANDBOX_TASK"`,
+		`claude -p "--" "$SANDBOX_TASK"`,
+		`claude -p '--' "$SANDBOX_TASK"`,
+		`claude --model $( (printf opus || echo x) | tr a-z A-Z) -p "$SANDBOX_TASK"`,
 	} {
 		argsFile := filepath.Join(root, "args")
 		_ = os.Remove(argsFile)

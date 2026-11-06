@@ -457,11 +457,19 @@ func skipQuoted(line string, i int) int {
 			}
 		}
 		return len(line)
-	default: // $(
+	default: // $( … ), with plain parentheses nested inside: $( (a || b) | c )
+		depth := 0
 		for j := i + 2; j < len(line); {
 			switch line[j] {
+			case '(':
+				depth++
+				j++
 			case ')':
-				return j + 1
+				if depth == 0 {
+					return j + 1
+				}
+				depth--
+				j++
 			case '\'', '"', '`', '\\':
 				j = skipQuoted(line, j)
 			case '$':
@@ -529,7 +537,7 @@ func (c harnessCommand) runsClaude() bool { return filepath.Base(c.program()) ==
 // or len(words) when there is none.
 func (c harnessCommand) optionsEnd() int {
 	for i := c.programIndex() + 1; i < len(c.words); i++ {
-		if c.words[i] == "--" {
+		if unquoted(c.words[i]) == "--" { // "--" and '--' are the terminator too: the shell strips the quotes
 			return i
 		}
 	}
