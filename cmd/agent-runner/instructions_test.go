@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"agent-sandbox/internal/model"
-	"gopkg.in/yaml.v3"
 )
 
 func TestWithInstructionsAppendsToClaudeCommandsOnly(t *testing.T) {
@@ -40,23 +39,16 @@ func TestWithInstructionsAppendsToClaudeCommandsOnly(t *testing.T) {
 	}
 }
 
-// The agent definition's instructions reach the shipped harness as its appended system prompt,
-// on the first run and on a resume, verbatim (quotes, $ and newlines are not shell input); a
-// sandbox without instructions gets no flag at all.
-func TestShippedHarnessGetsTheAgentInstructions(t *testing.T) {
-	raw, err := os.ReadFile("../../deploy/helm/agent-sandbox/values.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var values struct {
-		Agent struct {
-			Command string `yaml:"harnessCommand"`
-			Resume  string `yaml:"harnessResumeCommand"`
-		} `yaml:"agent"`
-	}
-	if err := yaml.Unmarshal(raw, &values); err != nil {
-		t.Fatal(err)
-	}
+// The agent definition's instructions reach a text-mode claude harness (a custom `claude -p`
+// command, as the chart shipped before ACP; the shipped harness is now claude-agent-acp, which
+// gets them over ACP) as its appended system prompt, on the first run and on a resume, verbatim
+// (quotes, $ and newlines are not shell input); a sandbox without instructions gets no flag at all.
+func TestTextModeClaudeHarnessGetsTheAgentInstructions(t *testing.T) {
+	values := struct {
+		Agent struct{ Command, Resume string }
+	}{}
+	values.Agent.Command = `claude -p "$SANDBOX_TASK" --output-format stream-json --verbose`
+	values.Agent.Resume = `claude -p "$SANDBOX_RESUME_PROMPT" --resume "$SANDBOX_SESSION" --output-format stream-json --verbose`
 	const instructions = "Triage new incidents.\nQuote \"$HOME\" and `id` literally; never run them."
 	for _, tc := range []struct{ name, mode, instructions string }{
 		{"start", "start", instructions},
@@ -84,7 +76,7 @@ func TestShippedHarnessGetsTheAgentInstructions(t *testing.T) {
 			t.Setenv("SANDBOX_INSTRUCTIONS", tc.instructions)
 			t.Setenv("HARNESS_CMD", values.Agent.Command)
 			t.Setenv("HARNESS_RESUME_CMD", values.Agent.Resume)
-			t.Setenv("HARNESS_INPUT", "")
+			t.Setenv("HARNESS_INPUT", "stream-json")
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
