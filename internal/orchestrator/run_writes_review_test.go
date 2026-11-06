@@ -156,6 +156,16 @@ func (s *claimHookStore) ClaimRun(ctx context.Context, runID string, startedAt t
 	return r, err
 }
 
+// ClaimRunFor is the claim NextRun makes (with the reclaim check): the same hook.
+func (s *claimHookStore) ClaimRunFor(ctx context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp store.RunStamp) (*model.Run, bool, error) {
+	r, reclaimed, err := s.Store.ClaimRunFor(ctx, sandboxID, runID, startedAt, session, stamp)
+	if h := s.hook; h != nil && err == nil {
+		s.hook = nil
+		h(r)
+	}
+	return r, reclaimed, err
+}
+
 // The claim stamps what executes the run in the same write. NextRun used to stamp it with a
 // second, full-row write from its copy afterwards: a usage line or a cancel landing between
 // the claim and that write was overwritten (the run back to running with no usage).

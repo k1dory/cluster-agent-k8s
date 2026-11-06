@@ -20,62 +20,25 @@ import (
 	"agent-sandbox/internal/store"
 )
 
-// round2Store injects the failures and interleavings of a multi-replica deployment into the
-// writes the agent API used to make one by one. These tests only use methods every release of
-// the store has, so they run unchanged against the code before the fix and fail there.
+// round2Store loses the acknowledgement of a committed output batch: the store committed, the
+// caller sees an error (a connection that broke during COMMIT).
 type round2Store struct {
 	store.Store
-	rendezvous  atomic.Int32  // > 0: that many batch-progress reads wait for each other
-	allArrived  chan struct{} // closed when the last of them arrives
-	failPut     atomic.Bool   // batch-progress writes fail
-	failUsage   atomic.Int32  // that many usage writes fail
-	failSession atomic.Int32  // that many session writes fail
+	loseAck atomic.Int32 // that many committed batches answer with an error
 }
 
-var errRound2 = errors.New("injected store failure")
-
-func (s *round2Store) GetIdempotent(ctx context.Context, key string) (*store.Idempotent, error) {
-	rec, err := s.Store.GetIdempotent(ctx, key)
-	if strings.HasPrefix(key, "batch|") {
-		if n := s.rendezvous.Add(-1); n >= 0 {
-			// Replicas handling the same batch have all read its progress before any of them
-			// stores a line.
-			if n == 0 {
-				close(s.allArrived)
-			}
-			select {
-			case <-s.allArrived:
-			case <-time.After(2 * time.Second):
-			}
-		}
+func (s *round2Store) AppendRunOutput(ctx context.Context, b *store.OutputBatch) (*store.OutputResult, error) {
+	res, err := s.Store.AppendRunOutput(ctx, b)
+	if err == nil && s.loseAck.Add(-1) >= 0 {
+		return nil, errors.New("conn closed while committing")
 	}
-	return rec, err
-}
-
-func (s *round2Store) PutIdempotent(ctx context.Context, rec *store.Idempotent) error {
-	if strings.HasPrefix(rec.Key, "batch|") && s.failPut.Load() {
-		return errRound2
-	}
-	return s.Store.PutIdempotent(ctx, rec)
-}
-
-func (s *round2Store) RecordRunUsage(ctx context.Context, id string, u model.Usage, replace bool) error {
-	if s.failUsage.Add(-1) >= 0 {
-		return errRound2
-	}
-	return s.Store.RecordRunUsage(ctx, id, u, replace)
-}
-
-func (s *round2Store) SetRunSession(ctx context.Context, id, session string) error {
-	if s.failSession.Add(-1) >= 0 {
-		return errRound2
-	}
-	return s.Store.SetRunSession(ctx, id, session)
+	return res, err
 }
 
 type round2Pod struct {
 	s     *stack
 	st    *round2Store
+	base  store.Store // the memory store under st: fault hooks go here
 	sb    model.Sandbox
 	cert  map[string]string
 	runID string
@@ -85,14 +48,15 @@ type round2Pod struct {
 func newRound2Pod(t *testing.T) *round2Pod {
 	t.Helper()
 	s := newStack(t)
-	st := &round2Store{Store: s.orch.Store, allArrived: make(chan struct{})}
+	base := s.orch.Store
+	st := &round2Store{Store: base}
 	s.orch.Store = st
 	api, gw := s.platform.URL, s.gateway.URL
 	resp, body := call(t, "POST", api+"/v1/sandboxes", "t0k", map[string]any{"name": "r2", "slug": "backend-dev", "owner": "alice"}, nil)
 	if resp.StatusCode != 201 {
 		t.Fatalf("create: %d %s", resp.StatusCode, body)
 	}
-	p := &round2Pod{s: s, st: st}
+	p := &round2Pod{s: s, st: st, base: base}
 	_ = json.Unmarshal(body, &p.sb)
 	s.tokens["r2-token"] = registrar.PodInfo{Name: "agent-r2", SandboxID: p.sb.ID, Slug: "backend-dev", Tenant: "alice"}
 	_, csr, _ := ca.NewCSR("backend-dev")
@@ -186,11 +150,11 @@ const round2UsageLine = `{"type":"usage","input_tokens":10,"output_tokens":5,"co
 
 // Wiki item 1: two replicas handling the same X-Batch-Id at once (the runner retried after a
 // network error while the original was still in flight) both read "nothing stored yet" and
-// both stored the lines and the usage.
+// both stored the lines and the usage. (The interleaving is forced in the store's contract test
+// TestRound2OutputBatchIsStoredOnce; this is the same through the gateway.)
 func TestRound2ConcurrentSameBatchStoresOnce(t *testing.T) {
 	p := newRound2Pod(t)
 	p.claim(t)
-	p.st.rendezvous.Store(2)
 	var wg sync.WaitGroup
 	codes := make([]int, 6)
 	for i := range codes {
@@ -211,22 +175,62 @@ func TestRound2ConcurrentSameBatchStoresOnce(t *testing.T) {
 	}
 }
 
-// Wiki item 1: the lines were stored, the write of the batch's progress failed and was ignored:
-// the runner's retry of the batch stored every line again.
-func TestRound2BatchRetryAfterProgressWriteFailure(t *testing.T) {
+// Wiki items 1 and 10: the lines were stored, then a later write of the same post (the batch's
+// progress, the usage, the session) failed: the progress was lost and the retry duplicated the
+// lines, or the usage or session was lost and the batch acknowledged anyway. A failure anywhere
+// in the transaction now stores nothing and answers 5xx; the runner's retry stores it whole.
+func TestRound2FailedBatchIsStoredWholeOnRetry(t *testing.T) {
 	p := newRound2Pod(t)
 	p.claim(t)
-	p.st.failPut.Store(true)
+	var failed atomic.Int32
+	store.SetFaultHook(p.base, func(point string) error {
+		if point == store.FaultOutput && failed.CompareAndSwap(0, 1) {
+			return errors.New("injected failure before the commit")
+		}
+		return nil
+	})
+	defer store.SetFaultHook(p.base, nil)
+	body := `{"type":"system","session_id":"sess-r2"}` + "\na\n" + round2UsageLine + "\n"
+	if code, out := p.post(t, "b-1", body); code < 500 || failed.Load() != 1 {
+		t.Fatalf("a post whose transaction failed: %d %s (failed %d)", code, out, failed.Load())
+	}
+	if out, r := p.events(t, model.EventRunOutput), p.run(t); len(out) != 0 || r.Usage.CostUSD != 0 || r.Session != "" {
+		t.Fatalf("a failed post left %d lines, usage %+v, session %q", len(out), r.Usage, r.Session)
+	}
+	if code, out := p.post(t, "b-1", body); code != 200 || !strings.Contains(out, `"skipped":0`) {
+		t.Fatalf("the runner's retry: %d %s", code, out)
+	}
+	if code, out := p.post(t, "b-1", body); code != 200 || !strings.Contains(out, `"skipped":3`) {
+		t.Fatalf("a second retry: %d %s", code, out)
+	}
+	if out, r := p.events(t, model.EventRunOutput), p.run(t); len(out) != 3 || r.Usage.CostUSD != 0.5 || r.Session != "sess-r2" {
+		t.Fatalf("after the retries: %d lines, usage %+v, session %q", len(out), r.Usage, r.Session)
+	}
+}
+
+// Codex round 1 of #31, finding 6: a commit whose acknowledgement was lost is a 5xx with the
+// batch stored. The answer no longer claims "stored 0 lines", and the retry under the same
+// X-Batch-Id (which the spec now requires) stores nothing twice.
+func TestRound2LostCommitAcknowledgementIsSafeToRetry(t *testing.T) {
+	p := newRound2Pod(t)
+	p.claim(t)
+	p.st.loseAck.Store(1)
 	body := "a\nb\n" + round2UsageLine + "\n"
-	p.post(t, "b-1", body)
-	p.post(t, "b-1", body) // the response was lost: the runner sends it again
+	code, out := p.post(t, "b-1", body)
+	if code < 500 || strings.Contains(out, "stored 0") || !strings.Contains(out, "same X-Batch-Id") {
+		t.Fatalf("a post whose commit was not acknowledged: %d %s", code, out)
+	}
+	if code, out := p.post(t, "b-1", body); code != 200 || !strings.Contains(out, `"skipped":3`) {
+		t.Fatalf("the retry: %d %s", code, out)
+	}
 	if out, r := p.events(t, model.EventRunOutput), p.run(t); len(out) != 3 || r.Usage.CostUSD != 0.5 {
-		t.Fatalf("retry after a failed progress write: %d lines, usage %+v", len(out), r.Usage)
+		t.Fatalf("after the retry: %d lines, usage %+v", len(out), r.Usage)
 	}
 }
 
 // Wiki item 1: the same X-Batch-Id with another body is refused, as Idempotency-Key is, instead
-// of silently skipping lines that were never stored.
+// of silently skipping lines that were never stored. Codex round 1 of #31, finding 4: so is a
+// longer body under the id of one that was stored whole (it added its usage).
 func TestRound2BatchIdWithOtherBodyIsRefused(t *testing.T) {
 	p := newRound2Pod(t)
 	p.claim(t)
@@ -236,34 +240,11 @@ func TestRound2BatchIdWithOtherBodyIsRefused(t *testing.T) {
 	if code, out := p.post(t, "b-1", "x\ny\nz\n"); code != 422 {
 		t.Fatalf("same id, other body: %d %s", code, out)
 	}
-	if out := p.events(t, model.EventRunOutput); len(out) != 2 || out[0].Data != "a" {
-		t.Fatalf("lines after the refused body: %+v", out)
+	if code, out := p.post(t, "b-1", "a\nb\n"+round2UsageLine+"\n"); code != 422 {
+		t.Fatalf("same id, the whole body extended: %d %s", code, out)
 	}
-}
-
-// Wiki item 10: the usage write failed after the line was stored; the error was logged and the
-// batch acknowledged, so the runner never sent it again and the run's cost was lost.
-func TestRound2UsageWriteFailureIsNotAcknowledged(t *testing.T) {
-	p := newRound2Pod(t)
-	p.claim(t)
-	p.st.failUsage.Store(1)
-	p.postAsRunner(t, "b-1", "a\n"+round2UsageLine+"\n")
-	if out, r := p.events(t, model.EventRunOutput), p.run(t); len(out) != 2 || r.Usage.CostUSD != 0.5 || r.Usage.InputTokens != 10 {
-		t.Fatalf("after a failed usage write: %d lines, usage %+v", len(out), r.Usage)
-	}
-}
-
-// Wiki item 10: the session id was cached on the replica before its write succeeded, so when
-// the write failed every later line naming the same session was skipped and resume had none.
-func TestRound2SessionWriteFailureIsRetried(t *testing.T) {
-	p := newRound2Pod(t)
-	p.claim(t)
-	p.st.failSession.Store(1)
-	line := `{"type":"system","session_id":"sess-r2"}`
-	p.postAsRunner(t, "b-1", line+"\n")
-	p.postAsRunner(t, "b-2", line+"\n")
-	if r := p.run(t); r.Session != "sess-r2" {
-		t.Fatalf("session after a failed write: %q", r.Session)
+	if out, r := p.events(t, model.EventRunOutput), p.run(t); len(out) != 2 || out[0].Data != "a" || r.Usage.CostUSD != 0 {
+		t.Fatalf("after the refused bodies: %+v, usage %+v", out, r.Usage)
 	}
 }
 

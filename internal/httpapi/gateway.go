@@ -186,9 +186,11 @@ func (g *Gateway) appendOutput(w http.ResponseWriter, r *http.Request, id *ident
 	// A body that breaks off otherwise stores nothing: the runner sends it again whole.
 	//
 	// The lines, the usage and session they carry and, with X-Batch-Id, the batch's progress
-	// are stored in one write, or nothing is (a 5xx: the runner retries). A retry of the same
-	// batch (after a lost response, on any replica, even at once) stores only what is not
-	// stored yet; the same id with another body is a 422.
+	// are stored in one write, or nothing is. A 5xx does not say which (the commit may have
+	// happened and its acknowledgement been lost), so the runner retries under the same
+	// X-Batch-Id: a retry (after a lost response, on any replica, even at once) stores only what
+	// is not stored yet; the same id with another body, or with more lines than a body that was
+	// stored whole, is a 422.
 	batchID := ""
 	if bid := r.Header.Get("X-Batch-Id"); bid != "" && len(bid) <= 100 {
 		batchID = bid
@@ -214,13 +216,19 @@ func (g *Gateway) appendOutput(w http.ResponseWriter, r *http.Request, id *ident
 			return
 		}
 	}
-	res, err := g.Orch.OutputBatch(r.Context(), id.SandboxID, run.ID, batchID, attempt, lines)
+	res, err := g.Orch.OutputBatch(r.Context(), id.SandboxID, run.ID, batchID, attempt, lines, tooLarge != "")
 	switch {
 	case errors.Is(err, store.ErrBatchMismatch):
 		writeErr(w, http.StatusUnprocessableEntity, err)
 		return
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrConflict):
+		writeOrchErr(w, err) // refused before anything was written
+		return
 	case err != nil:
-		writeOrchErr(w, fmt.Errorf("stored 0 lines: %w", err))
+		// Not "nothing was stored": the commit may have happened with its acknowledgement lost.
+		// The detail goes to the request log; the runner is told what makes the retry safe.
+		noteInternal(w, err)
+		writeErr(w, http.StatusServiceUnavailable, errors.New("the batch may or may not have been stored: send it again with the same X-Batch-Id"))
 		return
 	}
 	if tooLarge != "" {

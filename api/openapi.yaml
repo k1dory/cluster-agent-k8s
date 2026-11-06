@@ -1666,7 +1666,10 @@ paths:
       description: |
         Limits: 4 MiB per request, 1 MiB per line. Lines up to the first violation are stored and
         the 413 message says how many (`stored N lines`), so a retry resumes after them. The lines,
-        their usage and session are stored in one write: a 5xx means none of them was. Lines
+        their usage and session are stored in one write, all of them or none. A 5xx (or a lost
+        response) does not say which: the write may have been committed while its acknowledgement
+        was lost. Retry it with the same `X-Batch-Id`, which makes the retry safe; a retry without
+        one may store the lines and their usage twice. Lines
         that carry usage (Claude Code's `result`, generic `{"type":"usage"}`) update the run's accounting
         while the run is `queued`, `running` or `cancelled` (a cancelled harness still reports what it
         spent before it saw `run.cancel`). Once the run is `done` or `failed` the lines are still
@@ -1675,8 +1678,9 @@ paths:
         Send `X-Batch-Id` (any id, kept across retries of the same batch): the server records how
         many lines of that batch it stored in the same write as the lines, and a retry (on any
         replica, even one racing the original) skips them (`skipped` in the answer). The same id
-        with a body that does not start with the lines already stored is a 422. Without it a retry
-        after a lost response duplicates lines.
+        with a body that does not start with the lines already stored, or one that adds lines to a
+        body that was stored whole (not cut short by a 413), is a 422. Without it a retry after a
+        lost response duplicates lines.
       parameters:
         - { name: X-Batch-Id, in: header, schema: { type: string, maxLength: 100 } }
         - { $ref: "#/components/parameters/RunAttempt" }
@@ -1697,6 +1701,7 @@ paths:
         "409": { description: "X-Run-Attempt names an attempt the run was handed out past", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "413": { $ref: "#/components/responses/Error" }
         "422": { description: "X-Batch-Id was already used for a different body (nothing is stored)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: "The write failed, or its acknowledgement was lost: the batch may or may not be stored. Send it again with the same X-Batch-Id", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /agent/runs/{run}/input:
     parameters: [{ name: run, in: path, required: true, schema: { type: string } }]
     get:
