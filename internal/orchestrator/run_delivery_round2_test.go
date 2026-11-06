@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"agent-sandbox/internal/events"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/store"
 )
@@ -306,5 +307,159 @@ func TestRound2DelayedRequestDoesNotClaimAheadOfAConfirmedRun(t *testing.T) {
 	}
 	if r, err := o.NextRunFor(ctx, sb.ID, "1", 0); err != nil || r.ID != second.ID {
 		t.Fatalf("after run 1 finished: %v %+v", err, r)
+	}
+}
+
+// runningHookStore runs hook once, inside the next RunningRun, before it reads.
+type runningHookStore struct {
+	store.Store
+	hook atomic.Pointer[func()]
+}
+
+func (s *runningHookStore) RunningRun(ctx context.Context, sandboxID string) (*model.Run, error) {
+	if h := s.hook.Swap(nil); h != nil {
+		(*h)()
+	}
+	return s.Store.RunningRun(ctx, sandboxID)
+}
+
+// Codex round 3 of #31, finding 1: replica A's reconciler saw the stopped pod gone and stalled
+// before cancelling its run; replica B finished the stop, woke the sandbox and a replacement pod
+// started a new run; A then cancelled that new run (the stale move to sleeping was refused only
+// afterwards). The cancellation is fenced on the stop it belongs to.
+func TestRound2StaleStopRecoverySparesTheReplacementsRun(t *testing.T) {
+	ctx := context.Background()
+	rt := NewFakeRuntime()
+	base := store.NewMemory()
+	now := time.Now()
+	sb := &model.Sandbox{ID: "sb_stale", Slug: "dev", Tenant: "acme", Name: "s", Owner: "alice", Status: model.StatusStopping, CreatedAt: now, LastActivity: now}
+	if err := rt.EnsureVolume(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.CreateSandbox(ctx, sb); err != nil { // stopping, its pod already gone
+		t.Fatal(err)
+	}
+	hooked := &runningHookStore{Store: base}
+	a := New(hooked, rt, nil, events.New(), Config{}, nil)
+	b := New(base, rt, nil, events.New(), Config{}, nil)
+	var replacement *model.Run
+	hook := func() {
+		// A is about to read the running run of the stop it observed: meanwhile B finishes the
+		// stop, the sandbox is woken and the replacement pod starts a run.
+		b.Reconcile(ctx)
+		if _, err := b.Wake(ctx, sb.ID); err != nil {
+			t.Error(err)
+			return
+		}
+		waitFor(t, "replacement running", func() bool { cur, _ := base.GetSandbox(ctx, sb.ID); return cur.Status == model.StatusRunning })
+		if _, err := b.CreateRun(ctx, sb.ID, "new"); err != nil {
+			t.Error(err)
+			return
+		}
+		var err error
+		if replacement, err = b.NextRun(ctx, sb.ID, time.Second); err != nil {
+			t.Error(err)
+		}
+	}
+	hooked.hook.Store(&hook)
+	a.Reconcile(ctx) // observes the stop with no pod: recovers it
+	if replacement == nil {
+		t.Fatal("the replacement run never started")
+	}
+	got, _ := base.GetRun(ctx, replacement.ID)
+	cur, _ := base.GetSandbox(ctx, sb.ID)
+	if got.Status != model.RunRunning || cur.Status != model.StatusRunning {
+		t.Fatalf("a stale stop recovery touched the replacement: run %s, sandbox %s", got.Status, cur.Status)
+	}
+}
+
+// Codex round 3 of #31, finding 3: a pod lost while its run executed; the run's settlement
+// failed (its transaction rolled back), the reconciler moved the sandbox to error all the same,
+// and a wake gave it a healthy new pod: nothing ever settled the old run. The sandbox now stays
+// as it is until the settlement commits, and a wake settles a leftover run first.
+func TestRound2LostPodRunIsSettledBeforeAWake(t *testing.T) {
+	o, rt, sb := reviewRunningSandbox(t)
+	ctx := context.Background()
+	if _, err := o.CreateRun(ctx, sb.ID, "task"); err != nil {
+		t.Fatal(err)
+	}
+	run, err := o.NextRun(ctx, sb.ID, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := o.Store.GetSandbox(ctx, sb.ID)
+	if err := rt.FakeRuntime.DeletePod(ctx, cur); err != nil { // the pod is lost
+		t.Fatal(err)
+	}
+	hook, failed := failOnceAt(store.FaultSettle)
+	store.SetFaultHook(o.Store, hook)
+	defer store.SetFaultHook(o.Store, nil)
+	o.Reconcile(ctx)
+	if failed.Load() != 1 {
+		t.Fatal("the run's settlement was not attempted")
+	}
+	if _, err := o.Wake(ctx, sb.ID); err != nil { // the client wakes it right away
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // a pod the wake started would be up by now
+	o.Reconcile(ctx)
+	if got, _ := o.Store.GetRun(ctx, run.ID); got.Status != model.RunFailed || round2Events(t, o, sb.ID, run.ID, model.EventRunDone) != 1 {
+		t.Fatalf("the lost pod's run after a wake: %s with %d run.finished", got.Status, round2Events(t, o, sb.ID, run.ID, model.EventRunDone))
+	}
+}
+
+// Finding 3, the wake side: a sandbox in error with a run still marked running (its settlement
+// failed or has not happened) is not given a new pod until that run is settled.
+func TestRound2WakeSettlesALeftoverRunFirst(t *testing.T) {
+	o, sb, run := round2Running(t)
+	ctx := context.Background()
+	if _, err := o.setStatusFrom(ctx, sb.ID, []model.SandboxStatus{model.StatusRunning}, model.StatusError, nil); err != nil {
+		t.Fatal(err)
+	}
+	hook, failed := failOnceAt(store.FaultSettle)
+	store.SetFaultHook(o.Store, hook)
+	defer store.SetFaultHook(o.Store, nil)
+	if _, err := o.Wake(ctx, sb.ID); err == nil || failed.Load() != 1 {
+		t.Fatalf("a wake over a run it could not settle: %v (failed %d)", err, failed.Load())
+	}
+	if cur, _ := o.Store.GetSandbox(ctx, sb.ID); cur.Status != model.StatusError {
+		t.Fatalf("the wake went on: %s", cur.Status)
+	}
+	if _, err := o.Wake(ctx, sb.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := o.Store.GetRun(ctx, run.ID); got.Status != model.RunFailed {
+		t.Fatalf("leftover run after the wake: %s", got.Status)
+	}
+}
+
+// Codex round 3 of #31, finding 4: run.start was emitted after the claim committed; a retry
+// reclaiming the run in between delivered it without one, output and run.finished came first,
+// and if the original request died there was never a run.start. It is written by the claim.
+func TestRound2RunStartIsWrittenWithTheClaim(t *testing.T) {
+	o, _, sb := reviewRunningSandbox(t)
+	ctx := context.Background()
+	if _, err := o.CreateRun(ctx, sb.ID, "task"); err != nil {
+		t.Fatal(err)
+	}
+	hs := &claimHookStore{Store: o.Store}
+	o.Store = hs
+	starts := -1
+	hs.hook = func(r *model.Run) {
+		// The original request committed its claim and stalls; the runner's retry reclaims.
+		starts = round2Events(t, o, sb.ID, r.ID, model.EventRunStart)
+		if again, err := o.NextRunFor(ctx, sb.ID, "1", 0); err != nil || again.ID != r.ID {
+			t.Errorf("the retry: %v %+v", err, again)
+		}
+	}
+	first, err := o.NextRunFor(ctx, sb.ID, "1", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if starts != 1 {
+		t.Fatalf("run.start events when the claim was committed: %d", starts)
+	}
+	if n := round2Events(t, o, sb.ID, first.ID, model.EventRunStart); n != 1 {
+		t.Fatalf("run.start events after the claim and its reclaim: %d", n)
 	}
 }

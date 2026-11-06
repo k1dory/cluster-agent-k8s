@@ -818,7 +818,7 @@ func (o *Orchestrator) stopPodIf(ctx context.Context, id string, final model.San
 			o.Log.Error("retire identities", "id", id, "err", err)
 		}
 	}
-	if err := o.cancelRunning(ctx, id); err != nil {
+	if err := o.cancelRunning(ctx, id, sb); err != nil {
 		// The stop is not complete while its run may still be running: the sandbox stays
 		// stopping, and the reconciler cancels the run and settles it (settleStopped).
 		return nil, err
@@ -884,7 +884,13 @@ func (o *Orchestrator) detached(ctx context.Context) (context.Context, context.C
 // run.finished event is emitted once, by whoever settled it. An error means the run may still
 // be running: Delete keeps the sandbox in deleting and a stop keeps it in stopping, so the
 // retry (the reconciler's, or the caller's) settles it.
-func (o *Orchestrator) cancelRunning(ctx context.Context, id string) error {
+//
+// fence, when set, is the sandbox as the caller observed its stop: the cancellation commits only
+// while the record is still stopping (an ErrFenced is nothing to do: the stop was finished
+// elsewhere and the run now executing belongs to a replacement pod). Status, not revision:
+// other writes bump the revision of a stopping sandbox, and a newer stop of it wants its run
+// cancelled just the same.
+func (o *Orchestrator) cancelRunning(ctx context.Context, id string, fence *model.Sandbox) error {
 	r, err := o.Store.RunningRun(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
 		return nil
@@ -895,10 +901,14 @@ func (o *Orchestrator) cancelRunning(ctx context.Context, id string) error {
 	// The status and run.finished are one write: a crash between them cannot leave a cancelled
 	// run that its watchers never see end.
 	evs := []*model.Event{{SandboxID: id, RunID: r.ID, Type: model.EventRunDone, Data: string(model.RunCancelled)}}
-	if _, err := o.Store.SettleRunWithEvents(ctx, store.Settle{RunID: r.ID, From: []model.RunStatus{model.RunRunning},
-		To: model.RunCancelled, ExitCode: r.ExitCode, FinishedAt: time.Now(), Events: evs}); err != nil {
+	settle := store.Settle{RunID: r.ID, From: []model.RunStatus{model.RunRunning},
+		To: model.RunCancelled, ExitCode: r.ExitCode, FinishedAt: time.Now(), Events: evs}
+	if fence != nil {
+		settle.Sandbox = &store.SandboxFence{ID: fence.ID, Status: fence.Status}
+	}
+	if _, err := o.Store.SettleRunWithEvents(ctx, settle); err != nil {
 		if errors.Is(err, store.ErrConflict) {
-			return nil // settled by its runner or a cancel meanwhile
+			return nil // settled by its runner or a cancel meanwhile, or the stop moved on (ErrFenced)
 		}
 		return fmt.Errorf("cancel run %s: %w", r.ID, err)
 	}
@@ -921,6 +931,9 @@ func (o *Orchestrator) Wake(ctx context.Context, id string) (*model.Sandbox, err
 		// reconciler would only stop it, and the gateway refuses it anyway.
 		if o.Policies != nil && o.Policies.Revoked(sb.Slug, sb.Tenant, sb.AdminGrant) {
 			return nil, fmt.Errorf("%w: tenant %s no longer owns slug %s", ErrForbidden, sb.Tenant, sb.Slug)
+		}
+		if err := o.settleLeftoverRun(ctx, sb); err != nil {
+			return nil, err
 		}
 		return o.startPod(ctx, id)
 	default:
@@ -947,7 +960,7 @@ func (o *Orchestrator) Delete(ctx context.Context, id string) error {
 		_, _ = o.mutate(ctx, id, func(s *model.Sandbox) error { s.Error = "delete volume: " + err.Error(); return nil })
 		return fmt.Errorf("%w: delete volume: %v", ErrRuntime, err)
 	}
-	if err := o.cancelRunning(ctx, id); err != nil {
+	if err := o.cancelRunning(ctx, id, nil); err != nil {
 		// The record is what lets the retry find the run: without it the run stays running
 		// with neither an executor nor anything that reconciles it.
 		_, _ = o.mutate(ctx, id, func(s *model.Sandbox) error { s.Error = err.Error(); return nil })
@@ -1109,9 +1122,7 @@ func (o *Orchestrator) NextRunFor(ctx context.Context, sandboxID, owner string, 
 			EnvironmentRef: sb.EnvironmentRef, EnvironmentRevision: sb.EnvironmentRevision, Owner: owner,
 		})
 		if err == nil {
-			if !reclaimed {
-				o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunStart, Data: r.AgentVersion})
-			}
+			_ = reclaimed // run.start was appended by the claim itself (store.ClaimRunFor), once
 			return r, nil
 		}
 		if !errors.Is(err, store.ErrNotFound) {
@@ -1640,7 +1651,7 @@ func (o *Orchestrator) reconcileStopping(ctx context.Context, sb *model.Sandbox,
 			return // this replica's stop is still cleaning up after the pod: it settles itself
 		}
 		o.forgetStop(sb.ID)
-		if err := o.settleStopped(ctx, sb.ID); err != nil {
+		if err := o.settleStopped(ctx, sb); err != nil {
 			o.Log.Warn("settle a stopped sandbox", "id", sb.ID, "err", err) // the next pass tries again
 		}
 		return
@@ -1696,7 +1707,7 @@ func (o *Orchestrator) takeOverStop(seen *model.Sandbox) {
 				o.Log.Error("retire identities", "id", cur.ID, "err", err)
 			}
 		}
-		return o.settleStopped(ctx, cur.ID)
+		return o.settleStopped(ctx, cur)
 	})
 	switch {
 	case err == nil, errors.Is(err, errStopMoved), errors.Is(err, store.ErrNotFound):
@@ -1710,8 +1721,13 @@ func (o *Orchestrator) takeOverStop(seen *model.Sandbox) {
 // was executing in it is cancelled. Until then it stays stopping (the reconciler tries again):
 // a sleeping sandbox can be woken, and a healthy new pod would leave the old run running with
 // nothing that ever settles it.
-func (o *Orchestrator) settleStopped(ctx context.Context, id string) error {
-	if err := o.cancelRunning(ctx, id); err != nil {
+//
+// seen is the sandbox as the caller observed the stop: the run is cancelled only while the
+// record is still stopping (store.Settle.Sandbox). Another replica may have finished the
+// stop meanwhile and woken the sandbox; the run executing then is a replacement pod's.
+func (o *Orchestrator) settleStopped(ctx context.Context, seen *model.Sandbox) error {
+	id := seen.ID
+	if err := o.cancelRunning(ctx, id, seen); err != nil {
 		return err
 	}
 	_, _ = o.setStatusFrom(ctx, id, []model.SandboxStatus{model.StatusStopping}, model.StatusSleeping, func(s *model.Sandbox) { s.PodName, s.IP = "", "" })
@@ -1727,7 +1743,7 @@ func (o *Orchestrator) forgetStop(id string) {
 
 // failRun settles a run whose executor is gone: status failed, the reason in the output, the
 // usual run.finished event. Clients watching the run see it end instead of hanging forever.
-func (o *Orchestrator) failRun(ctx context.Context, sandboxID string, r *model.Run, reason string) {
+func (o *Orchestrator) failRun(ctx context.Context, sandboxID string, r *model.Run, reason string) error {
 	// The status, the reason and run.finished are one write.
 	evs := []*model.Event{
 		{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunOutput, Data: "[control plane] run lost: " + reason},
@@ -1737,10 +1753,12 @@ func (o *Orchestrator) failRun(ctx context.Context, sandboxID string, r *model.R
 		To: model.RunFailed, ExitCode: -1, FinishedAt: time.Now(), Events: evs}); err != nil {
 		if !errors.Is(err, store.ErrConflict) {
 			o.Log.Error("fail run", "run", r.ID, "err", err)
+			return err
 		}
-		return // settled by its runner or a cancel meanwhile
+		return nil // settled by its runner or a cancel meanwhile
 	}
 	o.publish(evs)
+	return nil
 }
 
 // IdleLoop is the single-replica form of Run, kept for callers that manage leadership themselves.
@@ -1801,7 +1819,7 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			// A run marked running while the sandbox has no pod is a leftover of a lost pod or a
 			// crashed replica: nobody will ever finish it.
 			if r, err := o.Store.RunningRun(ctx, sb.ID); err == nil {
-				o.failRun(ctx, sb.ID, r, "sandbox is "+string(sb.Status)+" while the run was executing")
+				_ = o.failRun(ctx, sb.ID, r, "sandbox is "+string(sb.Status)+" while the run was executing") // retried next pass; Wake settles it first
 			}
 			continue
 		}
@@ -1817,7 +1835,14 @@ func (o *Orchestrator) Reconcile(ctx context.Context) {
 			}
 			o.Log.Warn("running sandbox lost its pod", "id", sb.ID, "pod", sb.PodName, "reason", reason)
 			if r, err := o.Store.RunningRun(ctx, sb.ID); err == nil {
-				o.failRun(ctx, sb.ID, r, reason)
+				if err := o.failRun(ctx, sb.ID, r, reason); err != nil {
+					// The sandbox stays running (a wake is a no-op) until the run is settled: in
+					// error it could be woken, and with a healthy new pod nothing would settle
+					// the old run. The next pass sees the pod gone again and retries.
+					continue
+				}
+			} else if !errors.Is(err, store.ErrNotFound) {
+				continue // cannot tell whether a run is left: the next pass looks again
 			}
 			if o.Retirer != nil {
 				_ = o.Retirer.RetireSandbox(ctx, sb.ID)
@@ -1905,10 +1930,11 @@ func (o *Orchestrator) toStopping(ctx context.Context, id string, idle bool) (*m
 
 // claimAwake claims a queued run under claimLock, only while the sandbox is running: a pod that
 // is being stopped or replaced must not pick up work. errNotAwake otherwise. The claim is
-// store.ClaimRunFor: a claim of stamp.Owner it never confirmed is handed out instead (reclaimed).
+// store.ClaimRunFor: a claim of stamp.Owner it never confirmed is handed out instead (reclaimed),
+// and a new claim carries its run.start, written in its transaction.
 func (o *Orchestrator) claimAwake(ctx context.Context, sandboxID, runID, session string, stamp store.RunStamp) (*model.Run, bool, error) {
 	var r *model.Run
-	reclaimed := false
+	var start *model.Event
 	err := o.Store.WithTenantLock(ctx, claimLock(sandboxID), func(ctx context.Context) error {
 		sb, err := o.Store.GetSandbox(ctx, sandboxID)
 		if errors.Is(err, store.ErrNotFound) {
@@ -1920,9 +1946,12 @@ func (o *Orchestrator) claimAwake(ctx context.Context, sandboxID, runID, session
 		if sb.Status != model.StatusRunning {
 			return errNotAwake
 		}
-		r, reclaimed, err = o.Store.ClaimRunFor(ctx, sandboxID, runID, time.Now(), session, stamp)
+		r, start, err = o.Store.ClaimRunFor(ctx, sandboxID, runID, time.Now(), session, stamp)
 		return err
 	})
+	if start != nil {
+		o.publish([]*model.Event{start})
+	}
 	if r != nil {
 		// The claim is committed (it does not go through the lock's transaction): a failure to
 		// release the lock afterwards must not turn it into an error, or the run stays running
@@ -1930,7 +1959,7 @@ func (o *Orchestrator) claimAwake(ctx context.Context, sandboxID, runID, session
 		if err != nil {
 			o.Log.Warn("claim lock released with an error after a claim", "sandbox", sandboxID, "run", r.ID, "err", err)
 		}
-		return r, reclaimed, nil
+		return r, start == nil, nil
 	}
 	return nil, false, err
 }
@@ -2006,4 +2035,19 @@ func (o *Orchestrator) AckClaim(ctx context.Context, r *model.Run, owner string,
 		attempt = r.Attempt
 	}
 	return o.Store.AckRunClaim(ctx, r.ID, attempt)
+}
+
+// settleLeftoverRun fails a run still marked running in a sandbox about to get a new pod
+// (sleeping or error: no pod, so no runner executes it): the reconciler's settlement of a lost
+// pod's run that failed, or has not run yet. A failure fails the wake: with the new pod
+// healthy, nothing would ever settle the old run.
+func (o *Orchestrator) settleLeftoverRun(ctx context.Context, sb *model.Sandbox) error {
+	r, err := o.Store.RunningRun(ctx, sb.ID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return o.failRun(ctx, sb.ID, r, "sandbox is "+string(sb.Status)+" while the run was executing")
 }
