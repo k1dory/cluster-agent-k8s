@@ -28,6 +28,7 @@ import (
 	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/store"
+	"agent-sandbox/internal/telemetry"
 )
 
 // Runtime.PodStatus distinguishes three outcomes by error: ErrPodNotFound (the pod does not
@@ -279,7 +280,7 @@ func (o *Orchestrator) mutate(ctx context.Context, id string, fn func(sb *model.
 }
 
 // Create registers a sandbox, provisions its volume and starts the first pod.
-func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sandbox, error) {
+func (o *Orchestrator) create(ctx context.Context, req CreateRequest) (*model.Sandbox, error) {
 	if !slugRe.MatchString(req.Slug) {
 		return nil, fmt.Errorf("%w: slug must match %s", ErrBadRequest, slugRe)
 	}
@@ -770,7 +771,7 @@ func (o *Orchestrator) Update(ctx context.Context, id string, req UpdateRequest)
 }
 
 // Sleep deletes the pod and keeps the volume. Running work is not interrupted unless force.
-func (o *Orchestrator) Sleep(ctx context.Context, id string, force bool) (*model.Sandbox, error) {
+func (o *Orchestrator) sleep(ctx context.Context, id string, force bool) (*model.Sandbox, error) {
 	sb, err := o.Store.GetSandbox(ctx, id)
 	if err != nil {
 		return nil, err
@@ -917,7 +918,7 @@ func (o *Orchestrator) cancelRunning(ctx context.Context, id string, fence *mode
 }
 
 // Wake starts a pod for a sleeping sandbox. Idempotent for waking/running.
-func (o *Orchestrator) Wake(ctx context.Context, id string) (*model.Sandbox, error) {
+func (o *Orchestrator) wake(ctx context.Context, id string) (*model.Sandbox, error) {
 	sb, err := o.Store.GetSandbox(ctx, id)
 	if err != nil {
 		return nil, err
@@ -944,7 +945,7 @@ func (o *Orchestrator) Wake(ctx context.Context, id string) (*model.Sandbox, err
 // Delete stops the pod, removes the volume and then the record. If the cluster refuses, the
 // record stays in status `deleting` with the error attached; the reconciler and a repeated
 // DELETE retry it, so nothing is silently left behind.
-func (o *Orchestrator) Delete(ctx context.Context, id string) error {
+func (o *Orchestrator) deleteSandbox(ctx context.Context, id string) error {
 	sb, err := o.markDeleting(ctx, id)
 	if err != nil {
 		return err
@@ -1096,7 +1097,7 @@ func (o *Orchestrator) NextRun(ctx context.Context, sandboxID string, wait time.
 // claimed and never confirmed (the response was lost: the runner asks again) is handed to it
 // again first, under a new attempt; the claim is confirmed by the runner's first call about the
 // run (see AckClaim).
-func (o *Orchestrator) NextRunFor(ctx context.Context, sandboxID, owner string, wait time.Duration) (*model.Run, error) {
+func (o *Orchestrator) nextRunFor(ctx context.Context, sandboxID, owner string, wait time.Duration) (*model.Run, error) {
 	deadline := time.Now().Add(wait)
 	for {
 		// A pod that is being stopped or replaced must not pick up work: the run would die with it.
@@ -1212,7 +1213,7 @@ func (o *Orchestrator) Output(ctx context.Context, sandboxID, runID, data string
 // the runner retries under the same batchID: a retry of a batch that was stored stores nothing
 // again. partial: lines are only the beginning of the body (it was cut off), so the batch may
 // be continued under its id. attempt > 0 refuses an attempt the run has been handed out past.
-func (o *Orchestrator) OutputBatch(ctx context.Context, sandboxID, runID, batchID string, attempt int, lines []string, partial bool) (*store.OutputResult, error) {
+func (o *Orchestrator) outputBatch(ctx context.Context, sandboxID, runID, batchID string, attempt int, lines []string, partial bool) (*store.OutputResult, error) {
 	b := &store.OutputBatch{SandboxID: sandboxID, RunID: runID, BatchID: batchID, Attempt: attempt, Lines: make([]store.OutputLine, len(lines)), Partial: partial}
 	for i, data := range lines {
 		l := store.OutputLine{Data: data}
@@ -1239,7 +1240,7 @@ func (o *Orchestrator) FinishRun(ctx context.Context, sandboxID, runID string, e
 // overrides whatever was parsed from the output stream. The result and run.finished are one
 // write. attempt > 0 refuses (store.ErrStaleAttempt) an attempt the run has been handed out
 // past. A rollout deferred until the run ended is applied right after.
-func (o *Orchestrator) FinishRunAttempt(ctx context.Context, sandboxID, runID string, attempt, exitCode int, usage *model.Usage) error {
+func (o *Orchestrator) finishRunAttempt(ctx context.Context, sandboxID, runID string, attempt, exitCode int, usage *model.Usage) error {
 	r, err := o.Store.GetRun(ctx, runID)
 	if err != nil {
 		return err
@@ -1795,9 +1796,10 @@ func (o *Orchestrator) IdleLoop(ctx context.Context) {
 }
 
 // Reconcile is one pass of the background work. Exported for tests.
-func (o *Orchestrator) Reconcile(ctx context.Context) {
+func (o *Orchestrator) reconcile(ctx context.Context) {
 	sbs, err := o.Store.ListSandboxes(ctx)
 	if err != nil {
+		telemetry.ReconcileErrors.Inc()
 		o.Log.Error("reconcile", "err", err)
 		return
 	}

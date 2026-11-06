@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"agent-sandbox/internal/model"
+	"agent-sandbox/internal/telemetry"
 )
 
 // Hub is a per-sandbox broadcast channel set.
@@ -74,6 +75,7 @@ func (h *Hub) Publish(e model.Event) {
 			select {
 			case ch <- e:
 			default:
+				telemetry.EventsHubDropped.Inc()
 			}
 		}
 		for ch, f := range h.wakes[key] {
