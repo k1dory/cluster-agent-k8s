@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	"agent-sandbox/api"
@@ -112,29 +113,29 @@ func (failingStore) GetAPIKey(context.Context, string) (*model.APIKey, error) { 
 // request id, and the detail is in the log line of that id.
 func TestReviewStoreFailuresAre500AndLogged(t *testing.T) {
 	s := newStack(t)
-	resp, body := call(t, "POST", s.platform.URL+"/v1/sandboxes", "t0k", map[string]any{"name": "db", "slug": "backend-dev", "owner": "alice"}, nil)
+	// The failing store goes in before anything runs in the background (a sandbox start
+	// reads the store until after its last event), so nothing reads the field while it changes.
+	logs := &syncWriter{w: &bytes.Buffer{}}
+	broken := failingStore{s.orch.Store}
+	s.orch.Store = broken
+	s.p.Keys = &apikeys.Service{Store: broken}
+	s.p.Log = slog.New(slog.NewJSONHandler(logs, nil))
+	srv := httptest.NewServer(s.p.Routes())
+	defer srv.Close()
+	resp, body := call(t, "POST", srv.URL+"/v1/sandboxes", "t0k", map[string]any{"name": "db", "slug": "backend-dev", "owner": "alice"}, nil)
 	if resp.StatusCode != 201 {
 		t.Fatalf("create: %d %s", resp.StatusCode, body)
 	}
 	var sb model.Sandbox
 	_ = json.Unmarshal(body, &sb)
-	waitRunning(t, s.platform.URL, "t0k", sb.ID) // the start runs in the background and reads the store
-	var logs bytes.Buffer
-	broken := failingStore{s.orch.Store}
-	s.orch.Store = broken
-	s.p.Keys = &apikeys.Service{Store: broken}
-	s.p.Log = slog.New(slog.NewJSONHandler(&logs, nil))
-	srv := httptest.NewServer(s.p.Routes())
-	defer srv.Close()
 
 	for _, path := range []string{"/v1/sandboxes/" + sb.ID + "/runs/r1", "/v1/tenants/alice/keys/k1"} {
-		logs.Reset()
 		resp, body := call(t, "GET", srv.URL+path, "t0k", nil, map[string]string{"X-Request-Id": "rid-" + path[len(path)-2:]})
 		wantErr(t, path, resp, body, 500, CodeInternal)
 		if strings.Contains(string(body), "10.0.0.7") || !strings.Contains(string(body), "rid-") {
 			t.Fatalf("%s: the body leaks the detail or lacks the id: %s", path, body)
 		}
-		if !strings.Contains(logs.String(), "10.0.0.7") || !strings.Contains(logs.String(), `"rid":"rid-`) {
+		if !strings.Contains(logs.String(), "10.0.0.7") || !strings.Contains(logs.String(), `"rid":"rid-`+path[len(path)-2:]+`"`) {
 			t.Fatalf("%s: the detail is not logged under the request id: %s", path, logs.String())
 		}
 	}
@@ -173,4 +174,22 @@ func TestReviewInternalErrorsDoNotLeakThroughTheAttachedRecord(t *testing.T) {
 	if r.Code != 409 || !strings.Contains(r.Body.String(), `"sync":{`) {
 		t.Fatalf("stopped: %d %s", r.Code, r.Body)
 	}
+}
+
+// syncWriter lets background goroutines and the test share one log buffer.
+type syncWriter struct {
+	mu sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (s *syncWriter) Write(b []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(b)
+}
+
+func (s *syncWriter) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.String()
 }
