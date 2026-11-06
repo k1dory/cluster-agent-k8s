@@ -111,16 +111,16 @@ func TestRound2OutputBatchIsStoredOnce(t *testing.T) {
 		if _, err := s.AppendRunOutput(ctx, short); !errors.Is(err, ErrBatchMismatch) {
 			t.Fatalf("same id, fewer lines than stored: %v", err)
 		}
-		// The stored lines followed by more (a body the 413 cut short, sent again whole): only the rest.
+		// The stored lines followed by more: a batch stored whole takes no longer body either
+		// (TestRound2CompletedBatchTakesNoExtension).
 		longer := batch()
 		longer.Lines = append(longer.Lines, OutputLine{Data: "c"})
-		res, err := s.AppendRunOutput(ctx, longer)
-		if err != nil || res.Skipped != 3 || res.Accepted != 1 {
-			t.Fatalf("the batch extended: %v %+v", err, res)
+		if _, err := s.AppendRunOutput(ctx, longer); !errors.Is(err, ErrBatchMismatch) {
+			t.Fatalf("a whole batch extended: %v", err)
 		}
 		got, _ = s.GetRun(ctx, r.ID)
-		if out := round2Outputs(t, s, r); len(out) != 4 || out[3] != "c" || got.Usage.CostUSD != 0.5 {
-			t.Fatalf("after the extension: outputs=%v usage=%+v", out, got.Usage)
+		if out := round2Outputs(t, s, r); len(out) != 3 || got.Usage.CostUSD != 0.5 {
+			t.Fatalf("after the refused bodies: outputs=%v usage=%+v", out, got.Usage)
 		}
 		// A run of another sandbox is not found.
 		if _, err := s.AppendRunOutput(ctx, &OutputBatch{SandboxID: "other", RunID: r.ID, Lines: round2Lines("x")}); !errors.Is(err, ErrNotFound) {
@@ -319,4 +319,266 @@ func TestRound2SettleWritesItsEvents(t *testing.T) {
 			t.Fatalf("six concurrent repairs appended %d run.cancel", added)
 		}
 	})
+}
+
+// Codex round 1 of #31, finding 4: a batch id whose body was stored whole took a longer body
+// under the same id ("a", then "a" and a usage line): the usage was added. Only a body cut
+// short by a 413 may be continued under its id.
+func TestRound2CompletedBatchTakesNoExtension(t *testing.T) {
+	bothStores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		r := round2Run(t, s, "dl-ext")
+		if _, err := s.ClaimRun(ctx, r.ID, time.Now(), "", RunStamp{}); err != nil {
+			t.Fatal(err)
+		}
+		withUsage := round2Lines("a", "u")
+		withUsage[1].Usage = &model.Usage{InputTokens: 10, CostUSD: 0.5}
+		if _, err := s.AppendRunOutput(ctx, &OutputBatch{SandboxID: r.SandboxID, RunID: r.ID, BatchID: "whole", Lines: round2Lines("a")}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.AppendRunOutput(ctx, &OutputBatch{SandboxID: r.SandboxID, RunID: r.ID, BatchID: "whole", Lines: withUsage}); !errors.Is(err, ErrBatchMismatch) {
+			t.Fatalf("a whole batch extended under its id: %v", err)
+		}
+		if res, err := s.AppendRunOutput(ctx, &OutputBatch{SandboxID: r.SandboxID, RunID: r.ID, BatchID: "whole", Lines: round2Lines("a")}); err != nil || res.Skipped != 1 || res.Accepted != 0 {
+			t.Fatalf("the exact retry of a whole batch: %v %+v", err, res)
+		}
+		if got, _ := s.GetRun(ctx, r.ID); got.Usage.CostUSD != 0 {
+			t.Fatalf("the refused extension added usage: %+v", got.Usage)
+		}
+		// A body cut short (413) is a prefix: the same id may carry the rest, once.
+		if _, err := s.AppendRunOutput(ctx, &OutputBatch{SandboxID: r.SandboxID, RunID: r.ID, BatchID: "cut", Lines: round2Lines("a"), Partial: true}); err != nil {
+			t.Fatal(err)
+		}
+		res, err := s.AppendRunOutput(ctx, &OutputBatch{SandboxID: r.SandboxID, RunID: r.ID, BatchID: "cut", Lines: withUsage})
+		if err != nil || res.Skipped != 1 || res.Accepted != 1 {
+			t.Fatalf("the rest of a cut batch: %v %+v", err, res)
+		}
+		if _, err := s.AppendRunOutput(ctx, &OutputBatch{SandboxID: r.SandboxID, RunID: r.ID, BatchID: "cut", Lines: append(withUsage, OutputLine{Data: "more"})}); !errors.Is(err, ErrBatchMismatch) {
+			t.Fatalf("a cut batch, completed, extended again: %v", err)
+		}
+		if out, got := round2Outputs(t, s, r), func() *model.Run { g, _ := s.GetRun(ctx, r.ID); return g }(); len(out) != 3 || got.Usage.CostUSD != 0.5 {
+			t.Fatalf("outputs=%v usage=%+v", out, got.Usage)
+		}
+	})
+}
+
+// failOnce returns a fault hook failing the first call at point, and a counter of the failures.
+func failOnce(point string) (func(string) error, *int) {
+	var mu sync.Mutex
+	n := 0
+	return func(p string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if p == point && n == 0 {
+			n++
+			return errors.New("injected failure before the commit")
+		}
+		return nil
+	}, &n
+}
+
+// Codex round 1 of #31, finding 5: a failure inside the transaction (after the lines, usage,
+// session, progress and events are written, before the commit) leaves nothing behind, and the
+// retry under the same batch id stores the batch exactly once.
+func TestRound2OutputFailureBeforeCommitLeavesNothing(t *testing.T) {
+	bothStores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		r := round2Run(t, s, "dl-fault")
+		if _, err := s.ClaimRun(ctx, r.ID, time.Now(), "", RunStamp{}); err != nil {
+			t.Fatal(err)
+		}
+		hook, failed := failOnce(FaultOutput)
+		SetFaultHook(s, hook)
+		defer SetFaultHook(s, nil)
+		batch := func() *OutputBatch {
+			lines := round2Lines("a", "s", "u")
+			lines[1].Session = "sess-f"
+			lines[2].Usage = &model.Usage{InputTokens: 10, CostUSD: 0.5}
+			return &OutputBatch{SandboxID: r.SandboxID, RunID: r.ID, BatchID: "b-f", Lines: lines}
+		}
+		if _, err := s.AppendRunOutput(ctx, batch()); err == nil || *failed != 1 {
+			t.Fatalf("the injected failure: %v (failed %d)", err, *failed)
+		}
+		got, _ := s.GetRun(ctx, r.ID)
+		if out := round2Outputs(t, s, r); len(out) != 0 || got.Usage.CostUSD != 0 || got.Session != "" {
+			t.Fatalf("a failed batch left outputs=%v usage=%+v session=%q", out, got.Usage, got.Session)
+		}
+		res, err := s.AppendRunOutput(ctx, batch())
+		if err != nil || res.Skipped != 0 || res.Accepted != 3 {
+			t.Fatalf("the retry: %v %+v (its progress was rolled back too)", err, res)
+		}
+		if res, err := s.AppendRunOutput(ctx, batch()); err != nil || res.Skipped != 3 {
+			t.Fatalf("a second retry: %v %+v", err, res)
+		}
+		got, _ = s.GetRun(ctx, r.ID)
+		if out := round2Outputs(t, s, r); len(out) != 3 || got.Usage.CostUSD != 0.5 || got.Session != "sess-f" {
+			t.Fatalf("after the retries: outputs=%v usage=%+v session=%q", out, got.Usage, got.Session)
+		}
+	})
+}
+
+// Finding 5, the settle: a failure before the commit leaves the run as it was and no events.
+func TestRound2SettleFailureBeforeCommitLeavesNothing(t *testing.T) {
+	bothStores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		r := round2Run(t, s, "dl-sfault")
+		if _, err := s.ClaimRun(ctx, r.ID, time.Now(), "", RunStamp{}); err != nil {
+			t.Fatal(err)
+		}
+		hook, failed := failOnce(FaultSettle)
+		SetFaultHook(s, hook)
+		defer SetFaultHook(s, nil)
+		settle := Settle{RunID: r.ID, From: []model.RunStatus{model.RunRunning}, To: model.RunCancelled, FinishedAt: time.Now(),
+			Events: []*model.Event{{SandboxID: r.SandboxID, RunID: r.ID, Type: model.EventRunCancel}}}
+		if _, err := s.SettleRunWithEvents(ctx, settle); err == nil || *failed != 1 {
+			t.Fatalf("the injected failure: %v (failed %d)", err, *failed)
+		}
+		if got, _ := s.GetRun(ctx, r.ID); got.Status != model.RunRunning || got.FinishedAt != nil {
+			t.Fatalf("a failed settle moved the run: %+v", got)
+		}
+		if evs, _ := s.ListEvents(ctx, r.SandboxID, 0, 100); len(evs) != 0 {
+			t.Fatalf("a failed settle left events: %+v", evs)
+		}
+		settle.Events = []*model.Event{{SandboxID: r.SandboxID, RunID: r.ID, Type: model.EventRunCancel}}
+		if got, err := s.SettleRunWithEvents(ctx, settle); err != nil || got.Status != model.RunCancelled {
+			t.Fatalf("the retry: %v %+v", err, got)
+		}
+		if evs, _ := s.ListEvents(ctx, r.SandboxID, 0, 100); len(evs) != 1 || evs[0].Type != model.EventRunCancel {
+			t.Fatalf("events after the retry: %+v", evs)
+		}
+	})
+}
+
+// Codex round 1 of #31, finding 2: the reclaim check and the claim were separate, so a retry
+// overlapping the request whose response was lost could miss the claim of the first queued run
+// and take the second. Decided together, every overlapping request of the owner gets the first.
+func TestRound2ClaimDecisionIsSerialised(t *testing.T) {
+	bothStores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		first := round2Run(t, s, "dl-ser")
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		second := &model.Run{ID: "dl-ser-2", SandboxID: first.SandboxID, Tenant: "acme", Slug: "dev", Task: "next", Status: model.RunQueued,
+			Mode: model.RunMessage, ResumeOf: first.ID, CreatedAt: now.Add(time.Second)}
+		if err := s.CreateRun(ctx, second); err != nil {
+			t.Fatal(err)
+		}
+		// Every request read the queue before any claimed: each names the run it saw first.
+		var wg sync.WaitGroup
+		got := make([]string, 8)
+		for i := range got {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				target := first.ID
+				if i%2 == 1 {
+					target = second.ID // read after another request's claim moved the queue on
+				}
+				r, _, err := s.ClaimRunFor(ctx, first.SandboxID, target, time.Now(), "", RunStamp{Owner: "1"})
+				if err != nil {
+					if !errors.Is(err, ErrConflict) {
+						t.Error(err)
+					}
+					return
+				}
+				got[i] = r.ID
+			}(i)
+		}
+		wg.Wait()
+		running := map[string]bool{}
+		for _, id := range got {
+			if id != "" {
+				running[id] = true
+			}
+		}
+		if len(running) != 1 {
+			t.Fatalf("overlapping requests of one owner got runs %v", got)
+		}
+		// The first request may have taken the second run when it really was first in line here;
+		// what matters is that no request after it took another one.
+		remaining := first.ID
+		if running[first.ID] {
+			remaining = second.ID
+		}
+		if r, _ := s.GetRun(ctx, remaining); r.Status != model.RunQueued {
+			t.Fatalf("both runs were claimed: %v", got)
+		}
+		// Another owner is not handed the unconfirmed claim: it takes the run still queued.
+		r, reclaimed, err := s.ClaimRunFor(ctx, first.SandboxID, remaining, time.Now(), "", RunStamp{Owner: "2"})
+		if err != nil || reclaimed || r.ID != remaining {
+			t.Fatalf("another owner: %v reclaimed=%v %+v", err, reclaimed, r)
+		}
+	})
+}
+
+// Codex round 1 of #31, finding 1: event ids are drawn before the commit, and readers page by
+// id. A transaction holding id N while another writer commits N+1 made the listener of another
+// replica read past N, so output and run.finished vanished from live streams. The ids are now
+// drawn under the events lock AppendEvent takes, held to the commit.
+func TestRound2EventIdsBecomeVisibleInCommitOrder(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := round2Run(t, p, "dl-order")
+	if _, err := p.ClaimRun(ctx, r.ID, time.Now(), "", RunStamp{}); err != nil {
+		t.Fatal(err)
+	}
+	seen := make(chan *model.Event, 100)
+	ready := make(chan struct{})
+	go p.ListenEvents(ctx, func() { close(ready) }, func(e *model.Event) { seen <- e })
+	select {
+	case <-ready:
+	case <-time.After(10 * time.Second):
+		t.Fatal("listener not ready")
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	SetFaultHook(p, func(point string) error {
+		if point == FaultSettle {
+			once.Do(func() { close(entered); <-release }) // the settle's events are inserted, not committed
+		}
+		return nil
+	})
+	defer SetFaultHook(p, nil)
+	settled := make(chan error, 1)
+	go func() {
+		_, err := p.SettleRunWithEvents(ctx, Settle{RunID: r.ID, From: []model.RunStatus{model.RunRunning}, To: model.RunDone, FinishedAt: time.Now(),
+			Events: []*model.Event{{SandboxID: r.SandboxID, RunID: r.ID, Type: model.EventRunDone, Data: "done"}}})
+		settled <- err
+	}()
+	<-entered
+	appended := make(chan error, 1)
+	go func() {
+		appended <- p.AppendEvent(ctx, &model.Event{SandboxID: r.SandboxID, Tenant: "acme", Slug: "dev", Type: model.EventStatus, Data: "other writer"})
+	}()
+	want := map[string]bool{"done": false, "other writer": false}
+	deadline := time.After(10 * time.Second)
+	// Give the other writer, and the listener it wakes, every chance to run ahead: if its
+	// commit gets through while the settle is open, wait until the listener has read past it.
+	select {
+	case err := <-appended:
+		t.Logf("the other writer committed while the settle was open (%v)", err)
+		for !want["other writer"] {
+			select {
+			case e := <-seen:
+				want[e.Data] = true
+			case <-deadline:
+				t.Fatal("the listener never delivered the other writer's event")
+			}
+		}
+	case <-time.After(500 * time.Millisecond): // it waits for the settle's commit: the fix
+	}
+	close(release)
+	if err := <-settled; err != nil {
+		t.Fatal(err)
+	}
+	for !want["done"] || !want["other writer"] {
+		select {
+		case e := <-seen:
+			if _, ok := want[e.Data]; ok {
+				want[e.Data] = true
+			}
+		case <-deadline:
+			t.Fatalf("the listener never delivered: %v", want)
+		}
+	}
 }

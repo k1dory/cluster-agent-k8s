@@ -1727,9 +1727,8 @@ var (
 )
 
 type memBatch struct {
-	lines int
-	hash  string
-	at    time.Time
+	batchProgress
+	at time.Time
 }
 
 // appendEventLocked is AppendEvent under the lock already held.
@@ -1741,6 +1740,39 @@ func (m *Memory) appendEventLocked(e *model.Event) {
 	}
 	c := *e
 	m.events = append(m.events, &c)
+}
+
+// memUndo restores what a RunDelivery write changed when it fails at its fault point: the memory
+// store's form of a rolled-back transaction.
+type memUndo struct {
+	m         *Memory
+	events    int
+	nextEvent int64
+	run       *model.Run
+	saved     model.Run
+	batchKey  string
+	batch     memBatch
+	hadBatch  bool
+}
+
+func (m *Memory) undoFor(r *model.Run, batchKey string) *memUndo {
+	u := &memUndo{m: m, events: len(m.events), nextEvent: m.nextEvent, run: r, saved: *r, batchKey: batchKey}
+	if batchKey != "" {
+		u.batch, u.hadBatch = m.batches[batchKey]
+	}
+	return u
+}
+
+func (u *memUndo) rollback() {
+	u.m.events, u.m.nextEvent = u.m.events[:u.events], u.nextEvent
+	*u.run = u.saved
+	if u.batchKey != "" {
+		if u.hadBatch {
+			u.m.batches[u.batchKey] = u.batch
+		} else {
+			delete(u.m.batches, u.batchKey)
+		}
+	}
 }
 
 func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResult, error) {
@@ -1755,19 +1787,19 @@ func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResu
 		return nil, ErrStaleAttempt
 	}
 	res := &OutputResult{}
-	key := b.RunID + "|" + b.BatchID
+	key := ""
 	if b.BatchID != "" {
+		key = b.RunID + "|" + b.BatchID
 		if rec, ok := m.batches[key]; ok {
-			if rec.lines > len(b.Lines) || chain[rec.lines] != rec.hash {
-				return nil, ErrBatchMismatch
+			n, err := rec.resume(b, chain)
+			if err != nil {
+				return nil, err
 			}
-			res.Skipped = rec.lines
+			res.Skipped = n
 		}
 	}
+	undo := m.undoFor(r, key)
 	rest := b.Lines[res.Skipped:]
-	if len(rest) == 0 {
-		return res, nil
-	}
 	at := time.Now()
 	for _, l := range rest {
 		e := &model.Event{SandboxID: b.SandboxID, Tenant: r.Tenant, Slug: r.Slug, RunID: b.RunID, Type: model.EventRunOutput, Data: l.Data, At: at}
@@ -1784,7 +1816,7 @@ func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResu
 	if s := batchSession(rest); s != "" {
 		r.Session = s
 	}
-	if b.BatchID != "" {
+	if key != "" {
 		if m.batches == nil {
 			m.batches = map[string]memBatch{}
 		}
@@ -1793,7 +1825,11 @@ func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResu
 				delete(m.batches, k)
 			}
 		}
-		m.batches[key] = memBatch{lines: len(b.Lines), hash: chain[len(b.Lines)], at: at}
+		m.batches[key] = memBatch{batchProgress: batchProgress{lines: len(b.Lines), hash: chain[len(b.Lines)], complete: !b.Partial}, at: at}
+	}
+	if err := faultAt(m, FaultOutput); err != nil {
+		undo.rollback()
+		return nil, err
 	}
 	res.Accepted = len(rest)
 	return res, nil
@@ -1812,6 +1848,7 @@ func (m *Memory) SettleRunWithEvents(_ context.Context, s Settle) (*model.Run, e
 	if !slices.Contains(s.From, r.Status) {
 		return nil, ErrConflict
 	}
+	undo := m.undoFor(r, "")
 	r.Status, r.ExitCode, r.FinishedAt = s.To, s.ExitCode, &s.FinishedAt
 	if s.Usage != nil {
 		r.Usage = *s.Usage
@@ -1822,25 +1859,54 @@ func (m *Memory) SettleRunWithEvents(_ context.Context, s Settle) (*model.Run, e
 		}
 		m.appendEventLocked(e)
 	}
+	if err := faultAt(m, FaultSettle); err != nil {
+		undo.rollback()
+		for _, e := range s.Events {
+			e.ID = 0
+		}
+		return nil, err
+	}
 	out := *r
 	return &out, nil
 }
 
-func (m *Memory) ReclaimRun(_ context.Context, sandboxID, owner string) (*model.Run, error) {
-	if owner == "" {
-		return nil, ErrNotFound
-	}
+func (m *Memory) ReclaimRun(ctx context.Context, sandboxID, owner string) (*model.Run, error) {
+	r, _, err := m.ClaimRunFor(ctx, sandboxID, "", time.Time{}, "", RunStamp{Owner: owner})
+	return r, err
+}
+
+func (m *Memory) ClaimRunFor(_ context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, c := range m.runsOf(sandboxID) {
-		if c.Status == model.RunRunning && c.ClaimedBy == owner && !c.ClaimAcked {
-			r := m.runs[c.ID]
-			r.Attempt++
-			out := *r
-			return &out, nil
+	if stamp.Owner != "" {
+		for _, c := range m.runsOf(sandboxID) {
+			if c.Status == model.RunRunning && c.ClaimedBy == stamp.Owner && !c.ClaimAcked {
+				r := m.runs[c.ID]
+				r.Attempt++
+				out := *r
+				return &out, true, nil
+			}
 		}
 	}
-	return nil, ErrNotFound
+	if runID == "" {
+		return nil, false, ErrNotFound
+	}
+	r, ok := m.runs[runID]
+	if !ok || r.SandboxID != sandboxID {
+		return nil, false, ErrNotFound
+	}
+	if r.Status != model.RunQueued {
+		return nil, false, ErrConflict
+	}
+	r.Status, r.StartedAt = model.RunRunning, &startedAt
+	r.Attempt, r.ClaimedBy, r.ClaimAcked = r.Attempt+1, stamp.Owner, false
+	if r.Session == "" {
+		r.Session = session
+	}
+	r.AgentVersion, r.AgentRef, r.AgentRevision = stamp.AgentVersion, stamp.AgentRef, stamp.AgentRevision
+	r.EnvironmentRef, r.EnvironmentRevision = stamp.EnvironmentRef, stamp.EnvironmentRevision
+	out := *r
+	return &out, false, nil
 }
 
 func (m *Memory) AckRunClaim(_ context.Context, runID string, attempt int) error {

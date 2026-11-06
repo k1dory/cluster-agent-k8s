@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"agent-sandbox/internal/model"
@@ -33,8 +34,16 @@ type RunDelivery interface {
 	// ReclaimRun hands a run out again to the owner that claimed it, when the owner has not
 	// confirmed it got it (AckRunClaim): the response of the claim was lost and the runner asks
 	// again. The attempt is incremented, so whatever held the earlier one cannot write. Only
-	// the oldest such run of the sandbox; ErrNotFound when there is none.
+	// the oldest such run of the sandbox; ErrNotFound when there is none. It is ClaimRunFor
+	// with no run to fall back to.
 	ReclaimRun(ctx context.Context, sandboxID, owner string) (*model.Run, error)
+	// ClaimRunFor is the whole claim decision of one /agent/runs/next, serialised per sandbox:
+	// the run stamp.Owner claimed and never confirmed, handed out again (reclaimed true), or
+	// else ClaimRun of runID (the oldest queued run the caller read). Decided apart, a retry
+	// overlapping the request whose response was lost could miss the claim being made and take
+	// the next queued run, executing a continuation before the run it continues. ErrConflict
+	// when runID is no longer queued, ErrNotFound when it is absent, not the sandbox's, or "".
+	ClaimRunFor(ctx context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, bool, error)
 	// AckRunClaim records that the owner of attempt has the run: it is not handed out again.
 	// ErrStaleAttempt when the run is at another attempt, ErrNotFound when it is absent.
 	AckRunClaim(ctx context.Context, runID string, attempt int) error
@@ -65,6 +74,26 @@ type OutputBatch struct {
 	BatchID          string // "" = no retry protection
 	Attempt          int    // > 0: refuse when the run is at another attempt
 	Lines            []OutputLine
+	// Partial: the body was cut short (a 413) and Lines is only its beginning, so a later call
+	// under the same id may carry more. A batch stored whole takes no other body, longer or not.
+	Partial bool
+}
+
+// batchProgress is what is recorded of a batch id: how many lines are stored, the hash of
+// those lines, and whether they were the whole body.
+type batchProgress struct {
+	lines    int
+	hash     string
+	complete bool
+}
+
+// resume is how many lines of b were stored already under its id, or ErrBatchMismatch when b
+// is not that batch again: another body, fewer lines, or more lines than a batch stored whole.
+func (rec batchProgress) resume(b *OutputBatch, chain []string) (int, error) {
+	if rec.lines > len(b.Lines) || chain[rec.lines] != rec.hash || rec.complete && len(b.Lines) != rec.lines {
+		return 0, ErrBatchMismatch
+	}
+	return rec.lines, nil
 }
 
 // OutputResult: Skipped lines were stored by an earlier call under the same batch id, Events
@@ -132,3 +161,30 @@ func batchSession(lines []OutputLine) string {
 // outputBatchTTL is how long a batch's progress is kept: a runner retries a batch for minutes,
 // never for a day.
 const outputBatchTTL = IdempotencyTTL
+
+// Fault points of the RunDelivery transactions: the last step before the commit, after every
+// write of the operation. A failure injected there rolls the whole operation back.
+const (
+	FaultOutput = "output" // AppendRunOutput
+	FaultSettle = "settle" // SettleRunWithEvents
+)
+
+var faults sync.Map // Store → func(point string) error
+
+// SetFaultHook makes fn run at every fault point of st's RunDelivery transactions (a *Memory or
+// a *Postgres, not a wrapper); an error it returns fails the operation there, rolled back. nil
+// removes it. For tests: the failures a replica meets between its writes and its commit.
+func SetFaultHook(st Store, fn func(point string) error) {
+	if fn == nil {
+		faults.Delete(st)
+		return
+	}
+	faults.Store(st, fn)
+}
+
+func faultAt(st Store, point string) error {
+	if fn, ok := faults.Load(st); ok {
+		return fn.(func(string) error)(point)
+	}
+	return nil
+}

@@ -301,13 +301,15 @@ ALTER TABLE runs
     ADD COLUMN IF NOT EXISTS attempt integer NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS claimed_by text NOT NULL DEFAULT '',
     ADD COLUMN IF NOT EXISTS claim_acked boolean NOT NULL DEFAULT false;
--- The progress of each X-Batch-Id of a run's output: how many of its lines are stored and the
--- running hash of those lines, written in the transaction that stores them.
+-- The progress of each X-Batch-Id of a run's output: how many of its lines are stored, the
+-- running hash of those lines and whether they were the whole body, written in the
+-- transaction that stores them.
 CREATE TABLE IF NOT EXISTS run_output_batches (
     run_id     text NOT NULL,
     batch_id   text NOT NULL,
     lines      integer NOT NULL,
     hash       text NOT NULL,
+    complete   boolean NOT NULL DEFAULT true,
     created_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, batch_id)
 );
