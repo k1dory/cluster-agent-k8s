@@ -474,9 +474,10 @@ type BoundInstance struct {
 // ErrKeyInactive: the key is revoked or expired.
 var ErrKeyInactive = errors.New("api key is revoked or expired")
 
-// SuccessorInUseError: the key was already rotated and its successor has been used.
+// SuccessorInUseError: the key was already rotated and its successor has been used or was
+// itself rotated: replacing it again would start a second live branch.
 type SuccessorInUseError struct{ ID string }
 
 func (e *SuccessorInUseError) Error() string {
-	return "api key already rotated to " + e.ID + ", which is in use"
+	return "api key already rotated to " + e.ID + ", which has been used or rotated on"
 }

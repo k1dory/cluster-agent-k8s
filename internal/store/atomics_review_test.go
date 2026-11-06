@@ -389,3 +389,52 @@ func TestReviewOriginalExpiryGoesWithTheKey(t *testing.T) {
 		}
 	})
 }
+
+// A→B with grace, B used, B→C without grace (B now revoked), then a retry of A within its
+// grace: B is inactive, but its branch is taken; the retry must be refused, not create D
+// beside the live C.
+func TestReviewRotateRefusesARetryOverARotatedOnSuccessor(t *testing.T) {
+	bothStores(t, func(t *testing.T, st Store) {
+		ctx := t.Context()
+		now := time.Now().UTC().Truncate(time.Millisecond)
+		key := func(id string) *model.APIKey {
+			return &model.APIKey{ID: id, Tenant: "acme", Name: "ci", Hash: "h-" + id, CreatedAt: now}
+		}
+		if err := st.CreateAPIKey(ctx, key("A")); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RotateAPIKey(ctx, "A", key("B"), now, RotateOptions{Grace: time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.FirstUseAPIKey(ctx, "B", now); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RotateAPIKey(ctx, "B", key("C"), now.Add(time.Minute), RotateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		var taken *SuccessorInUseError
+		if err := st.RotateAPIKey(ctx, "A", key("D"), now.Add(2*time.Minute), RotateOptions{Grace: time.Hour}); !errors.As(err, &taken) || taken.ID != "B" {
+			t.Fatalf("a retry over a successor that was used and rotated on must be refused: %v", err)
+		}
+		if _, err := st.GetAPIKey(ctx, "D"); !errors.Is(err, ErrNotFound) {
+			t.Fatal("no second branch may be created")
+		}
+		// Rotated on without ever being used is the same: its holder has C.
+		for _, id := range []string{"P", "Q", "R"} {
+			if err := st.CreateAPIKey(ctx, key(id)); id == "P" && err != nil {
+				t.Fatal(err)
+			}
+		}
+		_ = st.DeleteAPIKey(ctx, "Q")
+		_ = st.DeleteAPIKey(ctx, "R")
+		if err := st.RotateAPIKey(ctx, "P", key("Q"), now, RotateOptions{Grace: time.Hour}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RotateAPIKey(ctx, "Q", key("R"), now, RotateOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.RotateAPIKey(ctx, "P", key("S"), now, RotateOptions{Grace: time.Hour}); !errors.As(err, &taken) {
+			t.Fatalf("an unused successor that was rotated on must also refuse the retry: %v", err)
+		}
+	})
+}

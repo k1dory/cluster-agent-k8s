@@ -1508,11 +1508,14 @@ func (m *Memory) RotateAPIKey(_ context.Context, oldID string, next *model.APIKe
 		return fmt.Errorf("%w: api key %s exists", ErrConflict, next.ID)
 	}
 	var withdraw *model.APIKey
-	if prev, ok := m.apiKeys[old.RotatedTo]; ok && old.RotatedTo != "" && prev.RevokedAt == nil && prev.Active(at) {
-		if prev.LastUsedAt != nil {
+	if prev, ok := m.apiKeys[old.RotatedTo]; ok && old.RotatedTo != "" {
+		switch {
+		case prev.LastUsedAt != nil || prev.RotatedTo != "":
+			// Used, or rotated on in turn: the branch is taken, even if no longer active.
 			return &SuccessorInUseError{ID: prev.ID}
+		case prev.RevokedAt == nil && prev.Active(at):
+			withdraw = prev
 		}
-		withdraw = prev
 	}
 	orig, recorded := memKeyOrigin(m, oldID)
 	if !recorded && old.RotatedTo == "" {

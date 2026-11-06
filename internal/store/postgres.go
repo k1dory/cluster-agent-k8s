@@ -1652,9 +1652,11 @@ func (p *Postgres) RotateAPIKey(ctx context.Context, oldID string, next *model.A
 		case errors.Is(err, ErrNotFound):
 		case err != nil:
 			return err
-		case prev.RevokedAt != nil || !prev.Active(at):
-		case prev.LastUsedAt != nil:
+		case prev.LastUsedAt != nil || prev.RotatedTo != "":
+			// Used, or rotated on in turn (its holder has the next key): the branch is taken,
+			// even if that successor is no longer active itself.
 			return &SuccessorInUseError{ID: prev.ID}
+		case prev.RevokedAt != nil || !prev.Active(at):
 		default:
 			if _, err := tx.Exec(ctx, `UPDATE api_keys SET revoked_at=COALESCE(revoked_at, $2) WHERE id=$1`, prev.ID, at); err != nil {
 				return err

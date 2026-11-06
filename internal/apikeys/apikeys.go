@@ -150,7 +150,7 @@ func (s *Service) Rotate(ctx context.Context, id string, ttl, grace time.Duratio
 	case err == nil:
 		return next, secret, nil
 	case errors.As(err, &inUse):
-		return nil, "", fmt.Errorf("%w: key %s was already rotated to %s, which is in use: rotate %s instead", ErrInvalid, id, inUse.ID, inUse.ID)
+		return nil, "", fmt.Errorf("%w: key %s was already rotated to %s, which has been used or rotated on: rotate the newest key instead", ErrInvalid, id, inUse.ID)
 	case errors.Is(err, store.ErrKeyInactive):
 		return nil, "", fmt.Errorf("%w: key %s is revoked or expired; create a new one", ErrInvalid, id)
 	case errors.Is(err, store.ErrNotFound):
