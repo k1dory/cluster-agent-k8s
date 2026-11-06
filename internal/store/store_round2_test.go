@@ -816,3 +816,90 @@ func TestRound2DeliveredRunsAreCopies(t *testing.T) {
 		}
 	})
 }
+
+// legacyIdempotencyCleanup is the cleanup a replica of main 8183731 (before step 11) runs on
+// every reservation, verbatim.
+const legacyIdempotencyCleanup = `DELETE FROM idempotency WHERE created_at < now() - $1::interval
+		OR (status = 0 AND created_at < now() - $2::interval)`
+
+// Review round 8 of #32: during a rolling upgrade an older replica's cleanup deletes every
+// unfinished reservation older than two minutes. A new replica's attempt created a sandbox and
+// died before storing its response; the older replica's cleanup runs; the retry takes the
+// reservation over with its seed and finds the one sandbox, instead of a fresh seed creating a
+// second. Rows the older replicas own (no seed) and expired ones are still deleted.
+func TestRound2PostgresSeededReservationSurvivesTheLegacyCleanup(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
+	ctx := context.Background()
+	legacy := func() {
+		t.Helper()
+		if _, err := p.pool.Exec(ctx, legacyIdempotencyCleanup, IdempotencyTTL.String(), IdempotencyStale.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	age := func(key string, d time.Duration) {
+		t.Helper()
+		if _, err := p.pool.Exec(ctx, `UPDATE idempotency SET created_at = created_at - $2::interval WHERE key=$1`, key, d.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exists := func(key string) bool {
+		t.Helper()
+		var n int
+		if err := p.pool.QueryRow(ctx, `SELECT count(*) FROM idempotency WHERE key=$1`, key).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n == 1
+	}
+
+	key := "acme|POST /v1/sandboxes|rolling"
+	first, reserved, err := p.ReserveIdempotent(ctx, key, "h")
+	if err != nil || !reserved {
+		t.Fatalf("reserve: %v %v", reserved, err)
+	}
+	id := "sb_rolling_upgrade"
+	if err := p.CreateKeyedSandbox(ctx, round2Sandbox(id), first.Seed); err != nil {
+		t.Fatal(err)
+	}
+	// The attempt dies here. Two minutes later an older replica reserves some other key.
+	age(key, IdempotencyStale+time.Minute)
+	legacy()
+	if !exists(key) {
+		t.Fatal("the older replica's cleanup deleted a seeded reservation within its TTL")
+	}
+	retry, reserved, err := p.ReserveIdempotent(ctx, key, "h")
+	if err != nil || !reserved || retry.Seed != first.Seed {
+		t.Fatalf("takeover after the legacy cleanup: reserved=%v seed kept=%v err=%v", reserved, retry != nil && retry.Seed == first.Seed, err)
+	}
+	if created, _, err := p.KeyedResult(ctx, retry.Seed); err != nil || created != id {
+		t.Fatalf("the retry's record of what was created: %q %v", created, err)
+	}
+	if _, err := p.GetSandbox(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+
+	// An older replica's own abandoned reservation (no seed) still goes, as it expects.
+	if err := p.PutIdempotent(ctx, &Idempotent{Key: "acme|POST /v1/sandboxes|old", BodyHash: "h", Status: 0, Body: []byte{},
+		CreatedAt: time.Now().Add(-IdempotencyStale - time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	legacy()
+	if exists("acme|POST /v1/sandboxes|old") {
+		t.Fatal("the older replica's own stale reservation was kept")
+	}
+	// Past its TTL a seeded reservation is deleted, by the new cleanup and the old alike.
+	age(key, IdempotencyTTL)
+	if _, _, err := p.ReserveIdempotent(ctx, "acme|POST /v1/sandboxes|other", "h"); err != nil {
+		t.Fatal(err)
+	}
+	if exists(key) {
+		t.Fatal("an expired seeded reservation was kept")
+	}
+}
+
+// The trigger of migration step 12 keeps a seeded reservation for IdempotencyTTL, written into
+// the SQL as an interval: the two must agree.
+func TestRound2SeededRetentionMatchesTheTTL(t *testing.T) {
+	if IdempotencyTTL != 24*time.Hour || !strings.Contains(migrations, "OLD.created_at >= now() - interval '24 hours'") {
+		t.Fatalf("IdempotencyTTL is %v: update the interval of idempotency_keep_seeded (migrations.sql step 12) with it", IdempotencyTTL)
+	}
+}
