@@ -2090,6 +2090,19 @@ func (p *Postgres) AppendRunOutput(ctx context.Context, b *OutputBatch) (*Output
 				Scan(&rec.lines, &rec.hash, &rec.complete)
 			switch {
 			case errors.Is(err, pgx.ErrNoRows):
+				// A batch an older release stored, retried after the upgrade (or on an older replica).
+				var n int
+				err := tx.QueryRow(ctx, `SELECT status FROM idempotency WHERE key=$1 AND created_at >= now() - $2::interval`,
+					legacyBatchKey(b.RunID, b.BatchID), IdempotencyTTL.String()).Scan(&n)
+				switch {
+				case errors.Is(err, pgx.ErrNoRows):
+				case err != nil:
+					return err
+				default:
+					if res.Skipped, err = legacyResume(n, b); err != nil {
+						return err
+					}
+				}
 			case err != nil:
 				return err
 			default:
@@ -2130,6 +2143,11 @@ func (p *Postgres) AppendRunOutput(ctx context.Context, b *OutputBatch) (*Output
 				b.RunID, b.BatchID, len(b.Lines), chain[len(b.Lines)], !b.Partial); err != nil {
 				return err
 			}
+			// The form an older replica reads, in the same transaction.
+			if _, err := tx.Exec(ctx, `INSERT INTO idempotency (key, status, body, created_at) VALUES ($1,$2,'',now())
+				ON CONFLICT (key) DO UPDATE SET status=EXCLUDED.status, created_at=now()`, legacyBatchKey(b.RunID, b.BatchID), len(b.Lines)); err != nil {
+				return err
+			}
 		}
 		// The events last: they take the events lock, held to the commit.
 		at := time.Now()
@@ -2163,6 +2181,18 @@ func (p *Postgres) SettleRunWithEvents(ctx context.Context, s Settle) (*model.Ru
 	}
 	var out *model.Run
 	err := pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		if f := s.Sandbox; f != nil {
+			// FOR SHARE: a transition of the sandbox (a wake) waits for this commit.
+			var status model.SandboxStatus
+			var rev int64
+			err := tx.QueryRow(ctx, `SELECT status, revision FROM sandboxes WHERE id=$1 FOR SHARE`, f.ID).Scan(&status, &rev)
+			if errors.Is(err, pgx.ErrNoRows) || err == nil && (status != f.Status || f.Revision != 0 && rev != f.Revision) {
+				return ErrFenced
+			}
+			if err != nil {
+				return err
+			}
+		}
 		r, err := scanRun(tx.QueryRow(ctx, `UPDATE runs SET status=$3, exit_code=$4, finished_at=$5,
 			model = CASE WHEN $6 THEN $7 ELSE model END,
 			input_tokens = CASE WHEN $6 THEN $8 ELSE input_tokens END,
@@ -2211,9 +2241,9 @@ func (p *Postgres) ReclaimRun(ctx context.Context, sandboxID, owner string) (*mo
 // claim it falls back to are one decision.
 const claimLockSQL = `SELECT pg_advisory_xact_lock(hashtext('agent-sandbox:claim:' || $1))`
 
-func (p *Postgres) ClaimRunFor(ctx context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, bool, error) {
+func (p *Postgres) ClaimRunFor(ctx context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, *model.Event, error) {
 	var out *model.Run
-	reclaimed := false
+	var start *model.Event
 	err := pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, claimLockSQL, sandboxID); err != nil {
 			return err
@@ -2251,7 +2281,7 @@ func (p *Postgres) ClaimRunFor(ctx context.Context, sandboxID, runID string, sta
 				if err != nil {
 					return err
 				}
-				out, reclaimed = r, true
+				out = r
 				return nil
 			}
 			if busy {
@@ -2270,23 +2300,27 @@ func (p *Postgres) ClaimRunFor(ctx context.Context, sandboxID, runID string, sta
 		if errors.Is(err, ErrNotFound) {
 			return errNoRunMatch
 		}
+		if err != nil {
+			return err
+		}
 		out = r
-		return err
+		start = &model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunStart, Data: r.AgentVersion}
+		return insertEventsTx(ctx, tx, r.Tenant, r.Slug, []*model.Event{start})
 	})
 	if errors.Is(err, errNoRunMatch) {
 		cur, gerr := p.GetRun(ctx, runID)
 		if gerr != nil {
-			return nil, false, gerr
+			return nil, nil, gerr
 		}
 		if cur.SandboxID != sandboxID {
-			return nil, false, ErrNotFound
+			return nil, nil, ErrNotFound
 		}
-		return nil, false, ErrConflict
+		return nil, nil, ErrConflict
 	}
 	if err != nil {
-		return nil, false, err
+		return nil, nil, err
 	}
-	return out, reclaimed, nil
+	return out, start, nil
 }
 
 func (p *Postgres) AckRunClaim(ctx context.Context, runID string, attempt int) error {

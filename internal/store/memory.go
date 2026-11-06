@@ -1753,6 +1753,8 @@ type memUndo struct {
 	batchKey  string
 	batch     memBatch
 	hadBatch  bool
+	idemKey   string
+	idem      *Idempotent
 }
 
 func (m *Memory) undoFor(r *model.Run, batchKey string) *memUndo {
@@ -1760,6 +1762,12 @@ func (m *Memory) undoFor(r *model.Run, batchKey string) *memUndo {
 	if batchKey != "" {
 		u.batch, u.hadBatch = m.batches[batchKey]
 	}
+	return u
+}
+
+// withIdem makes the undo restore the idempotency record key too.
+func (u *memUndo) withIdem(key string) *memUndo {
+	u.idemKey, u.idem = key, u.m.idem[key]
 	return u
 }
 
@@ -1771,6 +1779,13 @@ func (u *memUndo) rollback() {
 			u.m.batches[u.batchKey] = u.batch
 		} else {
 			delete(u.m.batches, u.batchKey)
+		}
+	}
+	if u.idemKey != "" {
+		if u.idem != nil {
+			u.m.idem[u.idemKey] = u.idem
+		} else {
+			delete(u.m.idem, u.idemKey)
 		}
 	}
 }
@@ -1796,9 +1811,19 @@ func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResu
 				return nil, err
 			}
 			res.Skipped = n
+		} else if v, ok := m.idem[legacyBatchKey(b.RunID, b.BatchID)]; ok && !v.CreatedAt.Before(time.Now().Add(-IdempotencyTTL)) {
+			// A batch an older release stored, retried after the upgrade.
+			n, err := legacyResume(v.Status, b)
+			if err != nil {
+				return nil, err
+			}
+			res.Skipped = n
 		}
 	}
 	undo := m.undoFor(r, key)
+	if key != "" {
+		undo.withIdem(legacyBatchKey(b.RunID, b.BatchID))
+	}
 	rest := b.Lines[res.Skipped:]
 	at := time.Now()
 	for _, l := range rest {
@@ -1827,6 +1852,9 @@ func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResu
 		}
 		prev := m.batches[key]
 		m.batches[key] = memBatch{batchProgress: batchProgress{lines: len(b.Lines), hash: chain[len(b.Lines)], complete: prev.complete || !b.Partial}, at: at}
+		// The form an older release reads (see legacyBatchKey).
+		lk := legacyBatchKey(b.RunID, b.BatchID)
+		m.idem[lk] = &Idempotent{Key: lk, Status: len(b.Lines), Body: []byte{}, CreatedAt: at}
 	}
 	if err := faultAt(m, FaultOutput); err != nil {
 		undo.rollback()
@@ -1848,6 +1876,11 @@ func (m *Memory) SettleRunWithEvents(_ context.Context, s Settle) (*model.Run, e
 	}
 	if !slices.Contains(s.From, r.Status) {
 		return nil, ErrConflict
+	}
+	if f := s.Sandbox; f != nil {
+		if sb, ok := m.sandboxes[f.ID]; !ok || sb.Status != f.Status || f.Revision != 0 && sb.Revision != f.Revision {
+			return nil, ErrFenced
+		}
 	}
 	undo := m.undoFor(r, "")
 	r.Status, r.ExitCode, r.FinishedAt = s.To, s.ExitCode, &s.FinishedAt
@@ -1876,7 +1909,7 @@ func (m *Memory) ReclaimRun(ctx context.Context, sandboxID, owner string) (*mode
 	return r, err
 }
 
-func (m *Memory) ClaimRunFor(_ context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, bool, error) {
+func (m *Memory) ClaimRunFor(_ context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, *model.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if stamp.Owner != "" {
@@ -1889,23 +1922,23 @@ func (m *Memory) ClaimRunFor(_ context.Context, sandboxID, runID string, started
 				r := m.runs[c.ID]
 				r.Attempt++
 				out := *r
-				return &out, true, nil
+				return &out, nil, nil
 			}
 			busy = true
 		}
 		if busy {
-			return nil, false, ErrOwnerBusy
+			return nil, nil, ErrOwnerBusy
 		}
 	}
 	if runID == "" {
-		return nil, false, ErrNotFound
+		return nil, nil, ErrNotFound
 	}
 	r, ok := m.runs[runID]
 	if !ok || r.SandboxID != sandboxID {
-		return nil, false, ErrNotFound
+		return nil, nil, ErrNotFound
 	}
 	if r.Status != model.RunQueued {
-		return nil, false, ErrConflict
+		return nil, nil, ErrConflict
 	}
 	r.Status, r.StartedAt = model.RunRunning, &startedAt
 	r.Attempt, r.ClaimedBy, r.ClaimAcked = r.Attempt+1, stamp.Owner, false
@@ -1914,8 +1947,10 @@ func (m *Memory) ClaimRunFor(_ context.Context, sandboxID, runID string, started
 	}
 	r.AgentVersion, r.AgentRef, r.AgentRevision = stamp.AgentVersion, stamp.AgentRef, stamp.AgentRevision
 	r.EnvironmentRef, r.EnvironmentRevision = stamp.EnvironmentRef, stamp.EnvironmentRevision
+	start := &model.Event{SandboxID: sandboxID, Tenant: r.Tenant, Slug: r.Slug, RunID: r.ID, Type: model.EventRunStart, Data: r.AgentVersion}
+	m.appendEventLocked(start)
 	out := *r
-	return &out, false, nil
+	return &out, start, nil
 }
 
 func (m *Memory) AckRunClaim(_ context.Context, runID string, attempt int) error {

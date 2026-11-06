@@ -503,9 +503,9 @@ func TestRound2ClaimDecisionIsSerialised(t *testing.T) {
 			t.Fatalf("both runs were claimed: %v", got)
 		}
 		// Another owner is not handed the unconfirmed claim: it takes the run still queued.
-		r, reclaimed, err := s.ClaimRunFor(ctx, first.SandboxID, remaining, time.Now(), "", RunStamp{Owner: "2"})
-		if err != nil || reclaimed || r.ID != remaining {
-			t.Fatalf("another owner: %v reclaimed=%v %+v", err, reclaimed, r)
+		r, start, err := s.ClaimRunFor(ctx, first.SandboxID, remaining, time.Now(), "", RunStamp{Owner: "2"})
+		if err != nil || start == nil || r.ID != remaining {
+			t.Fatalf("another owner: %v start=%v %+v", err, start, r)
 		}
 	})
 }
@@ -703,7 +703,7 @@ func TestRound2CutBodyCannotReopenAWholeBatch(t *testing.T) {
 	})
 }
 
-// ageBatch moves the last call under a batch id d into the past.
+// ageBatch moves the last call under a batch id d into the past (both forms of its progress).
 func ageBatch(t *testing.T, s Store, runID, batchID string, d time.Duration) {
 	t.Helper()
 	switch st := s.(type) {
@@ -717,11 +717,18 @@ func ageBatch(t *testing.T, s Store, runID, batchID string, d time.Duration) {
 		}
 		v.at = v.at.Add(-d)
 		st.batches[k] = v
+		if l, ok := st.idem[legacyBatchKey(runID, batchID)]; ok { // the form older replicas read
+			l.CreatedAt = l.CreatedAt.Add(-d)
+		}
 	case *Postgres:
 		tag, err := st.pool.Exec(context.Background(), `UPDATE run_output_batches SET touched_at = touched_at - $3::interval WHERE run_id=$1 AND batch_id=$2`,
 			runID, batchID, d.String())
 		if err != nil || tag.RowsAffected() != 1 {
 			t.Fatalf("age batch: %v %v", err, tag)
+		}
+		if _, err := st.pool.Exec(context.Background(), `UPDATE idempotency SET created_at = created_at - $2::interval WHERE key=$1`,
+			legacyBatchKey(runID, batchID), d.String()); err != nil {
+			t.Fatal(err)
 		}
 	default:
 		t.Fatalf("store %T", s)
@@ -762,6 +769,70 @@ func TestRound2BatchRetentionIsRenewedByItsRetries(t *testing.T) {
 		post("D", round2Lines("d"))
 		if res := post("B", lines); res.Skipped != 0 {
 			t.Fatalf("an expired batch was kept: %+v", res)
+		}
+	})
+}
+
+// Codex round 3 of #31, finding 2: a release before run_output_batches recorded a batch's
+// progress as an idempotency record (status = lines stored, no hash). A batch an older server
+// stored, retried after the upgrade, was stored again with its usage. The legacy record is
+// read when there is no new one, and written alongside it for older replicas of a rollout.
+func TestRound2LegacyBatchProgressSurvivesTheUpgrade(t *testing.T) {
+	bothStores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		r := round2Run(t, s, "dl-legacy")
+		if _, err := s.ClaimRun(ctx, r.ID, time.Now(), "", RunStamp{}); err != nil {
+			t.Fatal(err)
+		}
+		// What the older release did for "a\n<usage>\n" under X-Batch-Id B: the lines, the
+		// usage, then the progress record. Its response was lost.
+		for _, d := range []string{"a", "u"} {
+			if err := s.AppendEvent(ctx, &model.Event{SandboxID: r.SandboxID, Tenant: "acme", Slug: "dev", RunID: r.ID, Type: model.EventRunOutput, Data: d}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := s.RecordRunUsage(ctx, r.ID, model.Usage{InputTokens: 10, CostUSD: 0.5}, false); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.PutIdempotent(ctx, &Idempotent{Key: "batch|" + r.ID + "|B", Status: 2, Body: []byte{}}); err != nil {
+			t.Fatal(err)
+		}
+		lines := round2Lines("a", "u")
+		lines[1].Usage = &model.Usage{InputTokens: 10, CostUSD: 0.5}
+		res, err := s.AppendRunOutput(ctx, &OutputBatch{SandboxID: r.SandboxID, RunID: r.ID, BatchID: "B", Lines: lines})
+		if err != nil || res.Skipped != 2 || res.Accepted != 0 {
+			t.Fatalf("the retry after the upgrade: %v %+v", err, res)
+		}
+		got, _ := s.GetRun(ctx, r.ID)
+		if out := round2Outputs(t, s, r); len(out) != 2 || got.Usage.CostUSD != 0.5 {
+			t.Fatalf("after the retry: outputs=%v usage=%+v", out, got.Usage)
+		}
+		// The other way round: what this release stores, an older replica of the rollout skips.
+		if _, err := s.AppendRunOutput(ctx, &OutputBatch{SandboxID: r.SandboxID, RunID: r.ID, BatchID: "C", Lines: round2Lines("x", "y", "z")}); err != nil {
+			t.Fatal(err)
+		}
+		if rec, err := s.GetIdempotent(ctx, "batch|"+r.ID+"|C"); err != nil || rec.Status != 3 {
+			t.Fatalf("the progress an older replica reads: %v %+v", err, rec)
+		}
+	})
+}
+
+// Codex round 3 of #31, finding 4 (store side): the claim appends its run.start in its own
+// transaction; a reclaim appends none.
+func TestRound2ClaimWritesItsRunStart(t *testing.T) {
+	bothStores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		r := round2Run(t, s, "dl-start")
+		c, start, err := s.ClaimRunFor(ctx, r.SandboxID, r.ID, time.Now(), "", RunStamp{Owner: "1", AgentVersion: "img:3"})
+		if err != nil || start == nil || start.ID == 0 || start.Data != "img:3" || start.Tenant != "acme" {
+			t.Fatalf("claim: %v %+v %+v", err, c, start)
+		}
+		if again, start, err := s.ClaimRunFor(ctx, r.SandboxID, "", time.Now(), "", RunStamp{Owner: "1"}); err != nil || start != nil || again.ID != r.ID {
+			t.Fatalf("reclaim: %v %+v %+v", err, again, start)
+		}
+		evs, _ := s.ListEvents(ctx, r.SandboxID, 0, 100)
+		if len(evs) != 1 || evs[0].Type != model.EventRunStart || evs[0].RunID != r.ID {
+			t.Fatalf("events after a claim and a reclaim: %+v", evs)
 		}
 	})
 }

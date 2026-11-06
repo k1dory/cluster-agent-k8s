@@ -38,13 +38,15 @@ type RunDelivery interface {
 	// with no run to fall back to.
 	ReclaimRun(ctx context.Context, sandboxID, owner string) (*model.Run, error)
 	// ClaimRunFor is the whole claim decision of one /agent/runs/next, serialised per sandbox:
-	// the run stamp.Owner claimed and never confirmed, handed out again (reclaimed true);
+	// the run stamp.Owner claimed and never confirmed, handed out again (start nil);
 	// ErrOwnerBusy while the owner executes a run it confirmed; or else ClaimRun of runID (the
-	// oldest queued run the caller read). Decided apart, a retry
+	// oldest queued run the caller read), with its run.start (data: the agent version) appended
+	// in the same transaction and returned as start: a run is never handed to a runner before
+	// the event that says it started exists, and a reclaim appends no second one. Decided apart, a retry
 	// overlapping the request whose response was lost could miss the claim being made and take
 	// the next queued run, executing a continuation before the run it continues. ErrConflict
 	// when runID is no longer queued, ErrNotFound when it is absent, not the sandbox's, or "".
-	ClaimRunFor(ctx context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, bool, error)
+	ClaimRunFor(ctx context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp RunStamp) (r *model.Run, start *model.Event, err error)
 	// AckRunClaim records that the owner of attempt has the run: it is not handed out again.
 	// ErrStaleAttempt when the run is at another attempt, ErrNotFound when it is absent.
 	AckRunClaim(ctx context.Context, runID string, attempt int) error
@@ -121,7 +123,22 @@ type Settle struct {
 	Usage      *model.Usage
 	Attempt    int // > 0: only while the run is at this attempt
 	Events     []*model.Event
+	// Sandbox, when set: only while the run's sandbox is still in this status (and at this
+	// revision, unless 0; ErrFenced otherwise), checked in the same transaction and held against a concurrent
+	// change of the sandbox until the commit. A stop cancels the run of the pod it stopped,
+	// never that of a replacement another replica started after finishing the stop.
+	Sandbox *SandboxFence
 }
+
+// SandboxFence is a sandbox as a writer observed it: its status, and its revision unless 0.
+type SandboxFence struct {
+	ID       string
+	Status   model.SandboxStatus
+	Revision int64
+}
+
+// ErrFenced: the sandbox moved on from the state the settle was fenced on. It is an ErrConflict.
+var ErrFenced = fmt.Errorf("%w: the sandbox moved on since it was observed", ErrConflict)
 
 // outputChain is the running hash of a batch's lines: chain[n] covers the first n. A retry is
 // the same batch when its first n lines hash to what was recorded with n.
@@ -164,6 +181,21 @@ func batchSession(lines []OutputLine) string {
 		}
 	}
 	return s
+}
+
+// legacyBatchKey is where a release before run_output_batches recorded a batch's progress: an
+// idempotency record whose status is the number of lines stored, with no hash. It is still
+// read (a batch stored by an older replica, retried after the upgrade, must not be stored
+// again) and still written (an older replica of a rolling update reads only it).
+func legacyBatchKey(runID, batchID string) string { return "batch|" + runID + "|" + batchID }
+
+// legacyResume is resume for a legacy record of n lines: no hash to compare, so its count is
+// trusted, as the release that wrote it did.
+func legacyResume(n int, b *OutputBatch) (int, error) {
+	if n > len(b.Lines) {
+		return 0, ErrBatchMismatch
+	}
+	return n, nil
 }
 
 // outputBatchTTL is how long a batch's progress is kept after the last call under its id. A
