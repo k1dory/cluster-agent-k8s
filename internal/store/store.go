@@ -518,3 +518,15 @@ type SuccessorInUseError struct{ ID string }
 func (e *SuccessorInUseError) Error() string {
 	return "api key already rotated to " + e.ID + ", which has been used or rotated on"
 }
+
+// EventHead is implemented by both stores: the id of the newest event appended so far (0 on
+// an empty log). A stream that replays a bounded window and then follows live reads it when it
+// subscribes: events up to it are history (the window applies), events after it are live.
+type EventHead interface {
+	LastEventID(ctx context.Context) (int64, error)
+}
+
+var (
+	_ EventHead = (*Memory)(nil)
+	_ EventHead = (*Postgres)(nil)
+)

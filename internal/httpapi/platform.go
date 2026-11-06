@@ -15,6 +15,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -1013,16 +1014,45 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, evs)
 		return
 	}
-	// The stream follows the log live, past any ?to (as it always has); ?from still applies.
-	f.To = time.Time{}
+	// The replay keeps the window; what is appended after the stream subscribed is followed
+	// live past any ?to (as it always has); ?from applies to both.
 	wake, cancel := p.Hub.Wake(events.All, f.Types...)
 	defer cancel()
+	head, err := p.traceHead(r.Context(), f)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	live := f
+	live.To = time.Time{}
 	streamSSE(w, r, wake, 20*time.Second, after, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
-		g := f
+		g := live
+		if after < head {
+			g = f
+		}
 		g.AfterID, g.Limit = after, ssePageSize
 		evs, err := p.Orch.Store.QueryEvents(ctx, g)
+		if err == nil && len(evs) == 0 && after < head && head < math.MaxInt64 {
+			// The window holds nothing more up to the head: skip to it, live from there.
+			return nil, head, nil
+		}
 		return eventItems(evs), lastID(evs, after), err
 	})
+}
+
+// traceHead is where a trace stream's bounded replay ends and live following begins: the
+// newest event id when the stream subscribed (read after Wake, so nothing falls between).
+// Without ?to there is no window and the stream follows the log from the start (0); a store
+// that cannot tell its head keeps the window for the whole stream (MaxInt64).
+func (p *Platform) traceHead(ctx context.Context, f store.Filter) (int64, error) {
+	if f.To.IsZero() {
+		return 0, nil
+	}
+	h, ok := p.Orch.Store.(store.EventHead)
+	if !ok {
+		return math.MaxInt64, nil
+	}
+	return h.LastEventID(ctx)
 }
 
 // eventItems turns a page of the log into SSE frames named by event type.

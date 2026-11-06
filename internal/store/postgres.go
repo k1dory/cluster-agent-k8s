@@ -2037,3 +2037,11 @@ func (p *Postgres) FirstUseAPIKey(ctx context.Context, id string, at time.Time) 
 	}
 	return ErrKeyInactive
 }
+
+// LastEventID implements EventHead. The sequence may be ahead of the newest committed row
+// (rolled back or in-flight inserts); max(id) is what a reader can see.
+func (p *Postgres) LastEventID(ctx context.Context) (int64, error) {
+	var id int64
+	err := p.pool.QueryRow(ctx, `SELECT COALESCE(max(id), 0) FROM events`).Scan(&id)
+	return id, err
+}

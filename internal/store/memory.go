@@ -1736,3 +1736,10 @@ var (
 	_ Store = (*Memory)(nil)
 	_ Store = (*Postgres)(nil)
 )
+
+// LastEventID implements EventHead.
+func (m *Memory) LastEventID(context.Context) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.nextEvent, nil
+}
