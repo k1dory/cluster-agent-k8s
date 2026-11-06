@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -25,6 +26,13 @@ func TestInstructionsRespectShellSyntax(t *testing.T) {
 		{`claude -p 'it'"'"'s' --verbose`, `claude -p 'it'"'"'s' --verbose` + flag},
 		{`VAR="two words" claude -p "$SANDBOX_TASK"`, `VAR="two words" claude -p "$SANDBOX_TASK"` + flag},
 		{`A=1 B='x y' /usr/local/bin/claude -p x`, `A=1 B='x y' /usr/local/bin/claude -p x` + flag},
+		{`claude -p x 2>&1`, `claude -p x 2>&1` + flag},
+		{`claude -p x 2>&1 | tee run.log`, `claude -p x 2>&1` + flag + ` | tee run.log`},
+		{`claude -p x &> run.log`, `claude -p x &> run.log` + flag},
+		{`claude --model $(cat /etc/model | tr -d '\n') -p x`, `claude --model $(cat /etc/model | tr -d '\n') -p x` + flag},
+		{"claude --model `cat m | tr -d x` -p x", "claude --model `cat m | tr -d x` -p x" + flag},
+		{`claude -p "$(echo a; echo b)" && echo done`, `claude -p "$(echo a; echo b)"` + flag + ` && echo done`},
+		{`claude -p x $(f "$(g)") ; echo`, `claude -p x $(f "$(g)")` + flag + ` ; echo`},
 	} {
 		if got := withInstructions(tc.in); got != tc.want {
 			t.Errorf("%q\n got %q\nwant %q", tc.in, got, tc.want)
@@ -34,6 +42,9 @@ func TestInstructionsRespectShellSyntax(t *testing.T) {
 		`claude -p x --system-prompt=brief`,
 		`claude -p x --append-system-prompt-file=/etc/agent.md`,
 		`claude -p x --system-prompt-file /etc/agent.md && echo done`,
+		`claude -p x "--system-prompt" "operator policy"`,
+		`claude -p x '--append-system-prompt=operator policy'`,
+		`claude -p x --system\-prompt brief`,
 		`claude-agent-acp`,
 		`VAR=x claude-agent-acp --verbose`,
 		`VAR="two words" codex exec "$SANDBOX_TASK"`,
@@ -50,6 +61,12 @@ func TestInstructionsRespectShellSyntax(t *testing.T) {
 	}
 	if got := withMCPConfig(`claude -p "with --mcp-config in the text"`); !strings.HasSuffix(got, `--mcp-config "$SANDBOX_MCP_CONFIG"`) {
 		t.Errorf("an argument mentioning the option is not the option: %q", got)
+	}
+	if cmd := `claude -p x "--mcp-config" /etc/mcp.json`; withMCPConfig(cmd) != cmd {
+		t.Errorf("a quoted option is the option: %q", withMCPConfig(cmd))
+	}
+	if got := withMCPConfig(`claude -p x 2>&1 | tee log`); got != `claude -p x 2>&1 --mcp-config "$SANDBOX_MCP_CONFIG" | tee log` {
+		t.Errorf("redirection and pipe: %q", got)
 	}
 }
 
@@ -70,6 +87,8 @@ func TestInstructionsRewriteRunsInTheShell(t *testing.T) {
 		"claude -p \"$SANDBOX_TASK\" --verbose\n",
 		`claude -p "$SANDBOX_TASK" && echo done > "$SANDBOX_REVIEW_ARGS.done"`,
 		`VAR="two words" claude -p "$SANDBOX_TASK" # note`,
+		`claude -p "$SANDBOX_TASK" 2>&1`,
+		`claude --model $(printf opus | tr a-z A-Z) -p "$SANDBOX_TASK" && echo done > "$SANDBOX_REVIEW_ARGS.done"`,
 	} {
 		argsFile := filepath.Join(root, "args")
 		_ = os.Remove(argsFile)
@@ -92,6 +111,9 @@ func TestInstructionsRewriteRunsInTheShell(t *testing.T) {
 		}
 		if got != instructions {
 			t.Fatalf("%q: claude's argv %q lacks the instructions", cmd, parts)
+		}
+		if strings.Contains(cmd, "$(printf") && !slices.Contains(parts, "OPUS") {
+			t.Fatalf("%q: the substitution was not left intact: %q", cmd, parts)
 		}
 		if strings.Contains(cmd, "&&") {
 			if _, err := os.Stat(argsFile + ".done"); err != nil {

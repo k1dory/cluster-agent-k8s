@@ -360,9 +360,12 @@ func runsClaude(cmdline string) bool { return parseHarnessCommand(cmdline).runsC
 
 // harnessCommand is the leading simple command of a harness command line, as the shell would
 // split it: words with their quotes kept, and where the simple command ends — at an unquoted
-// newline, `;`, `&`, `|` or a `#` comment — so that an argument can be added to the program's
-// invocation rather than to whatever follows it (a `&& echo done`, a trailing newline from a
-// YAML block scalar). The words are not evaluated: "$VAR" stays "$VAR".
+// newline, `;`, `&` (not `&&`'s cousin in a redirection: `2>&1`, `&>`), `|` or a `#` comment,
+// outside any `$(…)` or backtick substitution — so that an argument can be added to the
+// program's invocation rather than to whatever follows it (a `&& echo done`, a trailing newline
+// from a YAML block scalar) or to a command inside a substitution. The words are not
+// evaluated: "$VAR" stays "$VAR"; options and the program are matched on their quote-stripped
+// text, so `"--system-prompt"` is the option too.
 type harnessCommand struct {
 	line  string
 	words []string
@@ -372,7 +375,8 @@ type harnessCommand struct {
 func parseHarnessCommand(line string) harnessCommand {
 	c := harnessCommand{line: line, end: len(line)}
 	var word strings.Builder
-	inWord, single, double, escaped := false, false, false, false
+	inWord, single, double, escaped, backtick := false, false, false, false, false
+	subst := 0 // depth of $( … )
 	flush := func() {
 		if inWord {
 			c.words = append(c.words, word.String())
@@ -397,6 +401,9 @@ func parseHarnessCommand(line string) harnessCommand {
 			} else if ch == '"' {
 				double = false
 			}
+		case backtick:
+			word.WriteByte(ch)
+			backtick = ch != '`'
 		case ch == '\\':
 			word.WriteByte(ch)
 			escaped, inWord = true, true
@@ -406,6 +413,24 @@ func parseHarnessCommand(line string) harnessCommand {
 		case ch == '"':
 			word.WriteByte(ch)
 			double, inWord = true, true
+		case ch == '`':
+			word.WriteByte(ch)
+			backtick, inWord = true, true
+		case ch == '$' && i+1 < len(line) && line[i+1] == '(':
+			word.WriteString("$(")
+			subst++
+			inWord = true
+			i++
+		case subst > 0:
+			word.WriteByte(ch)
+			if ch == '(' {
+				subst++
+			} else if ch == ')' {
+				subst--
+			}
+		case ch == '&' && (i+1 < len(line) && line[i+1] == '>' || inWord && (line[i-1] == '>' || line[i-1] == '<')):
+			word.WriteByte(ch) // a redirection: &>, >&, <&
+			inWord = true
 		case ch == '\n' || ch == ';' || ch == '&' || ch == '|' || (ch == '#' && !inWord):
 			flush()
 			c.end = i
@@ -421,13 +446,41 @@ func parseHarnessCommand(line string) harnessCommand {
 	return c
 }
 
+// unquoted is a word's text without its shell quoting, statically: quotes dropped, backslash
+// escapes resolved, nothing expanded.
+func unquoted(w string) string {
+	var out strings.Builder
+	single, double := false, false
+	for i := 0; i < len(w); i++ {
+		ch := w[i]
+		switch {
+		case single:
+			if ch == '\'' {
+				single = false
+			} else {
+				out.WriteByte(ch)
+			}
+		case ch == '\\' && !single && i+1 < len(w):
+			i++
+			out.WriteByte(w[i])
+		case ch == '\'' && !double:
+			single = true
+		case ch == '"':
+			double = !double
+		default:
+			out.WriteByte(ch)
+		}
+	}
+	return out.String()
+}
+
 // program is the first word that is not a VAR=value assignment, quotes stripped.
 func (c harnessCommand) program() string {
 	for _, w := range c.words {
 		if isAssignment(w) {
 			continue
 		}
-		return strings.Trim(w, `"'`)
+		return unquoted(w)
 	}
 	return ""
 }
@@ -435,14 +488,16 @@ func (c harnessCommand) program() string {
 func (c harnessCommand) runsClaude() bool { return filepath.Base(c.program()) == "claude" }
 
 // hasOption reports whether one of the options is given to the program, as `--opt` or
-// `--opt=value`; an option's value, or a word that merely contains the name, does not count.
+// `--opt=value`, quoted or not; an option's value, or a word that merely contains the name,
+// does not count.
 func (c harnessCommand) hasOption(names ...string) bool {
 	past := false
-	for _, w := range c.words {
+	for _, raw := range c.words {
 		if !past {
-			past = !isAssignment(w) // the program
+			past = !isAssignment(raw) // the program
 			continue
 		}
+		w := unquoted(raw)
 		for _, n := range names {
 			if w == n || strings.HasPrefix(w, n+"=") {
 				return true
