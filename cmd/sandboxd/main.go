@@ -47,6 +47,7 @@ import (
 	"agent-sandbox/internal/registrar"
 	"agent-sandbox/internal/secrets"
 	"agent-sandbox/internal/store"
+	"agent-sandbox/internal/telemetry"
 	"agent-sandbox/internal/usage"
 )
 
@@ -78,7 +79,8 @@ func main() {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	cfgPath := fs.String("config", "config/sandboxd.yaml", "path to sandboxd.yaml")
 	_ = fs.Parse(args)
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	// Lines logged with a context inside a span carry its trace_id and span_id.
+	log := slog.New(telemetry.NewLogHandler(slog.NewJSONHandler(os.Stdout, nil)))
 	slog.SetDefault(log)
 	if err := serve(*cfgPath, log); err != nil {
 		log.Error("fatal", "err", err)
@@ -103,12 +105,33 @@ func serve(cfgPath string, log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	telemetry.SetBuild(buildVersion())
+	if cfg.Tracing.Enabled {
+		shutdown, err := telemetry.StartTracing(ctx, telemetry.TracingConfig{Endpoint: cfg.Tracing.Endpoint,
+			Protocol: cfg.Tracing.Protocol, SamplerRatio: *cfg.Tracing.SamplerRatio}, buildVersion())
+		if err != nil {
+			return err
+		}
+		defer func() { // the spans still buffered go out before the process ends
+			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdown(sctx); err != nil {
+				log.Warn("tracing shutdown", "err", err)
+			}
+		}()
+		// Every outbound client on the default transport (Git providers, IdP discovery, OAuth,
+		// Vault, Infisical, MCP upstreams) gets a client span inside a trace; no trace context
+		// goes out to those third parties.
+		http.DefaultTransport = telemetry.Transport(http.DefaultTransport, false)
+		log.Info("tracing enabled", "endpoint", cfg.Tracing.Endpoint, "protocol", telemetry.Protocol(cfg.Tracing.Protocol), "sampler_ratio", *cfg.Tracing.SamplerRatio)
+	}
+
 	var st store.Store
 	if cfg.DatabaseURL == "" {
 		log.Warn("no database_url: using in-memory store, state is lost on restart")
 		st = store.NewMemory()
 	} else {
-		pg, err := store.OpenPostgres(ctx, cfg.DatabaseURL)
+		pg, err := store.OpenPostgres(ctx, cfg.DatabaseURL, store.WithStatements(cfg.Tracing.RecordStatements))
 		if err != nil {
 			return fmt.Errorf("postgres: %w", err)
 		}
@@ -330,6 +353,10 @@ func serve(cfgPath string, log *slog.Logger) error {
 		DefaultHarnessInput: cfg.Kube.HarnessInput,
 	}, log)
 	orch.ListenerPublishes = hasListener
+	if src := orch.StateSource(); src != nil {
+		// Sandboxes and unfinished runs by status, read when scraped, at most every 15s.
+		telemetry.Registry.MustRegister(telemetry.NewStateCollector(src, 15*time.Second))
+	}
 
 	var secretProvider secrets.Provider = secrets.Static{}
 	switch cfg.Secrets.Provider {
@@ -446,6 +473,12 @@ func serve(cfgPath string, log *slog.Logger) error {
 	servers := []*http.Server{server(cfg.Listen.API, platform.Routes()), server(cfg.Listen.Gateway, gw.Routes())}
 	if ing != nil {
 		servers = append(servers, server(cfg.Listen.Ingress, ing))
+	}
+	if l := *cfg.Metrics.Listen; l != "" {
+		// Its own listener: /metrics has no authentication (docs/observability.md).
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", telemetry.Handler())
+		servers = append(servers, server(l, mux))
 	}
 	// No request before the event listener knows where its feed starts: an event appended earlier
 	// would fall below its cursor and never reach this replica's hub (see store.EventListener).

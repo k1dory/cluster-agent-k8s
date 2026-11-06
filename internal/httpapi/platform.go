@@ -25,6 +25,9 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+
 	"agent-sandbox/api"
 	"agent-sandbox/internal/apikeys"
 	"agent-sandbox/internal/apply"
@@ -43,6 +46,7 @@ import (
 	"agent-sandbox/internal/plan"
 	"agent-sandbox/internal/policy"
 	"agent-sandbox/internal/store"
+	"agent-sandbox/internal/telemetry"
 	"agent-sandbox/internal/tenants"
 	"agent-sandbox/internal/usage"
 )
@@ -169,7 +173,8 @@ func healthz(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) }
 
 // Routes builds the platform mux.
 func (p *Platform) Routes() http.Handler {
-	return logRequests(p.Log, jsonMuxErrors(p.routes().ServeMux))
+	mux := p.routes().ServeMux
+	return observed("api", mux, p.Log, jsonMuxErrors(mux))
 }
 
 func (p *Platform) routes() *routeMux {
@@ -477,6 +482,9 @@ func (p *Platform) keyed(uploads bool, next http.HandlerFunc) http.HandlerFunc {
 		}
 		// What the request creates is named from the reservation's seed (orchestrator.KeyedID),
 		// so an attempt that takes over an abandoned reservation finds what that one created.
+		if res.Generation > 1 {
+			telemetry.IdempotencyTakeovers.Inc()
+		}
 		ctx := orchestrator.WithKeyedIDs(context.WithValue(r.Context(), reservationKey{}, res), res.Seed)
 		rec := &recorder{ResponseWriter: w, code: http.StatusOK}
 		next(rec, r.WithContext(ctx))
@@ -1478,6 +1486,13 @@ func newRequestID() string {
 // logRequests assigns every request an id (or keeps the client's X-Request-Id), echoes it in
 // the response and logs the outcome under it.
 func logRequests(log *slog.Logger, next http.Handler) http.Handler {
+	return logObserved(log, nil, next)
+}
+
+// logObserved is logRequests that also hands each outcome to observe (the request metrics,
+// see observe.go). The line is logged with the request's context, so under a span it carries
+// trace_id and span_id (telemetry.LogHandler), and the span carries the request id.
+func logObserved(log *slog.Logger, observe func(r *http.Request, code int, took time.Duration), next http.Handler) http.Handler {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -1487,14 +1502,19 @@ func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 			rid = newRequestID()
 		}
 		w.Header().Set("X-Request-Id", rid)
+		trace.SpanFromContext(r.Context()).SetAttributes(attribute.String("request_id", rid))
 		sw := &statusWriter{ResponseWriter: w, code: 200, log: true}
 		start := time.Now()
 		next.ServeHTTP(sw, r)
+		took := time.Since(start)
+		if observe != nil {
+			observe(r, sw.code, took)
+		}
 		if sw.err != nil {
-			log.Error("http", "rid", rid, "method", r.Method, "path", r.URL.Path, "code", sw.code, "took_ms", time.Since(start).Milliseconds(), "err", sw.err)
+			log.ErrorContext(r.Context(), "http", "rid", rid, "method", r.Method, "path", r.URL.Path, "code", sw.code, "took_ms", took.Milliseconds(), "err", sw.err)
 			return
 		}
-		log.Info("http", "rid", rid, "method", r.Method, "path", r.URL.Path, "code", sw.code, "took_ms", time.Since(start).Milliseconds())
+		log.InfoContext(r.Context(), "http", "rid", rid, "method", r.Method, "path", r.URL.Path, "code", sw.code, "took_ms", took.Milliseconds())
 	})
 }
 

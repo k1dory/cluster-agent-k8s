@@ -141,3 +141,16 @@ preview:
   ticket_key: "${PREVIEW_TICKET_KEY}"
   cookie_ttl: 1h
   hits_as_activity: true
+
+# Prometheus /metrics on a listener of its own: no authentication, so never the API or gateway
+# port, and keep it on the cluster network (docs/observability.md). "" disables it.
+metrics:
+  listen: ":9090"
+# OpenTelemetry tracing over OTLP (Tempo, Jaeger, an OTel Collector). The standard
+# OTEL_EXPORTER_OTLP_* variables apply when endpoint or protocol is left empty.
+tracing:
+  enabled: false
+  endpoint: http://tempo.monitoring:4318   # http: 4318; grpc: http://otel-collector:4317
+  protocol: http                           # http | grpc
+  sampler_ratio: 1                         # share of traces kept, decided per trace id
+  record_statements: false                 # put each query's SQL on its span

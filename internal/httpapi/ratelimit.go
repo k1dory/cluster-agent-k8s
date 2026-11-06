@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"agent-sandbox/internal/telemetry"
 )
 
 // RateLimit bounds attempts per source address with a token bucket: Burst attempts at once,
@@ -160,6 +162,7 @@ func (p *Platform) authLimiter() *limiter {
 
 // writeRateLimited is 429 with Retry-After (whole seconds, at least one).
 func writeRateLimited(w http.ResponseWriter, d time.Duration) {
+	telemetry.AuthRateLimited.Inc()
 	w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(d.Seconds())))))
 	writeErrWith(w, http.StatusTooManyRequests, ErrorBody{Code: CodeRateLimited}, errors.New("too many attempts from this address: retry later"))
 }
