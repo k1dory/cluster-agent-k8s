@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -121,5 +123,50 @@ func TestACPEachSettingHasItsOwnDeadline(t *testing.T) {
 	code, lines := runCore(t, conn, nil, &model.Run{ID: "r", Task: "x"})
 	if code != 0 || !hasCall(conn.coreConn, "set_config mode=plan") || !hasCall(conn.coreConn, "set_config model=fast") || notices(lines) != "" {
 		t.Fatalf("exit %d, calls %v, notices:\n%s", code, conn.calls, notices(lines))
+	}
+}
+
+// stuckCancelConn's session/cancel never returns on its own, whatever its context: the SDK's
+// write of it is blocked on a full pipe. Only ending the transport (abort) releases it.
+type stuckCancelConn struct {
+	*silentConn
+	released chan struct{}
+}
+
+func (c *stuckCancelConn) Cancel(context.Context, acp.CancelNotification) error {
+	c.call("cancel")
+	<-c.released
+	return errors.New("connection closed")
+}
+
+// After a turn overran HARNESS_TURN_TIMEOUT, the runner's own session/cancel is guarded like the
+// prompt: when its write blocks (the agent's input filled after the prompt's cancellation went
+// out), the transport is ended under it and the run finishes.
+func TestACPCancelAfterTheTurnTimeoutIsGuarded(t *testing.T) {
+	clearACPEnv(t)
+	t.Setenv("HARNESS_TURN_TIMEOUT", "1")
+	old := abortGrace
+	abortGrace = 200 * time.Millisecond
+	defer func() { abortGrace = old }()
+	conn := &stuckCancelConn{silentConn: &silentConn{coreConn: &coreConn{}, hangPrompt: true}, released: make(chan struct{})}
+	var once sync.Once
+	cl := &acpClient{abort: func() { once.Do(func() { close(conn.released) }) }}
+	type result struct {
+		code  int
+		lines []string
+	}
+	done := make(chan result, 1)
+	go func() {
+		code, lines := runCore(t, conn, cl, &model.Run{ID: "r", Task: "x"})
+		done <- result{code, lines}
+	}()
+	select {
+	case r := <-done:
+		if r.code != 1 || !hasCall(conn.coreConn, "cancel") || !strings.Contains(notices(r.lines), "HARNESS_TURN_TIMEOUT") {
+			t.Fatalf("exit %d, calls %v, notices:\n%s", r.code, conn.calls, notices(r.lines))
+		}
+	case <-time.After(10 * time.Second):
+		once.Do(func() { close(conn.released) })
+		t.Fatal("the run is stuck in session/cancel after the turn timeout")
 	}
 }

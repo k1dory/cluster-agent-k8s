@@ -550,9 +550,13 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 				if overran {
 					notice("the turn ran longer than %s (HARNESS_TURN_TIMEOUT): the run is cancelled", turnTimeout)
 				}
-				// Cancelled: tell the agent, which ends the turn it is in.
+				// Cancelled: tell the agent, which ends the turn it is in. Guarded like the prompt:
+				// the SDK writes synchronously, and a pipe the agent stopped reading may have filled
+				// since the prompt's own cancellation went out.
 				cctx, done := context.WithTimeout(context.Background(), 2*time.Second)
+				release := cl.guard(cctx)
 				_ = conn.Cancel(cctx, acp.CancelNotification{SessionId: sessionID})
+				release()
 				done()
 				return 1
 			}
@@ -569,7 +573,7 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 		chat.turnEnded()
 		next, ok := inputs.next(ctx)
 		if !ok {
-			closeACPSession(conn, sess, notice)
+			closeACPSession(conn, cl, sess, notice)
 			return 0
 		}
 		// A message that waited for this turn is a new turn: the idle clock stops until it ends.
@@ -581,13 +585,14 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 // closeACPSession ends the conversation's session on the agent's side when it declares
 // session/close: the agent frees what it holds for it and writes its state before the process
 // ends. The session stays continuable (resume, load).
-func closeACPSession(conn acpConn, sess acpOpened, notice func(string, ...any)) {
+func closeACPSession(conn acpConn, client *acpClient, sess acpOpened, notice func(string, ...any)) {
 	cl, ok := conn.(acpCloser)
 	if !sess.canClose || !ok {
 		return
 	}
 	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
 	defer done()
+	defer client.guard(ctx)() // a blocked write is not bounded by ctx (guard)
 	if _, err := cl.CloseSession(ctx, acp.CloseSessionRequest{SessionId: sess.id}); err != nil {
 		notice("acp session/close: %v", err)
 	}
