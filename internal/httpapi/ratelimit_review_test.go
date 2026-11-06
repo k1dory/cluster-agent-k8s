@@ -163,14 +163,16 @@ func TestReviewConcurrentGuessesCannotOutrunTheLimit(t *testing.T) {
 			t.Fatalf("only %d guesses refused; %d reached the verifier", limited, v.calls.Load())
 		}
 	}
-	if n := v.calls.Load(); n != 3 {
-		t.Fatalf("%d guesses reached the verifier, want 3", n)
-	}
+	// Counted only once every guess is answered: a guess holding a reservation may not have
+	// entered the verifier yet while the others were refused.
 	release()
 	for i := 0; i < 3; i++ {
 		if c := <-codes; c != 401 {
 			t.Fatalf("a checked guess: %d", c)
 		}
+	}
+	if n := v.calls.Load(); n != 3 {
+		t.Fatalf("%d guesses reached the verifier, want 3", n)
 	}
 }
 
