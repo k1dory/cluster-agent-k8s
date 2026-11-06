@@ -132,19 +132,10 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 		// Listed after the text (every harness reads it); an ACP agent gets them as resource links.
 		text = harness.WithAttachments(text, paths)
 	}
-	// A keyed retry that took over an abandoned attempt answers with the run that one queued
-	// (a message delivered as input or joined to a queued task creates nothing to find, and is
-	// delivered again).
-	if run, ok := p.keyedRun(r, id, false); ok {
-		writeJSON(w, http.StatusAccepted, MessageResponse{Run: run, Delivery: keyedDelivery(run), Files: uploaded})
-		return
-	}
+	// Under an Idempotency-Key, Say delivers the message once for every attempt: a later one
+	// gets the earlier one's delivery (see Orchestrator.Say).
 	run, delivery, err := p.Orch.Say(r.Context(), id, text)
 	if err != nil {
-		if run, ok := p.keyedRun(r, id, true); ok {
-			writeJSON(w, http.StatusAccepted, MessageResponse{Run: run, Delivery: keyedDelivery(run), Files: uploaded})
-			return
-		}
 		writeOrchErr(w, err)
 		return
 	}
@@ -440,13 +431,4 @@ func (p *Platform) replyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, ReplyResponse{RunID: run.ID, RequestID: reply.RequestID})
-}
-
-// keyedDelivery is how a run found by its keyed id carried the message: Say names a run that
-// continues a conversation "resumed", one that starts it "new".
-func keyedDelivery(run *model.Run) string {
-	if run.ResumeOf != "" {
-		return orchestrator.DeliveredResumed
-	}
-	return orchestrator.DeliveredNew
 }

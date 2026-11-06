@@ -98,16 +98,26 @@ type Idempotent struct {
 	Status    int
 	Body      []byte
 	CreatedAt time.Time
-	// Generation numbers the reservations of the key: 1 for the first, one more for every
-	// takeover of an abandoned one. Finishing it (PutIdempotent, ReleaseIdempotent) is
-	// conditional on it, so a handler whose reservation was taken over (it was slow, not dead)
-	// can neither overwrite nor drop its successor's.
+	// Generation counts the attempts under the key: 1 for the first, one more for each that
+	// took over an abandoned or released reservation. An attempt with Generation > 1 may find
+	// what an earlier one created.
 	Generation int
-	// Seed is chosen when the key is first reserved and kept across takeovers: what a keyed
-	// request creates is named from it, so the attempt that takes over an abandoned one finds
-	// the resource that one created instead of creating a second.
+	// Seed is chosen when the key is first reserved and kept by every later attempt with the
+	// same body: what a keyed request creates is named from it, so a later attempt finds the
+	// resource an earlier one created instead of creating a second. Empty on a record written
+	// by a replica of an earlier release.
 	Seed string
+	// Token is the random owner of the reservation, new for every attempt. Finishing it
+	// (PutIdempotent, ReleaseIdempotent) is conditional on it; a token never repeats, so a
+	// handler that was slow, not dead, can neither overwrite nor drop a later attempt's
+	// reservation, even one made after a release.
+	Token string
 }
+
+// Legacy reports a reservation written by a replica of an earlier release (it has no seed).
+// Unfinished, it is never taken over: the resource it may have created has a random name
+// that a new attempt cannot find, so running the request again could create a second one.
+func (i *Idempotent) Legacy() bool { return i.Seed == "" }
 
 // InProgress reports a reserved key whose request has not finished.
 func (i *Idempotent) InProgress() bool { return i.Status == 0 }
@@ -433,18 +443,23 @@ type Store interface {
 	ListInstances(ctx context.Context, sandboxID string) ([]*model.Instance, error)
 
 	// ReserveIdempotent atomically claims key for this body. reserved=true means the caller
-	// holds the reservation rec (its Generation and Seed) and must finish it with PutIdempotent
-	// or ReleaseIdempotent; otherwise rec is the earlier reservation or stored response. A
-	// reservation unfinished for IdempotencyStale is taken over by a request with the same body:
-	// Generation+1, the Seed kept. A record older than IdempotencyTTL is gone.
+	// holds the reservation rec (its Token, Generation and Seed) and must finish it with
+	// PutIdempotent or ReleaseIdempotent; otherwise rec is the earlier reservation or stored
+	// response. A released reservation is taken over at once, one unfinished for
+	// IdempotencyStale by a request with the same body: a new Token, Generation+1, the Seed kept
+	// when the body is the same (a new one otherwise). A Legacy reservation is never taken over.
+	// A record older than IdempotencyTTL is gone.
 	ReserveIdempotent(ctx context.Context, key, bodyHash string) (rec *Idempotent, reserved bool, err error)
-	// PutIdempotent records the finished response. With rec.Generation set it completes that
-	// reservation only: ErrConflict when the key is no longer reserved under it (taken over, or
-	// finished). Generation 0 writes the record whatever is there (a key nobody reserves).
+	// PutIdempotent records the finished response. With rec.Token set it completes that
+	// reservation only: ErrConflict when the key is no longer reserved under it (taken over,
+	// released, or finished). An empty Token writes the record whatever is there (a key nobody
+	// reserves).
 	PutIdempotent(ctx context.Context, rec *Idempotent) error
-	// ReleaseIdempotent drops the reservation of that generation, whose request failed, so a
-	// retry may run; a later generation or a finished record is left alone.
-	ReleaseIdempotent(ctx context.Context, key string, generation int) error
+	// ReleaseIdempotent gives up the reservation held under token, whose request failed, so a
+	// retry may run at once. The record and its seed stay (a later attempt with the same body
+	// finds what this one may have created); another token's reservation or a finished record
+	// is left alone.
+	ReleaseIdempotent(ctx context.Context, key, token string) error
 	GetIdempotent(ctx context.Context, key string) (*Idempotent, error)
 
 	// The catalogue uses only this part (see Catalog); the full Store embeds it for wiring.
@@ -485,7 +500,7 @@ const IdempotencyTTL = 24 * time.Hour
 // considered abandoned (the process died mid-request) and may be taken over.
 const IdempotencyStale = 2 * time.Minute
 
-// NewIdempotencySeed is the Seed of a new reservation: random, 16 bytes in hex.
+// NewIdempotencySeed is the Seed (and the Token) of a new reservation: random, 16 bytes in hex.
 func NewIdempotencySeed() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)

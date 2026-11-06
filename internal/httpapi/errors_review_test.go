@@ -43,7 +43,7 @@ func TestReviewErrorCodesAreTheSpecEnum(t *testing.T) {
 	enum := spec.Components.Schemas["Error"].Properties["code"].Enum
 	codes := []string{CodeBadRequest, CodeUnauthorized, CodeForbidden, CodeNotFound, CodeConflict, CodeTooLarge,
 		CodeQuota, CodeUpstream, CodeTimeout, CodeInternal, CodeUnavailable, CodeInvalid,
-		CodeInvalidPlan, CodeNothingToRollBack, CodeUnreachable, CodeCredential, CodeStopped, CodeRateLimited}
+		CodeInvalidPlan, CodeNothingToRollBack, CodeUnreachable, CodeCredential, CodeStopped, CodeRateLimited, CodePreviewTaken}
 	for status := 400; status < 600; status++ {
 		codes = append(codes, codeFor(status))
 	}

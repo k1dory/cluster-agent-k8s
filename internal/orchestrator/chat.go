@@ -37,7 +37,16 @@ func (o *Orchestrator) Say(ctx context.Context, sandboxID, text string) (run *mo
 	// happens after this one is released: locks are a bounded resource shared by every caller.
 	wake := false
 	err = o.Store.WithTenantLock(ctx, "sandbox:"+sandboxID, func(ctx context.Context) error {
+		// Under an Idempotency-Key, an earlier attempt's delivery is checked under this lock, so
+		// a slow attempt that resumes after another delivered never delivers the text again.
+		var said bool
+		if run, how, wake, said, err = o.keyedSaid(ctx, sandboxID); err != nil || said {
+			return err
+		}
 		run, how, wake, err = o.say(ctx, sandboxID, text)
+		if err == nil {
+			o.recordSaid(ctx, sandboxID, run, how)
+		}
 		return err
 	})
 	if err == nil && wake {

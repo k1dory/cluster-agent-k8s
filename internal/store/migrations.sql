@@ -294,13 +294,17 @@ ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS run integer NOT NULL DEFAULT 0;
 -- generation they were issued under, and older ones are refused.
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS preview_gen bigint NOT NULL DEFAULT 0;
 
--- step 9: idempotency reservation generations
--- generation fences the finish of a reservation (a takeover bumps it, the abandoned handler's
--- write no longer matches); seed names what the keyed request creates and survives a takeover.
--- Rows of an older replica get generation 1 and no seed (a takeover gives them one).
+-- step 9: idempotency reservation owners and seeds
+-- token is the random owner of a reservation: finishing it (result or release) is conditional
+-- on it, and a token never repeats, so a handler that lost its reservation can never finish a
+-- later one. generation counts the attempts under the key. seed names what the keyed request
+-- creates and is kept by every later attempt with the same body, so one finds what an earlier
+-- one created. Rows of an older replica have no seed: an unfinished one is never run again
+-- (the resource it may have made has a random name nothing can find).
 ALTER TABLE idempotency
     ADD COLUMN IF NOT EXISTS generation integer NOT NULL DEFAULT 1,
-    ADD COLUMN IF NOT EXISTS seed text NOT NULL DEFAULT '';
+    ADD COLUMN IF NOT EXISTS seed text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS token text NOT NULL DEFAULT '';
 
 -- every start: repairs of rows a replica of an older release may still write
 -- No DDL here: these run on every start, after the steps, because during a rolling update an

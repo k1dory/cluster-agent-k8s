@@ -227,6 +227,11 @@ func (m *Memory) WithTenantLock(ctx context.Context, tenant string, fn func(ctx 
 		return ctx.Err()
 	}
 	defer func() { <-l }()
+	// With the lock free and ctx already done, select may take either case: the callback
+	// never runs on an ended context, as the advisory lock's query fails on Postgres.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return fn(ctx)
 }
 
@@ -681,17 +686,19 @@ func (m *Memory) ReserveIdempotent(_ context.Context, key, bodyHash string) (*Id
 	}
 	v, ok := m.idem[key]
 	if !ok {
-		v = &Idempotent{Key: key, BodyHash: bodyHash, CreatedAt: now, Generation: 1, Seed: NewIdempotencySeed()}
+		v = &Idempotent{Key: key, BodyHash: bodyHash, CreatedAt: now, Generation: 1, Seed: NewIdempotencySeed(), Token: NewIdempotencySeed()}
 		m.idem[key] = v
 		return cloneIdem(v), true, nil
 	}
-	if v.InProgress() && v.BodyHash == bodyHash && v.CreatedAt.Before(now.Add(-IdempotencyStale)) {
-		// Abandoned: taken over, with the seed, so the resource it may have created is found.
-		v.Generation++
-		v.CreatedAt = now
-		if v.Seed == "" {
+	// As Postgres: released (no owner) is taken by any body, the seed kept for the same one;
+	// abandoned (owned, stale) only by the same body; a legacy record (no seed) never.
+	released := v.Token == ""
+	abandoned := v.BodyHash == bodyHash && v.CreatedAt.Before(now.Add(-IdempotencyStale))
+	if v.InProgress() && !v.Legacy() && (released || abandoned) {
+		if v.BodyHash != bodyHash {
 			v.Seed = NewIdempotencySeed()
 		}
+		v.BodyHash, v.Generation, v.CreatedAt, v.Token = bodyHash, v.Generation+1, now, NewIdempotencySeed()
 		return cloneIdem(v), true, nil
 	}
 	return cloneIdem(v), false, nil
@@ -704,22 +711,22 @@ func (m *Memory) PutIdempotent(_ context.Context, rec *Idempotent) error {
 	if c.CreatedAt.IsZero() {
 		c.CreatedAt = m.idemNow()
 	}
-	if rec.Generation > 0 {
+	if rec.Token != "" {
 		cur, ok := m.idem[rec.Key]
-		if !ok || !cur.InProgress() || cur.Generation != rec.Generation {
-			return fmt.Errorf("%w: idempotency key is no longer reserved under generation %d", ErrConflict, rec.Generation)
+		if !ok || !cur.InProgress() || cur.Token != rec.Token {
+			return fmt.Errorf("%w: idempotency key is no longer reserved by this attempt", ErrConflict)
 		}
-		c.Seed = cur.Seed
+		c.Seed, c.Generation, c.CreatedAt = cur.Seed, cur.Generation, m.idemNow()
 	}
 	m.idem[rec.Key] = c
 	return nil
 }
 
-func (m *Memory) ReleaseIdempotent(_ context.Context, key string, generation int) error {
+func (m *Memory) ReleaseIdempotent(_ context.Context, key, token string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if cur, ok := m.idem[key]; ok && cur.InProgress() && cur.Generation == generation {
-		delete(m.idem, key)
+	if cur, ok := m.idem[key]; ok && token != "" && cur.InProgress() && cur.Token == token {
+		cur.Token = ""
 	}
 	return nil
 }

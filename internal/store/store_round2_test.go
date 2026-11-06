@@ -47,26 +47,27 @@ func round2Sandbox(id string) *model.Sandbox {
 	return &model.Sandbox{ID: id, Name: "r2", Slug: "dev", Owner: "alice", Tenant: "acme", Status: model.StatusRunning, CreatedAt: now, LastActivity: now}
 }
 
-// Item 4: a reservation is finished only by the generation that holds it. A takeover of an
-// abandoned one is won by exactly one of the callers racing for it, keeps the seed (what the
-// keyed request creates is named from it), and leaves the old holder unable to overwrite or
-// drop it.
-func TestRound2IdempotencyGenerations(t *testing.T) {
+// Item 4: a reservation is finished only by the attempt that holds it (its token). A takeover
+// of an abandoned one is won by exactly one of the callers racing for it and keeps the seed
+// (what the keyed request creates is named from it); the old holder can neither overwrite nor
+// drop it. Review round 1 of #32: a token never repeats, not even after a release, and a
+// release keeps the seed for the next attempt with the same body.
+func TestRound2IdempotencyOwners(t *testing.T) {
 	round2Run(t, func(t *testing.T, s round2Store) {
 		ctx := context.Background()
 		key := "acme|POST /v1/sandboxes|gen"
-		first, reserved, err := s.ReserveIdempotent(ctx, key, "h")
-		if err != nil || !reserved || first.Generation != 1 || first.Seed == "" {
-			t.Fatalf("first reservation: %v %v %+v", err, reserved, first)
+		a, reserved, err := s.ReserveIdempotent(ctx, key, "h")
+		if err != nil || !reserved || a.Generation != 1 || a.Seed == "" || a.Token == "" {
+			t.Fatalf("first reservation: %v %v %+v", err, reserved, a)
 		}
 		if rec, reserved, err := s.ReserveIdempotent(ctx, key, "h"); err != nil || reserved || !rec.InProgress() {
 			t.Fatalf("repeat while in progress: %v %v %+v", err, reserved, rec)
 		}
-		// Abandoned: N retries race for it, one takes it over.
+		// Abandoned: N retries race for it, one (B) takes it over.
 		s.age(t, key)
 		var won atomic.Int32
 		var wg sync.WaitGroup
-		var taken *Idempotent
+		var b *Idempotent
 		var mu sync.Mutex
 		for range 8 {
 			wg.Add(1)
@@ -80,47 +81,96 @@ func TestRound2IdempotencyGenerations(t *testing.T) {
 				if reserved {
 					won.Add(1)
 					mu.Lock()
-					taken = rec
+					b = rec
 					mu.Unlock()
 				}
 			}()
 		}
 		wg.Wait()
-		if won.Load() != 1 || taken.Generation != 2 || taken.Seed != first.Seed {
-			t.Fatalf("takeover: %d winners, %+v (first %+v)", won.Load(), taken, first)
+		if won.Load() != 1 || b.Generation != 2 || b.Seed != a.Seed || b.Token == a.Token {
+			t.Fatalf("takeover: %d winners, %+v (first %+v)", won.Load(), b, a)
 		}
-		// The old holder was slow, not dead: neither its result nor its release lands.
-		if err := s.PutIdempotent(ctx, &Idempotent{Key: key, BodyHash: "h", Status: 201, Body: []byte("old"), Generation: 1}); !errors.Is(err, ErrConflict) {
-			t.Fatalf("finish by the superseded generation: %v", err)
-		}
-		if err := s.ReleaseIdempotent(ctx, key, 1); err != nil {
+		// B fails and releases: C reserves at once, a new attempt with the same seed.
+		if err := s.ReleaseIdempotent(ctx, key, b.Token); err != nil {
 			t.Fatal(err)
 		}
-		if rec, err := s.GetIdempotent(ctx, key); err != nil || rec.Generation != 2 || !rec.InProgress() {
-			t.Fatalf("after the old holder's release: %v %+v", err, rec)
+		c, reserved, err := s.ReserveIdempotent(ctx, key, "h")
+		if err != nil || !reserved || c.Generation != 3 || c.Seed != a.Seed || c.Token == a.Token || c.Token == b.Token {
+			t.Fatalf("reservation after a release: %v %v %+v", err, reserved, c)
 		}
-		if err := s.PutIdempotent(ctx, &Idempotent{Key: key, BodyHash: "h", Status: 201, Body: []byte("new"), Generation: 2}); err != nil {
+		// A and B were slow, not dead: neither their results nor their releases land on C's.
+		for _, old := range []*Idempotent{a, b} {
+			if err := s.PutIdempotent(ctx, &Idempotent{Key: key, BodyHash: "h", Status: 201, Body: []byte("old"), Token: old.Token}); !errors.Is(err, ErrConflict) {
+				t.Fatalf("finish by a superseded attempt (generation %d): %v", old.Generation, err)
+			}
+			if err := s.ReleaseIdempotent(ctx, key, old.Token); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if rec, err := s.GetIdempotent(ctx, key); err != nil || rec.Token != c.Token || !rec.InProgress() {
+			t.Fatalf("after the superseded attempts finished: %v %+v", err, rec)
+		}
+		if rec, reserved, err := s.ReserveIdempotent(ctx, key, "h"); err != nil || reserved || !rec.InProgress() {
+			t.Fatalf("C's reservation was taken: %v %v %+v", err, reserved, rec)
+		}
+		if err := s.PutIdempotent(ctx, &Idempotent{Key: key, BodyHash: "h", Status: 201, Body: []byte("new"), Token: c.Token}); err != nil {
 			t.Fatal(err)
 		}
 		// Finished: replayed, not taken over (however old), not released.
-		if err := s.ReleaseIdempotent(ctx, key, 2); err != nil {
+		if err := s.ReleaseIdempotent(ctx, key, c.Token); err != nil {
 			t.Fatal(err)
 		}
 		s.age(t, key)
 		rec, reserved, err := s.ReserveIdempotent(ctx, key, "h")
-		if err != nil || reserved || rec.Status != 201 || string(rec.Body) != "new" || rec.Seed != first.Seed {
+		if err != nil || reserved || rec.Status != 201 || string(rec.Body) != "new" || rec.Seed != a.Seed {
 			t.Fatalf("replay: %v %v %+v", err, reserved, rec)
 		}
-		// A different body never takes over an abandoned reservation.
+		// A different body never takes over an abandoned reservation; a released one it does,
+		// with a seed of its own (it is another request).
 		other := "acme|POST /v1/sandboxes|other"
-		if _, reserved, err := s.ReserveIdempotent(ctx, other, "h1"); err != nil || !reserved {
+		o1, reserved, err := s.ReserveIdempotent(ctx, other, "h1")
+		if err != nil || !reserved {
 			t.Fatal(err)
 		}
 		s.age(t, other)
 		if rec, reserved, err := s.ReserveIdempotent(ctx, other, "h2"); err != nil || reserved || rec.BodyHash != "h1" {
 			t.Fatalf("takeover with another body: %v %v %+v", err, reserved, rec)
 		}
+		if err := s.ReleaseIdempotent(ctx, other, o1.Token); err != nil {
+			t.Fatal(err)
+		}
+		if o2, reserved, err := s.ReserveIdempotent(ctx, other, "h2"); err != nil || !reserved || o2.Seed == o1.Seed || o2.BodyHash != "h2" {
+			t.Fatalf("another body after a release: %v %v %+v", err, reserved, o2)
+		}
 	})
+}
+
+// Item 4, review round 1 of #32: a reservation an older replica left unfinished has no seed.
+// The sandbox it may have created has a random id no attempt can find, so it is never taken
+// over (the request would run again and create a second one): it is answered, unfinished,
+// until it expires.
+func TestRound2PostgresLegacyReservationIsNotRunAgain(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
+	ctx := context.Background()
+	key := "acme|POST /v1/sandboxes|legacy"
+	// As a replica of the earlier release writes it: the old columns only.
+	if _, err := p.pool.Exec(ctx, `INSERT INTO idempotency (key, body_hash, status, body, created_at) VALUES ($1,'h',0,'',now() - $2::interval)`,
+		key, (IdempotencyStale + time.Minute).String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.CreateSandbox(ctx, round2Sandbox("sb_random_legacy")); err != nil {
+		t.Fatal(err)
+	}
+	rec, reserved, err := p.ReserveIdempotent(ctx, key, "h")
+	if err != nil || reserved || !rec.InProgress() || !rec.Legacy() {
+		t.Fatalf("legacy reservation: %v %v %+v", err, reserved, rec)
+	}
+	if err := p.ReleaseIdempotent(ctx, key, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, reserved, _ := p.ReserveIdempotent(ctx, key, "h"); reserved {
+		t.Fatal("an empty token released the legacy reservation")
+	}
 }
 
 // Item 5: DeleteItem and a conditional PutItem of the same item end in one of their serial
@@ -485,4 +535,19 @@ func TestRound2PoolOfOneConnectionIsRefused(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "pool_max_conns=1") || !strings.Contains(err.Error(), "at least 2") {
 		t.Fatalf("pool of one connection: %v", err)
 	}
+}
+
+// Item 9, review round 1 of #32: an already-ended context never runs the callback, even with
+// the lock free (select may pick the free lock over the done context).
+func TestRound2TenantLockRefusesAnEndedContext(t *testing.T) {
+	round2Run(t, func(t *testing.T, s round2Store) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		for i := range 200 {
+			ran := false
+			if err := s.WithTenantLock(ctx, fmt.Sprintf("free-%d", i), func(context.Context) error { ran = true; return nil }); err == nil || ran {
+				t.Fatalf("attempt %d: err %v, ran %v", i, err, ran)
+			}
+		}
+	})
 }

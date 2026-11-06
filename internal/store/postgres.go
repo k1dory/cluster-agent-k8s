@@ -908,11 +908,11 @@ func (p *Postgres) CountEvents(ctx context.Context, f Filter) ([]EventCount, err
 	return out, rows.Err()
 }
 
-const idemCols = `key, body_hash, status, body, created_at, generation, seed`
+const idemCols = `key, body_hash, status, body, created_at, generation, seed, token`
 
 func scanIdem(row pgx.Row) (*Idempotent, error) {
 	var rec Idempotent
-	err := row.Scan(&rec.Key, &rec.BodyHash, &rec.Status, &rec.Body, &rec.CreatedAt, &rec.Generation, &rec.Seed)
+	err := row.Scan(&rec.Key, &rec.BodyHash, &rec.Status, &rec.Body, &rec.CreatedAt, &rec.Generation, &rec.Seed, &rec.Token)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -924,22 +924,24 @@ func scanIdem(row pgx.Row) (*Idempotent, error) {
 
 func (p *Postgres) ReserveIdempotent(ctx context.Context, key, bodyHash string) (*Idempotent, bool, error) {
 	// Expired records make room; then the INSERT is the lock: exactly one concurrent caller
-	// gets a row back. An abandoned reservation is not deleted but taken over in place, by one
-	// caller (the UPDATE's condition), keeping its seed.
+	// gets a row back. A released or abandoned reservation is not deleted but taken over in
+	// place, by one caller (the UPDATE's condition), with a token of its own.
 	_, _ = p.pool.Exec(ctx, `DELETE FROM idempotency WHERE created_at < now() - $1::interval`, IdempotencyTTL.String())
 	for attempt := 0; ; attempt++ {
-		rec, err := scanIdem(p.pool.QueryRow(ctx, `INSERT INTO idempotency (key, body_hash, status, body, created_at, generation, seed)
-			VALUES ($1,$2,0,'',now(),1,$3) ON CONFLICT (key) DO NOTHING RETURNING `+idemCols, key, bodyHash, NewIdempotencySeed()))
+		rec, err := scanIdem(p.pool.QueryRow(ctx, `INSERT INTO idempotency (key, body_hash, status, body, created_at, generation, seed, token)
+			VALUES ($1,$2,0,'',now(),1,$3,$4) ON CONFLICT (key) DO NOTHING RETURNING `+idemCols, key, bodyHash, NewIdempotencySeed(), NewIdempotencySeed()))
 		if err == nil {
 			return rec, true, nil
 		}
 		if !errors.Is(err, ErrNotFound) {
 			return nil, false, err
 		}
-		rec, err = scanIdem(p.pool.QueryRow(ctx, `UPDATE idempotency SET generation = generation + 1, created_at = now(),
-				seed = CASE WHEN seed = '' THEN $3 ELSE seed END
-			WHERE key=$1 AND status=0 AND body_hash=$2 AND created_at < now() - $4::interval RETURNING `+idemCols,
-			key, bodyHash, NewIdempotencySeed(), IdempotencyStale.String()))
+		// Released (no owner): any body takes it, keeping the seed only for the same body.
+		// Abandoned (owned, stale): only the same body, seed kept. Legacy (no seed): never.
+		rec, err = scanIdem(p.pool.QueryRow(ctx, `UPDATE idempotency SET generation = generation + 1, created_at = now(), token = $4,
+				seed = CASE WHEN body_hash = $2 THEN seed ELSE $3 END, body_hash = $2
+			WHERE key=$1 AND status=0 AND seed <> '' AND (token = '' OR body_hash=$2 AND created_at < now() - $5::interval)
+			RETURNING `+idemCols, key, bodyHash, NewIdempotencySeed(), NewIdempotencySeed(), IdempotencyStale.String()))
 		if err == nil {
 			return rec, true, nil
 		}
@@ -948,21 +950,21 @@ func (p *Postgres) ReserveIdempotent(ctx context.Context, key, bodyHash string) 
 		}
 		existing, err := p.GetIdempotent(ctx, key)
 		if errors.Is(err, ErrNotFound) && attempt < 3 {
-			continue // released between the INSERT and the SELECT: reserve again
+			continue // expired between the INSERT and the SELECT: reserve again
 		}
 		return existing, false, err
 	}
 }
 
 func (p *Postgres) PutIdempotent(ctx context.Context, rec *Idempotent) error {
-	if rec.Generation > 0 {
+	if rec.Token != "" {
 		tag, err := p.pool.Exec(ctx, `UPDATE idempotency SET status=$2, body=$3, created_at=now()
-			WHERE key=$1 AND generation=$4 AND status=0`, rec.Key, rec.Status, rec.Body, rec.Generation)
+			WHERE key=$1 AND token=$4 AND status=0`, rec.Key, rec.Status, rec.Body, rec.Token)
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("%w: idempotency key is no longer reserved under generation %d", ErrConflict, rec.Generation)
+			return fmt.Errorf("%w: idempotency key is no longer reserved by this attempt", ErrConflict)
 		}
 		return nil
 	}
@@ -975,8 +977,8 @@ func (p *Postgres) PutIdempotent(ctx context.Context, rec *Idempotent) error {
 	return err
 }
 
-func (p *Postgres) ReleaseIdempotent(ctx context.Context, key string, generation int) error {
-	_, err := p.pool.Exec(ctx, `DELETE FROM idempotency WHERE key=$1 AND generation=$2 AND status=0`, key, generation)
+func (p *Postgres) ReleaseIdempotent(ctx context.Context, key, token string) error {
+	_, err := p.pool.Exec(ctx, `UPDATE idempotency SET token='' WHERE key=$1 AND token=$2 AND token <> '' AND status=0`, key, token)
 	return err
 }
 
