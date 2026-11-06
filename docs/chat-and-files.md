@@ -91,9 +91,10 @@ answers and the run records.
    finishes with its exit code and usage. In `stream-json` mode the runner also closes the
    conversation by itself after `chat_idle` seconds without a message following a completed turn
    (default 10 minutes), so an idle chat does not hold a pod and a run open forever. The next
-   message resumes the session (point 2). Cancelling a run (`/cancel`) stops the harness: SIGINT
-   first (`claude -p` completes its turn and writes its result on it), SIGTERM 5 seconds later if it
-   is still running.
+   message resumes the session (point 2). Cancelling a run (`/cancel`) stops the harness and
+   everything it started (its process group): SIGINT first (`claude -p` completes its turn and
+   writes its result on it), SIGTERM 5 seconds later if it is still running. Whatever the harness
+   leaves running in its group when it exits gets SIGTERM, then SIGKILL 10 seconds later.
 
    The deployment's default harness is not `claude -p` but Claude over ACP (`claude-agent-acp`,
    `agent.harnessInput: acp` in the chart, `kube.harness_input` in sandboxd's configuration), and
@@ -182,6 +183,18 @@ calls (`acpx.Dial`, `Conn.Steer`, `acpx.Configure`, `acpx.SessionMeta`).
   `_meta` of every session request: claude-agent-acp takes `claudeCode.options` from it
   (`maxTurns`, `maxBudgetUsd` — the turn ends with `budget_exhausted` —, `promptSuggestions`,
   `fallbackModel`, `effort`). It is configuration: no secret goes there.
+- **Deadlines.** Each call that opens the session (`initialize`, `authenticate`,
+  `session/resume`, `session/load`, `session/new`, and each of the settings after them) has
+  `HARNESS_ACP_SETUP_TIMEOUT` seconds of its own to answer (default 300; `authenticate` gets
+  `ask_timeout` when that is longer and `permissions` is `ask`). What runs out of time is what
+  fails otherwise: a resume or a load that does not answer falls back (to a load, then to a new
+  session), a setting that does not answer is reported and the agent keeps its own, and
+  `initialize`, `authenticate` or `session/new` end the run (exit 1) with a notice. One prompt
+  may run for `HARNESS_TURN_TIMEOUT` seconds (default 7200); past it the runner cancels the
+  turn (`session/cancel`) and ends the run with exit 1 and a notice: the run is `failed`, not
+  `cancelled` (that is a person's `/cancel`). A call still stuck 5 seconds after its deadline
+  (an agent that stopped reading its input) has the agent's process group killed under it. Both
+  are set in the profile's `env`.
 - **Permissions.** `session/request_permission` is answered by `permissions`: the agent's
   `allow_once` (else `allow_always`) option, or with `deny` its `reject_once` (else
   `reject_always`). The sandbox, its policy and the gateway stay the boundary either way. Every

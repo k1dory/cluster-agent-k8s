@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,9 +33,9 @@ import (
 // What the agent reports becomes the ACP lines of internal/harness (acp.session, acp.message,
 // acp.tool_call with its diffs, acp.permission, acp.turn_end) on the run's output, so the
 // control plane reads the transcript, the session id and the turn ends like any harness's.
-func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, env []string) int {
+func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, env []string, w *runWatch) int {
 	fmt.Printf("agent-runner: run %s (acp): %q\n", run.ID, truncate(run.Task, 80))
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(w.ctx) // a cancel the watch sees ends the conversation too
 	defer cancel()
 	// The agent is stopped by the runner (stdin closed, then SIGTERM), not by runCtx: a cancelled
 	// run still gets its session/cancel first.
@@ -46,7 +45,7 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	// env:NAME) are in place before it starts.
 	env, delivered, err := deliverInstructions(env, os.Getenv("HARNESS_INSTRUCTIONS"), os.Getenv("SANDBOX_INSTRUCTIONS"), os.Getenv("HOME"))
 	if err != nil {
-		c.post(run.ID, []string{"[agent-runner] instructions: " + err.Error()})
+		c.postWhile(ctx, w.ctx, run.ID, []string{"[agent-runner] instructions: " + err.Error()})
 		return 1
 	}
 	cmd := exec.CommandContext(procCtx, "/bin/sh", "-lc", cmdline)
@@ -57,13 +56,7 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	cmd.Cancel = func() error { return signalGroup(cmd, syscall.SIGTERM) }
 	cmd.WaitDelay = 20 * time.Second
 	cmd.Env = env
-	cmd.Dir = os.Getenv("PWD")
-	if _, err := os.Stat(filepath.Join(repoDir(), ".git")); err == nil {
-		cmd.Dir = repoDir()
-	}
-	if cmd.Dir == "" {
-		cmd.Dir, _ = os.Getwd()
-	}
+	cmd.Dir = harnessDir()
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return 1
@@ -72,25 +65,46 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	if err != nil {
 		return 1
 	}
-	// The run's output is what the runner writes (ACP lines, notices) and the agent's stderr.
-	outR, outW := io.Pipe()
-	cmd.Stderr = outW
-	if err := cmd.Start(); err != nil {
-		c.post(run.ID, []string{"[agent-runner] cannot start harness: " + err.Error()})
+	// The run's output is what the runner writes (ACP lines, notices) and the agent's stderr, both
+	// into one spool: neither waits on the control plane. The stderr pipe is the runner's own, not a
+	// copier of exec's: Wait would wait on that copier for as long as anything holds the pipe (a
+	// helper that left the group), WaitDelay's 20 s on top of the grace, past the whole shutdown
+	// budget. The runner reads it to EOF and closes it when it stops waiting.
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		return 1
+	}
+	cmd.Stderr = errW
+	if w.cancelled() {
+		_, _, _, _ = stdin.Close(), stdout.Close(), errR.Close(), errW.Close()
+		return c.cancelledBeforeStart(ctx, run.ID)
+	}
+	err = cmd.Start()
+	_ = errW.Close() // the agent has its copy
+	if err != nil {
+		_ = errR.Close()
+		c.post(ctx, run.ID, []string{"[agent-runner] cannot start harness: " + err.Error()})
 		return 127
 	}
+	defer errR.Close()
+	spool := newOutputSpool(ctx, c, run.ID)
+	// After SIGTERM the agent has until the shutdown budget leaves only enough time for its output
+	// and the result: then its group is killed and its stdin closed, which ends the connection.
+	defer stopAtShutdown(ctx, func() {
+		_ = signalGroup(cmd, syscall.SIGKILL)
+		_ = stdin.Close()
+		time.AfterFunc(500*time.Millisecond, func() { _ = errR.Close() })
+	})()
 	chat := newChat(harness.InputACP, chatIdle())
 	var outputDone sync.WaitGroup
 	outputDone.Add(1)
 	// The conversation's idle clock is driven by driveACP itself (turn ended, next prompt sent),
-	// not by the output, which reaches streamOutput later than the next prompt may start. Once
-	// the reading ends the pipe is closed, so no write can wait on a reader that is gone.
+	// not by the output, which reaches the control plane later than the next prompt may start.
 	go func() {
 		defer outputDone.Done()
-		streamOutput(c, run.ID, outR, nil)
-		_ = outR.CloseWithError(io.ErrClosedPipe)
+		spool.read(errR, nil)
 	}()
-	emit := func(line string) { _, _ = io.WriteString(outW, line+"\n") }
+	emit := spool.emit
 
 	// The agent's notices and compaction updates are asked for by the wire (the SDK cannot) and
 	// told apart from the SDK's own updates in their place in the stream (Classify): the client
@@ -98,10 +112,16 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{Notices: true, Compaction: true})
 	cl := &acpClient{emit: emit, permissions: os.Getenv("HARNESS_PERMISSIONS"), instructionsDelivered: delivered,
 		usageDir: filepath.Join(os.Getenv("HOME"), ".sandbox-acp-usage"), wire: wire, systemPrompt: wire.SystemPrompt,
-		pending: acpx.NewPending(), askTimeout: askTimeout(os.Getenv("HARNESS_ASK_TIMEOUT"))}
+		pending: acpx.NewPending(), askTimeout: askTimeout(os.Getenv("HARNESS_ASK_TIMEOUT")),
+		resumePrompt: envValue(env, "SANDBOX_RESUME_PROMPT"), emitRequest: spool.emitKept,
+		abort: func() {
+			_ = signalGroup(cmd, syscall.SIGKILL)
+			_ = stdin.Close()
+		}}
 	conn := wire.Connect(cl)
 	exit := driveACP(runCtx, conn, cl, run, emit, chat, func(inputs inputSink) {
 		go forwardInput(runCtx, c, run.ID, inputs, cancel, chat)
+		w.stop() // forwardInput reads the input from its start: a cancel since is its
 	})
 
 	// The conversation is over: end of input, a grace period for the agent to exit on its own,
@@ -118,17 +138,84 @@ func executeACP(ctx context.Context, c *client, run *model.Run, cmdline string, 
 	// What the agent left running in its group is stopped too: SIGTERM (a daemon drains on it),
 	// SIGKILL a moment later for what did not exit.
 	endGroup(cmd)
-	_ = outW.Close()
-	outputDone.Wait()
+	// The agent's stderr ends when nothing of the group holds it any more. A process that left the
+	// group (setsid) and kept it is not waited for past the group's kill: the pipe is closed.
+	readDone := make(chan struct{})
+	go func() { outputDone.Wait(); close(readDone) }()
+	select {
+	case <-readDone:
+	case <-time.After(groupKillDelay + 2*time.Second):
+		_ = errR.Close()
+		<-readDone
+	}
+	spool.close(outputDrainBudget) // the output is delivered before the run is finished
 	return exit
 }
 
 // askTimeout is how long a request waits for a person (HARNESS_ASK_TIMEOUT seconds; 0 or unset: 15 minutes).
-func askTimeout(v string) time.Duration {
+func askTimeout(v string) time.Duration { return secondsOr(v, 15*time.Minute) }
+
+// acpSetupTimeout bounds each call that opens the session: initialize, session/resume,
+// session/load, session/new and the settings after them (HARNESS_ACP_SETUP_TIMEOUT seconds; 0
+// or unset: 5 minutes). An agent that never answers one would hold the run, and the pod, with no
+// turn ever started: the conversation's idle clock only runs after a turn.
+func acpSetupTimeout() time.Duration {
+	return secondsOr(os.Getenv("HARNESS_ACP_SETUP_TIMEOUT"), 5*time.Minute)
+}
+
+// acpTurnTimeout is the longest one prompt may run (HARNESS_TURN_TIMEOUT seconds; 0 or unset: 2
+// hours). A turn past it is cancelled and so is the run: an agent stuck in a turn (a hung tool, a
+// loop) otherwise holds the pod until someone cancels by hand.
+func acpTurnTimeout() time.Duration {
+	return secondsOr(os.Getenv("HARNESS_TURN_TIMEOUT"), 2*time.Hour)
+}
+
+// secondsOr reads a positive number of seconds; anything else is def.
+func secondsOr(v string, def time.Duration) time.Duration {
 	if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
 		return time.Duration(n) * time.Second
 	}
-	return 15 * time.Minute
+	return def
+}
+
+// abortGrace is how long a call has to return once its context ended (a deadline, the run's
+// cancel) before the transport is ended under it.
+var abortGrace = 5 * time.Second
+
+// guard ends the transport (abort) when a call outlives its context by abortGrace. A context only
+// bounds the wait for an answer: the SDK writes the request first, synchronously, and a write to an
+// agent that stopped reading its stdin blocks once the pipe is full, deadline or not. release is
+// called when the call returned.
+func (a *acpClient) guard(ctx context.Context) (release func()) {
+	if a.abort == nil {
+		return func() {}
+	}
+	var mu sync.Mutex
+	var t *time.Timer
+	released := false
+	unregister := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if released {
+			return
+		}
+		t = time.AfterFunc(abortGrace, func() {
+			a.abortOnce.Do(func() {
+				fmt.Fprintf(os.Stderr, "agent-runner: an ACP call did not return %s after its deadline: stopping the agent\n", abortGrace)
+				a.notice("the agent did not let go of a call %s after its deadline (it stopped reading its input): the agent is stopped", abortGrace)
+				a.abort()
+			})
+		})
+	})
+	return func() {
+		unregister()
+		mu.Lock()
+		defer mu.Unlock()
+		released = true
+		if t != nil {
+			t.Stop()
+		}
+	}
 }
 
 // signalGroup sends sig to the process group the command leads.
@@ -142,14 +229,27 @@ func signalGroup(cmd *exec.Cmd, sig syscall.Signal) error {
 // groupKillDelay is how long what is left of an agent's process group has between SIGTERM and SIGKILL.
 var groupKillDelay = 10 * time.Second
 
-// endGroup stops whatever is left of the agent's process group once the agent has exited.
+// groupKills counts the process groups still being stopped; main waits for them before the runner
+// exits, so the SIGKILL is not lost with the process that was to send it.
+var groupKills sync.WaitGroup
+
+// endGroup stops whatever is left of the harness's process group once the harness has exited:
+// SIGTERM (a daemon drains on it), SIGKILL after groupKillDelay to what is still there. It
+// returns at once; the kill is awaited on the runner's way out (groupKills).
 func endGroup(cmd *exec.Cmd) {
 	if signalGroup(cmd, syscall.SIGTERM) != nil {
 		return // nothing left
 	}
-	delay := groupKillDelay
+	deadline := time.Now().Add(groupKillDelay)
+	groupKills.Add(1)
 	go func() {
-		time.Sleep(delay)
+		defer groupKills.Done()
+		for time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+			if signalGroup(cmd, 0) != nil {
+				return // the group is gone
+			}
+		}
 		_ = signalGroup(cmd, syscall.SIGKILL)
 	}()
 }
@@ -228,15 +328,32 @@ type acpOpened struct {
 // prompted here: a failure has been reported through emit when ok is false.
 func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, emit func(string)) (s acpOpened, ok bool) {
 	notice := noticeFunc(emit)
-	init, err := conn.Initialize(ctx, acp.InitializeRequest{
+	// Every call has its own deadline (a load that timed out still leaves session/new its own).
+	setup := acpSetupTimeout()
+	call := func(d time.Duration) (context.Context, context.CancelFunc) {
+		cctx, cancel := context.WithTimeout(ctx, d)
+		release := cl.guard(cctx)
+		return cctx, func() { release(); cancel() }
+	}
+	// failed reports a call that failed; one that ran out of time says which limit it met.
+	failed := func(op string, cctx context.Context, err error) {
+		if errors.Is(cctx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+			notice("acp %s: no answer within %s (HARNESS_ACP_SETUP_TIMEOUT)", op, setup)
+			return
+		}
+		notice("acp %s: %v", op, err)
+	}
+	ictx, done := call(setup)
+	init, err := conn.Initialize(ictx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		// The agent works in its own pod with its own tools: the runner offers no file system
 		// or terminal of its own. With permissions ask a person is there: the agent may ask them
 		// questions (a form, a sign-in link).
 		ClientCapabilities: clientCapabilities(cl.permissions),
 	})
+	done()
 	if err != nil {
-		notice("acp initialize: %v", err)
+		failed("initialize", ictx, err)
 		return s, false
 	}
 	if init.AgentInfo != nil {
@@ -256,26 +373,28 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 			notice("acp authenticate: the connection cannot authenticate")
 			return s, false
 		}
-		if _, err := auth.Authenticate(ctx, acp.AuthenticateRequest{MethodId: method}); err != nil {
-			notice("acp authenticate %s: %v", method, err)
+		// Signing in may wait for a person (a link to open): the ask timeout, when longer.
+		d := setup
+		if cl.permissions == harness.PermissionsAsk {
+			d = max(d, cl.askTimeout)
+		}
+		actx, done := call(d)
+		_, err := auth.Authenticate(actx, acp.AuthenticateRequest{MethodId: method})
+		done()
+		if err != nil {
+			failed("authenticate "+method, actx, err)
 			return s, false
 		}
 	}
-	authNeeded := func(op string, err error) {
+	authNeeded := func(op string, cctx context.Context, err error) {
 		var re *acp.RequestError
 		if errors.As(err, &re) && re.Code == acp.NewAuthRequired(nil).Code {
 			notice("acp %s: the agent requires authentication: set spec.harness.auth_method to one of %v", op, authMethodIDs(init.AuthMethods))
 			return
 		}
-		notice("acp %s: %v", op, err)
+		failed(op, cctx, err)
 	}
-	cwd := os.Getenv("PWD")
-	if _, err := os.Stat(filepath.Join(repoDir(), ".git")); err == nil {
-		cwd = repoDir()
-	}
-	if cwd == "" {
-		cwd, _ = os.Getwd()
-	}
+	cwd := harnessDir()
 	// harness.mcp: always passes the servers to an agent that takes them without declaring MCP
 	// over HTTP (Hermes); auto (the default) only to one that declares it.
 	httpMCP := init.AgentCapabilities.McpCapabilities.Http || os.Getenv("HARNESS_MCP") == harness.MCPAlways
@@ -312,22 +431,26 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 		resumer, canResume := conn.(acpResumer)
 		if caps.SessionCapabilities.Resume != nil && canResume {
 			// session/resume continues without replaying the history.
-			r, err := resumer.ResumeSession(ctx, acp.ResumeSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
+			rctx, done := call(setup)
+			r, err := resumer.ResumeSession(rctx, acp.ResumeSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
+			done()
 			if err == nil {
 				s.id, st = prev, acpSessionState{Modes: r.Modes, Options: r.ConfigOptions}
 			} else {
-				authNeeded("session/resume "+run.Session, err)
+				authNeeded("session/resume "+run.Session, rctx, err)
 			}
 		}
 		if s.id == "" && caps.LoadSession {
 			// session/load replays the conversation as updates: the transcript already has it.
 			cl.setReplaying(true)
-			r, err := conn.LoadSession(ctx, acp.LoadSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
+			lctx, done := call(setup)
+			r, err := conn.LoadSession(lctx, acp.LoadSessionRequest{Meta: meta, SessionId: prev, Cwd: cwd, McpServers: servers})
+			done()
 			cl.setReplaying(false)
 			if err == nil {
 				s.id, st = prev, acpSessionState{Modes: r.Modes, Options: r.ConfigOptions}
 			} else {
-				authNeeded("session/load "+run.Session, err)
+				authNeeded("session/load "+run.Session, lctx, err)
 			}
 		}
 		switch {
@@ -339,14 +462,16 @@ func openACPSession(ctx context.Context, conn acpConn, cl *acpClient, run *model
 		}
 	}
 	if s.id == "" {
-		ns, err := conn.NewSession(ctx, acp.NewSessionRequest{Meta: meta, Cwd: cwd, McpServers: servers})
+		nctx, done := call(setup)
+		ns, err := conn.NewSession(nctx, acp.NewSessionRequest{Meta: meta, Cwd: cwd, McpServers: servers})
+		done()
 		if err != nil {
-			authNeeded("session/new", err)
+			authNeeded("session/new", nctx, err)
 			return s, false
 		}
 		s.id, s.fresh, st = ns.SessionId, true, acpSessionState{Modes: ns.Modes, Options: ns.ConfigOptions}
 	}
-	configureACPSession(ctx, conn, s.id, st, acpSettings{mode: os.Getenv("HARNESS_MODE"), model: os.Getenv("SANDBOX_MODEL"),
+	configureACPSession(func() (context.Context, context.CancelFunc) { return call(setup) }, conn, s.id, st, acpSettings{mode: os.Getenv("HARNESS_MODE"), model: os.Getenv("SANDBOX_MODEL"),
 		thoughtLevel: os.Getenv("HARNESS_THOUGHT_LEVEL")}, notice)
 	return s, true
 }
@@ -408,17 +533,30 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 	if sess.instructions {
 		instructions = "" // the session's system prompt has them
 	}
-	prompt := firstPrompt(run, sess.fresh, instructions, os.Getenv("SANDBOX_RESUME_PROMPT"), cl.isCommand)
+	prompt := firstPrompt(run, sess.fresh, instructions, cl.resumePrompt, cl.isCommand)
+	turnTimeout := acpTurnTimeout()
 	for {
 		inputs.setTurn(true)
-		resp, err := promptACP(ctx, conn, cl, sessionID, prompt, notice)
+		turnCtx, endTurn := context.WithTimeout(ctx, turnTimeout)
+		release := cl.guard(turnCtx)
+		resp, err := promptACP(turnCtx, conn, cl, sessionID, prompt, notice)
+		release()
+		overran := errors.Is(turnCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil
+		endTurn()
 		inputs.setTurn(false)
 		cl.flush()
 		if err != nil {
-			if ctx.Err() != nil {
-				// Cancelled: tell the agent, which ends the turn it is in.
+			if ctx.Err() != nil || overran {
+				if overran {
+					notice("the turn ran longer than %s (HARNESS_TURN_TIMEOUT): the run is cancelled", turnTimeout)
+				}
+				// Cancelled: tell the agent, which ends the turn it is in. Guarded like the prompt:
+				// the SDK writes synchronously, and a pipe the agent stopped reading may have filled
+				// since the prompt's own cancellation went out.
 				cctx, done := context.WithTimeout(context.Background(), 2*time.Second)
+				release := cl.guard(cctx)
 				_ = conn.Cancel(cctx, acp.CancelNotification{SessionId: sessionID})
+				release()
 				done()
 				return 1
 			}
@@ -435,7 +573,7 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 		chat.turnEnded()
 		next, ok := inputs.next(ctx)
 		if !ok {
-			closeACPSession(conn, sess, notice)
+			closeACPSession(conn, cl, sess, notice)
 			return 0
 		}
 		// A message that waited for this turn is a new turn: the idle clock stops until it ends.
@@ -447,13 +585,14 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 // closeACPSession ends the conversation's session on the agent's side when it declares
 // session/close: the agent frees what it holds for it and writes its state before the process
 // ends. The session stays continuable (resume, load).
-func closeACPSession(conn acpConn, sess acpOpened, notice func(string, ...any)) {
+func closeACPSession(conn acpConn, client *acpClient, sess acpOpened, notice func(string, ...any)) {
 	cl, ok := conn.(acpCloser)
 	if !sess.canClose || !ok {
 		return
 	}
 	ctx, done := context.WithTimeout(context.Background(), 5*time.Second)
 	defer done()
+	defer client.guard(ctx)() // a blocked write is not bounded by ctx (guard)
 	if _, err := cl.CloseSession(ctx, acp.CloseSessionRequest{SessionId: sess.id}); err != nil {
 		notice("acp session/close: %v", err)
 	}
@@ -534,7 +673,7 @@ func firstPrompt(run *model.Run, fresh bool, instructions, resumePrompt string, 
 	if run.ResumeOf != "" && run.Mode != model.RunMessage {
 		task = resumePrompt
 		if task == "" {
-			task = "The sandbox was restarted to update the agent. Continue the task where you left off."
+			task = defaultResumePrompt
 		}
 		if fresh {
 			task = run.Task // nothing to continue: do the task again
@@ -577,20 +716,8 @@ func authMethodIDs(methods []acp.AuthMethod) []string {
 // http MCP capability gets none (skipped counts them).
 func acpMCPServers(raw string, http bool) (servers []acp.McpServer, skipped int) {
 	servers = []acp.McpServer{}
-	if strings.TrimSpace(raw) == "" {
-		return servers, 0
-	}
-	var list []struct {
-		Name string `json:"name"`
-		URL  string `json:"url"`
-	}
-	if json.Unmarshal([]byte(raw), &list) != nil {
-		return servers, 0
-	}
+	list, _ := parseMCPServers(raw) // malformed: none (writeMCPConfig reports it for claude)
 	for _, s := range list {
-		if s.Name == "" || s.URL == "" {
-			continue
-		}
 		if !http {
 			skipped++
 			continue
@@ -759,6 +886,14 @@ type acpClient struct {
 	askTimeout time.Duration
 	// lastCommands is the list of commands last written (acp.commands is written when it changes).
 	lastCommands string
+	// resumePrompt is $SANDBOX_RESUME_PROMPT as execute set it for this run.
+	resumePrompt string
+	// emitRequest writes a request to a person and says whether it was kept (outputSpool.emitKept);
+	// nil: emit, always kept.
+	emitRequest func(string) bool
+	// abort ends the transport: the agent's group killed, its stdin closed (guard); nil: nothing to end.
+	abort     func()
+	abortOnce sync.Once
 	// usageDir keeps the last cumulative usage of the sessions of an agent that reports one
 	// (acpUsage); "" keeps it in memory only.
 	usageDir string
@@ -1076,10 +1211,10 @@ func (a *acpClient) askPermission(ctx context.Context, p acp.RequestPermissionRe
 	}
 	a.withDiffsLocked(&harness.ACPLine{ToolCallID: req.ToolCallID}, diffs)
 	rl.Diffs = snapshot
-	a.emit(boundRequestLine(rl))
+	delivered := a.emitRequestLocked(boundRequestLine(rl))
 	a.mu.Unlock()
 
-	reply, by := a.awaitReply(ctx, req.ID)
+	reply, by := a.awaitDelivered(ctx, req.ID, delivered)
 	resp := acp.RequestPermissionResponse{Outcome: acp.RequestPermissionOutcome{Cancelled: &acp.RequestPermissionOutcomeCancelled{}}}
 	outcome := "cancelled"
 	if by == "user" {
@@ -1126,6 +1261,30 @@ func boundRequestLine(l harness.ACPLine) string {
 	return l.String()
 }
 
+// emitRequestLocked writes a request line; false: it could not be kept for the person to see.
+// Called with a.mu held.
+func (a *acpClient) emitRequestLocked(line string) bool {
+	if a.emitRequest == nil {
+		a.emit(line)
+		return true
+	}
+	return a.emitRequest(line)
+}
+
+// awaitDelivered waits for the reply to a request the person was shown; one that could not be
+// shown (the output spool is full even in the requests' reserve) is given up at once, by
+// "undeliverable", instead of waiting out the ask timeout for an answer nobody can give.
+func (a *acpClient) awaitDelivered(ctx context.Context, id string, delivered bool) (acpx.Reply, string) {
+	if delivered {
+		return a.awaitReply(ctx, id)
+	}
+	gone, cancel := context.WithCancel(ctx)
+	cancel()
+	_, _ = a.pending.Wait(gone, id, 0) // closes the request
+	a.notice("request %s could not be shown (the output is not reaching the control plane): refused", id)
+	return acpx.Reply{}, "undeliverable"
+}
+
 // awaitReply waits for a person's reply to an open request; by is "user", or "timeout" / "cancelled"
 // when none came.
 func (a *acpClient) awaitReply(ctx context.Context, id string) (acpx.Reply, string) {
@@ -1156,10 +1315,10 @@ func (a *acpClient) UnstableCreateElicitation(ctx context.Context, p acp.Unstabl
 	req := a.pending.Open(r)
 	a.mu.Lock()
 	// Requests come apart from the ordered notifications: a message being streamed is not cut here.
-	a.emit(boundRequestLine(harness.ACPLine{Type: harness.ACPRequest, Request: &req}))
+	delivered := a.emitRequestLocked(boundRequestLine(harness.ACPLine{Type: harness.ACPRequest, Request: &req}))
 	a.mu.Unlock()
 
-	reply, by := a.awaitReply(ctx, req.ID)
+	reply, by := a.awaitDelivered(ctx, req.ID, delivered)
 	resp, outcome := acpx.CancelledElicitation(), "cancelled"
 	if by == "user" {
 		if resp, err = acpx.ElicitationResponse(req, reply); err != nil {

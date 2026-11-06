@@ -39,8 +39,9 @@ func named(s acpx.Setting, name string) acpx.Setting {
 
 // configureACPSession puts a freshly opened, loaded or resumed session in the profile's mode, on
 // its model and its reasoning level, through what the agent advertised (acpx.Configure). What
-// cannot be applied is reported, never fatal: the agent runs with its own default.
-func configureACPSession(ctx context.Context, conn acpConn, sid acp.SessionId, st acpSessionState, s acpSettings, notice func(string, ...any)) {
+// cannot be applied is reported, never fatal: the agent runs with its own default. Each setting's
+// call has a context of its own from call (a deadline per call, not one for all of them).
+func configureACPSession(call func() (context.Context, context.CancelFunc), conn acpConn, sid acp.SessionId, st acpSessionState, s acpSettings, notice func(string, ...any)) {
 	if s.mode == "" && s.model == "" && s.thoughtLevel == "" {
 		return
 	}
@@ -55,7 +56,9 @@ func configureACPSession(ctx context.Context, conn acpConn, sid acp.SessionId, s
 	}{{modeSetting, s.mode}, {acpx.ModelSetting, s.model}, {thoughtLevelSetting, s.thoughtLevel}} {
 		// One selection can change the others (another model offers other reasoning levels):
 		// the next goes by the agent's answer.
+		ctx, done := call()
 		next, err := acpx.Configure(ctx, cf, sid, st, c.setting, c.want)
+		done()
 		if err != nil {
 			notice("%v", err)
 		}
