@@ -56,13 +56,17 @@ func newLimiter(cfg RateLimit) *limiter {
 	return &limiter{cfg: cfg.withDefaults(), now: time.Now}
 }
 
-// refill brings b up to now; the caller holds b.mu.
+// refill brings b up to now; the caller holds b.mu. Time never runs backwards for a bucket:
+// a now older than its last refill adds nothing.
 func (l *limiter) refill(b *bucket, now time.Time) {
+	if !now.After(b.at) {
+		return
+	}
 	b.tokens = math.Min(float64(l.cfg.Burst), b.tokens+float64(now.Sub(b.at))/float64(l.cfg.Every))
 	b.at = now
 }
 
-// use runs fn on key's bucket, locked and refilled. A bucket the sweep evicted between the
+// use runs fn on key's bucket, locked and refilled to the time read under its lock. A bucket the sweep evicted between the
 // lookup and the lock is gone: spending from it would let the next request start from a
 // fresh full bucket, so the lookup is repeated until it holds the bucket in the map.
 func (l *limiter) use(key string, fn func(b *bucket)) {
@@ -79,7 +83,9 @@ func (l *limiter) use(key string, fn func(b *bucket)) {
 			b.mu.Unlock()
 			continue
 		}
-		l.refill(b, now)
+		// The clock is read under the lock: a time read before it may be older than the last
+		// refill another request made meanwhile.
+		l.refill(b, l.now())
 		fn(b)
 		b.mu.Unlock()
 		return

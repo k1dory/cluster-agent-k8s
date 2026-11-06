@@ -197,3 +197,31 @@ func TestReviewSweepCannotDetachABucketATakeIsUsing(t *testing.T) {
 		t.Fatal("a second attempt passed a burst of one: the first spent from an evicted bucket")
 	}
 }
+
+// Time is read under the bucket's lock: a take that read the clock, paused, and locked after
+// a later take must not refill backwards. Burst 2, 10s: A reads t=0 and pauses, B takes at
+// t=1 (one left), A then takes the last one; reading t=0 after B's t=1 used to subtract a
+// tenth of a token and refuse A.
+func TestReviewTakeDoesNotRefillBackwards(t *testing.T) {
+	t0 := time.Unix(1000, 0)
+	var mu sync.Mutex
+	now := t0
+	l := newLimiter(RateLimit{Burst: 2, Every: 10 * time.Second})
+	l.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	l.wait("a") // the bucket exists, full, at t0
+	var fired atomic.Bool
+	l.lookedUp = func() { // A has looked the bucket up, not locked it yet: B runs at t=1
+		if fired.Swap(true) {
+			return
+		}
+		mu.Lock()
+		now = t0.Add(time.Second)
+		mu.Unlock()
+		if d := l.take("a"); d != 0 {
+			t.Errorf("B: %v", d)
+		}
+	}
+	if d := l.take("a"); d != 0 {
+		t.Fatalf("A was refused with %v: the bucket was refilled backwards", d)
+	}
+}
