@@ -846,6 +846,9 @@ paths:
         may). Syncing the same commit again finds the same applies and writes nothing; a sync whose
         apply stopped is continued by syncing that commit again. The record comes back with the
         outcome and one entry per bundle (apply id, status, changes).
+        The files read are bounded: 1 MiB per file, 256 files, 16 MiB together. Sizes are read
+        before any content; a set over a bound is refused before anything is applied (422,
+        `invalid_plan`, error `… too large: …`).
       requestBody:
         required: false
         content:
@@ -864,7 +867,7 @@ paths:
         "409": { description: "An apply did not finish (failed or conflict; code `stopped`, with the record): sync the same commit again once the cause is fixed", content: { application/json: { schema: { $ref: "#/components/schemas/GitSyncError" } } } }
         "413": { description: "Body over the limit (4096 bytes; code `too_large`)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "422":
-          description: "A bundle is not valid, nothing of it written (code `invalid_plan`, with the record); the credential is not available (code `credential`, with the record); or `commit` is not a 40-digit SHA (code `invalid`, no record)"
+          description: "A bundle is not valid or the files are over the size bounds, nothing of it written (code `invalid_plan`, with the record); the credential is not available (code `credential`, with the record); or `commit` is not a 40-digit SHA (code `invalid`, no record)"
           content:
             application/json:
               schema:
