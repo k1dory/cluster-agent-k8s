@@ -149,8 +149,9 @@ func TestACPOutputRegressionHelper(t *testing.T) {
 			os.Exit(3)
 		}
 		f := &oversizedDiffAgent{fakeAgent: &fakeAgent{log: log}}
-		f.conn = acp.NewAgentSideConnection(f, os.Stdout, os.Stdin)
-		<-f.conn.Done()
+		c := acp.NewAgentSideConnection(f, os.Stdout, os.Stdin)
+		f.connection.Store(c)
+		<-c.Done()
 		_ = log.Close()
 		os.Exit(0) // no Go test footer on the ACP transport
 	case "runner":
@@ -185,7 +186,7 @@ func (f *oversizedDiffAgent) Prompt(ctx context.Context, p acp.PromptRequest) (a
 		})),
 		acp.UpdateAgentMessageText("after-large-diff"),
 	} {
-		if err := f.conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: update}); err != nil {
+		if err := f.conn().SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: update}); err != nil {
 			return acp.PromptResponse{}, err
 		}
 	}
