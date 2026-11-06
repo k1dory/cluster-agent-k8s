@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"agent-sandbox/internal/apikeys"
@@ -54,20 +55,28 @@ func TestReviewApplyRoutesWithoutAnApplier(t *testing.T) {
 	}
 }
 
-// staleRunning answers RunningRun with the run as it was when the conversation was opened.
+// staleRunning answers RunningRun, once a run is set, with that run as it was when the
+// conversation was opened. It is installed before anything runs in the background (a sandbox
+// start reads the store until after its last event), and armed later.
 type staleRunning struct {
 	store.Store
-	run *model.Run
+	run *atomic.Pointer[model.Run]
 }
 
-func (s staleRunning) RunningRun(context.Context, string) (*model.Run, error) {
-	cp := *s.run
+func (s staleRunning) RunningRun(ctx context.Context, id string) (*model.Run, error) {
+	r := s.run.Load()
+	if r == nil {
+		return s.Store.RunningRun(ctx, id)
+	}
+	cp := *r
 	return &cp, nil
 }
 
 // closeConversation answers with the run as CloseRun left it, not the copy read before.
 func TestReviewCloseConversationReturnsTheRunAfterTheClose(t *testing.T) {
 	s := newStack(t)
+	stale := &atomic.Pointer[model.Run]{}
+	s.orch.Store = staleRunning{Store: s.orch.Store, run: stale}
 	api, gw := s.platform.URL, s.gateway.URL
 	sb, hdr := agentOf(t, s, "close")
 	resp, body := call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", MessageRequest{Text: "hello"}, nil)
@@ -83,7 +92,7 @@ func TestReviewCloseConversationReturnsTheRunAfterTheClose(t *testing.T) {
 	if resp, body := call(t, "POST", gw+"/agent/runs/"+running.ID+"/finish", "", `{"exit_code":0}`, hdr); resp.StatusCode != 204 {
 		t.Fatalf("finish: %d %s", resp.StatusCode, body)
 	}
-	s.orch.Store = staleRunning{Store: s.orch.Store, run: &running}
+	stale.Store(&running)
 	resp, body = call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/messages/close", "alice-tok", nil, nil)
 	var got model.Run
 	_ = json.Unmarshal(body, &got)
