@@ -10,6 +10,7 @@
 cd "$ci_root"
 [ -n "${SANDBOX_TEST_POSTGRES_URL:-}" ] || ci_die "postgres: SANDBOX_TEST_POSTGRES_URL is required (postgres://user:password@host:5432/db?sslmode=disable)"
 export SANDBOX_TEST_POSTGRES_URL SANDBOX_TEST_REQUIRE_EXTERNAL=1
+go test ./internal/httpapi/ -count=1 -race
 go test ./internal/store/ -count=1 -race -v
 go test ./internal/gitsync/ -count=1 -race
 go test ./internal/ciauth/ -count=1 -race
