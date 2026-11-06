@@ -594,14 +594,16 @@ func (p *Postgres) DeleteSandbox(ctx context.Context, id string) error {
 
 const runCols = `id, sandbox_id, tenant, slug, task, status, exit_code, created_at, started_at, finished_at,
 	model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, turns,
-	agent_version, resume_of, session, agent_ref, agent_revision, environment_ref, environment_revision, mode`
+	agent_version, resume_of, session, agent_ref, agent_revision, environment_ref, environment_revision, mode,
+	attempt, claimed_by, claim_acked`
 
 func scanRun(row pgx.Row) (*model.Run, error) {
 	var r model.Run
 	u := &r.Usage
 	err := row.Scan(&r.ID, &r.SandboxID, &r.Tenant, &r.Slug, &r.Task, &r.Status, &r.ExitCode, &r.CreatedAt, &r.StartedAt, &r.FinishedAt,
 		&u.Model, &u.InputTokens, &u.OutputTokens, &u.CacheRead, &u.CacheWrite, &u.CostUSD, &u.Turns,
-		&r.AgentVersion, &r.ResumeOf, &r.Session, &r.AgentRef, &r.AgentRevision, &r.EnvironmentRef, &r.EnvironmentRevision, &r.Mode)
+		&r.AgentVersion, &r.ResumeOf, &r.Session, &r.AgentRef, &r.AgentRevision, &r.EnvironmentRef, &r.EnvironmentRevision, &r.Mode,
+		&r.Attempt, &r.ClaimedBy, &r.ClaimAcked)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -613,10 +615,11 @@ func scanRun(row pgx.Row) (*model.Run, error) {
 
 func (p *Postgres) CreateRun(ctx context.Context, r *model.Run) error {
 	u := r.Usage
-	_, err := p.pool.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
+	_, err := p.pool.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)`,
 		r.ID, r.SandboxID, r.Tenant, r.Slug, r.Task, r.Status, r.ExitCode, r.CreatedAt, r.StartedAt, r.FinishedAt,
 		u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
-		r.AgentVersion, r.ResumeOf, r.Session, r.AgentRef, r.AgentRevision, r.EnvironmentRef, r.EnvironmentRevision, r.Mode)
+		r.AgentVersion, r.ResumeOf, r.Session, r.AgentRef, r.AgentRevision, r.EnvironmentRef, r.EnvironmentRevision, r.Mode,
+		r.Attempt, r.ClaimedBy, r.ClaimAcked)
 	return err
 }
 
@@ -666,29 +669,7 @@ func (p *Postgres) SetRunSession(ctx context.Context, id, session string) error 
 }
 
 func (p *Postgres) SettleRun(ctx context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error) {
-	states := make([]string, len(from))
-	for i, f := range from {
-		states[i] = string(f)
-	}
-	var u model.Usage
-	if usage != nil {
-		u = *usage
-	}
-	r, err := scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, exit_code=$4, finished_at=$5,
-		model = CASE WHEN $6 THEN $7 ELSE model END,
-		input_tokens = CASE WHEN $6 THEN $8 ELSE input_tokens END,
-		output_tokens = CASE WHEN $6 THEN $9 ELSE output_tokens END,
-		cache_read_tokens = CASE WHEN $6 THEN $10 ELSE cache_read_tokens END,
-		cache_write_tokens = CASE WHEN $6 THEN $11 ELSE cache_write_tokens END,
-		cost_usd = CASE WHEN $6 THEN $12 ELSE cost_usd END,
-		turns = CASE WHEN $6 THEN $13 ELSE turns END
-		WHERE id=$1 AND status = ANY($2) RETURNING `+runCols,
-		id, states, to, exitCode, finishedAt, usage != nil,
-		u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns))
-	if errors.Is(err, ErrNotFound) {
-		return nil, p.runExists(ctx, id)
-	}
-	return r, err
+	return p.SettleRunWithEvents(ctx, Settle{RunID: id, From: from, To: to, ExitCode: exitCode, FinishedAt: finishedAt, Usage: usage})
 }
 
 func (p *Postgres) queryRuns(ctx context.Context, q string, args ...any) ([]*model.Run, error) {
@@ -743,7 +724,7 @@ func (p *Postgres) ReleaseRun(ctx context.Context, runID string) error {
 
 func (p *Postgres) ClaimQueuedRun(ctx context.Context, sandboxID string, startedAt time.Time) (*model.Run, error) {
 	// One statement: pick the oldest queued run, skipping rows another poller is claiming.
-	return scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4 WHERE id = (
+	return scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4, attempt=attempt+1 WHERE id = (
 			SELECT id FROM runs WHERE sandbox_id=$1 AND status=$2 ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED)
 		RETURNING `+runCols, sandboxID, model.RunQueued, model.RunRunning, startedAt))
 }
@@ -756,9 +737,10 @@ func (p *Postgres) QueuedRun(ctx context.Context, sandboxID string) (*model.Run,
 func (p *Postgres) ClaimRun(ctx context.Context, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, error) {
 	r, err := scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4,
 		session = CASE WHEN session = '' THEN $5 ELSE session END,
-		agent_version=$6, agent_ref=$7, agent_revision=$8, environment_ref=$9, environment_revision=$10
+		agent_version=$6, agent_ref=$7, agent_revision=$8, environment_ref=$9, environment_revision=$10,
+		attempt=attempt+1, claimed_by=$11, claim_acked=false
 		WHERE id=$1 AND status=$2 RETURNING `+runCols, runID, model.RunQueued, model.RunRunning, startedAt, session,
-		stamp.AgentVersion, stamp.AgentRef, stamp.AgentRevision, stamp.EnvironmentRef, stamp.EnvironmentRevision))
+		stamp.AgentVersion, stamp.AgentRef, stamp.AgentRevision, stamp.EnvironmentRef, stamp.EnvironmentRevision, stamp.Owner))
 	if errors.Is(err, ErrNotFound) {
 		if _, gerr := p.GetRun(ctx, runID); gerr != nil {
 			return nil, gerr
@@ -2036,4 +2018,214 @@ func (p *Postgres) FirstUseAPIKey(ctx context.Context, id string, at time.Time) 
 		return err
 	}
 	return ErrKeyInactive
+}
+
+// errNoRunMatch: a conditional run write matched no row; the caller tells why.
+var errNoRunMatch = errors.New("no run matched")
+
+// insertEventsTx appends events of one run inside tx, stamped with the run's tenant and slug
+// when they have none, and wakes every replica's listener once (NOTIFY is delivered at commit).
+func insertEventsTx(ctx context.Context, tx pgx.Tx, tenant, slug string, evs []*model.Event) error {
+	if len(evs) == 0 {
+		return nil
+	}
+	b := &pgx.Batch{}
+	for _, e := range evs {
+		if e.At.IsZero() {
+			e.At = time.Now()
+		}
+		if e.Tenant == "" && e.Slug == "" {
+			e.Tenant, e.Slug = tenant, slug
+		}
+		b.Queue(`INSERT INTO events (sandbox_id, tenant, slug, run_id, type, data, at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
+			e.SandboxID, e.Tenant, e.Slug, e.RunID, e.Type, e.Data, e.At).QueryRow(func(row pgx.Row) error { return row.Scan(&e.ID) })
+	}
+	if err := tx.SendBatch(ctx, b).Close(); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `SELECT pg_notify('`+eventsChannel+`', $1)`, strconv.FormatInt(evs[len(evs)-1].ID, 10))
+	return err
+}
+
+func (p *Postgres) AppendRunOutput(ctx context.Context, b *OutputBatch) (*OutputResult, error) {
+	chain := outputChain(b.Lines)
+	var res *OutputResult
+	err := pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		res = &OutputResult{}
+		var sandbox, tenant, slug string
+		var status model.RunStatus
+		var attempt int
+		// The run's row lock serialises the batches of a run: two replicas handling the same
+		// batch at once (a retry racing the original) see each other's progress.
+		err := tx.QueryRow(ctx, `SELECT sandbox_id, tenant, slug, status, attempt FROM runs WHERE id=$1 FOR UPDATE`, b.RunID).
+			Scan(&sandbox, &tenant, &slug, &status, &attempt)
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && sandbox != b.SandboxID {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if b.Attempt > 0 && b.Attempt != attempt {
+			return ErrStaleAttempt
+		}
+		if b.BatchID != "" {
+			var n int
+			var h string
+			err := tx.QueryRow(ctx, `SELECT lines, hash FROM run_output_batches WHERE run_id=$1 AND batch_id=$2`, b.RunID, b.BatchID).Scan(&n, &h)
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+			case err != nil:
+				return err
+			case n > len(b.Lines) || chain[n] != h:
+				return ErrBatchMismatch
+			default:
+				res.Skipped = n
+			}
+		}
+		rest := b.Lines[res.Skipped:]
+		if len(rest) == 0 {
+			return nil
+		}
+		// Usage as RecordRunUsage would apply it line by line; a run already done or failed has
+		// its final usage and takes none (no error: the lines are still stored).
+		if u, replace, ok := batchUsage(rest); ok && status != model.RunDone && status != model.RunFailed {
+			if _, err := tx.Exec(ctx, `UPDATE runs SET
+				model = CASE WHEN $2 THEN $3 WHEN $3 = '' THEN model ELSE $3 END,
+				input_tokens = CASE WHEN $2 THEN 0 ELSE input_tokens END + $4,
+				output_tokens = CASE WHEN $2 THEN 0 ELSE output_tokens END + $5,
+				cache_read_tokens = CASE WHEN $2 THEN 0 ELSE cache_read_tokens END + $6,
+				cache_write_tokens = CASE WHEN $2 THEN 0 ELSE cache_write_tokens END + $7,
+				cost_usd = CASE WHEN $2 THEN 0 ELSE cost_usd END + $8,
+				turns = CASE WHEN $2 THEN 0 ELSE turns END + $9
+				WHERE id=$1`,
+				b.RunID, replace, u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns); err != nil {
+				return err
+			}
+		}
+		if s := batchSession(rest); s != "" {
+			if _, err := tx.Exec(ctx, `UPDATE runs SET session=$2 WHERE id=$1 AND session <> $2`, b.RunID, s); err != nil {
+				return err
+			}
+		}
+		if b.BatchID != "" {
+			if _, err := tx.Exec(ctx, `INSERT INTO run_output_batches (run_id, batch_id, lines, hash, created_at) VALUES ($1,$2,$3,$4,now())
+				ON CONFLICT (run_id, batch_id) DO UPDATE SET lines=EXCLUDED.lines, hash=EXCLUDED.hash`,
+				b.RunID, b.BatchID, len(b.Lines), chain[len(b.Lines)]); err != nil {
+				return err
+			}
+		}
+		// The events last: the listeners of other replicas read events in id order, and an id
+		// taken early in a transaction that commits late is one they may already have read past.
+		at := time.Now()
+		for _, l := range rest {
+			res.Events = append(res.Events, &model.Event{SandboxID: b.SandboxID, RunID: b.RunID, Type: model.EventRunOutput, Data: l.Data, At: at})
+		}
+		if err := insertEventsTx(ctx, tx, tenant, slug, res.Events); err != nil {
+			return err
+		}
+		res.Accepted = len(rest)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if b.BatchID != "" && res.Skipped == 0 && res.Accepted > 0 {
+		// A new batch makes room for itself: progress older than any retry is dropped.
+		_, _ = p.pool.Exec(ctx, `DELETE FROM run_output_batches WHERE created_at < now() - $1::interval`, outputBatchTTL.String())
+	}
+	return res, nil
+}
+
+func (p *Postgres) SettleRunWithEvents(ctx context.Context, s Settle) (*model.Run, error) {
+	states := make([]string, len(s.From))
+	for i, f := range s.From {
+		states[i] = string(f)
+	}
+	var u model.Usage
+	if s.Usage != nil {
+		u = *s.Usage
+	}
+	var out *model.Run
+	err := pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		r, err := scanRun(tx.QueryRow(ctx, `UPDATE runs SET status=$3, exit_code=$4, finished_at=$5,
+			model = CASE WHEN $6 THEN $7 ELSE model END,
+			input_tokens = CASE WHEN $6 THEN $8 ELSE input_tokens END,
+			output_tokens = CASE WHEN $6 THEN $9 ELSE output_tokens END,
+			cache_read_tokens = CASE WHEN $6 THEN $10 ELSE cache_read_tokens END,
+			cache_write_tokens = CASE WHEN $6 THEN $11 ELSE cache_write_tokens END,
+			cost_usd = CASE WHEN $6 THEN $12 ELSE cost_usd END,
+			turns = CASE WHEN $6 THEN $13 ELSE turns END
+			WHERE id=$1 AND status = ANY($2) AND ($14 = 0 OR attempt = $14) RETURNING `+runCols,
+			s.RunID, states, s.To, s.ExitCode, s.FinishedAt, s.Usage != nil,
+			u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns, s.Attempt))
+		if errors.Is(err, ErrNotFound) {
+			return errNoRunMatch
+		}
+		if err != nil {
+			return err
+		}
+		out = r
+		return insertEventsTx(ctx, tx, r.Tenant, r.Slug, s.Events)
+	})
+	if errors.Is(err, errNoRunMatch) {
+		cur, gerr := p.GetRun(ctx, s.RunID)
+		if gerr != nil {
+			return nil, gerr
+		}
+		if s.Attempt > 0 && cur.Attempt != s.Attempt {
+			return nil, ErrStaleAttempt
+		}
+		return nil, ErrConflict
+	}
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (p *Postgres) ReclaimRun(ctx context.Context, sandboxID, owner string) (*model.Run, error) {
+	if owner == "" {
+		return nil, ErrNotFound
+	}
+	return scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET attempt=attempt+1 WHERE id = (
+			SELECT id FROM runs WHERE sandbox_id=$1 AND status=$2 AND claimed_by=$3 AND NOT claim_acked
+			ORDER BY created_at, id LIMIT 1 FOR UPDATE)
+		RETURNING `+runCols, sandboxID, model.RunRunning, owner))
+}
+
+func (p *Postgres) AckRunClaim(ctx context.Context, runID string, attempt int) error {
+	tag, err := p.pool.Exec(ctx, `UPDATE runs SET claim_acked=true WHERE id=$1 AND attempt=$2`, runID, attempt)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		if _, err := p.GetRun(ctx, runID); err != nil {
+			return err
+		}
+		return ErrStaleAttempt
+	}
+	return nil
+}
+
+func (p *Postgres) EnsureRunEvent(ctx context.Context, e *model.Event) (bool, error) {
+	added := false
+	err := pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		var tenant, slug string
+		// The run's row lock: two replicas repairing the same run append one event.
+		err := tx.QueryRow(ctx, `SELECT tenant, slug FROM runs WHERE id=$1 FOR UPDATE`, e.RunID).Scan(&tenant, &slug)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM events WHERE sandbox_id=$1 AND type=$2 AND run_id=$3)`,
+			e.SandboxID, e.Type, e.RunID).Scan(&exists); err != nil || exists {
+			return err
+		}
+		added = true
+		return insertEventsTx(ctx, tx, tenant, slug, []*model.Event{e})
+	})
+	return added && err == nil, err
 }

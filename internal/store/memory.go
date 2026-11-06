@@ -36,6 +36,7 @@ type Memory struct {
 	oauth     map[string]*memOAuth      // tenant|name
 	nextInst  int
 	nextEvent int64
+	batches   map[string]memBatch // run|batch id → progress (Postgres: run_output_batches)
 }
 
 // NewMemory returns an empty in-memory store.
@@ -427,22 +428,8 @@ func (m *Memory) SetRunSession(_ context.Context, id, session string) error {
 	return nil
 }
 
-func (m *Memory) SettleRun(_ context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	r, ok := m.runs[id]
-	if !ok {
-		return nil, ErrNotFound
-	}
-	if !slices.Contains(from, r.Status) {
-		return nil, ErrConflict
-	}
-	r.Status, r.ExitCode, r.FinishedAt = to, exitCode, &finishedAt
-	if usage != nil {
-		r.Usage = *usage
-	}
-	out := *r
-	return &out, nil
+func (m *Memory) SettleRun(ctx context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error) {
+	return m.SettleRunWithEvents(ctx, Settle{RunID: id, From: from, To: to, ExitCode: exitCode, FinishedAt: finishedAt, Usage: usage})
 }
 
 func (m *Memory) runsOf(sandboxID string) []*model.Run {
@@ -470,6 +457,7 @@ func (m *Memory) ClaimQueuedRun(_ context.Context, sandboxID string, startedAt t
 		if c.Status == model.RunQueued {
 			r := m.runs[c.ID]
 			r.Status, r.StartedAt = model.RunRunning, &startedAt
+			r.Attempt++
 			out := *r
 			return &out, nil
 		}
@@ -528,6 +516,7 @@ func (m *Memory) ClaimRun(_ context.Context, runID string, startedAt time.Time, 
 		return nil, ErrConflict
 	}
 	r.Status, r.StartedAt = model.RunRunning, &startedAt
+	r.Attempt, r.ClaimedBy, r.ClaimAcked = r.Attempt+1, stamp.Owner, false
 	if r.Session == "" {
 		r.Session = session
 	}
@@ -1736,3 +1725,153 @@ var (
 	_ Store = (*Memory)(nil)
 	_ Store = (*Postgres)(nil)
 )
+
+type memBatch struct {
+	lines int
+	hash  string
+	at    time.Time
+}
+
+// appendEventLocked is AppendEvent under the lock already held.
+func (m *Memory) appendEventLocked(e *model.Event) {
+	m.nextEvent++
+	e.ID = m.nextEvent
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
+	c := *e
+	m.events = append(m.events, &c)
+}
+
+func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResult, error) {
+	chain := outputChain(b.Lines)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[b.RunID]
+	if !ok || r.SandboxID != b.SandboxID {
+		return nil, ErrNotFound
+	}
+	if b.Attempt > 0 && b.Attempt != r.Attempt {
+		return nil, ErrStaleAttempt
+	}
+	res := &OutputResult{}
+	key := b.RunID + "|" + b.BatchID
+	if b.BatchID != "" {
+		if rec, ok := m.batches[key]; ok {
+			if rec.lines > len(b.Lines) || chain[rec.lines] != rec.hash {
+				return nil, ErrBatchMismatch
+			}
+			res.Skipped = rec.lines
+		}
+	}
+	rest := b.Lines[res.Skipped:]
+	if len(rest) == 0 {
+		return res, nil
+	}
+	at := time.Now()
+	for _, l := range rest {
+		e := &model.Event{SandboxID: b.SandboxID, Tenant: r.Tenant, Slug: r.Slug, RunID: b.RunID, Type: model.EventRunOutput, Data: l.Data, At: at}
+		m.appendEventLocked(e)
+		res.Events = append(res.Events, e)
+	}
+	if u, replace, ok := batchUsage(rest); ok && r.Status != model.RunDone && r.Status != model.RunFailed {
+		if replace {
+			r.Usage = u
+		} else {
+			r.Usage.Add(u)
+		}
+	}
+	if s := batchSession(rest); s != "" {
+		r.Session = s
+	}
+	if b.BatchID != "" {
+		if m.batches == nil {
+			m.batches = map[string]memBatch{}
+		}
+		for k, v := range m.batches {
+			if v.at.Before(at.Add(-outputBatchTTL)) {
+				delete(m.batches, k)
+			}
+		}
+		m.batches[key] = memBatch{lines: len(b.Lines), hash: chain[len(b.Lines)], at: at}
+	}
+	res.Accepted = len(rest)
+	return res, nil
+}
+
+func (m *Memory) SettleRunWithEvents(_ context.Context, s Settle) (*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[s.RunID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if s.Attempt > 0 && s.Attempt != r.Attempt {
+		return nil, ErrStaleAttempt
+	}
+	if !slices.Contains(s.From, r.Status) {
+		return nil, ErrConflict
+	}
+	r.Status, r.ExitCode, r.FinishedAt = s.To, s.ExitCode, &s.FinishedAt
+	if s.Usage != nil {
+		r.Usage = *s.Usage
+	}
+	for _, e := range s.Events {
+		if e.Tenant == "" && e.Slug == "" {
+			e.Tenant, e.Slug = r.Tenant, r.Slug
+		}
+		m.appendEventLocked(e)
+	}
+	out := *r
+	return &out, nil
+}
+
+func (m *Memory) ReclaimRun(_ context.Context, sandboxID, owner string) (*model.Run, error) {
+	if owner == "" {
+		return nil, ErrNotFound
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.runsOf(sandboxID) {
+		if c.Status == model.RunRunning && c.ClaimedBy == owner && !c.ClaimAcked {
+			r := m.runs[c.ID]
+			r.Attempt++
+			out := *r
+			return &out, nil
+		}
+	}
+	return nil, ErrNotFound
+}
+
+func (m *Memory) AckRunClaim(_ context.Context, runID string, attempt int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[runID]
+	if !ok {
+		return ErrNotFound
+	}
+	if r.Attempt != attempt {
+		return ErrStaleAttempt
+	}
+	r.ClaimAcked = true
+	return nil
+}
+
+func (m *Memory) EnsureRunEvent(_ context.Context, e *model.Event) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[e.RunID]
+	if !ok {
+		return false, ErrNotFound
+	}
+	for _, x := range m.events {
+		if x.SandboxID == e.SandboxID && x.RunID == e.RunID && x.Type == e.Type {
+			return false, nil
+		}
+	}
+	if e.Tenant == "" && e.Slug == "" {
+		e.Tenant, e.Slug = r.Tenant, r.Slug
+	}
+	m.appendEventLocked(e)
+	return true, nil
+}

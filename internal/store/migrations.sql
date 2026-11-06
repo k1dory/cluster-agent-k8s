@@ -294,6 +294,25 @@ ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS run integer NOT NULL DEFAULT 0;
 -- generation they were issued under, and older ones are refused.
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS preview_gen bigint NOT NULL DEFAULT 0;
 
+-- step 9: run delivery
+-- attempt counts the times a run was handed to a runner; claimed_by/claim_acked let a claim
+-- whose response was lost be handed to the same instance again (and to no other).
+ALTER TABLE runs
+    ADD COLUMN IF NOT EXISTS attempt integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS claimed_by text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS claim_acked boolean NOT NULL DEFAULT false;
+-- The progress of each X-Batch-Id of a run's output: how many of its lines are stored and the
+-- running hash of those lines, written in the transaction that stores them.
+CREATE TABLE IF NOT EXISTS run_output_batches (
+    run_id     text NOT NULL,
+    batch_id   text NOT NULL,
+    lines      integer NOT NULL,
+    hash       text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (run_id, batch_id)
+);
+CREATE INDEX IF NOT EXISTS run_output_batches_created ON run_output_batches (created_at);
+
 -- every start: repairs of rows a replica of an older release may still write
 -- No DDL here: these run on every start, after the steps, because during a rolling update an
 -- older replica keeps writing the old form after the step that introduced the new one ran.

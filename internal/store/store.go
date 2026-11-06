@@ -431,6 +431,7 @@ type Store interface {
 	GitJobs
 	TokenUses
 	Atomics
+	RunDelivery
 
 	Close() error
 }
@@ -446,6 +447,10 @@ type RunStamp struct {
 	AgentRevision       int
 	EnvironmentRef      string
 	EnvironmentRevision int
+	// Owner is the instance the run is handed to (its pod's identity number): a claim whose
+	// response is lost is handed to the same owner again (RunDelivery.ReclaimRun), never to
+	// another. "" for a caller that does not say (it is then never handed out again).
+	Owner string
 }
 
 // IdempotencyTTL is how long a stored response is replayed.
