@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"agent-sandbox/internal/events"
@@ -17,6 +18,9 @@ type sseItem struct {
 	ID    int64
 	Event string
 	Data  any
+	// Cursor, when set, is the frame's SSE id instead of ID: what the client must hand back
+	// to resume (a bounded trace adds its replay boundary).
+	Cursor string
 }
 
 // ssePage reads the durable log after a cursor: the frames to send and the cursor to continue
@@ -72,7 +76,11 @@ func streamSSE(w http.ResponseWriter, r *http.Request, open sseOpen, keepalive t
 				if err != nil {
 					return err
 				}
-				if _, err := fmt.Fprintf(w, "id: %d\nevent: %s\ndata: %s\n\n", it.ID, it.Event, b); err != nil {
+				id := it.Cursor
+				if id == "" {
+					id = strconv.FormatInt(it.ID, 10)
+				}
+				if _, err := fmt.Fprintf(w, "id: %s\nevent: %s\ndata: %s\n\n", id, it.Event, b); err != nil {
 					return errWrite
 				}
 			}

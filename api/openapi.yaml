@@ -1603,7 +1603,10 @@ paths:
         an `Egress` object). `run.output` is excluded unless `type` lists it or is `all`.
         `stream=true` switches to SSE and keeps following live events after the replay;
         reconnect with `Last-Event-ID`. A stream that cannot read the log ends with an
-        `event: error` frame (an `Error` body).
+        `event: error` frame (an `Error` body). With `to`, the replay keeps the window up to the
+        newest event when the stream began and everything after that is followed live; such a
+        stream's frames are named `<event id>:<boundary>`, and `Last-Event-ID` takes that value
+        back as sent, so a resume keeps the boundary of the stream it continues.
       parameters:
         - { name: tenant, in: query, schema: { type: string } }
         - { name: slug, in: query, schema: { type: string } }

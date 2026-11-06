@@ -62,7 +62,7 @@ func (s *stallWriter) String() string {
 	return s.buf.String()
 }
 
-var frameID = regexp.MustCompile(`(?m)^id: (\d+)$`)
+var frameID = regexp.MustCompile(`(?m)^id: (\d+)(?::\d+)?$`)
 
 func frameIDs(body string) []int64 {
 	var out []int64

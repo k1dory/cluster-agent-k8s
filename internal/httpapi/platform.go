@@ -967,13 +967,28 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		from = now.Add(-d)
 	}
 	after := q.int64("after", 0)
+	// A bounded stream's frames carry `<event id>:<replay boundary>`: a resume keeps the
+	// boundary of the stream it resumes, so what that stream followed live past ?to is not
+	// re-judged by the window against a newer head (which would skip it for good).
+	resumeHead := int64(-1)
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
-		n, err := strconv.ParseInt(v, 10, 64)
+		id, head, bounded := strings.Cut(v, ":")
+		n, err := strconv.ParseInt(id, 10, 64)
+		var h int64
+		if err == nil && bounded {
+			h, err = strconv.ParseInt(head, 10, 64)
+			if err == nil && h < 0 {
+				err = errors.New("negative")
+			}
+		}
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, errors.New("Last-Event-ID must be an integer"))
+			writeErr(w, http.StatusBadRequest, errors.New("Last-Event-ID must be an event id, or <event id>:<boundary> as a bounded trace sends it"))
 			return
 		}
 		after = n
+		if bounded {
+			resumeHead = h
+		}
 	}
 	limit := q.limit(500, 5000)
 	stream := q.boolean("stream", false)
@@ -1022,9 +1037,21 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 	var head int64
 	live := f
 	live.To = time.Time{}
+	// bounded names a bounded stream's frames by event id and boundary (see resumeHead).
+	bounded := func(items []sseItem) []sseItem {
+		if f.To.IsZero() || head == math.MaxInt64 {
+			return items
+		}
+		for i := range items {
+			items[i].Cursor = fmt.Sprintf("%d:%d", items[i].ID, head)
+		}
+		return items
+	}
 	open := func(ctx context.Context) (<-chan struct{}, func(), error) {
 		var err error
-		if head, err = p.traceHead(ctx, f); err != nil {
+		if resumeHead >= 0 && !f.To.IsZero() {
+			head = resumeHead
+		} else if head, err = p.traceHead(ctx, f); err != nil {
 			return nil, nil, err
 		}
 		wake, cancel := p.Hub.Wake(events.All, f.Types...)
@@ -1035,7 +1062,7 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 			g := live
 			g.AfterID, g.Limit = after, ssePageSize
 			evs, err := p.Orch.Store.QueryEvents(ctx, g)
-			return eventItems(evs), lastID(evs, after), err
+			return bounded(eventItems(evs)), lastID(evs, after), err
 		}
 		// The replay: the window, and ids up to the head only. An event above the head is
 		// live whatever its time, and ids and times disagree across replicas: H+1 outside the
@@ -1059,7 +1086,7 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 			// The window holds nothing more up to the head: live from the head on.
 			next = head
 		}
-		return eventItems(evs[:n]), next, nil
+		return bounded(eventItems(evs[:n])), next, nil
 	})
 }
 
