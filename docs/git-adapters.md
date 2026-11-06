@@ -209,7 +209,8 @@ events* including *synchronized* (new commits on the head). From then on:
   from the request's own ref (`refs/pull/N/head`, `refs/merge-requests/N/head`), the comment
   and the status are posted with the repository's `credential` to the API of the registered
   repository's host, never to an address the delivery names (GitHub's API or `/api/v3`,
-  GitLab's `/api/v4`, Forgejo's and Gitea's `/api/v1`: the credential is an access token with
+  GitLab's `/api/v4`, Forgejo's and Gitea's `/api/v1`, under the subpath the server is
+  mounted at when its repository URL has one, as `https://host/code/acme/config.git`: the credential is an access token with
   write access to the repository's issues and statuses);
 - everything else (another branch, a deleted ref, a closed request, an event the platform
   does not act on, a delivery naming another repository) is recorded as ignored with the

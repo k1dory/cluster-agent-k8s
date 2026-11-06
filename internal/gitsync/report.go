@@ -40,7 +40,7 @@ const StatusContext = "agent-sandbox/plan"
 // Target is one pull (merge) request at a provider's API.
 type Target struct {
 	Provider string
-	APIBase  string // https://api.github.com, https://ghe.example/api/v3, https://gitlab.example/api/v4, https://forgejo.example/api/v1
+	APIBase  string // https://api.github.com, https://ghe.example/api/v3, https://gitlab.example/api/v4, https://forgejo.example[/subpath]/api/v1
 	Repo     string // owner/name (GitHub, Forgejo) or the project path (GitLab)
 	Number   int
 	SHA      string
@@ -51,9 +51,10 @@ type Target struct {
 // its credential, never from the delivery: a webhook cannot send the platform's comments
 // anywhere but to the registered repository's own server. The delivery's provider only picks
 // the API on that server: GitHub's (api.github.com, or /api/v3 on GitHub Enterprise Server),
-// GitLab's (/api/v4) or Forgejo's and Gitea's (/api/v1). A pull request that names no provider
-// (a job persisted before it was recorded) is told by its head ref, which cannot tell Forgejo
-// from GitHub: such a job is taken for GitHub's, as it always was.
+// GitLab's (/api/v4) or Forgejo's and Gitea's (/api/v1, under the subpath the server is mounted
+// at, if any). A pull request that names no provider (a job persisted before it was recorded)
+// is told by its head ref, which cannot tell Forgejo from GitHub: such a job is taken for
+// GitHub's, as it always was.
 func TargetOf(r Remote, pr PullRequest) (Target, error) {
 	u, err := url.Parse(r.URL)
 	if err != nil || u.Host == "" {
@@ -87,6 +88,16 @@ func TargetOf(r Remote, pr PullRequest) (Target, error) {
 	case ProviderGitLab:
 		t.APIBase = origin + "/api/v4"
 	case ProviderForgejo:
+		// Forgejo and Gitea have no nested groups: a repository is always owner/name, the last
+		// two segments of its path. Whatever comes before them is the subpath the server is
+		// mounted under (ROOT_URL https://host/code/), and its API lives under it as well:
+		// https://host/code/acme/config.git is https://host/code/api/v1/repos/acme/config.
+		segs := strings.Split(repo, "/")
+		prefix := strings.Join(segs[:len(segs)-2], "/")
+		t.Repo = strings.Join(segs[len(segs)-2:], "/")
+		if prefix != "" {
+			origin += "/" + prefix
+		}
 		t.APIBase = origin + "/api/v1"
 	default:
 		return Target{}, fmt.Errorf("unknown provider %q", provider)
