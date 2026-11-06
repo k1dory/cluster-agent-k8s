@@ -127,9 +127,10 @@ func TestTraceHeadFailureIsAnErrorFrameRound2(t *testing.T) {
 	first := appendAt(t, s, t0, "seen before the outage")
 	second := appendAt(t, s, t0.Add(time.Minute), "after the cursor")
 	appendAt(t, s, t0.Add(time.Hour), "outside the window")
-	down := true
+	var down atomic.Bool // read by the handler: atomic, so a stream outliving its request cannot race the flip
+	down.Store(true)
 	s.orch.Store = &hookedHead{Store: mem, head: func(ctx context.Context) (int64, error) {
-		if down {
+		if down.Load() {
 			return 0, errors.New("connection reset")
 		}
 		return mem.(store.EventHead).LastEventID(ctx)
@@ -148,7 +149,7 @@ func TestTraceHeadFailureIsAnErrorFrameRound2(t *testing.T) {
 	if code != 200 || !strings.Contains(body, "event: error\n") || len(frameIDs(body)) != 0 {
 		t.Fatalf("a failed head read: %d %q", code, body)
 	}
-	down = false
+	down.Store(false)
 	code, body = get()
 	if ids := frameIDs(body); code != 200 || len(ids) != 1 || ids[0] != second {
 		t.Fatalf("the reconnect from %d: %d %v %q", first, code, ids, body)
