@@ -667,6 +667,14 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 	if p.TTLFromToken {
 		req.ExpiresBefore = pr.expiresBefore()
 	}
+	// A keyed retry after an earlier attempt answers with what that one created. Before the
+	// inputs of a fresh creation are resolved: the sandbox carries its resolved launch, so an
+	// agent or environment deleted (or a tenant restricted) since it was created must not
+	// fail the retry that only has to find it. After the tenant checks: the key is the
+	// tenant's, and nothing is answered to a caller who could not have made the request.
+	if p.keyedSandbox(w, r, false) {
+		return
+	}
 	if req.AgentRef != "" {
 		if err := p.resolveAgentRef(r, &req); err != nil {
 			writeCatalogErr(w, err)
@@ -676,10 +684,6 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 		// The bare-slug path runs the server's default environment; a tenant confined to listed
 		// environments (tenant settings) must create through an agent that names one of them.
 		writeErr(w, http.StatusForbidden, errors.New("tenant "+req.Tenant+" is confined to its allowed environments: create with agent_ref"))
-		return
-	}
-	// A keyed retry after an earlier attempt answers with what that one created.
-	if p.keyedSandbox(w, r, false) {
 		return
 	}
 	sb, err := p.Orch.Create(r.Context(), req)
@@ -811,14 +815,14 @@ func (p *Platform) createRun(w http.ResponseWriter, r *http.Request) {
 		writeBodyErr(w, err)
 		return
 	}
-	if run, ok := p.keyedRun(r, r.PathValue("id"), false); ok {
-		writeJSON(w, http.StatusAccepted, run)
+	if run, ok, err := p.keyedRun(r, r.PathValue("id"), false); err != nil || ok {
+		writeKeyedRun(w, run, err)
 		return
 	}
 	run, err := p.Orch.CreateRun(r.Context(), r.PathValue("id"), req.Task)
 	if err != nil {
-		if run, ok := p.keyedRun(r, r.PathValue("id"), true); ok {
-			writeJSON(w, http.StatusAccepted, run)
+		if run, ok, kerr := p.keyedRun(r, r.PathValue("id"), true); kerr != nil || ok {
+			writeKeyedRun(w, run, kerr)
 			return
 		}
 		writeOrchErr(w, err)
@@ -1526,20 +1530,37 @@ func (p *Platform) keyedSandbox(w http.ResponseWriter, r *http.Request, failed b
 }
 
 // keyedRun is the run an earlier attempt of this keyed request queued in the sandbox, if any.
-func (p *Platform) keyedRun(r *http.Request, sandboxID string, failed bool) (*model.Run, bool) {
+// An error means the recovery could not be finished (the run or its sandbox could not be
+// read): the request is answered as failed, so the key is released, not stored as a success
+// whose wake may never come, and the retry recovers again.
+func (p *Platform) keyedRun(r *http.Request, sandboxID string, failed bool) (*model.Run, bool, error) {
 	seed, ok := keyedResult(r, failed)
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
 	ctx, cancel := recoveryContext(r)
 	defer cancel()
 	run, err := p.Orch.Store.GetRun(ctx, orchestrator.KeyedID(seed, "run"))
-	if err != nil || run.SandboxID != sandboxID {
-		return nil, false
+	if errors.Is(err, store.ErrNotFound) || err == nil && run.SandboxID != sandboxID {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
 	}
 	// The attempt that queued it may have died before waking the sandbox for it.
-	p.Orch.WakeForKeyedRun(ctx, run)
-	return run, true
+	if err := p.Orch.WakeForKeyedRun(ctx, run); err != nil {
+		return nil, false, err
+	}
+	return run, true, nil
+}
+
+// writeKeyedRun answers with the run keyedRun recovered, or with its error.
+func writeKeyedRun(w http.ResponseWriter, run *model.Run, err error) {
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, run)
 }
 
 // recoveryContext is where a keyed request looks for (and finishes) what an earlier attempt

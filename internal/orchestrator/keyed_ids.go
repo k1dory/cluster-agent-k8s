@@ -72,18 +72,50 @@ func keyedSeed(ctx context.Context) string {
 // WakeForKeyedRun wakes the sandbox of a run an earlier attempt of a keyed request queued, when
 // the run still waits and the sandbox sleeps: that attempt may have died between the insert and
 // its wake, and nothing else wakes a sandbox for queued work.
-func (o *Orchestrator) WakeForKeyedRun(ctx context.Context, run *model.Run) {
-	if o.keyedRunWaits(ctx, run) {
+// An error means the sandbox could not be inspected: the caller must answer as failed (not
+// store a success the wake may never follow).
+func (o *Orchestrator) WakeForKeyedRun(ctx context.Context, run *model.Run) error {
+	waits, err := o.keyedRunWaits(ctx, run)
+	if err != nil {
+		return err
+	}
+	if waits {
 		o.wakeForRun(ctx, run.SandboxID, run.ID)
 	}
+	return nil
 }
 
-func (o *Orchestrator) keyedRunWaits(ctx context.Context, run *model.Run) bool {
+func (o *Orchestrator) keyedRunWaits(ctx context.Context, run *model.Run) (bool, error) {
 	if run.Status != model.RunQueued {
-		return false
+		return false, nil
 	}
 	sb, err := o.Store.GetSandbox(ctx, run.SandboxID)
-	return err == nil && (sb.Status == model.StatusSleeping || sb.Status == model.StatusError)
+	if err != nil {
+		return false, err
+	}
+	return sb.Status == model.StatusSleeping || sb.Status == model.StatusError, nil
+}
+
+// insertRun records a queued run and its run.queued event. A keyed request's run (the one
+// named from its seed) and its event are one store write (CreateKeyedRun): an attempt that
+// finds the run later finds the user turn the conversation shows for it too.
+func (o *Orchestrator) insertRun(ctx context.Context, r *model.Run) error {
+	e := model.Event{SandboxID: r.SandboxID, RunID: r.ID, Type: model.EventRunQueued, Data: r.ResumeOf}
+	if seed := keyedSeed(ctx); seed == "" || r.ID != KeyedID(seed, "run") {
+		if err := o.Store.CreateRun(ctx, r); err != nil {
+			return err
+		}
+		o.emit(ctx, e)
+		return nil
+	}
+	e.Tenant, e.Slug = r.Tenant, r.Slug
+	if err := o.Store.CreateKeyedRun(ctx, r, &e); err != nil {
+		return err
+	}
+	if o.Hub != nil && !o.ListenerPublishes {
+		o.Hub.Publish(e)
+	}
+	return nil
 }
 
 // A keyed message's delivery is recorded on its reservation (store.KeyedResults), so every
@@ -129,7 +161,11 @@ func (o *Orchestrator) keyedSaid(ctx context.Context, sandboxID string) (run *mo
 			how = DeliveredResumed
 		}
 	}
-	return run, how, o.keyedRunWaits(ctx, run), true, nil
+	waits, err := o.keyedRunWaits(ctx, run)
+	if err != nil {
+		return nil, "", false, false, err
+	}
+	return run, how, waits, true, nil
 }
 
 // recordSaid notes a keyed message's delivery. On a context of its own: the delivery has

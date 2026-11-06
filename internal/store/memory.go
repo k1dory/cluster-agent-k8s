@@ -1867,3 +1867,20 @@ func (m *Memory) NoteKeyedSaid(_ context.Context, seed, said string) error {
 	}
 	return nil
 }
+
+func (m *Memory) CreateKeyedRun(_ context.Context, r *model.Run, e *model.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, dup := m.runs[r.ID]; dup {
+		return fmt.Errorf("%w: run %s exists", ErrConflict, r.ID)
+	}
+	m.runs[r.ID] = cloneRun(r)
+	m.nextEvent++
+	e.ID = m.nextEvent
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
+	c := *e
+	m.events = append(m.events, &c)
+	return nil
+}

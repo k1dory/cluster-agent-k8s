@@ -592,4 +592,8 @@ type KeyedResults interface {
 	KeyedResult(ctx context.Context, seed string) (created, said string, err error)
 	// NoteKeyedSaid records how the seed's message was delivered.
 	NoteKeyedSaid(ctx context.Context, seed, said string) error
+	// CreateKeyedRun is CreateRun and AppendEvent of e (the run's run.queued) in one
+	// transaction: a keyed run an attempt finds always has the event the conversation's user
+	// turn is read from, whatever became of the attempt that queued it. e.ID is set.
+	CreateKeyedRun(ctx context.Context, r *model.Run, e *model.Event) error
 }

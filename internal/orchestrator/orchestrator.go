@@ -1002,10 +1002,9 @@ func (o *Orchestrator) enqueue(ctx context.Context, sandboxID string, r *model.R
 	}
 	r.ID, r.SandboxID, r.Tenant, r.Slug = idFor(ctx, "run"), sandboxID, sb.Tenant, sb.Slug
 	r.Status, r.CreatedAt = model.RunQueued, time.Now()
-	if err := o.Store.CreateRun(ctx, r); err != nil {
+	if err := o.insertRun(ctx, r); err != nil {
 		return nil, false, err
 	}
-	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunQueued, Data: r.ResumeOf})
 	o.Touch(ctx, sandboxID)
 	return r, sb.Status == model.StatusSleeping || sb.Status == model.StatusError, nil
 }

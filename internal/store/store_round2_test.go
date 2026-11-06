@@ -682,3 +682,51 @@ func TestRound2KeyedInsertNeedsALiveUnusedReservation(t *testing.T) {
 		gone("sb_finished")
 	})
 }
+
+// Review round 4 of #32, finding 3: a keyed run and its run.queued event are one write. Of
+// attempts racing to insert the run, one does, and the stream holds exactly one run.queued
+// for it: a refused insert leaves no event, a written run never lacks its event.
+func TestRound2KeyedRunCarriesItsQueuedEvent(t *testing.T) {
+	round2Run(t, func(t *testing.T, s round2Store) {
+		ctx := context.Background()
+		sb := round2Sandbox("sb_keyed_run")
+		if err := s.CreateSandbox(ctx, sb); err != nil {
+			t.Fatal(err)
+		}
+		var wins atomic.Int32
+		var wg sync.WaitGroup
+		for range 6 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				r := &model.Run{ID: "run_keyed", SandboxID: sb.ID, Tenant: sb.Tenant, Slug: sb.Slug, Task: "build",
+					Status: model.RunQueued, CreatedAt: time.Now().UTC().Truncate(time.Microsecond)}
+				e := &model.Event{SandboxID: sb.ID, Tenant: sb.Tenant, Slug: sb.Slug, RunID: r.ID, Type: model.EventRunQueued}
+				err := s.CreateKeyedRun(ctx, r, e)
+				switch {
+				case err == nil:
+					wins.Add(1)
+					if e.ID == 0 {
+						t.Error("the event's id is not set")
+					}
+				case !errors.Is(err, ErrConflict):
+					t.Error(err)
+				}
+			}()
+		}
+		wg.Wait()
+		if wins.Load() != 1 {
+			t.Fatalf("%d inserts of one keyed run", wins.Load())
+		}
+		if _, err := s.GetRun(ctx, "run_keyed"); err != nil {
+			t.Fatal(err)
+		}
+		evs, err := s.QueryEvents(ctx, Filter{SandboxID: sb.ID, Types: []string{model.EventRunQueued}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(evs) != 1 || evs[0].RunID != "run_keyed" {
+			t.Fatalf("run.queued events for one keyed run: %+v", evs)
+		}
+	})
+}

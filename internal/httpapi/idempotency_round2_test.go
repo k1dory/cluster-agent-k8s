@@ -37,9 +37,11 @@ type idemFaultStore struct {
 	holdPut    chan struct{} // when set, the next PutIdempotent waits for it to close
 	holdLock   chan struct{} // when set, the next WithTenantLock waits for it to close
 	afterWrite hook          // runs after CreateSandbox
-	afterRun   hook          // runs after CreateRun
-	mu         sync.Mutex
-	putErrs    []error
+	afterRun   hook          // runs after CreateRun and CreateKeyedRun
+	// failSandboxRead, when set to n, fails the n-th GetSandbox from then on (once).
+	failSandboxRead atomic.Int32
+	mu              sync.Mutex
+	putErrs         []error
 }
 
 func (s *idemFaultStore) PutIdempotent(ctx context.Context, rec *store.Idempotent) error {
@@ -113,9 +115,23 @@ func (s *idemFaultStore) CreateRun(ctx context.Context, r *model.Run) error {
 	return err
 }
 
+func (s *idemFaultStore) CreateKeyedRun(ctx context.Context, r *model.Run, e *model.Event) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := s.Memory.CreateKeyedRun(ctx, r, e)
+	if err == nil {
+		s.afterRun.run()
+	}
+	return err
+}
+
 func (s *idemFaultStore) GetSandbox(ctx context.Context, id string) (*model.Sandbox, error) {
 	if err := s.readErr(ctx); err != nil {
 		return nil, err
+	}
+	if s.failSandboxRead.Add(-1) == 0 {
+		return nil, errors.New("fixture: sandbox read failed")
 	}
 	return s.Memory.GetSandbox(ctx, id)
 }
@@ -783,5 +799,171 @@ func TestRound2FailedRecoveryIsNotStoredAsSuccess(t *testing.T) {
 	round2Provisioned(t, s, id)
 	if n := round2Count(t, s); n != 1 {
 		t.Fatalf("%d sandboxes for one key", n)
+	}
+}
+
+// --- review round 4 of #32 ------------------------------------------------------------------
+
+// round4Sleeping creates a sandbox and puts it to sleep.
+func round4Sleeping(t *testing.T, s *stack, fs *idemFaultStore) string {
+	t.Helper()
+	code, sbID, _ := round2Create(t, s, "")
+	if code != 201 {
+		t.Fatalf("create: %d", code)
+	}
+	if resp, body := call(t, "POST", s.platform.URL+"/v1/sandboxes/"+sbID+"/sleep?force=true", "t0k", nil, nil); resp.StatusCode != 200 {
+		t.Fatalf("sleep: %d %s", resp.StatusCode, body)
+	}
+	round2WaitFor(t, func() bool {
+		sb, _ := fs.Memory.GetSandbox(context.Background(), sbID)
+		return sb.Status == model.StatusSleeping
+	})
+	return sbID
+}
+
+// round4Die sends a keyed POST whose attempt dies right after its run is written (no wake, no
+// result); the transport's own retry of the broken request finds the reservation fresh.
+func round4Die(t *testing.T, fs *idemFaultStore, url, body, key string) {
+	t.Helper()
+	fs.afterRun.set(func() { panic(http.ErrAbortHandler) })
+	defer fs.afterRun.set(nil)
+	req, _ := http.NewRequest("POST", url, bytes.NewReader([]byte(body+"\n")))
+	req.Header.Set("Authorization", "Bearer t0k")
+	req.Header.Set("Idempotency-Key", key)
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+	}
+}
+
+// round4UserTurns counts the conversation's user turns.
+func round4UserTurns(t *testing.T, s *stack, sbID string) int {
+	t.Helper()
+	msgs, _, err := s.orch.Messages(context.Background(), sbID, 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, m := range msgs {
+		if m.Role == model.RoleUser {
+			n++
+		}
+	}
+	return n
+}
+
+// Finding 1: the attempt that queued a keyed run died before waking the sleeping sandbox, and
+// the takeover's look at the sandbox fails. The takeover answers as failed (not a stored 202
+// for a run nothing will wake), and the next retry wakes the sandbox. Both recovery paths:
+// POST /runs and POST /messages.
+func TestRound4FailedWakeInspectionIsNotStoredAsSuccess(t *testing.T) {
+	for _, route := range []string{"runs", "messages"} {
+		t.Run(route, func(t *testing.T) {
+			s, fs, age := idemFaults(t)
+			sbID := round4Sleeping(t, s, fs)
+			url := s.platform.URL + "/v1/sandboxes/" + sbID + "/" + route
+			body := map[string]any{"task": "build"}
+			if route == "messages" {
+				body = map[string]any{"text": "build"}
+			}
+			raw, _ := json.Marshal(body)
+			key := "inspect-" + route
+			round4Die(t, fs, url, string(raw), key)
+			age()
+			// The first GetSandbox is the handler's access check; the second, the recovery's.
+			fs.failSandboxRead.Store(2)
+			resp, b := call(t, "POST", url, "t0k", body, map[string]string{"Idempotency-Key": key})
+			fs.failSandboxRead.Store(0)
+			if resp.StatusCode < 500 {
+				t.Fatalf("recovery that could not inspect the sandbox answered %d %s, want a failure to retry", resp.StatusCode, b)
+			}
+			resp, b = call(t, "POST", url, "t0k", body, map[string]string{"Idempotency-Key": key})
+			if resp.StatusCode != 202 || resp.Header.Get("Idempotency-Replayed") == "true" {
+				t.Fatalf("retry after the failed recovery: %d replayed=%s %s", resp.StatusCode, resp.Header.Get("Idempotency-Replayed"), b)
+			}
+			round2WaitFor(t, func() bool {
+				sb, _ := fs.Memory.GetSandbox(context.Background(), sbID)
+				return sb.Status == model.StatusWaking || sb.Status == model.StatusRunning
+			})
+			if runs, _ := fs.Memory.ListRuns(context.Background(), sbID); len(runs) != 1 {
+				t.Fatalf("%d runs for one key", len(runs))
+			}
+		})
+	}
+}
+
+// Finding 2: the attempt that created a sandbox from an agent died before its result was
+// stored, and the agent is deleted before the retry. The retry finds the sandbox (it carries
+// its resolved launch) instead of failing on the definition a fresh creation would need.
+func TestRound4RetryFindsTheSandboxOfADeletedAgent(t *testing.T) {
+	s := catalogStack(t)
+	mem := s.orch.Store.(*store.Memory)
+	var offset atomic.Int64
+	mem.SetIdempotencyClock(func() time.Time { return time.Now().Add(time.Duration(offset.Load())) })
+	fs := &idemFaultStore{Memory: mem}
+	s.orch.Store = fs
+	api := s.platform.URL
+	if code, _ := putDoc(t, api, "alice-tok", "environments", "lean", `{"spec":{"image":"stable"}}`); code != 201 {
+		t.Fatalf("environment: %d", code)
+	}
+	if code, _ := putDoc(t, api, "alice-tok", "agents", "lean", `{"spec":{"policy":"backend-dev","environment":"lean"}}`); code != 201 {
+		t.Fatalf("agent: %d", code)
+	}
+	body := map[string]any{"name": "shop", "owner": "alice", "agent_ref": "lean"}
+	raw, _ := json.Marshal(body)
+	fs.afterWrite.set(func() { panic(http.ErrAbortHandler) })
+	req, _ := http.NewRequest("POST", api+"/v1/sandboxes", bytes.NewReader(append(raw, '\n')))
+	req.Header.Set("Authorization", "Bearer alice-tok")
+	req.Header.Set("Idempotency-Key", "deleted-agent")
+	if resp, err := http.DefaultClient.Do(req); err == nil {
+		resp.Body.Close()
+	}
+	fs.afterWrite.set(nil)
+	if resp, b := call(t, "DELETE", api+"/v1/agents/lean", "alice-tok", nil, nil); resp.StatusCode >= 300 {
+		t.Fatalf("delete agent: %d %s", resp.StatusCode, b)
+	}
+	offset.Add(int64(store.IdempotencyStale + time.Minute))
+	resp, b := call(t, "POST", api+"/v1/sandboxes", "alice-tok", body, map[string]string{"Idempotency-Key": "deleted-agent"})
+	var sb model.Sandbox
+	_ = json.Unmarshal(b, &sb)
+	if resp.StatusCode != 201 || sb.ID == "" {
+		t.Fatalf("retry after the agent was deleted: %d %s", resp.StatusCode, b)
+	}
+	c, err := fs.CountSandboxes(context.Background(), "alice", "")
+	if err != nil || c.Total != 1 {
+		t.Fatalf("%+v sandboxes for one key (%v)", c, err)
+	}
+}
+
+// Finding 3: the attempt that queued a keyed run (POST /runs, or a message that starts a new
+// conversation) died right after the run was written. The run's run.queued event, which the
+// conversation's user turn is read from, is written with it: the takeover shows exactly one
+// user turn, not a run whose prompt is missing from the conversation.
+func TestRound4KeyedRunKeepsItsUserTurnAfterACrash(t *testing.T) {
+	for _, route := range []string{"runs", "messages"} {
+		t.Run(route, func(t *testing.T) {
+			s, fs, age := idemFaults(t)
+			code, sbID, _ := round2Create(t, s, "")
+			if code != 201 {
+				t.Fatalf("create: %d", code)
+			}
+			url := s.platform.URL + "/v1/sandboxes/" + sbID + "/" + route
+			body := map[string]any{"task": "build"}
+			if route == "messages" {
+				body = map[string]any{"text": "build"}
+			}
+			raw, _ := json.Marshal(body)
+			key := "turn-" + route
+			round4Die(t, fs, url, string(raw), key)
+			age()
+			if resp, b := call(t, "POST", url, "t0k", body, map[string]string{"Idempotency-Key": key}); resp.StatusCode != 202 {
+				t.Fatalf("takeover: %d %s", resp.StatusCode, b)
+			}
+			if runs, _ := fs.Memory.ListRuns(context.Background(), sbID); len(runs) != 1 {
+				t.Fatalf("%d runs for one key", len(runs))
+			}
+			if n := round4UserTurns(t, s, sbID); n != 1 {
+				t.Fatalf("%d user turns for one keyed %s", n, route)
+			}
+		})
 	}
 }

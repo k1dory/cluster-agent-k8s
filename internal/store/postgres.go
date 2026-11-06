@@ -633,8 +633,12 @@ func scanRun(row pgx.Row) (*model.Run, error) {
 }
 
 func (p *Postgres) CreateRun(ctx context.Context, r *model.Run) error {
+	return createRunIn(ctx, p.pool, r)
+}
+
+func createRunIn(ctx context.Context, db pgExec, r *model.Run) error {
 	u := r.Usage
-	_, err := p.pool.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
+	_, err := db.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
 		r.ID, r.SandboxID, r.Tenant, r.Slug, r.Task, r.Status, r.ExitCode, r.CreatedAt, r.StartedAt, r.FinishedAt,
 		u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
 		r.AgentVersion, r.ResumeOf, r.Session, r.AgentRef, r.AgentRevision, r.EnvironmentRef, r.EnvironmentRevision, r.Mode)
@@ -2144,4 +2148,24 @@ func (p *Postgres) KeyedResult(ctx context.Context, seed string) (created, said 
 func (p *Postgres) NoteKeyedSaid(ctx context.Context, seed, said string) error {
 	_, err := p.pool.Exec(ctx, `UPDATE idempotency SET said=$2 WHERE seed=$1 AND seed <> ''`, seed, said)
 	return err
+}
+
+func (p *Postgres) CreateKeyedRun(ctx context.Context, r *model.Run, e *model.Event) error {
+	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		if err := createRunIn(ctx, tx, r); err != nil {
+			return err
+		}
+		// The event last: its id is drawn under the events lock (see AppendEvent), held from
+		// here to the commit.
+		if e.At.IsZero() {
+			e.At = time.Now()
+		}
+		b := &pgx.Batch{}
+		b.Queue(eventsLockSQL)
+		b.Queue(`WITH ins AS (
+				INSERT INTO events (sandbox_id, tenant, slug, run_id, type, data, at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id)
+			SELECT id FROM ins, pg_notify('`+eventsChannel+`', id::text)`,
+			e.SandboxID, e.Tenant, e.Slug, e.RunID, e.Type, e.Data, e.At).QueryRow(func(row pgx.Row) error { return row.Scan(&e.ID) })
+		return tx.SendBatch(ctx, b).Close()
+	})
 }
