@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 
@@ -66,6 +67,18 @@ func Protocol(configured string) string {
 	return "http"
 }
 
+// HTTPTracesURL is the OTLP/HTTP URL spans are posted to: the configured one when it names a
+// path, else the collector's standard /v1/traces under it. The exporter takes a URL as given
+// and would post to "/" of a bare http://tempo:4318, which no collector answers.
+func HTTPTracesURL(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil || strings.Trim(u.Path, "/") != "" {
+		return endpoint
+	}
+	u.Path = "/v1/traces"
+	return u.String()
+}
+
 // StartTracing installs the global tracer provider and the W3C propagators (traceparent and
 // baggage) and returns the function that flushes and stops it.
 func StartTracing(ctx context.Context, cfg TracingConfig, version string) (shutdown func(context.Context) error, err error) {
@@ -80,7 +93,7 @@ func StartTracing(ctx context.Context, cfg TracingConfig, version string) (shutd
 	default:
 		var opts []otlptracehttp.Option
 		if cfg.Endpoint != "" {
-			opts = append(opts, otlptracehttp.WithEndpointURL(cfg.Endpoint))
+			opts = append(opts, otlptracehttp.WithEndpointURL(HTTPTracesURL(cfg.Endpoint)))
 		}
 		exp, err = otlptracehttp.New(ctx, opts...)
 	}

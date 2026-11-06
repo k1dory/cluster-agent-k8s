@@ -61,7 +61,8 @@ tracing:
   record_statements: false
 ```
 
-With `endpoint` or `protocol` empty, the standard `OTEL_EXPORTER_OTLP_*` variables apply, as do
+For `http`, an endpoint without a path gets the standard `/v1/traces`, and one with a path is
+used as written. With `endpoint` or `protocol` empty, the standard `OTEL_EXPORTER_OTLP_*` variables apply, as do
 `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`. The resource is `service.name=sandboxd`,
 `service.version`, and `k8s.pod.name` and `k8s.namespace.name` when `POD_NAME` and
 `POD_NAMESPACE` are set (the chart sets them). Tempo and Jaeger both take OTLP directly. Point
