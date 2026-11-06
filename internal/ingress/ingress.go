@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"agent-sandbox/internal/model"
@@ -41,6 +42,11 @@ type Handler struct {
 	CookieTTL      time.Duration
 	HitsAsActivity bool
 	Log            *slog.Logger
+
+	// One transport for every proxied request: a transport per request never reused a
+	// connection and left each one's idle connections open until the backend closed them.
+	transportOnce sync.Once
+	transport     *http.Transport
 }
 
 const cookieName = "__Host-sandbox_pv"
@@ -116,10 +122,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			pr.Out.Host = target.Host
 			pr.SetXForwarded()
 		},
-		Transport: &http.Transport{
-			DialContext:           (&net.Dialer{Timeout: 5 * time.Second}).DialContext,
-			ResponseHeaderTimeout: 60 * time.Second,
-		},
+		Transport: h.proxyTransport(),
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			http.Error(w, "application in sandbox is not answering on port "+strconv.Itoa(sb.Preview.Port), http.StatusBadGateway)
 		},
@@ -212,4 +215,23 @@ func safeNext(next string) string {
 		return "/"
 	}
 	return next
+}
+
+// proxyTransport is the transport every proxied request shares, created on first use.
+func (h *Handler) proxyTransport() *http.Transport {
+	h.transportOnce.Do(func() {
+		h.transport = &http.Transport{
+			DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			ResponseHeaderTimeout: 60 * time.Second,
+			MaxIdleConns:          256,
+			MaxIdleConnsPerHost:   8,
+			IdleConnTimeout:       90 * time.Second,
+		}
+	})
+	return h.transport
+}
+
+// Close drops the idle connections to sandboxes; called when the ingress server shuts down.
+func (h *Handler) Close() {
+	h.proxyTransport().CloseIdleConnections()
 }
