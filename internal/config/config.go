@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"agent-sandbox/internal/credentials"
+	"agent-sandbox/internal/httpapi"
 	"agent-sandbox/internal/oidc"
 	"agent-sandbox/internal/orchestrator"
 	"agent-sandbox/internal/secrets"
@@ -69,6 +70,11 @@ type Config struct {
 		Default orchestrator.Quota            `yaml:"default"`
 		Tenants map[string]orchestrator.Quota `yaml:"tenants"`
 	} `yaml:"quotas"`
+	// AuthLimit bounds, per client address, POST /v1/auth/ci and failed bearer authentication:
+	// burst attempts at once, then one more every `every` (defaults 30 and 1s); over that is 429.
+	// off: true turns it off, e.g. behind a proxy that hides client addresses (every client
+	// would share one budget) and limits on its own.
+	AuthLimit httpapi.RateLimit `yaml:"auth_limit"`
 	// OIDC: bearer JWTs from this issuer are accepted next to the static tokens.
 	OIDC        *oidc.Config `yaml:"oidc"`
 	DatabaseURL string       `yaml:"database_url"` // empty → in-memory store
@@ -301,6 +307,9 @@ func Load(path string) (*Config, error) {
 		if t.Token == c.APIToken {
 			return nil, fmt.Errorf("%s: api_tokens[%d]: same value as api_token", path, i)
 		}
+	}
+	if c.AuthLimit.Burst < 0 || c.AuthLimit.Every < 0 {
+		return nil, fmt.Errorf("%s: auth_limit: burst and every must not be negative", path)
 	}
 	switch c.Accounting.EgressTrace {
 	case "":

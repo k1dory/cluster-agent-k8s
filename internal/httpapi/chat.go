@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"path"
 	"regexp"
@@ -16,6 +15,7 @@ import (
 	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/orchestrator"
+	"agent-sandbox/internal/store"
 	"github.com/k1dory/acpx"
 )
 
@@ -29,8 +29,8 @@ import (
 //	GET  /v1/sandboxes/{id}/files?path=&depth= list the workspace
 //	GET  /v1/sandboxes/{id}/files/content?path= read a file
 //	PUT  /v1/sandboxes/{id}/files/content?path= write a file (the body)
-func (p *Platform) chatRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /v1/sandboxes/{id}/messages", p.auth(p.idempotent(p.sendMessage)))
+func (p *Platform) chatRoutes(mux *routeMux) {
+	mux.HandleFunc("POST /v1/sandboxes/{id}/messages", p.auth(removeForm(p.idempotentUpload(p.sendMessage))))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/messages", p.auth(p.listMessages))
 	mux.HandleFunc("GET /v1/sandboxes/{id}/messages/stream", p.auth(p.streamMessages))
 	mux.HandleFunc("POST /v1/sandboxes/{id}/messages/close", p.auth(p.closeConversation))
@@ -66,14 +66,28 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var req MessageRequest
 	var uploaded []string
-	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if ct == "multipart/form-data" {
-		if err := r.ParseMultipartForm(orchestrator.MaxFileBytes); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+	if isMultipart(r) {
+		// Capped as a whole (every file at its cap, see body.go), so what ParseMultipartForm
+		// spills to disk is bounded too; a form the idempotency middleware already parsed is
+		// not parsed again.
+		capBody(w, r, multipartBodyLimit)
+		if err := r.ParseMultipartForm(multipartMemory); err != nil {
+			writeBodyErr(w, err)
+			return
+		}
+		// The parser stops at the closing boundary; what follows (the epilogue) counts against
+		// the cap too, and is read to its end before anything is written or sent.
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			writeBodyErr(w, err)
 			return
 		}
 		req.Text = r.FormValue("text")
-		for _, fh := range r.MultipartForm.File["file"] {
+		files := r.MultipartForm.File["file"]
+		if len(files) > MaxUploadFiles {
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Errorf("at most %d files per message", MaxUploadFiles))
+			return
+		}
+		for _, fh := range files {
 			name := uploadNameRe.ReplaceAllString(path.Base(fh.Filename), "_")
 			if name == "" || name == "." || name == ".." {
 				writeErr(w, http.StatusBadRequest, fmt.Errorf("attachment %q has no usable name", fh.Filename))
@@ -99,8 +113,8 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Attachments = append(req.Attachments, uploaded...)
 	} else {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeBodyErr(w, err)
 			return
 		}
 	}
@@ -219,15 +233,20 @@ func (p *Platform) closeConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	run, err := p.Orch.Store.RunningRun(r.Context(), id)
-	if err != nil {
+	if errors.Is(err, store.ErrNotFound) {
 		writeErr(w, http.StatusConflict, errors.New("no conversation is open"))
 		return
 	}
-	if _, err := p.Orch.CloseRun(r.Context(), id, run.ID); err != nil {
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	closed, err := p.Orch.CloseRun(r.Context(), id, run.ID)
+	if err != nil {
 		writeOrchErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, run)
+	writeJSON(w, http.StatusOK, closed) // the run as it is now, not as it was before the close
 }
 
 func (p *Platform) closeRun(w http.ResponseWriter, r *http.Request) {
@@ -317,7 +336,7 @@ func (p *Platform) writeFile(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, orchestrator.MaxFileBytes))
+	data, err := io.ReadAll(maxBytes(w, r.Body, orchestrator.MaxFileBytes))
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
@@ -398,8 +417,8 @@ func (p *Platform) replyRequest(w http.ResponseWriter, r *http.Request) {
 		acpx.Reply
 		RunID string `json:"run_id"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 128<<10)).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &body); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	reply := body.Reply

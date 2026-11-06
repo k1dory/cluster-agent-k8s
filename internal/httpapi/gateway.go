@@ -2,7 +2,6 @@ package httpapi
 
 import (
 	"bufio"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -33,8 +32,12 @@ type Gateway struct {
 
 // Routes builds the gateway mux.
 func (g *Gateway) Routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
+	return logRequests(g.Log, g.routes().ServeMux)
+}
+
+func (g *Gateway) routes() *routeMux {
+	mux := newRouteMux()
+	mux.HandleFunc("GET /healthz", healthz)
 	mux.Handle("GET /authz", g.Authz)
 	mux.Handle("POST /authz", g.Authz)
 	mux.HandleFunc("POST /bootstrap", g.bootstrap)
@@ -50,14 +53,14 @@ func (g *Gateway) Routes() http.Handler {
 	if g.MCP != nil {
 		mux.Handle("/", g.MCP) // everything else is an MCP host proxied by Caddy (see gateway template)
 	}
-	return logRequests(g.Log, mux)
+	return mux
 }
 
 func (g *Gateway) bootstrap(w http.ResponseWriter, r *http.Request) {
 	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	var req registrar.BootstrapRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeStrict(w, r, &req, smallBodyLimit); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	res, err := g.Registrar.Bootstrap(r.Context(), token, req)
@@ -167,7 +170,7 @@ func (g *Gateway) appendOutput(w http.ResponseWriter, r *http.Request, id *ident
 			_ = g.Orch.Store.PutIdempotent(r.Context(), &store.Idempotent{Key: batchKey, Status: n, Body: []byte{}})
 		}
 	}
-	sc := bufio.NewScanner(http.MaxBytesReader(w, r.Body, MaxBodyBytes))
+	sc := bufio.NewScanner(maxBytes(w, r.Body, MaxBodyBytes))
 	sc.Buffer(make([]byte, 0, 64<<10), MaxLineBytes)
 	for sc.Scan() {
 		line := sc.Text()
@@ -255,7 +258,12 @@ func (g *Gateway) finish(w http.ResponseWriter, r *http.Request, id *identity.Id
 		ExitCode int          `json:"exit_code"`
 		Usage    *model.Usage `json:"usage,omitempty"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	// A body that does not decode is refused, never read as exit 0 without usage: that would
+	// record a failed run as a success. The runner retries finish until it is acknowledged.
+	if err := decodeStrict(w, r, &req, smallBodyLimit); err != nil {
+		writeBodyErr(w, err)
+		return
+	}
 	if err := g.Orch.FinishRun(r.Context(), id.SandboxID, run.ID, req.ExitCode, req.Usage); err != nil {
 		writeOrchErr(w, err)
 		return
@@ -296,8 +304,8 @@ func (g *Gateway) fsRequests(w http.ResponseWriter, r *http.Request, id *identit
 // fsResult records the pod's answer to a file request.
 func (g *Gateway) fsResult(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
 	var res model.FSResult
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxBodyBytes)).Decode(&res); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeStrict(w, r, &res, MaxBodyBytes); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	if res.Blob != "" && !orchestrator.OwnsFSBlob(id.SandboxID, res.Blob) {
@@ -313,7 +321,7 @@ func (g *Gateway) fsResult(w http.ResponseWriter, r *http.Request, id *identity.
 
 // putBlob stores file content the pod read, under a name confined to its sandbox.
 func (g *Gateway) putBlob(w http.ResponseWriter, r *http.Request, id *identity.Identity) {
-	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, orchestrator.MaxFileBytes))
+	data, err := io.ReadAll(maxBytes(w, r.Body, orchestrator.MaxFileBytes))
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {

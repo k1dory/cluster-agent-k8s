@@ -12,6 +12,13 @@ api_token: "${SANDBOXD_API_TOKEN}"
 #   max_ttl: 1h
 api_keys:
   max_ttl: 0s
+# POST /v1/auth/ci and failed bearer tokens are limited per client address: burst attempts at
+# once, then one per `every`; over that is 429 with Retry-After. Behind a proxy that hides
+# client addresses every client shares one budget: turn it off there (off: true).
+# auth_limit:
+#   burst: 30
+#   every: 1s
+#   off: false
 # Static tenant-scoped tokens (optional, next to the keys): each sees only its own sandboxes.
 # api_tokens:
 #   - { token: "${ACME_TOKEN}", tenant: acme }

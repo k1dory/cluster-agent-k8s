@@ -14,10 +14,14 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
+	"mime/multipart"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"agent-sandbox/api"
@@ -75,9 +79,15 @@ type Platform struct {
 	// TTLFromToken caps the lifetime of sandboxes created with a short-lived token (and so
 	// their agent certificates) at the token's expiry.
 	TTLFromToken bool
-	Build        string // control-plane version reported by GET /v1/version
-	Replica      string // this replica's name (the pod), reported by GET /v1/version
-	Log          *slog.Logger
+	// AuthLimit bounds, per source address, POST /v1/auth/ci and failed bearer authentication
+	// (see RateLimit); the zero value is on with the defaults.
+	AuthLimit RateLimit
+	limitOnce sync.Once
+	limiter   *limiter
+
+	Build   string // control-plane version reported by GET /v1/version
+	Replica string // this replica's name (the pod), reported by GET /v1/version
+	Log     *slog.Logger
 }
 
 // SetServices installs the configuration services (see internal/app).
@@ -116,9 +126,16 @@ func (pr Principal) expiresBefore() time.Time {
 func (pr Principal) admin() bool { return pr.Admin }
 
 // TokenVerifier resolves a bearer token that is not one of the configured static tokens.
+// An error that wraps ErrVerifierUnavailable says nothing about the token.
 type TokenVerifier interface {
 	Verify(ctx context.Context, token string) (Principal, error)
 }
+
+// ErrVerifierUnavailable marks a verification that could not be made: the identity provider
+// (its discovery document, its keys) did not answer. The token is not judged, so the attempt
+// it reserved is given back and the answer is 503, not 401: an outage of the provider must not
+// spend an address's budget and lock out the valid tokens sent from there.
+var ErrVerifierUnavailable = errors.New("token verification unavailable")
 
 type principalKey struct{}
 
@@ -127,10 +144,36 @@ func principalOf(r *http.Request) Principal {
 	return pr
 }
 
+// routeMux is a ServeMux that remembers its patterns, so a test can hold the routes against
+// openapi.yaml.
+type routeMux struct {
+	*http.ServeMux
+	patterns []string
+}
+
+func newRouteMux() *routeMux { return &routeMux{ServeMux: http.NewServeMux()} }
+
+func (m *routeMux) HandleFunc(pattern string, h func(http.ResponseWriter, *http.Request)) {
+	m.patterns = append(m.patterns, pattern)
+	m.ServeMux.HandleFunc(pattern, h)
+}
+
+func (m *routeMux) Handle(pattern string, h http.Handler) {
+	m.patterns = append(m.patterns, pattern)
+	m.ServeMux.Handle(pattern, h)
+}
+
+// healthz is liveness, on both listeners.
+func healthz(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) }
+
 // Routes builds the platform mux.
 func (p *Platform) Routes() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok\n")) })
+	return logRequests(p.Log, jsonMuxErrors(p.routes().ServeMux))
+}
+
+func (p *Platform) routes() *routeMux {
+	mux := newRouteMux()
+	mux.HandleFunc("GET /healthz", healthz)
 	// Readiness: the store answers. A replica that lost its database stops taking traffic
 	// (the others, on the same database, keep it); liveness stays /healthz, so it is not
 	// restarted for an outage that is not its own.
@@ -182,14 +225,14 @@ func (p *Platform) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/whoami", p.auth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, principalOf(r))
 	}))
-	return logRequests(p.Log, jsonMuxErrors(mux))
+	return mux
 }
 
 // rollout answers POST /v1/rollouts: move agents to another version (see orchestrator.RolloutRequest).
 func (p *Platform) rollout(w http.ResponseWriter, r *http.Request) {
 	var req orchestrator.RolloutRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	pr := principalOf(r)
@@ -278,6 +321,25 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		got := []byte(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+		// Attempts are counted per source address. Each presented token reserves one before it
+		// is checked, so concurrent guesses cannot all pass while the first are still being
+		// verified; a token that authenticates (or a check that failed inside) gives it back.
+		// Once the bucket is empty every token from there is refused unchecked (a check would
+		// still tell a guess that is right). Requests without a token are not counted.
+		lim, src := p.authLimiter(), "auth|"+sourceOf(r)
+		reserved := false
+		if lim != nil && len(got) > 0 {
+			if d := lim.take(src); d > 0 {
+				writeRateLimited(w, d)
+				return
+			}
+			reserved = true
+		}
+		refund := func() {
+			if reserved {
+				lim.refund(src)
+			}
+		}
 		var pr *Principal
 		if p.Token != "" && subtle.ConstantTimeCompare(got, []byte(p.Token)) == 1 {
 			pr = &Principal{Admin: true, Subject: "admin-token"}
@@ -293,6 +355,7 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 				if errors.Is(err, apikeys.ErrBadKey) {
 					writeErr(w, http.StatusUnauthorized, errors.New("bad token"))
 				} else {
+					refund()
 					writeErr(w, http.StatusInternalServerError, fmt.Errorf("api key: %w", err))
 				}
 				return
@@ -301,6 +364,11 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if pr == nil && p.Verifier != nil && strings.Count(string(got), ".") == 2 {
 			v, err := p.Verifier.Verify(r.Context(), string(got))
+			if errors.Is(err, ErrVerifierUnavailable) {
+				refund()
+				writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("token: %w", err))
+				return
+			}
 			if err != nil {
 				writeErr(w, http.StatusUnauthorized, fmt.Errorf("token: %w", err))
 				return
@@ -311,6 +379,7 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusUnauthorized, errors.New("bad token"))
 			return
 		}
+		refund()
 		next(w, r.WithContext(context.WithValue(r.Context(), principalKey{}, *pr)))
 	}
 }
@@ -329,22 +398,40 @@ func (p *Platform) sandbox(w http.ResponseWriter, r *http.Request) (*model.Sandb
 	return sb, true
 }
 
-// tenantScope narrows a requested tenant filter to what the caller may see.
-func tenantScope(w http.ResponseWriter, r *http.Request, requested string) (string, bool) {
+// scopeTenant is the one tenant-scope rule of the API: the admin works in the tenant it names
+// (empty: the shared scope, or every tenant for a filter); a tenant principal works in its own,
+// and naming another tenant is 403. With required, naming none is 400.
+func scopeTenant(w http.ResponseWriter, r *http.Request, requested string, required bool) (string, bool) {
+	if required && requested == "" {
+		writeErr(w, http.StatusBadRequest, errors.New("tenant is required"))
+		return "", false
+	}
 	pr := principalOf(r)
 	if pr.admin() {
 		return requested, true
 	}
 	if requested != "" && requested != pr.Tenant {
-		writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.Tenant))
+		writeErr(w, http.StatusForbidden, errOtherTenant(pr))
 		return "", false
 	}
 	return pr.Tenant, true
 }
 
+// errOtherTenant is the refusal of a tenant principal that names another tenant.
+func errOtherTenant(pr Principal) error { return errors.New("token is scoped to tenant " + pr.Tenant) }
+
 // idempotent replays the stored response when the client repeats a request with the same
 // Idempotency-Key (per tenant and route, 24h). Only 2xx responses are stored.
-func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
+func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc { return p.keyed(false, next) }
+
+// idempotentUpload is idempotent for the one route that takes multipart (messages): its
+// multipart bodies are parsed and hashed by content. The route removes the parsed form's
+// temporary files (removeForm).
+func (p *Platform) idempotentUpload(next http.HandlerFunc) http.HandlerFunc {
+	return p.keyed(true, next)
+}
+
+func (p *Platform) keyed(uploads bool, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("Idempotency-Key")
 		if key == "" {
@@ -355,14 +442,11 @@ func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
 			writeErr(w, http.StatusBadRequest, errors.New("Idempotency-Key longer than 200 bytes"))
 			return
 		}
-		body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		hash, legacy, err := requestHash(w, r, uploads)
 		if err != nil {
-			writeErr(w, http.StatusBadRequest, err)
+			writeBodyErr(w, err)
 			return
 		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		sum := sha256.Sum256(body)
-		hash := hex.EncodeToString(sum[:])
 		full := principalOf(r).Tenant + "|" + r.Method + " " + r.URL.Path + "|" + key
 		// The reservation is the lock: concurrent repeats see it and wait, a repeat with another
 		// body is refused, and a finished request is replayed from the stored response.
@@ -373,7 +457,7 @@ func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if !reserved {
 			switch {
-			case existing.BodyHash != hash:
+			case existing.BodyHash != hash && (legacy == "" || existing.BodyHash != legacy):
 				writeErr(w, http.StatusUnprocessableEntity, errors.New("Idempotency-Key was already used with a different request body"))
 			case existing.InProgress():
 				w.Header().Set("Retry-After", "1")
@@ -401,13 +485,97 @@ func (p *Platform) idempotent(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// requestHash fingerprints the body of an idempotent request. The routes it wraps take JSON
+// (or, for messages, multipart) under the body policy's cap: the hash is over the whole body,
+// never a prefix of it, so two requests that differ past some offset are never taken for the
+// same one; over the cap is 413.
+//
+// JSON is hashed as sent. A multipart body is hashed by what it carries, not by its bytes: the
+// boundary is random per request, so a client's retry of the same upload never has the same
+// bytes. The form is parsed here only on the route that takes uploads (files beyond
+// multipartMemory spill to temporary files, which that route removes) and its handler reads
+// the parsed form. Every other route reads a multipart body as the JSON it is not, under the
+// JSON cap, and its handler refuses it: nothing is parsed or spilled there.
+func requestHash(w http.ResponseWriter, r *http.Request, uploads bool) (hash, legacy string, err error) {
+	if !uploads || !isMultipart(r) {
+		body, err := readBody(w, r, jsonBodyLimit)
+		if err != nil {
+			return "", "", err
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		sum := sha256.Sum256(body)
+		return hex.EncodeToString(sum[:]), "", nil
+	}
+	// The raw bytes are hashed on the way through as well: records stored before the content
+	// hash hold the SHA-256 of the raw body (unprefixed), and the very retry of such a request
+	// has those same bytes. legacy matches them for as long as they live (24h).
+	capBody(w, r, multipartBodyLimit)
+	raw := sha256.New()
+	body := r.Body
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.TeeReader(body, raw), body}
+	if err := r.ParseMultipartForm(multipartMemory); err != nil {
+		return "", "", err
+	}
+	if _, err := io.Copy(io.Discard, r.Body); err != nil { // the epilogue after the last part
+		return "", "", err
+	}
+	hash, err = multipartHash(r.MultipartForm)
+	if err != nil {
+		return "", "", err
+	}
+	return multipartHashVersion + hash, hex.EncodeToString(raw.Sum(nil)), nil
+}
+
+// multipartHashVersion prefixes a content hash, so it is never taken for a raw body's.
+const multipartHashVersion = "multipart-v1:"
+
+// multipartHash is sha256 over the form's parts in a canonical order: fields by name, each
+// field's values (and files) in the order they were sent, every name, file name and content
+// length-prefixed so no two different forms write the same stream.
+func multipartHash(form *multipart.Form) (string, error) {
+	h := sha256.New()
+	put := func(s string) { fmt.Fprintf(h, "%d:%s", len(s), s) }
+	h.Write([]byte("multipart/form-data\n"))
+	for _, name := range slices.Sorted(maps.Keys(form.Value)) {
+		put("value")
+		put(name)
+		fmt.Fprintf(h, "%d\n", len(form.Value[name]))
+		for _, v := range form.Value[name] {
+			put(v)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(form.File)) {
+		put("file")
+		put(name)
+		fmt.Fprintf(h, "%d\n", len(form.File[name]))
+		for _, fh := range form.File[name] {
+			put(fh.Filename)
+			f, err := fh.Open()
+			if err != nil {
+				return "", err
+			}
+			fmt.Fprintf(h, "%d:", fh.Size)
+			_, err = io.Copy(h, f)
+			f.Close()
+			if err != nil {
+				return "", err
+			}
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
 type recorder struct {
 	http.ResponseWriter
 	code int
 	body bytes.Buffer
 }
 
-func (rc *recorder) WriteHeader(c int) { rc.code = c; rc.ResponseWriter.WriteHeader(c) }
+func (rc *recorder) WriteHeader(c int)           { rc.code = c; rc.ResponseWriter.WriteHeader(c) }
+func (rc *recorder) Unwrap() http.ResponseWriter { return rc.ResponseWriter }
 func (rc *recorder) Write(b []byte) (int, error) {
 	rc.body.Write(b)
 	return rc.ResponseWriter.Write(b)
@@ -423,7 +591,7 @@ func (p *Platform) list(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, q.err)
 		return
 	}
-	tenant, ok := tenantScope(w, r, q.str("tenant"))
+	tenant, ok := scopeTenant(w, r, q.str("tenant"), false)
 	if !ok {
 		return
 	}
@@ -447,17 +615,17 @@ func (p *Platform) list(w http.ResponseWriter, r *http.Request) {
 
 func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 	var req orchestrator.CreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	pr := principalOf(r)
 	if !pr.admin() {
-		if req.Tenant != "" && req.Tenant != pr.Tenant {
-			writeErr(w, http.StatusForbidden, errors.New("token is scoped to tenant "+pr.Tenant))
+		tenant, ok := scopeTenant(w, r, req.Tenant, false)
+		if !ok {
 			return
 		}
-		req.Tenant = pr.Tenant
+		req.Tenant = tenant
 	}
 	req.Admin = pr.admin()
 	if p.TTLFromToken {
@@ -495,8 +663,8 @@ func (p *Platform) update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req orchestrator.UpdateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	if p.TTLFromToken {
@@ -596,8 +764,8 @@ func (p *Platform) createRun(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Task string `json:"task"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	run, err := p.Orch.CreateRun(r.Context(), r.PathValue("id"), req.Task)
@@ -613,6 +781,10 @@ func (p *Platform) ownRun(w http.ResponseWriter, r *http.Request) (*model.Run, b
 		return nil, false
 	}
 	run, err := p.Orch.Store.GetRun(r.Context(), r.PathValue("run"))
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		writeErr(w, http.StatusInternalServerError, err) // the store failed: not a missing run
+		return nil, false
+	}
 	if err != nil || run.SandboxID != r.PathValue("id") {
 		writeErr(w, http.StatusNotFound, fmt.Errorf("run %s: %w", r.PathValue("run"), store.ErrNotFound))
 		return nil, false
@@ -645,8 +817,8 @@ func (p *Platform) input(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Text string `json:"text"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	if err := p.Orch.Input(r.Context(), r.PathValue("id"), r.PathValue("run"), req.Text); err != nil {
@@ -754,8 +926,8 @@ func (p *Platform) setPreview(w http.ResponseWriter, r *http.Request) {
 		Port   int    `json:"port"`
 		Access string `json:"access"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	sb, err := p.Orch.SetPreview(r.Context(), r.PathValue("id"), req.Port, req.Access)
@@ -775,8 +947,8 @@ func (p *Platform) previewTicket(w http.ResponseWriter, r *http.Request) {
 		User string `json:"user"`
 		Next string `json:"next"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeErr(w, http.StatusBadRequest, err)
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeBodyErr(w, err)
 		return
 	}
 	if sb.Preview == nil {
@@ -808,7 +980,7 @@ func (p *Platform) usage(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, q.err)
 		return
 	}
-	tenant, ok := tenantScope(w, r, q.str("tenant"))
+	tenant, ok := scopeTenant(w, r, q.str("tenant"), false)
 	if !ok {
 		return
 	}
@@ -850,7 +1022,7 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, q.err)
 		return
 	}
-	tenant, ok := tenantScope(w, r, q.str("tenant"))
+	tenant, ok := scopeTenant(w, r, q.str("tenant"), false)
 	if !ok {
 		return
 	}
@@ -959,14 +1131,21 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 // ErrorBody is the JSON every error response carries. `error` stays for older clients;
-// `code` is the stable machine-readable class, `request_id` matches the server log line.
+// `code` is the stable machine-readable class, `request_id` matches the server log line. A
+// few errors travel with the record they are about (the sync of a repository, the plan of a
+// refused apply, the rollback that could not run, the apply a conflict is with).
 type ErrorBody struct {
 	Error     string `json:"error"`
 	Code      string `json:"code"`
 	RequestID string `json:"request_id,omitempty"`
+	Sync      any    `json:"sync,omitempty"`
+	Plan      any    `json:"plan,omitempty"`
+	Rollback  any    `json:"rollback,omitempty"`
+	Apply     any    `json:"apply,omitempty"`
 }
 
-// Stable error codes (see openapi.yaml → Error).
+// Stable error codes (see openapi.yaml → Error). Most follow from the status (codeFor); the
+// rest name a refusal more precisely than its status does.
 const (
 	CodeBadRequest   = "bad_request"
 	CodeUnauthorized = "unauthorized"
@@ -976,9 +1155,17 @@ const (
 	CodeTooLarge     = "too_large"
 	CodeQuota        = "quota_exceeded"
 	CodeUpstream     = "upstream_failed"
+	CodeTimeout      = "timeout" // 504: the cluster or the pod did not answer in time
 	CodeInternal     = "internal"
 	CodeUnavailable  = "unavailable"
 	CodeInvalid      = "invalid" // 422: the request was understood and refused by validation
+
+	CodeInvalidPlan       = "invalid_plan"         // 422: a bundle does not validate; the plan is attached
+	CodeNothingToRollBack = "nothing_to_roll_back" // 422: the rollback would change nothing
+	CodeUnreachable       = "unreachable"          // 502: a Git repository could not be read
+	CodeCredential        = "credential"           // 422: the credential a spec names is not available
+	CodeStopped           = "stopped"              // 409: an apply of a sync did not finish
+	CodeRateLimited       = "rate_limited"         // 429: too many attempts from this address
 )
 
 func codeFor(status int) string {
@@ -999,6 +1186,8 @@ func codeFor(status int) string {
 		return CodeQuota
 	case http.StatusBadGateway:
 		return CodeUpstream
+	case http.StatusGatewayTimeout:
+		return CodeTimeout
 	case http.StatusUnprocessableEntity:
 		return CodeInvalid
 	case http.StatusServiceUnavailable:
@@ -1007,8 +1196,47 @@ func codeFor(status int) string {
 	return CodeInternal
 }
 
-func writeErr(w http.ResponseWriter, code int, err error) {
-	writeJSON(w, code, ErrorBody{Error: err.Error(), Code: codeFor(code), RequestID: w.Header().Get("X-Request-Id")})
+// writeErr is the error response of every handler: the envelope, the code its status implies.
+func writeErr(w http.ResponseWriter, status int, err error) {
+	writeErrWith(w, status, ErrorBody{}, err)
+}
+
+// writeErrWith writes the envelope from base: its code (empty: the status's) and the record
+// the error travels with. A 500 never carries the error text, nor a record (whose own error
+// fields would carry it just the same): what failed inside (the store, the cluster) is logged
+// under the request id, and the client gets the id to quote.
+func writeErrWith(w http.ResponseWriter, status int, base ErrorBody, err error) {
+	if base.Code == "" {
+		base.Code = codeFor(status)
+	}
+	base.RequestID = w.Header().Get("X-Request-Id")
+	base.Error = err.Error()
+	if status == http.StatusInternalServerError {
+		noteInternal(w, err)
+		base.Error = "internal error"
+		base.Sync, base.Plan, base.Rollback, base.Apply = nil, nil, nil, nil
+		if base.RequestID != "" {
+			base.Error += " (request " + base.RequestID + ")"
+		}
+	}
+	writeJSON(w, status, base)
+}
+
+// noteInternal hands the detail of a 500 to the request log line (logRequests), or logs it on
+// its own when the writer is not under logRequests.
+func noteInternal(w http.ResponseWriter, err error) {
+	for cur := w; cur != nil; {
+		if sw, ok := cur.(*statusWriter); ok && sw.log {
+			sw.err = err
+			return
+		}
+		u, ok := cur.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			break
+		}
+		cur = u.Unwrap()
+	}
+	slog.Default().Error("internal error", "rid", w.Header().Get("X-Request-Id"), "err", err)
 }
 
 func writeOrchErr(w http.ResponseWriter, err error) {
@@ -1137,7 +1365,11 @@ func (q *query) oneOf(name, def string, allowed ...string) string {
 type statusWriter struct {
 	http.ResponseWriter
 	code int
+	log  bool  // the request log line's writer (logRequests)
+	err  error // what failed inside, for that line (writeErr on a 500)
 }
+
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
 
 func (s *statusWriter) WriteHeader(c int) { s.code = c; s.ResponseWriter.WriteHeader(c) }
 func (s *statusWriter) Flush() {
@@ -1164,9 +1396,13 @@ func logRequests(log *slog.Logger, next http.Handler) http.Handler {
 			rid = newRequestID()
 		}
 		w.Header().Set("X-Request-Id", rid)
-		sw := &statusWriter{ResponseWriter: w, code: 200}
+		sw := &statusWriter{ResponseWriter: w, code: 200, log: true}
 		start := time.Now()
 		next.ServeHTTP(sw, r)
+		if sw.err != nil {
+			log.Error("http", "rid", rid, "method", r.Method, "path", r.URL.Path, "code", sw.code, "took_ms", time.Since(start).Milliseconds(), "err", sw.err)
+			return
+		}
 		log.Info("http", "rid", rid, "method", r.Method, "path", r.URL.Path, "code", sw.code, "took_ms", time.Since(start).Milliseconds())
 	})
 }

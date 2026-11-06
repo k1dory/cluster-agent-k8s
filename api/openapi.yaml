@@ -56,9 +56,18 @@ info:
     Contract notes:
     * **Errors** are always `{error, code, request_id}`; `code` is stable
       (`bad_request`, `unauthorized`, `forbidden`, `not_found`, `conflict`, `too_large`,
-      `quota_exceeded`, `upstream_failed`, `internal`, `unavailable`). `request_id` also comes back
-      as the `X-Request-Id` header and is in the server log; send your own `X-Request-Id` to correlate.
+      `quota_exceeded`, `rate_limited`, `upstream_failed`, `timeout`, `invalid`, `internal`,
+      `unavailable`, and for Git syncs, plans and rollbacks `invalid_plan`, `nothing_to_roll_back`,
+      `unreachable`, `credential`, `stopped`). A few errors carry the record they are about
+      (`sync`, `plan`, `rollback`, `apply`), never a 500. `request_id` also comes back as the `X-Request-Id`
+      header and is in the server log; send your own `X-Request-Id` to correlate. A 500 says only
+      `internal error (request …)`: what failed inside is in the server log under that id.
     * **Malformed query parameters are 400**, never silently defaulted.
+    * **Request bodies** are read whole under a cap per kind of route, never cut short: small JSON
+      bodies (sandboxes, runs, input, messages, preview, rollouts, rollback, replies) at most 1 MiB,
+      one versioned document 1 MiB, a plan or apply bundle 8 MiB, a multipart message 8 files of
+      16 MiB, a workspace file 16 MiB. Over the cap is 413 (`too_large`). A JSON body is exactly
+      one object with known fields only: unknown fields, a second document or trailing data are 400.
     * **Paging**: list endpoints take `limit` and `after`. `X-Next-Cursor` is present only when
       another page exists (the server fetches one row more than `limit`); its value is opaque and
       keeps working after the anchor row is deleted or stops matching the filter. Event endpoints
@@ -66,8 +75,12 @@ info:
     * **Idempotency**: `POST /v1/sandboxes` and `POST .../runs` honour `Idempotency-Key`. The key is
       reserved before the request runs: a concurrent repeat gets 409 with `Retry-After: 1`, a repeat
       with a different body gets 422, a repeat after success replays the stored response with
-      `Idempotency-Replayed: true` (24h, per tenant and route).
+      `Idempotency-Replayed: true` (24h, per tenant and route). A JSON body is compared as sent;
+      a multipart body by what it carries (fields, file names and contents in order), not by its
+      bytes, so a retry under a new boundary replays.
     * Unknown routes and methods answer the same JSON error shape (404 / 405 with `Allow`).
+    * **Rate limits**: `POST /v1/auth/ci` and failed bearer authentication are limited per source
+      address (429 `rate_limited` with `Retry-After`, see `components/responses/RateLimited`).
 servers:
   - url: http://localhost:8080
     description: platform API
@@ -318,6 +331,9 @@ paths:
         already uploaded; multipart/form-data with a `text` field and `file` parts uploads each file
         to `uploads/<name>` first. Attached paths are listed after the text so the agent knows where
         to look. Supports `Idempotency-Key`.
+
+        Limits: a JSON body is at most 1 MiB; a multipart body carries at most 8 `file` parts of
+        16 MiB each and is at most 8 × 16 MiB + 1 MiB as a whole. Over either is 413.
       parameters: [{ $ref: "#/components/parameters/idempotencyKey" }]
       requestBody:
         required: true
@@ -929,7 +945,9 @@ paths:
           description: The key, its secret (shown once), the trust that matched and the token's subject
           content: { application/json: { schema: { $ref: "#/components/schemas/CIGrant" } } }
         "400": { description: "The body is not one JSON object with `token`", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { description: "The body is over its limit (32 KiB; code `too_large`)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { description: "No CITrust accepts the token (unknown issuer, another audience, claims that match no trust, expired, already exchanged, two tenants' trusts matching)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/RateLimited" }
         "503": { description: "CI authentication is disabled, or the issuer's keys could not be fetched", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /v1/bindings:
     get:
@@ -1214,9 +1232,10 @@ paths:
       responses:
         "200": { description: Replaced, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
         "201": { description: Added, content: { application/json: { schema: { $ref: "#/components/schemas/Credential" } } } }
-        "400": { description: "Malformed JSON, unknown field, trailing data, or a body over the limit (the value itself may be up to 65536 bytes)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "400": { description: "Malformed JSON, unknown field or trailing data", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/ScopeForbidden" }
+        "413": { description: "The body is over its limit (code `too_large`): 6 × 65536 + 1024 bytes of JSON, room for a value of 65536 bytes however it is escaped", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "422": { description: "Bad name or empty / oversized value", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "503": { $ref: "#/components/responses/CredentialsDisabled" }
     delete:
@@ -1700,6 +1719,83 @@ paths:
                   description: Optional harness total; overrides what was parsed from the output stream
       responses:
         "204": { description: Recorded }
+        "400": { description: "The body is not one JSON object with these fields (nothing is recorded)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { $ref: "#/components/responses/Error" }
+  /agent/fs/requests:
+    get:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Long-poll for file operations asked of this pod
+      description: |
+        Returns `fs.request` events with id > `after` that have no answer yet; each event's
+        `data` is an `FSRequest` (JSON). Requests older than ten minutes are not returned: the
+        caller stopped waiting long ago. Keep `after` at the id of the last event you received.
+      parameters:
+        - { name: after, in: query, schema: { type: integer, format: int64 } }
+        - { name: wait, in: query, schema: { type: string, default: 30s } }
+      responses:
+        "200":
+          description: File requests (possibly none once `wait` is over)
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Event" }
+        "400": { $ref: "#/components/responses/Error" }
+  /agent/fs/results:
+    post:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Answer a file request
+      description: |
+        The body is one `FSResult` object (at most 4 MiB, unknown fields are 400). For a read,
+        upload the content first (`POST /agent/blobs`) and name the blob; a blob of another
+        sandbox is 403.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FSResult" }
+      responses:
+        "204": { description: Recorded }
+        "400": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "413": { $ref: "#/components/responses/Error" }
+  /agent/blobs:
+    post:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Upload file content the pod read (at most 16 MiB)
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema: { type: string, format: binary }
+      responses:
+        "201":
+          description: Stored under a name confined to the calling sandbox
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string, description: "Blob name to put in the FSResult" }
+                  size: { type: integer }
+        "413": { $ref: "#/components/responses/Error" }
+  /agent/blobs/{name}:
+    parameters:
+      - { name: name, in: path, required: true, schema: { type: string }, description: "Blob name from an FSRequest (may contain slashes)" }
+    get:
+      tags: [agent]
+      security: [{ mtls: [] }]
+      summary: Download content the control plane wants written into the workspace
+      responses:
+        "200":
+          description: The content
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "404": { description: "No such blob, or one of another sandbox", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
 
   /bootstrap:
     post:
@@ -1747,6 +1843,13 @@ paths:
         Reads `X-Agent-Cert`, `X-Forwarded-Host`, `X-Forwarded-Method`, `X-Forwarded-Uri`.
         200 means allowed; response headers `Authorization`, `X-Api-Key`, `X-Agent-*` are copied
         onto the upstream request by Caddy. 403 otherwise.
+      responses:
+        "200": { description: Allowed }
+        "403": { description: Denied }
+    post:
+      tags: [gateway]
+      security: []
+      summary: Caddy forward_auth hook (same as GET; Caddy may forward with the original method's body)
       responses:
         "200": { description: Allowed }
         "403": { description: Denied }
@@ -1814,7 +1917,18 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     Unauthorized:
-      description: "No bearer token, or one that is unknown, revoked or expired (`bad token`); every authenticated route answers it"
+      description: "No bearer token, or one that is unknown, revoked or expired (`bad token`); every authenticated route answers it, and 429 (`rate_limited`, see RateLimited) once an address has failed too often. A JWT the identity provider could not be asked about (its discovery or keys do not answer) is 503 `unavailable` instead, and spends nothing of the address's budget"
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: |
+        Too many attempts from this address (code `rate_limited`): every `POST /v1/auth/ci`, and
+        every bearer token that fails authentication, spends one of a per-address budget (30 at
+        once, one more per second, per replica). While it is spent, every token from the address
+        is refused unchecked, valid ones too; requests without a token are not counted.
+      headers:
+        Retry-After: { schema: { type: integer }, description: Seconds until the next attempt is accepted }
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -1841,8 +1955,12 @@ components:
         error: { type: string, description: Human-readable message }
         code:
           type: string
-          enum: [bad_request, unauthorized, forbidden, not_found, conflict, too_large, quota_exceeded, upstream_failed, invalid, internal, unavailable]
+          enum: [bad_request, unauthorized, forbidden, not_found, conflict, too_large, quota_exceeded, rate_limited, upstream_failed, timeout, invalid, internal, unavailable, invalid_plan, nothing_to_roll_back, unreachable, credential, stopped]
         request_id: { type: string }
+        sync: { $ref: "#/components/schemas/GitSync", description: "Git check or sync errors: the record" }
+        plan: { type: object, description: "invalid_plan of an apply: the plan with the problems per document" }
+        rollback: { type: object, description: "invalid_plan or nothing_to_roll_back of a rollback: the rollback" }
+        apply: { $ref: "#/components/schemas/Apply", description: "conflict of an apply: the apply the key or plan belongs to" }
     CreateSandbox:
       type: object
       required: [name, slug, owner]
@@ -2072,10 +2190,11 @@ components:
         at: { type: string, format: date-time }
     GitSyncError:
       type: object
-      description: A check or sync that did not succeed, with the record
+      description: A check or sync that did not succeed, with the record (not on a 500, which carries no record)
       properties:
         error: { type: string }
-        code: { type: string, enum: [unreachable, credential, invalid_plan, stopped, error] }
+        code: { type: string, enum: [unreachable, credential, invalid_plan, stopped, internal] }
+        request_id: { type: string }
         sync: { $ref: "#/components/schemas/GitSync" }
     Credential:
       type: object
@@ -2401,6 +2520,27 @@ components:
         text: { type: string }
         at: { type: string, format: date-time }
         data: { type: object, additionalProperties: true, description: "request, resolved, commands: the runner's line (acp.request with request {request_id, kind, title, message, options[], schema, url} and diffs[]; acp.request_resolved {request_id, outcome, by}; acp.commands {commands[{name, description, hint}]}), docs/chat-and-files.md" }
+    FSRequest:
+      type: object
+      description: A file operation asked of the pod (the data of an fs.request event)
+      properties:
+        id: { type: string }
+        op: { type: string, enum: [list, read, write] }
+        path: { type: string, description: "Relative to /workspace" }
+        depth: { type: integer, description: "list: levels below path to include (1 = its entries)" }
+        blob: { type: string, description: "write: the blob holding the content (GET /agent/blobs/{name})" }
+    FSResult:
+      type: object
+      required: [request, ok]
+      properties:
+        request: { type: string, description: "The FSRequest id" }
+        ok: { type: boolean }
+        error: { type: string }
+        entries: { type: array, items: { $ref: "#/components/schemas/FSEntry" }, description: list }
+        truncated: { type: boolean, description: "list: more entries than the limit" }
+        blob: { type: string, description: "read: the blob holding the content (POST /agent/blobs)" }
+        size: { type: integer, format: int64, description: "read / write" }
+        content_type: { type: string, description: read }
     FSEntry:
       type: object
       properties:
@@ -2474,8 +2614,8 @@ components:
         tenant: { type: string }
         slug: { type: string }
         run_id: { type: string }
-        type: { type: string, enum: [status, run.queued, run.started, run.output, run.finished, run.cancel, input, egress.allow, egress.deny, rollout] }
-        data: { type: string, description: "status: new status; run.started: agent version; run.finished: final run status; egress.*: Egress JSON; rollout: {from, to, mode, run_id, resume_id}" }
+        type: { type: string, enum: [status, run.queued, run.started, run.output, run.finished, run.cancel, run.close, input, reply, fs.request, fs.result, egress.allow, egress.deny, rollout] }
+        data: { type: string, description: "status: new status; run.started: agent version; run.finished: final run status; reply: the answer to a request of the agent (JSON); fs.request: FSRequest JSON; fs.result: FSResult JSON; egress.*: Egress JSON; rollout: {from, to, mode, run_id, resume_id}" }
         at: { type: string, format: date-time }
     UsageTotals:
       type: object

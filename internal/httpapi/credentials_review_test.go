@@ -80,6 +80,8 @@ func TestReviewCredentialsOpenAPIResponseContract(t *testing.T) {
 		{"list", "GET", "/v1/credentials", "/v1/credentials", "alice-tok", nil, 200, false},
 		{"missing", "GET", item, "/v1/credentials/absent", "alice-tok", nil, 404, false},
 		{"invalid", "PUT", item, "/v1/credentials/fixture", "alice-tok", map[string]string{"value": ""}, 422, false},
+		{"oversized", "PUT", item, "/v1/credentials/fixture", "alice-tok", map[string]string{"value": strings.Repeat("a", 6*credentials.MaxValue+2048)}, 413, false},
+		{"malformed", "PUT", item, "/v1/credentials/fixture", "alice-tok", `{"value":"x","extra":1}`, 400, false},
 		{"unauthenticated", "GET", "/v1/credentials", "/v1/credentials", "", nil, 401, false},
 		{"foreign_scope", "GET", "/v1/credentials", "/v1/credentials?tenant=bob", "alice-tok", nil, 403, false},
 		{"delete", "DELETE", item, "/v1/credentials/fixture", "alice-tok", nil, 204, false},
