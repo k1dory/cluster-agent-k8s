@@ -198,6 +198,26 @@ func legacyResume(n int, b *OutputBatch) (int, error) {
 	return n, nil
 }
 
+// batchResume is how many lines of b were stored already under its id, from both records of
+// its progress: rec, this release's (nil when there is none or it expired), and legacy, the
+// count an older release keeps (-1 when there is none or it expired). Both are consulted even
+// when rec exists: during a rolling update an older replica may have continued the batch after
+// rec was written (a body cut by a 413, then the rest), and only the legacy count knows. rec
+// still checks the prefix it covers; a greater legacy count is the later progress.
+func batchResume(rec *batchProgress, legacy int, b *OutputBatch, chain []string) (int, error) {
+	n := 0
+	if rec != nil {
+		var err error
+		if n, err = rec.resume(b, chain); err != nil {
+			return 0, err
+		}
+	}
+	if legacy > n {
+		return legacyResume(legacy, b)
+	}
+	return n, nil
+}
+
 // outputBatchTTL is how long a batch's progress is kept after the last call under its id. A
 // runner retries a batch for as long as its harness lives, with at most 30 s between attempts
 // (postBackoffMax in cmd/agent-runner), so every retry renews it long before it runs out.

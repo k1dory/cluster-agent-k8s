@@ -1803,21 +1803,27 @@ func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResu
 	}
 	res := &OutputResult{}
 	key := ""
+	prevComplete := false // of the batch's progress still in retention
 	if b.BatchID != "" {
 		key = b.RunID + "|" + b.BatchID
-		if rec, ok := m.batches[key]; ok {
-			n, err := rec.resume(b, chain)
-			if err != nil {
-				return nil, err
-			}
-			res.Skipped = n
-		} else if v, ok := m.idem[legacyBatchKey(b.RunID, b.BatchID)]; ok && !v.CreatedAt.Before(time.Now().Add(-IdempotencyTTL)) {
-			// A batch an older release stored, retried after the upgrade.
-			n, err := legacyResume(v.Status, b)
-			if err != nil {
-				return nil, err
-			}
-			res.Skipped = n
+		// Each record counts only within its retention, checked here and not left to a cleanup
+		// that other traffic happens to trigger (as in the Postgres store).
+		now := time.Now()
+		var rec *batchProgress
+		if v, ok := m.batches[key]; ok && !v.at.Before(now.Add(-outputBatchTTL)) {
+			rec = &v.batchProgress
+		}
+		legacy := -1 // a batch an older release stored or continued
+		if v, ok := m.idem[legacyBatchKey(b.RunID, b.BatchID)]; ok && !v.CreatedAt.Before(now.Add(-IdempotencyTTL)) {
+			legacy = v.Status
+		}
+		n, err := batchResume(rec, legacy, b, chain)
+		if err != nil {
+			return nil, err
+		}
+		res.Skipped = n
+		if rec != nil {
+			prevComplete = rec.complete
 		}
 	}
 	undo := m.undoFor(r, key)
@@ -1850,8 +1856,7 @@ func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResu
 				delete(m.batches, k)
 			}
 		}
-		prev := m.batches[key]
-		m.batches[key] = memBatch{batchProgress: batchProgress{lines: len(b.Lines), hash: chain[len(b.Lines)], complete: prev.complete || !b.Partial}, at: at}
+		m.batches[key] = memBatch{batchProgress: batchProgress{lines: len(b.Lines), hash: chain[len(b.Lines)], complete: prevComplete || !b.Partial}, at: at}
 		// The form an older release reads (see legacyBatchKey).
 		lk := legacyBatchKey(b.RunID, b.BatchID)
 		m.idem[lk] = &Idempotent{Key: lk, Status: len(b.Lines), Body: []byte{}, CreatedAt: at}

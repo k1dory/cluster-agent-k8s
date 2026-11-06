@@ -315,6 +315,24 @@ CREATE TABLE IF NOT EXISTS run_output_batches (
 );
 CREATE INDEX IF NOT EXISTS run_output_batches_touched ON run_output_batches (touched_at);
 
+-- step 10: event ids in commit order
+-- Readers page events by id, so an id must not become visible before a smaller one: a writer
+-- holding id N uncommitted while another commits N+1 makes a listener move past N for good.
+-- The id is drawn here, under a transaction-scoped lock held to the commit, so the next
+-- writer's id is drawn only after this one is visible. In the database, not in the Go code:
+-- during a rolling update the replicas of an older release keep sending a bare INSERT, and
+-- they must take the same lock. The column default has already drawn a value when a BEFORE
+-- trigger runs, outside the lock; it is replaced (the gap it leaves is harmless).
+CREATE OR REPLACE FUNCTION events_ordered_id() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('agent-sandbox:events'));
+    NEW.id := nextval(pg_get_serial_sequence('events', 'id'));
+    RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS events_ordered_id ON events;
+CREATE TRIGGER events_ordered_id BEFORE INSERT ON events FOR EACH ROW EXECUTE FUNCTION events_ordered_id();
+
 -- every start: repairs of rows a replica of an older release may still write
 -- No DDL here: these run on every start, after the steps, because during a rolling update an
 -- older replica keeps writing the old form after the step that introduced the new one ran.

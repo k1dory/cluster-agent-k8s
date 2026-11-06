@@ -775,7 +775,10 @@ func (p *Postgres) AppendEvent(ctx context.Context, e *model.Event) error {
 	return p.pool.SendBatch(ctx, b).Close()
 }
 
-// eventsLockSQL serialises event ids with their commits (see AppendEvent).
+// eventsLockSQL serialises event ids with their commits (see AppendEvent). Since migration
+// step 10 the events table's trigger takes the same lock for every INSERT, including the bare
+// ones of older replicas during a rolling update, and draws the id under it; taking it here
+// first is harmless: the lock is re-entrant within a transaction.
 const eventsLockSQL = `SELECT pg_advisory_xact_lock(hashtext('agent-sandbox:events'))`
 
 func (p *Postgres) ListEvents(ctx context.Context, sandboxID string, afterID int64, limit int) ([]*model.Event, error) {
@@ -2085,30 +2088,28 @@ func (p *Postgres) AppendRunOutput(ctx context.Context, b *OutputBatch) (*Output
 			return ErrStaleAttempt
 		}
 		if b.BatchID != "" {
-			var rec batchProgress
-			err := tx.QueryRow(ctx, `SELECT lines, hash, complete FROM run_output_batches WHERE run_id=$1 AND batch_id=$2`, b.RunID, b.BatchID).
-				Scan(&rec.lines, &rec.hash, &rec.complete)
+			// Both records of the batch's progress, each only within its retention (see
+			// batchResume): an expired one is not there, whatever cleanup has run.
+			var rec *batchProgress
+			var got batchProgress
+			err := tx.QueryRow(ctx, `SELECT lines, hash, complete FROM run_output_batches WHERE run_id=$1 AND batch_id=$2
+				AND touched_at >= now() - $3::interval`, b.RunID, b.BatchID, outputBatchTTL.String()).
+				Scan(&got.lines, &got.hash, &got.complete)
 			switch {
 			case errors.Is(err, pgx.ErrNoRows):
-				// A batch an older release stored, retried after the upgrade (or on an older replica).
-				var n int
-				err := tx.QueryRow(ctx, `SELECT status FROM idempotency WHERE key=$1 AND created_at >= now() - $2::interval`,
-					legacyBatchKey(b.RunID, b.BatchID), IdempotencyTTL.String()).Scan(&n)
-				switch {
-				case errors.Is(err, pgx.ErrNoRows):
-				case err != nil:
-					return err
-				default:
-					if res.Skipped, err = legacyResume(n, b); err != nil {
-						return err
-					}
-				}
 			case err != nil:
 				return err
 			default:
-				if res.Skipped, err = rec.resume(b, chain); err != nil {
-					return err
-				}
+				rec = &got
+			}
+			legacy := -1 // a batch an older release stored or continued
+			err = tx.QueryRow(ctx, `SELECT status FROM idempotency WHERE key=$1 AND created_at >= now() - $2::interval`,
+				legacyBatchKey(b.RunID, b.BatchID), IdempotencyTTL.String()).Scan(&legacy)
+			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return err
+			}
+			if res.Skipped, err = batchResume(rec, legacy, b, chain); err != nil {
+				return err
 			}
 		}
 		rest := b.Lines[res.Skipped:]
@@ -2139,8 +2140,9 @@ func (p *Postgres) AppendRunOutput(ctx context.Context, b *OutputBatch) (*Output
 			// a batch stays whole.
 			if _, err := tx.Exec(ctx, `INSERT INTO run_output_batches (run_id, batch_id, lines, hash, complete, touched_at) VALUES ($1,$2,$3,$4,$5,now())
 				ON CONFLICT (run_id, batch_id) DO UPDATE SET lines=EXCLUDED.lines, hash=EXCLUDED.hash,
-					complete = run_output_batches.complete OR EXCLUDED.complete, touched_at=now()`,
-				b.RunID, b.BatchID, len(b.Lines), chain[len(b.Lines)], !b.Partial); err != nil {
+					complete = (run_output_batches.complete AND run_output_batches.touched_at >= now() - $6::interval) OR EXCLUDED.complete,
+					touched_at=now()`,
+				b.RunID, b.BatchID, len(b.Lines), chain[len(b.Lines)], !b.Partial, outputBatchTTL.String()); err != nil {
 				return err
 			}
 			// The form an older replica reads, in the same transaction.
