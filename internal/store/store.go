@@ -112,6 +112,10 @@ type Idempotent struct {
 	// handler that was slow, not dead, can neither overwrite nor drop a later attempt's
 	// reservation, even one made after a release.
 	Token string
+
+	// What the seed's attempts did (KeyedResults); the memory store keeps them here, Postgres
+	// in the row's columns. Neither is part of the record a reservation returns.
+	keyedCreated, keyedSaid string
 }
 
 // Legacy reports a reservation written by a replica of an earlier release (it has no seed).
@@ -472,6 +476,7 @@ type Store interface {
 	GitJobs
 	TokenUses
 	Atomics
+	KeyedResults
 
 	Close() error
 }
@@ -569,4 +574,19 @@ type SuccessorInUseError struct{ ID string }
 
 func (e *SuccessorInUseError) Error() string {
 	return "api key already rotated to " + e.ID + ", which has been used or rotated on"
+}
+
+// KeyedResults are what the attempts of one Idempotency-Key request did, recorded on its
+// reservation (found by its Seed) and gone with it: no attempt can ask once the key expired,
+// and while it lives they survive a takeover, a release and the deletion of what was created.
+type KeyedResults interface {
+	// CreateKeyedSandbox is CreateSandbox, and in the same transaction the reservation with
+	// that seed records the sandbox's id: an attempt that finds the record but not the sandbox
+	// knows it was created and deleted since, and does not create it again.
+	CreateKeyedSandbox(ctx context.Context, s *model.Sandbox, seed string) error
+	// KeyedResult returns what the seed's reservation recorded: the sandbox created, the
+	// delivery of a message (NoteKeyedSaid). ErrNotFound when no reservation has the seed.
+	KeyedResult(ctx context.Context, seed string) (created, said string, err error)
+	// NoteKeyedSaid records how the seed's message was delivered.
+	NoteKeyedSaid(ctx context.Context, seed, said string) error
 }

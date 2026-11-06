@@ -343,6 +343,11 @@ func (m *Memory) previewTaken(s *model.Sandbox) bool {
 func (m *Memory) CreateSandbox(_ context.Context, s *model.Sandbox) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.createSandbox(s)
+}
+
+// createSandbox is CreateSandbox under the lock already held.
+func (m *Memory) createSandbox(s *model.Sandbox) error {
 	if _, dup := m.sandboxes[s.ID]; dup {
 		return fmt.Errorf("%w: sandbox %s exists", ErrConflict, s.ID)
 	}
@@ -696,7 +701,7 @@ func (m *Memory) ReserveIdempotent(_ context.Context, key, bodyHash string) (*Id
 	abandoned := v.BodyHash == bodyHash && v.CreatedAt.Before(now.Add(-IdempotencyStale))
 	if v.InProgress() && !v.Legacy() && (released || abandoned) {
 		if v.BodyHash != bodyHash {
-			v.Seed = NewIdempotencySeed()
+			v.Seed, v.keyedCreated, v.keyedSaid = NewIdempotencySeed(), "", ""
 		}
 		v.BodyHash, v.Generation, v.CreatedAt, v.Token = bodyHash, v.Generation+1, now, NewIdempotencySeed()
 		return cloneIdem(v), true, nil
@@ -717,6 +722,7 @@ func (m *Memory) PutIdempotent(_ context.Context, rec *Idempotent) error {
 			return fmt.Errorf("%w: idempotency key is no longer reserved by this attempt", ErrConflict)
 		}
 		c.Seed, c.Generation, c.CreatedAt = cur.Seed, cur.Generation, m.idemNow()
+		c.keyedCreated, c.keyedSaid = cur.keyedCreated, cur.keyedSaid
 	}
 	m.idem[rec.Key] = c
 	return nil
@@ -1814,3 +1820,48 @@ var (
 	_ Store = (*Memory)(nil)
 	_ Store = (*Postgres)(nil)
 )
+
+// idemBySeed is the live reservation with seed; lock held.
+func (m *Memory) idemBySeed(seed string) *Idempotent {
+	if seed == "" {
+		return nil
+	}
+	now := m.idemNow()
+	for _, v := range m.idem {
+		if v.Seed == seed && !v.CreatedAt.Before(now.Add(-IdempotencyTTL)) {
+			return v
+		}
+	}
+	return nil
+}
+
+func (m *Memory) CreateKeyedSandbox(_ context.Context, s *model.Sandbox, seed string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.createSandbox(s); err != nil {
+		return err
+	}
+	if v := m.idemBySeed(seed); v != nil {
+		v.keyedCreated = s.ID
+	}
+	return nil
+}
+
+func (m *Memory) KeyedResult(_ context.Context, seed string) (string, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v := m.idemBySeed(seed)
+	if v == nil {
+		return "", "", ErrNotFound
+	}
+	return v.keyedCreated, v.keyedSaid, nil
+}
+
+func (m *Memory) NoteKeyedSaid(_ context.Context, seed, said string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if v := m.idemBySeed(seed); v != nil {
+		v.keyedSaid = said
+	}
+	return nil
+}

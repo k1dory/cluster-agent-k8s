@@ -50,7 +50,7 @@ func (o *Orchestrator) Say(ctx context.Context, sandboxID, text string) (run *mo
 		return err
 	})
 	if err == nil && wake {
-		o.wakeForRun(ctx, sandboxID, run.ID)
+		o.wakeKeyed(ctx, sandboxID, run.ID)
 	}
 	return run, how, err
 }

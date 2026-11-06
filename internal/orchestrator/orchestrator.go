@@ -344,7 +344,7 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 		if err := o.checkQuota(ctx, sb.Tenant, sb.Slug, true); err != nil {
 			return err
 		}
-		return o.Store.CreateSandbox(ctx, sb)
+		return o.insertSandbox(ctx, sb)
 	})
 	if err != nil {
 		return nil, err
@@ -981,7 +981,7 @@ func (o *Orchestrator) queueRun(ctx context.Context, sandboxID string, r *model.
 		return nil, err
 	}
 	if wake {
-		o.wakeForRun(ctx, sandboxID, r.ID)
+		o.wakeKeyed(ctx, sandboxID, r.ID)
 	}
 	return r, nil
 }

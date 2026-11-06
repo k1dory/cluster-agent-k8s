@@ -246,9 +246,18 @@ func connectionsCol(s *model.Sandbox) []byte {
 }
 
 func (p *Postgres) CreateSandbox(ctx context.Context, s *model.Sandbox) error {
+	return createSandboxIn(ctx, p.pool, s)
+}
+
+// pgExec is what the pool and a transaction share: CreateSandbox runs on either.
+type pgExec interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func createSandboxIn(ctx context.Context, db pgExec, s *model.Sandbox) error {
 	port, access, host := previewCols(s)
 	s.Revision = 1
-	_, err := p.pool.Exec(ctx, `INSERT INTO sandboxes (`+sandboxCols+`)
+	_, err := db.Exec(ctx, `INSERT INTO sandboxes (`+sandboxCols+`)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
 		s.PodName, s.LastActivity, s.CreatedAt, s.ExpiresAt, port, access, host, s.Error,
@@ -939,7 +948,9 @@ func (p *Postgres) ReserveIdempotent(ctx context.Context, key, bodyHash string) 
 		// Released (no owner): any body takes it, keeping the seed only for the same body.
 		// Abandoned (owned, stale): only the same body, seed kept. Legacy (no seed): never.
 		rec, err = scanIdem(p.pool.QueryRow(ctx, `UPDATE idempotency SET generation = generation + 1, created_at = now(), token = $4,
-				seed = CASE WHEN body_hash = $2 THEN seed ELSE $3 END, body_hash = $2
+				seed = CASE WHEN body_hash = $2 THEN seed ELSE $3 END,
+				created = CASE WHEN body_hash = $2 THEN created ELSE '' END,
+				said = CASE WHEN body_hash = $2 THEN said ELSE '' END, body_hash = $2
 			WHERE key=$1 AND status=0 AND seed <> '' AND (token = '' OR body_hash=$2 AND created_at < now() - $5::interval)
 			RETURNING `+idemCols, key, bodyHash, NewIdempotencySeed(), NewIdempotencySeed(), IdempotencyStale.String()))
 		if err == nil {
@@ -2093,4 +2104,33 @@ func (p *Postgres) FirstUseAPIKey(ctx context.Context, id string, at time.Time) 
 func uniqueViolation(err error) bool {
 	var pe *pgconn.PgError
 	return errors.As(err, &pe) && pe.Code == "23505"
+}
+
+func (p *Postgres) CreateKeyedSandbox(ctx context.Context, s *model.Sandbox, seed string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := createSandboxIn(ctx, tx, s); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE idempotency SET created=$2 WHERE seed=$1 AND seed <> ''`, seed, s.ID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) KeyedResult(ctx context.Context, seed string) (created, said string, err error) {
+	err = p.pool.QueryRow(ctx, `SELECT created, said FROM idempotency WHERE seed=$1 AND seed <> '' AND created_at >= now() - $2::interval LIMIT 1`,
+		seed, IdempotencyTTL.String()).Scan(&created, &said)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrNotFound
+	}
+	return created, said, err
+}
+
+func (p *Postgres) NoteKeyedSaid(ctx context.Context, seed, said string) error {
+	_, err := p.pool.Exec(ctx, `UPDATE idempotency SET said=$2 WHERE seed=$1 AND seed <> ''`, seed, said)
+	return err
 }

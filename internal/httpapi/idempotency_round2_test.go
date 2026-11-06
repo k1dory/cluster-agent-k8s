@@ -32,7 +32,7 @@ type idemFaultStore struct {
 	*store.Memory
 	putDown    atomic.Bool
 	readsDown  atomic.Bool   // GetSandbox and GetRun fail
-	blobsDown  atomic.Bool   // PutBlob fails
+	notesDown  atomic.Bool   // NoteKeyedSaid fails
 	holdPut    chan struct{} // when set, the next PutIdempotent waits for it to close
 	holdLock   chan struct{} // when set, the next WithTenantLock waits for it to close
 	afterWrite func()        // runs after CreateSandbox
@@ -87,6 +87,17 @@ func (s *idemFaultStore) CreateSandbox(ctx context.Context, sb *model.Sandbox) e
 	return err
 }
 
+func (s *idemFaultStore) CreateKeyedSandbox(ctx context.Context, sb *model.Sandbox, seed string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	err := s.Memory.CreateKeyedSandbox(ctx, sb, seed)
+	if err == nil && s.afterWrite != nil {
+		s.afterWrite()
+	}
+	return err
+}
+
 func (s *idemFaultStore) CreateRun(ctx context.Context, r *model.Run) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -112,11 +123,11 @@ func (s *idemFaultStore) GetRun(ctx context.Context, id string) (*model.Run, err
 	return s.Memory.GetRun(ctx, id)
 }
 
-func (s *idemFaultStore) PutBlob(ctx context.Context, name string, data []byte) error {
-	if s.blobsDown.Load() {
+func (s *idemFaultStore) NoteKeyedSaid(ctx context.Context, seed, said string) error {
+	if s.notesDown.Load() {
 		return errors.New("fixture: store unavailable")
 	}
-	return s.Memory.PutBlob(ctx, name, data)
+	return s.Memory.NoteKeyedSaid(ctx, seed, said)
 }
 
 func (s *idemFaultStore) readErr(ctx context.Context) error {
@@ -379,6 +390,9 @@ func TestRound2HangupDuringCreationNeverYieldsASecondSandbox(t *testing.T) {
 			if n := round2Count(t, s); n != 1 {
 				t.Fatalf("%d sandboxes for one key (first attempt %d %s)", n, w.Code, w.Body)
 			}
+			// Review round 2 of #32, finding 1: the success every retry replays is a sandbox
+			// that was provisioned, not a bare row the reconciler later marks failed.
+			round2Provisioned(t, s, id)
 		})
 	}
 }
@@ -526,10 +540,10 @@ func TestRound2MessageRetryFindsTheRunWithoutARecord(t *testing.T) {
 		t.Fatalf("create: %d", code)
 	}
 	path := s.platform.URL + "/v1/sandboxes/" + sbID + "/messages"
-	fs.blobsDown.Store(true)
+	fs.notesDown.Store(true)
 	fs.putDown.Store(true)
 	resp, _ := call(t, "POST", path, "t0k", map[string]any{"text": "hello"}, map[string]string{"Idempotency-Key": "msg-norecord"})
-	fs.blobsDown.Store(false)
+	fs.notesDown.Store(false)
 	fs.putDown.Store(false)
 	if resp.StatusCode != 202 {
 		t.Fatalf("first attempt: %d", resp.StatusCode)
@@ -602,5 +616,78 @@ func TestRound2TakenPreviewHostIs409(t *testing.T) {
 			resp, body := preview(ids[1])
 			wantErr(t, "second preview", resp, body, 409, CodePreviewTaken)
 		})
+	}
+}
+
+// round2Provisioned waits for the sandbox to have its pod (waking or running).
+func round2Provisioned(t *testing.T, s *stack, id string) {
+	t.Helper()
+	ctx := context.Background()
+	round2WaitFor(t, func() bool {
+		sb, err := s.orch.Store.GetSandbox(ctx, id)
+		if err != nil || sb.Status != model.StatusWaking && sb.Status != model.StatusRunning {
+			return false
+		}
+		ok, _, _ := s.rt.PodStatus(ctx, sb)
+		return ok
+	})
+}
+
+// Review round 2 of #32, finding 2: the client hangs up right after the run row is written,
+// before the wake. The success stored for every retry to replay is not left with a sleeping
+// sandbox: the wake does not end with the client.
+func TestRound2RunHangupStillWakesTheSandbox(t *testing.T) {
+	s, fs, _ := idemFaults(t)
+	code, sbID, _ := round2Create(t, s, "")
+	if code != 201 {
+		t.Fatalf("create: %d", code)
+	}
+	if resp, body := call(t, "POST", s.platform.URL+"/v1/sandboxes/"+sbID+"/sleep?force=true", "t0k", nil, nil); resp.StatusCode != 200 {
+		t.Fatalf("sleep: %d %s", resp.StatusCode, body)
+	}
+	round2WaitFor(t, func() bool {
+		sb, _ := fs.Memory.GetSandbox(context.Background(), sbID)
+		return sb.Status == model.StatusSleeping
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fs.afterRun = cancel
+	req := httptest.NewRequest("POST", "/v1/sandboxes/"+sbID+"/runs", bytes.NewReader([]byte(`{"task":"build"}`+"\n"))).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer t0k")
+	req.Header.Set("Idempotency-Key", "run-hangup")
+	w := httptest.NewRecorder()
+	s.p.Routes().ServeHTTP(w, req)
+	fs.afterRun = nil
+	if w.Code != 202 {
+		t.Fatalf("first attempt: %d %s", w.Code, w.Body)
+	}
+	resp, body := call(t, "POST", s.platform.URL+"/v1/sandboxes/"+sbID+"/runs", "t0k", map[string]any{"task": "build"}, map[string]string{"Idempotency-Key": "run-hangup"})
+	if resp.StatusCode != 202 || resp.Header.Get("Idempotency-Replayed") != "true" {
+		t.Fatalf("retry: %d %s", resp.StatusCode, body)
+	}
+	round2Provisioned(t, s, sbID)
+}
+
+// Review round 2 of #32, finding 3: the creation succeeded, its result was not recorded, and
+// the sandbox was deleted (here by its owner; a short ttl the same) before the retry took the
+// reservation over. The retry does not make it again.
+func TestRound2DeletedSandboxIsNotRecreatedByARetry(t *testing.T) {
+	s, fs, age := idemFaults(t)
+	fs.putDown.Store(true)
+	code, id, _ := round2Create(t, s, "deleted")
+	fs.putDown.Store(false)
+	if code != 201 || id == "" {
+		t.Fatalf("first attempt: %d", code)
+	}
+	if resp, body := call(t, "DELETE", s.platform.URL+"/v1/sandboxes/"+id, "t0k", nil, nil); resp.StatusCode != 204 {
+		t.Fatalf("delete: %d %s", resp.StatusCode, body)
+	}
+	age()
+	resp, body := call(t, "POST", s.platform.URL+"/v1/sandboxes", "t0k", round2CreateBody, map[string]string{"Idempotency-Key": "deleted"})
+	if resp.StatusCode != 409 || !strings.Contains(string(body), "deleted") {
+		t.Fatalf("retry after the deletion: %d %s", resp.StatusCode, body)
+	}
+	if n := round2Count(t, s); n != 0 {
+		t.Fatalf("the deleted sandbox came back: %d sandboxes", n)
 	}
 }

@@ -21,7 +21,8 @@ import (
 // IdempotencyStale without waiting for it.
 type round2Store struct {
 	Store
-	age func(t *testing.T, key string)
+	age   func(t *testing.T, key string)
+	ageBy func(t *testing.T, key string, d time.Duration) // ages the reservation by d
 }
 
 func round2Run(t *testing.T, body func(t *testing.T, s round2Store)) {
@@ -29,16 +30,18 @@ func round2Run(t *testing.T, body func(t *testing.T, s round2Store)) {
 		m := NewMemory()
 		var offset atomic.Int64
 		m.SetIdempotencyClock(func() time.Time { return time.Now().Add(time.Duration(offset.Load())) })
-		body(t, round2Store{Store: m, age: func(*testing.T, string) { offset.Add(int64(IdempotencyStale + time.Minute)) }})
+		ageBy := func(_ *testing.T, _ string, d time.Duration) { offset.Add(int64(d)) }
+		body(t, round2Store{Store: m, ageBy: ageBy, age: func(t *testing.T, key string) { ageBy(t, key, IdempotencyStale+time.Minute) }})
 	})
 	t.Run("postgres", func(t *testing.T) {
 		p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
-		body(t, round2Store{Store: p, age: func(t *testing.T, key string) {
+		ageBy := func(t *testing.T, key string, d time.Duration) {
 			if _, err := p.pool.Exec(context.Background(), `UPDATE idempotency SET created_at = created_at - $2::interval WHERE key=$1`,
-				key, (IdempotencyStale + time.Minute).String()); err != nil {
+				key, d.String()); err != nil {
 				t.Fatal(err)
 			}
-		}})
+		}
+		body(t, round2Store{Store: p, ageBy: ageBy, age: func(t *testing.T, key string) { ageBy(t, key, IdempotencyStale+time.Minute) }})
 	})
 }
 
@@ -548,6 +551,71 @@ func TestRound2TenantLockRefusesAnEndedContext(t *testing.T) {
 			if err := s.WithTenantLock(ctx, fmt.Sprintf("free-%d", i), func(context.Context) error { ran = true; return nil }); err == nil || ran {
 				t.Fatalf("attempt %d: err %v, ran %v", i, err, ran)
 			}
+		}
+	})
+}
+
+// Review round 2 of #32, findings 3 and 4: what a key's attempts did is recorded on its
+// reservation and lives exactly as long: a keyed sandbox's id is recorded in the insert's
+// transaction and survives the sandbox's deletion; a delivery note survives a renewal near the
+// end of the key's life and the cleanup that follows; both go with the reservation, and a
+// takeover by another body starts with neither.
+func TestRound2KeyedResultsLiveAsLongAsTheReservation(t *testing.T) {
+	round2Run(t, func(t *testing.T, s round2Store) {
+		ctx := context.Background()
+		key := "acme|POST /v1/sandboxes|results"
+		rec, _, err := s.ReserveIdempotent(ctx, key, "h")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.KeyedResult(ctx, "no-such-seed"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("unknown seed: %v", err)
+		}
+		sb := round2Sandbox("sb_keyed_results")
+		if err := s.CreateKeyedSandbox(ctx, sb, rec.Seed); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CreateKeyedSandbox(ctx, round2Sandbox(sb.ID), rec.Seed); !errors.Is(err, ErrConflict) {
+			t.Fatalf("second keyed insert: %v", err)
+		}
+		if err := s.DeleteSandbox(ctx, sb.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.NoteKeyedSaid(ctx, rec.Seed, `{"run":"r"}`); err != nil {
+			t.Fatal(err)
+		}
+		// Abandoned near the end of the key's life, renewed by a takeover, then a cleanup.
+		s.ageBy(t, key, IdempotencyTTL-time.Minute)
+		if _, reserved, err := s.ReserveIdempotent(ctx, key, "h"); err != nil || !reserved {
+			t.Fatalf("renewal: %v %v", err, reserved)
+		}
+		s.ageBy(t, key, 2*time.Minute)
+		if _, _, err := s.ReserveIdempotent(ctx, "acme|POST /v1/sandboxes|cleanup", "x"); err != nil {
+			t.Fatal(err)
+		}
+		created, said, err := s.KeyedResult(ctx, rec.Seed)
+		if err != nil || created != sb.ID || said != `{"run":"r"}` {
+			t.Fatalf("after renewal and cleanup: %q %q %v", created, said, err)
+		}
+		// Released and taken by another body: another request, nothing recorded.
+		cur, _ := s.GetIdempotent(ctx, key)
+		if err := s.ReleaseIdempotent(ctx, key, cur.Token); err != nil {
+			t.Fatal(err)
+		}
+		other, reserved, err := s.ReserveIdempotent(ctx, key, "h2")
+		if err != nil || !reserved {
+			t.Fatal(err)
+		}
+		if created, said, err := s.KeyedResult(ctx, other.Seed); err != nil || created != "" || said != "" {
+			t.Fatalf("another body's reservation: %q %q %v", created, said, err)
+		}
+		// Expired with its reservation.
+		s.ageBy(t, key, IdempotencyTTL+time.Minute)
+		if _, _, err := s.ReserveIdempotent(ctx, "acme|POST /v1/sandboxes|cleanup2", "x"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.KeyedResult(ctx, other.Seed); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("after expiry: %v", err)
 		}
 	})
 }

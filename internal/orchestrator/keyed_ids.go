@@ -86,12 +86,11 @@ func (o *Orchestrator) keyedRunWaits(ctx context.Context, run *model.Run) bool {
 	return err == nil && (sb.Status == model.StatusSleeping || sb.Status == model.StatusError)
 }
 
-// A keyed message's delivery is recorded under its seed, so every attempt of the request
-// delivers it once: as input to a run in progress, joined to a queued task, or as a new run.
-// The record is written under Say's sandbox lock right after the delivery, and checked under it
-// before one; a new run is found by its keyed id as well, should the record be missing.
-const saidPrefix = "idempotency-said/"
-
+// A keyed message's delivery is recorded on its reservation (store.KeyedResults), so every
+// attempt of the request delivers it once: as input to a run in progress, joined to a queued
+// task, or as a new run. The note is written under Say's sandbox lock right after the delivery
+// and checked under it before one; a new run is found by its keyed id as well, should the note
+// be missing. It lives as long as the reservation does.
 type saidRecord struct {
 	Run string `json:"run"`
 	How string `json:"how"`
@@ -104,18 +103,20 @@ func (o *Orchestrator) keyedSaid(ctx context.Context, sandboxID string) (run *mo
 	if seed == "" {
 		return nil, "", false, false, nil
 	}
-	b, err := o.Store.GetBlob(ctx, saidPrefix+sandboxID+"/"+seed)
-	switch {
-	case err == nil:
+	_, note, err := o.Store.KeyedResult(ctx, seed)
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return nil, "", false, false, err
+	}
+	if note != "" {
 		var rec saidRecord
-		if err := json.Unmarshal(b, &rec); err != nil {
+		if err := json.Unmarshal([]byte(note), &rec); err != nil {
 			return nil, "", false, false, err
 		}
 		if run, err = o.Store.GetRun(ctx, rec.Run); err != nil {
 			return nil, "", false, false, err
 		}
 		how = rec.How
-	case errors.Is(err, store.ErrNotFound):
+	} else {
 		run, err = o.Store.GetRun(ctx, KeyedID(seed, "run"))
 		if errors.Is(err, store.ErrNotFound) || err == nil && run.SandboxID != sandboxID {
 			return nil, "", false, false, nil
@@ -127,25 +128,91 @@ func (o *Orchestrator) keyedSaid(ctx context.Context, sandboxID string) (run *mo
 		if run.ResumeOf != "" {
 			how = DeliveredResumed
 		}
-	default:
-		return nil, "", false, false, err
 	}
 	return run, how, o.keyedRunWaits(ctx, run), true, nil
 }
 
-// recordSaid records a keyed message's delivery. On a context of its own: the delivery has
+// recordSaid notes a keyed message's delivery. On a context of its own: the delivery has
 // happened, and a client that hangs up now must not leave its retry to deliver it again.
 func (o *Orchestrator) recordSaid(ctx context.Context, sandboxID string, run *model.Run, how string) {
 	seed := keyedSeed(ctx)
 	if seed == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	ctx, cancel := detached(ctx)
 	defer cancel()
 	b, _ := json.Marshal(saidRecord{Run: run.ID, How: how})
-	if err := o.Store.PutBlob(ctx, saidPrefix+sandboxID+"/"+seed, b); err != nil {
+	if err := o.Store.NoteKeyedSaid(ctx, seed, string(b)); err != nil {
 		o.Log.Warn("record keyed message delivery", "sandbox", sandboxID, "run", run.ID, "err", err)
 	}
-	// A record outlives its key by nothing: past IdempotencyTTL no attempt can ask for it.
-	_, _ = o.Store.DeleteBlobsBefore(ctx, saidPrefix, time.Now().Add(-store.IdempotencyTTL))
+}
+
+// detachedTimeout bounds what a keyed request finishes after its client may have gone.
+const detachedTimeout = 30 * time.Second
+
+// detached is ctx without its cancellation (values kept), bounded.
+func detached(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), detachedTimeout)
+}
+
+// insertSandbox creates the record; a keyed request's sandbox is recorded on its reservation
+// in the same transaction (see store.KeyedResults).
+func (o *Orchestrator) insertSandbox(ctx context.Context, sb *model.Sandbox) error {
+	if seed := keyedSeed(ctx); seed != "" && sb.ID == KeyedID(seed, "sb") {
+		return o.Store.CreateKeyedSandbox(ctx, sb, seed)
+	}
+	return o.Store.CreateSandbox(ctx, sb)
+}
+
+// wakeKeyed wakes the sandbox for a run just queued. Under an Idempotency-Key the wake does
+// not end with the client: the request's success is stored for every retry to replay, and a
+// replay wakes nothing, so a wake cut short by a hang-up would leave the run waiting in a
+// sleeping sandbox.
+func (o *Orchestrator) wakeKeyed(ctx context.Context, sandboxID, runID string) {
+	if keyedSeed(ctx) != "" {
+		var cancel context.CancelFunc
+		ctx, cancel = detached(ctx)
+		defer cancel()
+	}
+	o.wakeForRun(ctx, sandboxID, runID)
+}
+
+// KeyedSandbox is what an earlier attempt of the keyed create in ctx made: the sandbox, or
+// gone=true when it was created and has been deleted since (it is not created again).
+// found=false when no attempt created one.
+func (o *Orchestrator) KeyedSandbox(ctx context.Context) (sb *model.Sandbox, gone, found bool) {
+	seed := keyedSeed(ctx)
+	if seed == "" {
+		return nil, false, false
+	}
+	id := KeyedID(seed, "sb")
+	sb, err := o.Store.GetSandbox(ctx, id)
+	if err == nil {
+		return sb, false, true
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return nil, false, false
+	}
+	created, _, err := o.Store.KeyedResult(ctx, seed)
+	return nil, err == nil && created == id, err == nil && created == id
+}
+
+// ResumeKeyedCreate finishes the provisioning of a sandbox an earlier attempt of the keyed
+// create inserted and did not get to provision (it lost its client or its process between
+// the insert and the pod): the volume, then the pod. A sandbox past creating is returned as
+// it is; its own failures show in its status, as Create reports them.
+func (o *Orchestrator) ResumeKeyedCreate(ctx context.Context, sb *model.Sandbox) *model.Sandbox {
+	if sb.Status != model.StatusCreating {
+		return sb
+	}
+	o.remember(sb)
+	if err := o.Runtime.EnsureVolume(ctx, sb); err != nil {
+		o.fail(ctx, sb.ID, model.StatusCreating, "volume: "+err.Error())
+	} else if _, err := o.startPod(ctx, sb.ID); err != nil {
+		o.Log.Warn("resume keyed create", "sandbox", sb.ID, "err", err)
+	}
+	if cur, err := o.Store.GetSandbox(ctx, sb.ID); err == nil {
+		return cur
+	}
+	return sb
 }

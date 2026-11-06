@@ -80,10 +80,15 @@ info:
       a multipart body by what it carries (fields, file names and contents in order), not by its
       bytes, so a retry under a new boundary replays. A reservation left unfinished for two minutes
       (its replica died), or released by a failed attempt, is taken over by the next repeat, which
-      answers with the sandbox or run an earlier attempt created rather than creating another; a
-      message is delivered once for all attempts. A reservation left unfinished by a replica of a
-      release before this behaviour is not run again: 409 until it expires, so check whether it
-      took effect and retry under a new key.
+      answers with the sandbox or run an earlier attempt created rather than creating another (a
+      sandbox it created and that was deleted since is not made again: 409). A message that starts
+      a run is delivered once for all attempts. One that is delivered into a run that already
+      exists (input to a running run, or text joined to a queued run's task) is delivered once
+      too, except when the replica that delivered it dies before recording the delivery: the
+      next attempt then delivers it again. A client for which a repeated message is harmful
+      should not retry such a message automatically. A reservation left unfinished by a replica
+      of a release before this behaviour is not run again: 409 until it expires, so check whether
+      it took effect and retry under a new key.
     * Unknown routes and methods answer the same JSON error shape (404 / 405 with `Allow`).
     * **Rate limits**: `POST /v1/auth/ci` and failed bearer authentication are limited per source
       address (429 `rate_limited` with `Retry-After`, see `components/responses/RateLimited`).

@@ -678,15 +678,13 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, errors.New("tenant "+req.Tenant+" is confined to its allowed environments: create with agent_ref"))
 		return
 	}
-	// A keyed retry that took over an abandoned attempt answers with what that one created.
-	if sb, ok := p.keyedSandbox(r, false); ok {
-		writeJSON(w, http.StatusCreated, sb)
+	// A keyed retry after an earlier attempt answers with what that one created.
+	if p.keyedSandbox(w, r, false) {
 		return
 	}
 	sb, err := p.Orch.Create(r.Context(), req)
 	if err != nil && sb == nil {
-		if sb, ok := p.keyedSandbox(r, true); ok {
-			writeJSON(w, http.StatusCreated, sb)
+		if p.keyedSandbox(w, r, true) {
 			return
 		}
 		writeOrchErr(w, err)
@@ -1500,16 +1498,26 @@ func keyedResult(r *http.Request, failed bool) (seed string, ok bool) {
 	return res.Seed, true
 }
 
-// keyedSandbox is the sandbox an earlier attempt of this keyed create made, if any.
-func (p *Platform) keyedSandbox(r *http.Request, failed bool) (*model.Sandbox, bool) {
-	seed, ok := keyedResult(r, failed)
-	if !ok {
-		return nil, false
+// keyedSandbox answers a keyed create with what an earlier attempt (or this one, before it
+// failed) made, and reports whether it did: the sandbox, its provisioning finished first when
+// that attempt never got to it, so the success stored for every retry is one; or 409 when the
+// sandbox was created and has been deleted since (it is not created again under the key).
+func (p *Platform) keyedSandbox(w http.ResponseWriter, r *http.Request, failed bool) bool {
+	if _, ok := keyedResult(r, failed); !ok {
+		return false
 	}
 	ctx, cancel := recoveryContext(r)
 	defer cancel()
-	sb, err := p.Orch.Store.GetSandbox(ctx, orchestrator.KeyedID(seed, "sb"))
-	return sb, err == nil
+	sb, gone, found := p.Orch.KeyedSandbox(ctx)
+	switch {
+	case !found:
+		return false
+	case gone:
+		writeErr(w, http.StatusConflict, errors.New("the sandbox this Idempotency-Key created has been deleted since; it is not created again under this key"))
+	default:
+		writeJSON(w, http.StatusCreated, p.Orch.ResumeKeyedCreate(ctx, sb))
+	}
+	return true
 }
 
 // keyedRun is the run an earlier attempt of this keyed request queued in the sandbox, if any.
@@ -1529,9 +1537,12 @@ func (p *Platform) keyedRun(r *http.Request, sandboxID string, failed bool) (*mo
 	return run, true
 }
 
-// recoveryContext is where a keyed request looks for what an earlier attempt created: detached
-// from the client (a hang-up after the creation must not turn a found resource into an error
-// and a released key) and bounded.
+// recoveryContext is where a keyed request looks for (and finishes) what an earlier attempt
+// created: detached from the client (a hang-up after the creation must not turn a found
+// resource into an error and a released key) and bounded.
 func recoveryContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(r.Context()), idempotencyFinishTimeout)
+	return context.WithTimeout(context.WithoutCancel(r.Context()), recoveryTimeout)
 }
+
+// recoveryTimeout bounds a keyed request's recovery: reads, and a provisioning resumed.
+const recoveryTimeout = 30 * time.Second

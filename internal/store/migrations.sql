@@ -300,11 +300,17 @@ ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS preview_gen bigint NOT NULL DEFAU
 -- later one. generation counts the attempts under the key. seed names what the keyed request
 -- creates and is kept by every later attempt with the same body, so one finds what an earlier
 -- one created. Rows of an older replica have no seed: an unfinished one is never run again
--- (the resource it may have made has a random name nothing can find).
+-- (the resource it may have made has a random name nothing can find). created and said record
+-- what the seed's attempts did (the sandbox inserted, in the same transaction; a message's
+-- delivery): they live exactly as long as the reservation, and a deleted sandbox is not made
+-- again under its key.
 ALTER TABLE idempotency
     ADD COLUMN IF NOT EXISTS generation integer NOT NULL DEFAULT 1,
     ADD COLUMN IF NOT EXISTS seed text NOT NULL DEFAULT '',
-    ADD COLUMN IF NOT EXISTS token text NOT NULL DEFAULT '';
+    ADD COLUMN IF NOT EXISTS token text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS created text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS said text NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idempotency_seed ON idempotency (seed) WHERE seed <> '';
 
 -- every start: repairs of rows a replica of an older release may still write
 -- No DDL here: these run on every start, after the steps, because during a rolling update an
