@@ -166,3 +166,38 @@ func TestRound4BatchExpiryIsDecidedAtTheLookup(t *testing.T) {
 		})
 	}
 }
+
+// Codex round 6 of #31: the memory store answered ErrConflict for a run already settled before
+// it looked at the sandbox fence, while Postgres checks the fence first. A cleanup whose
+// observation went stale (the sandbox's revision moved) and whose run was settled meanwhile
+// took the conflict for "settled elsewhere" on memory and went on. Both stores say ErrFenced.
+func TestRound6StaleFenceWinsOverASettledRun(t *testing.T) {
+	bothStores(t, func(t *testing.T, s Store) {
+		ctx := context.Background()
+		r := round2Run(t, s, "dl-r6-fence")
+		if _, err := s.ClaimRun(ctx, r.ID, time.Now(), "", RunStamp{}); err != nil {
+			t.Fatal(err)
+		}
+		seen, err := s.GetSandbox(ctx, r.SandboxID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Meanwhile: the runner finishes the run, and a settings change bumps the revision.
+		if _, err := s.SettleRunWithEvents(ctx, Settle{RunID: r.ID, From: []model.RunStatus{model.RunRunning}, To: model.RunDone, FinishedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		moved := *seen
+		moved.IdleTimeout = 600
+		if err := s.UpdateSandbox(ctx, &moved); err != nil {
+			t.Fatal(err)
+		}
+		_, err = s.SettleRunWithEvents(ctx, Settle{RunID: r.ID, From: []model.RunStatus{model.RunRunning}, To: model.RunFailed, FinishedAt: time.Now(),
+			Sandbox: &SandboxFence{ID: seen.ID, Status: seen.Status, Revision: seen.Revision}})
+		if !errors.Is(err, ErrFenced) {
+			t.Fatalf("a stale fence over a settled run: %v, want ErrFenced", err)
+		}
+		if got, _ := s.GetRun(ctx, r.ID); got.Status != model.RunDone {
+			t.Fatalf("the run: %s", got.Status)
+		}
+	})
+}

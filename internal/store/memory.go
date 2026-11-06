@@ -1880,6 +1880,15 @@ func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResu
 func (m *Memory) SettleRunWithEvents(_ context.Context, s Settle) (*model.Run, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// The fence first, as in the Postgres store: a caller acting on a stale observation must
+	// learn that it is stale even when the run was settled meanwhile too. A plain ErrConflict
+	// would read as "settled elsewhere, carry on" and let it retire identities or move the
+	// sandbox on the strength of what it saw.
+	if f := s.Sandbox; f != nil {
+		if sb, ok := m.sandboxes[f.ID]; !ok || sb.Status != f.Status || f.Revision != 0 && sb.Revision != f.Revision {
+			return nil, ErrFenced
+		}
+	}
 	r, ok := m.runs[s.RunID]
 	if !ok {
 		return nil, ErrNotFound
@@ -1889,11 +1898,6 @@ func (m *Memory) SettleRunWithEvents(_ context.Context, s Settle) (*model.Run, e
 	}
 	if !slices.Contains(s.From, r.Status) {
 		return nil, ErrConflict
-	}
-	if f := s.Sandbox; f != nil {
-		if sb, ok := m.sandboxes[f.ID]; !ok || sb.Status != f.Status || f.Revision != 0 && sb.Revision != f.Revision {
-			return nil, ErrFenced
-		}
 	}
 	undo := m.undoFor(r, "")
 	r.Status, r.ExitCode, r.FinishedAt = s.To, s.ExitCode, &s.FinishedAt

@@ -173,3 +173,80 @@ func TestRound5StaleLostPodCleanupSparesTheReplacement(t *testing.T) {
 		t.Fatalf("the lost pod's run: %s, want cancelled by the stop", o.Status)
 	}
 }
+
+// afterRunningRunStore runs hook once, right after the next RunningRun has read its run.
+type afterRunningRunStore struct {
+	store.Store
+	hook atomic.Pointer[func()]
+}
+
+func (s *afterRunningRunStore) RunningRun(ctx context.Context, sandboxID string) (*model.Run, error) {
+	r, err := s.Store.RunningRun(ctx, sandboxID)
+	if h := s.hook.Swap(nil); h != nil {
+		(*h)()
+	}
+	return r, err
+}
+
+// Codex round 6 of #31, the orchestrator side: the lost-pod cleanup read the running run, then
+// its runner finished it and a settings change bumped the sandbox's revision. On the memory
+// store the fenced settle answered ErrConflict (run already settled) instead of ErrFenced, and
+// the cleanup went on to retire identities and move the sandbox to error on a stale view.
+func TestRound6StaleLostPodCleanupStopsWhenItsRunWasSettledToo(t *testing.T) {
+	ctx := context.Background()
+	fake := NewFakeRuntime()
+	base := store.NewMemory()
+	now := time.Now()
+	sb := &model.Sandbox{ID: "sb_r6", Slug: "dev", Tenant: "acme", Name: "s", Owner: "alice", Status: model.StatusRunning, CreatedAt: now, LastActivity: now}
+	if err := fake.EnsureVolume(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	if sb.PodName, err = fake.CreatePod(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	if err := base.CreateSandbox(ctx, sb); err != nil {
+		t.Fatal(err)
+	}
+	hooked := &afterRunningRunStore{Store: base}
+	a := New(hooked, fake, nil, events.New(), Config{}, nil)
+	retiredByA := &countingRetirer{}
+	a.Retirer = retiredByA
+	b := New(base, fake, nil, events.New(), Config{}, nil)
+	if _, err := b.CreateRun(ctx, sb.ID, "task"); err != nil {
+		t.Fatal(err)
+	}
+	run, err := b.NextRun(ctx, sb.ID, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := base.GetSandbox(ctx, sb.ID)
+	if err := fake.DeletePod(ctx, cur); err != nil { // the pod is lost
+		t.Fatal(err)
+	}
+	hook := func() {
+		// The cleanup has read the run. Meanwhile its runner finishes it, and a settings change
+		// moves the sandbox to a newer revision (straight on the store: the cleanup holds the
+		// tenant lock).
+		if err := b.FinishRun(ctx, sb.ID, run.ID, 0, nil); err != nil {
+			t.Error(err)
+		}
+		moved, _ := base.GetSandbox(ctx, sb.ID)
+		moved.IdleTimeout = 600
+		if err := base.UpdateSandbox(ctx, moved); err != nil {
+			t.Error(err)
+		}
+	}
+	hooked.hook.Store(&hook)
+	a.Reconcile(ctx)
+	if hooked.hook.Load() != nil {
+		t.Fatal("the cleanup never read the running run")
+	}
+	after, _ := base.GetSandbox(ctx, sb.ID)
+	if after.Status != model.StatusRunning || retiredByA.n.Load() != 0 {
+		t.Fatalf("a stale cleanup went on: sandbox %s (%s), identities retired %d times", after.Status, after.Error, retiredByA.n.Load())
+	}
+	if got, _ := base.GetRun(ctx, run.ID); got.Status != model.RunDone {
+		t.Fatalf("the run its runner finished: %s", got.Status)
+	}
+}
