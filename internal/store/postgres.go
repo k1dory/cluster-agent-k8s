@@ -2112,6 +2112,17 @@ func (p *Postgres) CreateKeyedSandbox(ctx context.Context, s *model.Sandbox, see
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	// FOR UPDATE: a concurrent attempt waits for this one's commit, then sees created set and
+	// finds no row.
+	var one int
+	err = tx.QueryRow(ctx, `SELECT 1 FROM idempotency WHERE seed=$1 AND seed <> '' AND status=0 AND created=''
+		AND created_at >= now() - $2::interval FOR UPDATE`, seed, IdempotencyTTL.String()).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: the key's reservation is gone, finished or has created its sandbox already", ErrConflict)
+	}
+	if err != nil {
+		return err
+	}
 	if err := createSandboxIn(ctx, tx, s); err != nil {
 		return err
 	}

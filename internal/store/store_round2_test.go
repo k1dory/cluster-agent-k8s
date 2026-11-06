@@ -619,3 +619,66 @@ func TestRound2KeyedResultsLiveAsLongAsTheReservation(t *testing.T) {
 		}
 	})
 }
+
+// Review round 3 of #32, finding 1: a keyed insert needs the seed's reservation live,
+// unfinished and unused. An attempt superseded while it paused before the insert, after a
+// later attempt created the sandbox and it was deleted, does not make it again; of two
+// attempts racing for one reservation, one inserts.
+func TestRound2KeyedInsertNeedsALiveUnusedReservation(t *testing.T) {
+	round2Run(t, func(t *testing.T, s round2Store) {
+		ctx := context.Background()
+		gone := func(id string) {
+			t.Helper()
+			if _, err := s.GetSandbox(ctx, id); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("sandbox %s exists: %v", id, err)
+			}
+		}
+		if err := s.CreateKeyedSandbox(ctx, round2Sandbox("sb_no_reservation"), "no-such-seed"); !errors.Is(err, ErrConflict) {
+			t.Fatalf("without a reservation: %v", err)
+		}
+		gone("sb_no_reservation")
+
+		key := "acme|POST /v1/sandboxes|gate"
+		rec, _, err := s.ReserveIdempotent(ctx, key, "h")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wins atomic.Int32
+		var wg sync.WaitGroup
+		for i := range 6 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				err := s.CreateKeyedSandbox(ctx, round2Sandbox(fmt.Sprintf("sb_gate_%d", i)), rec.Seed)
+				if err == nil {
+					wins.Add(1)
+				} else if !errors.Is(err, ErrConflict) {
+					t.Error(err)
+				}
+			}()
+		}
+		wg.Wait()
+		if wins.Load() != 1 {
+			t.Fatalf("%d keyed inserts for one reservation", wins.Load())
+		}
+		created, _, _ := s.KeyedResult(ctx, rec.Seed)
+		if err := s.DeleteSandbox(ctx, created); err != nil {
+			t.Fatal(err)
+		}
+		// The superseded attempt resumes with the same id after the deletion.
+		if err := s.CreateKeyedSandbox(ctx, round2Sandbox(created), rec.Seed); !errors.Is(err, ErrConflict) {
+			t.Fatalf("insert after the sandbox was deleted: %v", err)
+		}
+		gone(created)
+
+		finished := "acme|POST /v1/sandboxes|finished"
+		f, _, _ := s.ReserveIdempotent(ctx, finished, "h")
+		if err := s.PutIdempotent(ctx, &Idempotent{Key: finished, BodyHash: "h", Status: 201, Body: []byte("{}"), Token: f.Token}); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CreateKeyedSandbox(ctx, round2Sandbox("sb_finished"), f.Seed); !errors.Is(err, ErrConflict) {
+			t.Fatalf("after the reservation finished: %v", err)
+		}
+		gone("sb_finished")
+	})
+}

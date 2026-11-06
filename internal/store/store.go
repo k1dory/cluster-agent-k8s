@@ -582,7 +582,10 @@ func (e *SuccessorInUseError) Error() string {
 type KeyedResults interface {
 	// CreateKeyedSandbox is CreateSandbox, and in the same transaction the reservation with
 	// that seed records the sandbox's id: an attempt that finds the record but not the sandbox
-	// knows it was created and deleted since, and does not create it again.
+	// knows it was created and deleted since, and does not create it again. It inserts only
+	// while that reservation is live, unfinished and has created nothing yet: ErrConflict
+	// otherwise, so an attempt that was superseded while it paused before the insert cannot
+	// make a sandbox a later attempt created and someone deleted since.
 	CreateKeyedSandbox(ctx context.Context, s *model.Sandbox, seed string) error
 	// KeyedResult returns what the seed's reservation recorded: the sandbox created, the
 	// delivery of a message (NoteKeyedSaid). ErrNotFound when no reservation has the seed.

@@ -33,10 +33,11 @@ type idemFaultStore struct {
 	putDown    atomic.Bool
 	readsDown  atomic.Bool   // GetSandbox and GetRun fail
 	notesDown  atomic.Bool   // NoteKeyedSaid fails
+	lockDown   atomic.Bool   // WithTenantLock fails
 	holdPut    chan struct{} // when set, the next PutIdempotent waits for it to close
 	holdLock   chan struct{} // when set, the next WithTenantLock waits for it to close
-	afterWrite func()        // runs after CreateSandbox
-	afterRun   func()        // runs after CreateRun
+	afterWrite hook          // runs after CreateSandbox
+	afterRun   hook          // runs after CreateRun
 	mu         sync.Mutex
 	putErrs    []error
 }
@@ -70,6 +71,9 @@ func (s *idemFaultStore) WithTenantLock(ctx context.Context, tenant string, fn f
 	if hold != nil {
 		<-hold
 	}
+	if s.lockDown.Load() {
+		return errors.New("fixture: lock unavailable")
+	}
 	if err := s.Memory.WithTenantLock(ctx, tenant, fn); err != nil {
 		return err
 	}
@@ -81,8 +85,8 @@ func (s *idemFaultStore) CreateSandbox(ctx context.Context, sb *model.Sandbox) e
 		return err
 	}
 	err := s.Memory.CreateSandbox(ctx, sb)
-	if err == nil && s.afterWrite != nil {
-		s.afterWrite()
+	if err == nil {
+		s.afterWrite.run()
 	}
 	return err
 }
@@ -92,8 +96,8 @@ func (s *idemFaultStore) CreateKeyedSandbox(ctx context.Context, sb *model.Sandb
 		return err
 	}
 	err := s.Memory.CreateKeyedSandbox(ctx, sb, seed)
-	if err == nil && s.afterWrite != nil {
-		s.afterWrite()
+	if err == nil {
+		s.afterWrite.run()
 	}
 	return err
 }
@@ -103,8 +107,8 @@ func (s *idemFaultStore) CreateRun(ctx context.Context, r *model.Run) error {
 		return err
 	}
 	err := s.Memory.CreateRun(ctx, r)
-	if err == nil && s.afterRun != nil {
-		s.afterRun()
+	if err == nil {
+		s.afterRun.run()
 	}
 	return err
 }
@@ -135,6 +139,23 @@ func (s *idemFaultStore) readErr(ctx context.Context) error {
 		return errors.New("fixture: store unavailable")
 	}
 	return ctx.Err()
+}
+
+// hook is a test callback a handler goroutine may run while the test replaces it.
+type hook struct{ fn atomic.Pointer[func()] }
+
+func (h *hook) set(fn func()) {
+	if fn == nil {
+		h.fn.Store(nil)
+		return
+	}
+	h.fn.Store(&fn)
+}
+
+func (h *hook) run() {
+	if fn := h.fn.Load(); fn != nil {
+		(*fn)()
+	}
 }
 
 // idemFaults puts the fault store under the stack and returns it with a clock that ages
@@ -175,7 +196,7 @@ func TestRound2IdempotentResultSurvivesTheClientHangingUp(t *testing.T) {
 	s, fs, _ := idemFaults(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	fs.afterWrite = cancel
+	fs.afterWrite.set(cancel)
 	raw, _ := json.Marshal(round2CreateBody)
 	raw = append(raw, '\n') // as call's encoder writes it: the same body, the same hash
 	req := httptest.NewRequest("POST", "/v1/sandboxes", bytes.NewReader(raw)).WithContext(ctx)
@@ -183,7 +204,7 @@ func TestRound2IdempotentResultSurvivesTheClientHangingUp(t *testing.T) {
 	req.Header.Set("Idempotency-Key", "hangup")
 	w := httptest.NewRecorder()
 	s.p.Routes().ServeHTTP(w, req)
-	fs.afterWrite = nil
+	fs.afterWrite.set(nil)
 	var first model.Sandbox
 	if err := json.Unmarshal(w.Body.Bytes(), &first); err != nil || w.Code != 201 || first.ID == "" {
 		t.Fatalf("first attempt: %d %s", w.Code, w.Body)
@@ -364,10 +385,10 @@ func TestRound2HangupDuringCreationNeverYieldsASecondSandbox(t *testing.T) {
 			s, fs, _ := idemFaults(t)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			fs.afterWrite = func() {
+			fs.afterWrite.set(func() {
 				cancel()
 				fs.readsDown.Store(readsDown)
-			}
+			})
 			raw, _ := json.Marshal(round2CreateBody)
 			raw = append(raw, '\n')
 			req := httptest.NewRequest("POST", "/v1/sandboxes", bytes.NewReader(raw)).WithContext(ctx)
@@ -375,7 +396,7 @@ func TestRound2HangupDuringCreationNeverYieldsASecondSandbox(t *testing.T) {
 			req.Header.Set("Idempotency-Key", "hangup-commit")
 			w := httptest.NewRecorder()
 			s.p.Routes().ServeHTTP(w, req)
-			fs.afterWrite = nil
+			fs.afterWrite.set(nil)
 			fs.readsDown.Store(false)
 			if n := round2Count(t, s); n != 1 {
 				t.Fatalf("first attempt left %d sandboxes (%d %s)", n, w.Code, w.Body)
@@ -412,7 +433,7 @@ func TestRound2RecoveredRunWakesItsSandbox(t *testing.T) {
 		sb, _ := fs.Memory.GetSandbox(context.Background(), sbID)
 		return sb.Status == model.StatusSleeping
 	})
-	fs.afterRun = func() { panic(http.ErrAbortHandler) } // the process dies: no wake, no result
+	fs.afterRun.set(func() { panic(http.ErrAbortHandler) }) // the process dies: no wake, no result
 	path := s.platform.URL + "/v1/sandboxes/" + sbID + "/runs"
 	req, _ := http.NewRequest("POST", path, bytes.NewReader([]byte(`{"task":"build"}`+"\n")))
 	req.Header.Set("Authorization", "Bearer t0k")
@@ -426,7 +447,7 @@ func TestRound2RecoveredRunWakesItsSandbox(t *testing.T) {
 			t.Fatalf("the dying attempt answered %d %s", resp.StatusCode, b)
 		}
 	}
-	fs.afterRun = nil
+	fs.afterRun.set(nil)
 	if sb, _ := fs.Memory.GetSandbox(context.Background(), sbID); sb.Status != model.StatusSleeping {
 		t.Fatalf("the dying attempt woke the sandbox: %s", sb.Status)
 	}
@@ -651,13 +672,13 @@ func TestRound2RunHangupStillWakesTheSandbox(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	fs.afterRun = cancel
+	fs.afterRun.set(cancel)
 	req := httptest.NewRequest("POST", "/v1/sandboxes/"+sbID+"/runs", bytes.NewReader([]byte(`{"task":"build"}`+"\n"))).WithContext(ctx)
 	req.Header.Set("Authorization", "Bearer t0k")
 	req.Header.Set("Idempotency-Key", "run-hangup")
 	w := httptest.NewRecorder()
 	s.p.Routes().ServeHTTP(w, req)
-	fs.afterRun = nil
+	fs.afterRun.set(nil)
 	if w.Code != 202 {
 		t.Fatalf("first attempt: %d %s", w.Code, w.Body)
 	}
@@ -689,5 +710,78 @@ func TestRound2DeletedSandboxIsNotRecreatedByARetry(t *testing.T) {
 	}
 	if n := round2Count(t, s); n != 0 {
 		t.Fatalf("the deleted sandbox came back: %d sandboxes", n)
+	}
+}
+
+// Review round 3 of #32, finding 1: attempt A pauses before its insert; B takes the
+// reservation over and creates the sandbox; the sandbox is deleted; A resumes. Its insert of
+// the same id is refused by the reservation (it has created its sandbox already), and A
+// answers that the sandbox was deleted rather than making it again.
+func TestRound2SupersededCreateDoesNotResurrectADeletedSandbox(t *testing.T) {
+	s, fs, age := idemFaults(t)
+	release := make(chan struct{})
+	fs.mu.Lock()
+	fs.holdLock = release
+	fs.mu.Unlock()
+	type result struct {
+		code int
+		id   string
+	}
+	slow := make(chan result, 1)
+	go func() {
+		code, id, _ := round2Create(t, s, "resurrect")
+		slow <- result{code, id}
+	}()
+	round2WaitFor(t, func() bool {
+		_, err := fs.Memory.GetIdempotent(context.Background(), "|POST /v1/sandboxes|resurrect")
+		fs.mu.Lock()
+		defer fs.mu.Unlock()
+		return err == nil && fs.holdLock == nil
+	})
+	age()
+	code, id, _ := round2Create(t, s, "resurrect")
+	if code != 201 || id == "" {
+		t.Fatalf("takeover: %d", code)
+	}
+	if resp, body := call(t, "DELETE", s.platform.URL+"/v1/sandboxes/"+id, "t0k", nil, nil); resp.StatusCode != 204 {
+		t.Fatalf("delete: %d %s", resp.StatusCode, body)
+	}
+	close(release)
+	if old := <-slow; old.code != 409 {
+		t.Fatalf("the superseded attempt: %+v, want 409", old)
+	}
+	if n := round2Count(t, s); n != 0 {
+		t.Fatalf("the deleted sandbox came back: %d sandboxes", n)
+	}
+}
+
+// Review round 3 of #32, finding 3: the first attempt dies right after its insert, leaving
+// the sandbox creating. The retry's recovery cannot take the tenant lock: it answers with an
+// error, not a stored 201 for a sandbox nothing provisioned, and the next retry provisions it.
+func TestRound2FailedRecoveryIsNotStoredAsSuccess(t *testing.T) {
+	s, fs, age := idemFaults(t)
+	fs.afterWrite.set(func() { panic(http.ErrAbortHandler) })
+	raw, _ := json.Marshal(round2CreateBody)
+	req, _ := http.NewRequest("POST", s.platform.URL+"/v1/sandboxes", bytes.NewReader(append(raw, '\n')))
+	req.Header.Set("Authorization", "Bearer t0k")
+	req.Header.Set("Idempotency-Key", "recovery-fails")
+	if resp, err := http.DefaultClient.Do(req); err == nil { // the transport's own retry: 409
+		resp.Body.Close()
+	}
+	fs.afterWrite.set(nil)
+	age()
+	fs.lockDown.Store(true)
+	code, _, _ := round2Create(t, s, "recovery-fails")
+	fs.lockDown.Store(false)
+	if code < 500 {
+		t.Fatalf("recovery without the lock answered %d, want a failure to retry", code)
+	}
+	code, id, replayed := round2Create(t, s, "recovery-fails")
+	if code != 201 || replayed {
+		t.Fatalf("retry after the failed recovery: %d replayed=%v", code, replayed)
+	}
+	round2Provisioned(t, s, id)
+	if n := round2Count(t, s); n != 1 {
+		t.Fatalf("%d sandboxes for one key", n)
 	}
 }

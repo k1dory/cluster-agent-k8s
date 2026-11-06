@@ -1838,12 +1838,14 @@ func (m *Memory) idemBySeed(seed string) *Idempotent {
 func (m *Memory) CreateKeyedSandbox(_ context.Context, s *model.Sandbox, seed string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	v := m.idemBySeed(seed)
+	if v == nil || !v.InProgress() || v.keyedCreated != "" {
+		return fmt.Errorf("%w: the key's reservation is gone, finished or has created its sandbox already", ErrConflict)
+	}
 	if err := m.createSandbox(s); err != nil {
 		return err
 	}
-	if v := m.idemBySeed(seed); v != nil {
-		v.keyedCreated = s.ID
-	}
+	v.keyedCreated = s.ID
 	return nil
 }
 

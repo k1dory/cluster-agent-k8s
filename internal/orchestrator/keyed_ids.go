@@ -199,20 +199,24 @@ func (o *Orchestrator) KeyedSandbox(ctx context.Context) (sb *model.Sandbox, gon
 
 // ResumeKeyedCreate finishes the provisioning of a sandbox an earlier attempt of the keyed
 // create inserted and did not get to provision (it lost its client or its process between
-// the insert and the pod): the volume, then the pod. A sandbox past creating is returned as
-// it is; its own failures show in its status, as Create reports them.
-func (o *Orchestrator) ResumeKeyedCreate(ctx context.Context, sb *model.Sandbox) *model.Sandbox {
+// the insert and the pod). It goes through startPod, which provisions the volume under the
+// tenant lock a Delete takes, as Create does. A sandbox past creating is returned as it is.
+// After a failure the sandbox is returned only when it shows the outcome itself (the start
+// began, or its failure is recorded, as Create reports a runtime failure); while it is still
+// creating the error is returned, so the request is answered as failed and retried, never
+// stored as a success that nothing provisioned.
+func (o *Orchestrator) ResumeKeyedCreate(ctx context.Context, sb *model.Sandbox) (*model.Sandbox, error) {
 	if sb.Status != model.StatusCreating {
-		return sb
+		return sb, nil
 	}
 	o.remember(sb)
-	if err := o.Runtime.EnsureVolume(ctx, sb); err != nil {
-		o.fail(ctx, sb.ID, model.StatusCreating, "volume: "+err.Error())
-	} else if _, err := o.startPod(ctx, sb.ID); err != nil {
-		o.Log.Warn("resume keyed create", "sandbox", sb.ID, "err", err)
+	started, err := o.startPod(ctx, sb.ID)
+	if err == nil {
+		return started, nil
 	}
-	if cur, err := o.Store.GetSandbox(ctx, sb.ID); err == nil {
-		return cur
+	cur, gerr := o.Store.GetSandbox(ctx, sb.ID)
+	if gerr != nil || cur.Status == model.StatusCreating {
+		return nil, err
 	}
-	return sb
+	return cur, nil
 }

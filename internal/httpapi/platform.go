@@ -1515,7 +1515,12 @@ func (p *Platform) keyedSandbox(w http.ResponseWriter, r *http.Request, failed b
 	case gone:
 		writeErr(w, http.StatusConflict, errors.New("the sandbox this Idempotency-Key created has been deleted since; it is not created again under this key"))
 	default:
-		writeJSON(w, http.StatusCreated, p.Orch.ResumeKeyedCreate(ctx, sb))
+		sb, err := p.Orch.ResumeKeyedCreate(ctx, sb)
+		if err != nil {
+			writeOrchErr(w, err) // not stored: the release keeps the seed for the retry
+			return true
+		}
+		writeJSON(w, http.StatusCreated, sb)
 	}
 	return true
 }
