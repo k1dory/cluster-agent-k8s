@@ -312,6 +312,9 @@ type Sandbox struct {
 	ExpiresAt      *time.Time `json:"expires_at,omitempty"` // when set, the sandbox is deleted after this time
 	Preview        *Preview   `json:"preview,omitempty"`
 	Error          string     `json:"error,omitempty"`
+	// PreviewGen is the preview's access generation: bumped when the preview is closed or its
+	// access level changes, it invalidates every preview sign-in issued before.
+	PreviewGen int64 `json:"-"`
 }
 
 // IdleDuration returns the idle timeout as a duration.

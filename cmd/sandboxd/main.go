@@ -472,6 +472,9 @@ func serve(cfgPath string, log *slog.Logger) error {
 	for _, s := range servers {
 		httpapi.ShutdownServer(context.Background(), s)
 	}
+	if ing != nil {
+		ing.Close()
+	}
 	// The lead is handed over before the process ends: the reconciler releases its lease
 	// (unlock, connection closed), so a standby takes over within its polling interval rather
 	// than once the database notices a connection that went away with the process.

@@ -513,6 +513,9 @@ paths:
     put:
       tags: [preview]
       summary: Expose a port of the sandbox under a stable host name
+      description: >-
+        Removing the preview (port 0) or changing its access level signs out everyone signed in to
+        it: tickets and cookies issued before are refused. Moving the port keeps them.
       requestBody:
         required: true
         content:
@@ -534,6 +537,10 @@ paths:
     post:
       tags: [preview]
       summary: Mint a short-lived sign-in ticket for the preview (your auth service checked the user)
+      description: >-
+        The ticket, and the cookie it is exchanged for, are bound to this sandbox, its tenant and the
+        preview's current access generation: a sandbox created again under the same name, or a
+        preview whose access was changed or removed since, refuses them.
       requestBody:
         required: true
         content:
@@ -1483,7 +1490,11 @@ paths:
           `force` → `forced`: the run is cancelled, the pod replaced, and (unless `resume: false`) a
           new run with `resume_of` and the captured harness `session` is queued so the agent
           continues the conversation on the new version;
-        * creating / waking / stopping → `deferred`; deleting → `skipped`.
+        * creating / waking / stopping → `deferred`; deleting → `skipped`;
+        * running, but whether a run is in progress cannot be read (the database did not answer), or
+          the restart could not begin (the sandbox moved meanwhile) → `deferred` with that `reason`:
+          nothing was stopped, the version stays pending and the reconciler applies it once the
+          sandbox is running and idle.
 
         Tenants may only name versions from the catalogue (`GET /v1/version`); the admin may pass
         any image reference. Every decision is a `rollout` event in the sandbox's trace.

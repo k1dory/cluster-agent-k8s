@@ -960,7 +960,7 @@ func (p *Platform) previewTicket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	next := SafeNext(req.Next)
-	t := p.Ingress.SignTicket(sb.Preview.Host, req.User, time.Minute)
+	t := p.Ingress.SignTicket(sb, req.User, time.Minute)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"ticket":   t,
 		"redirect": fmt.Sprintf("https://%s/__sandbox/auth?ticket=%s&next=%s", sb.Preview.Host, url.QueryEscape(t), url.QueryEscape(next)),

@@ -289,6 +289,11 @@ CREATE INDEX IF NOT EXISTS git_jobs_waiting ON git_jobs (status, lease_until, cr
 -- the job): the identity an execution's writes are fenced by.
 ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS run integer NOT NULL DEFAULT 0;
 
+-- step 8: preview access generation
+-- Bumped when a preview is closed or its access level changes; preview sign-ins carry the
+-- generation they were issued under, and older ones are refused.
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS preview_gen bigint NOT NULL DEFAULT 0;
+
 -- every start: repairs of rows a replica of an older release may still write
 -- No DDL here: these run on every start, after the steps, because during a rolling update an
 -- older replica keeps writing the old form after the step that introduced the new one ran.
