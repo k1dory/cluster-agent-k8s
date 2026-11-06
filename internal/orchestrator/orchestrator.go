@@ -311,7 +311,7 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 	}
 	now := time.Now()
 	sb := &model.Sandbox{
-		ID: newID("sb"), Name: req.Name, Slug: req.Slug, Owner: req.Owner, Tenant: req.Tenant, Repo: req.Repo,
+		ID: idFor(ctx, "sb"), Name: req.Name, Slug: req.Slug, Owner: req.Owner, Tenant: req.Tenant, Repo: req.Repo,
 		IdleTimeout: int(o.Cfg.DefaultIdleTimeout.Seconds()), WakeOnPreview: true, AgentVersion: version, AdminGrant: adminGrant,
 		AgentRef: req.AgentRef, AgentRevision: req.AgentRevision, EnvironmentRef: req.EnvironmentRef, EnvironmentRevision: req.EnvironmentRevision,
 		Launch: req.Launch, Connections: req.Connections, Status: model.StatusCreating, LastActivity: now, CreatedAt: now,
@@ -1000,7 +1000,7 @@ func (o *Orchestrator) enqueue(ctx context.Context, sandboxID string, r *model.R
 	if sb.Status == model.StatusDeleting {
 		return nil, false, fmt.Errorf("%w: sandbox is being deleted", ErrConflict)
 	}
-	r.ID, r.SandboxID, r.Tenant, r.Slug = newID("run"), sandboxID, sb.Tenant, sb.Slug
+	r.ID, r.SandboxID, r.Tenant, r.Slug = idFor(ctx, "run"), sandboxID, sb.Tenant, sb.Slug
 	r.Status, r.CreatedAt = model.RunQueued, time.Now()
 	if err := o.Store.CreateRun(ctx, r); err != nil {
 		return nil, false, err

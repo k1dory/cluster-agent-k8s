@@ -77,7 +77,9 @@ info:
       with a different body gets 422, a repeat after success replays the stored response with
       `Idempotency-Replayed: true` (24h, per tenant and route). A JSON body is compared as sent;
       a multipart body by what it carries (fields, file names and contents in order), not by its
-      bytes, so a retry under a new boundary replays.
+      bytes, so a retry under a new boundary replays. A reservation left unfinished for two minutes
+      (its replica died) is taken over by the next repeat, which answers with the sandbox or run the
+      first attempt created rather than creating another.
     * Unknown routes and methods answer the same JSON error shape (404 / 405 with `Allow`).
     * **Rate limits**: `POST /v1/auth/ci` and failed bearer authentication are limited per source
       address (429 `rate_limited` with `Retry-After`, see `components/responses/RateLimited`).

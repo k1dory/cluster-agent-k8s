@@ -145,7 +145,9 @@ func TestReviewStoreFailuresAre500AndLogged(t *testing.T) {
 func TestReviewInternalErrorReachesTheLogThroughTheRecorder(t *testing.T) {
 	var logs bytes.Buffer
 	h := logRequests(slog.New(slog.NewJSONHandler(&logs, nil)), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		writeErr(&recorder{ResponseWriter: w, code: 200}, http.StatusInternalServerError, errors.New("inner detail"))
+		rec := &recorder{ResponseWriter: w, code: 200}
+		writeErr(rec, http.StatusInternalServerError, errors.New("inner detail"))
+		rec.flush() // the recorder holds the response until the idempotency result is stored
 	}))
 	r := httptest.NewRecorder()
 	h.ServeHTTP(r, httptest.NewRequest("GET", "/x", nil))

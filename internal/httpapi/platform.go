@@ -450,38 +450,54 @@ func (p *Platform) keyed(uploads bool, next http.HandlerFunc) http.HandlerFunc {
 		full := principalOf(r).Tenant + "|" + r.Method + " " + r.URL.Path + "|" + key
 		// The reservation is the lock: concurrent repeats see it and wait, a repeat with another
 		// body is refused, and a finished request is replayed from the stored response.
-		existing, reserved, err := p.Orch.Store.ReserveIdempotent(r.Context(), full, hash)
+		res, reserved, err := p.Orch.Store.ReserveIdempotent(r.Context(), full, hash)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
 		if !reserved {
 			switch {
-			case existing.BodyHash != hash && (legacy == "" || existing.BodyHash != legacy):
+			case res.BodyHash != hash && (legacy == "" || res.BodyHash != legacy):
 				writeErr(w, http.StatusUnprocessableEntity, errors.New("Idempotency-Key was already used with a different request body"))
-			case existing.InProgress():
+			case res.InProgress():
 				w.Header().Set("Retry-After", "1")
 				writeErr(w, http.StatusConflict, errors.New("a request with this Idempotency-Key is still in progress"))
 			default:
 				w.Header().Set("Idempotency-Replayed", "true")
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(existing.Status)
-				w.Write(existing.Body)
+				w.WriteHeader(res.Status)
+				w.Write(res.Body)
 			}
 			return
 		}
-		rec := &recorder{ResponseWriter: w, code: 200}
-		next(rec, r)
+		// What the request creates is named from the reservation's seed (orchestrator.KeyedID),
+		// so an attempt that takes over an abandoned reservation finds what that one created.
+		ctx := orchestrator.WithKeyedIDs(context.WithValue(r.Context(), reservationKey{}, res), res.Seed)
+		rec := &recorder{ResponseWriter: w, code: http.StatusOK}
+		next(rec, r.WithContext(ctx))
+		// The response is held until the key's result is stored, and stored on a context the
+		// client cannot cancel: a client that hangs up after the resource exists must not leave
+		// the key unfinished (its retry would wait IdempotencyStale and then run again). The
+		// write is conditional on the generation: a holder that was slow, not dead, cannot
+		// overwrite or drop the reservation of the attempt that took over from it.
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), idempotencyFinishTimeout)
+		defer cancel()
 		if rec.code >= 200 && rec.code < 300 {
-			err = p.Orch.Store.PutIdempotent(r.Context(), &store.Idempotent{Key: full, BodyHash: hash, Status: rec.code, Body: rec.body.Bytes()})
+			err = p.Orch.Store.PutIdempotent(fctx, &store.Idempotent{Key: full, BodyHash: hash, Status: rec.code, Body: rec.body.Bytes(), Generation: res.Generation})
 		} else {
-			err = p.Orch.Store.ReleaseIdempotent(r.Context(), full)
+			err = p.Orch.Store.ReleaseIdempotent(fctx, full, res.Generation)
 		}
 		if err != nil {
-			// The response is already on the wire; the reservation stays until IdempotencyStale,
-			// so a fast retry gets 409 rather than a duplicate, and the log says why.
-			p.Log.Error("finish idempotent request", "key", key, "err", err)
+			// Sent anyway: it describes what this attempt did. Unrecorded, the reservation stays
+			// until IdempotencyStale and a retry then takes it over and finds the keyed
+			// resource; taken over already (ErrConflict), the successor answers for the key.
+			log := p.Log
+			if log == nil {
+				log = slog.Default() // as logRequests: a Platform built without a logger
+			}
+			log.Error("finish idempotent request", "key", key, "generation", res.Generation, "err", err)
 		}
+		rec.flush()
 	}
 }
 
@@ -568,17 +584,31 @@ func multipartHash(form *multipart.Form) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// recorder holds a keyed request's response (status and body; headers go to the real writer's
+// map, sent with the status) until the idempotency middleware has stored it, then flush sends it.
 type recorder struct {
 	http.ResponseWriter
-	code int
-	body bytes.Buffer
+	code        int
+	wroteHeader bool
+	body        bytes.Buffer
 }
 
-func (rc *recorder) WriteHeader(c int)           { rc.code = c; rc.ResponseWriter.WriteHeader(c) }
+func (rc *recorder) WriteHeader(c int) {
+	if !rc.wroteHeader {
+		rc.code, rc.wroteHeader = c, true
+	}
+}
 func (rc *recorder) Unwrap() http.ResponseWriter { return rc.ResponseWriter }
 func (rc *recorder) Write(b []byte) (int, error) {
-	rc.body.Write(b)
-	return rc.ResponseWriter.Write(b)
+	rc.WriteHeader(http.StatusOK)
+	return rc.body.Write(b)
+}
+
+func (rc *recorder) flush() {
+	rc.ResponseWriter.WriteHeader(rc.code)
+	if rc.body.Len() > 0 {
+		rc.ResponseWriter.Write(rc.body.Bytes())
+	}
 }
 
 func (p *Platform) list(w http.ResponseWriter, r *http.Request) {
@@ -642,8 +672,17 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, errors.New("tenant "+req.Tenant+" is confined to its allowed environments: create with agent_ref"))
 		return
 	}
+	// A keyed retry that took over an abandoned attempt answers with what that one created.
+	if sb, ok := p.keyedSandbox(r, false); ok {
+		writeJSON(w, http.StatusCreated, sb)
+		return
+	}
 	sb, err := p.Orch.Create(r.Context(), req)
 	if err != nil && sb == nil {
+		if sb, ok := p.keyedSandbox(r, true); ok {
+			writeJSON(w, http.StatusCreated, sb)
+			return
+		}
 		writeOrchErr(w, err)
 		return
 	}
@@ -768,8 +807,16 @@ func (p *Platform) createRun(w http.ResponseWriter, r *http.Request) {
 		writeBodyErr(w, err)
 		return
 	}
+	if run, ok := p.keyedRun(r, r.PathValue("id"), false); ok {
+		writeJSON(w, http.StatusAccepted, run)
+		return
+	}
 	run, err := p.Orch.CreateRun(r.Context(), r.PathValue("id"), req.Task)
 	if err != nil {
+		if run, ok := p.keyedRun(r, r.PathValue("id"), true); ok {
+			writeJSON(w, http.StatusAccepted, run)
+			return
+		}
 		writeOrchErr(w, err)
 		return
 	}
@@ -1421,4 +1468,43 @@ func ShutdownServer(ctx context.Context, srv *http.Server) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+}
+
+// idempotencyFinishTimeout bounds storing a keyed request's result (detached from the client).
+const idempotencyFinishTimeout = 10 * time.Second
+
+// reservationKey carries a keyed request's reservation (store.Idempotent) to its handler.
+type reservationKey struct{}
+
+// keyedResult reports whether the handler should look for what an earlier attempt of the same
+// keyed request created: always after the handler's own attempt failed (the store refuses a
+// second resource of the keyed id: a holder that was slow, not dead, made it first), and before
+// it only when this attempt took over an abandoned reservation (generation > 1): the first
+// attempt of a key has a fresh seed and nothing can carry its id yet.
+func keyedResult(r *http.Request, failed bool) (seed string, ok bool) {
+	res, _ := r.Context().Value(reservationKey{}).(*store.Idempotent)
+	if res == nil || res.Seed == "" || !failed && res.Generation <= 1 {
+		return "", false
+	}
+	return res.Seed, true
+}
+
+// keyedSandbox is the sandbox an earlier attempt of this keyed create made, if any.
+func (p *Platform) keyedSandbox(r *http.Request, failed bool) (*model.Sandbox, bool) {
+	seed, ok := keyedResult(r, failed)
+	if !ok {
+		return nil, false
+	}
+	sb, err := p.Orch.Store.GetSandbox(r.Context(), orchestrator.KeyedID(seed, "sb"))
+	return sb, err == nil
+}
+
+// keyedRun is the run an earlier attempt of this keyed request queued in the sandbox, if any.
+func (p *Platform) keyedRun(r *http.Request, sandboxID string, failed bool) (*model.Run, bool) {
+	seed, ok := keyedResult(r, failed)
+	if !ok {
+		return nil, false
+	}
+	run, err := p.Orch.Store.GetRun(r.Context(), orchestrator.KeyedID(seed, "run"))
+	return run, err == nil && run.SandboxID == sandboxID
 }
