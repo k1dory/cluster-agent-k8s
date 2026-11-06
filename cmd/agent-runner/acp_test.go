@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -550,5 +551,29 @@ func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd) {
 	case <-time.After(5 * time.Second):
 		cancel()
 		<-exited
+	}
+	endProcessGroup(cmd.Process.Pid)
+}
+
+// endProcessGroup ends what the adapter left in its process group (it is the group's leader,
+// Setpgid) and returns when the group is empty, or after a bound. The adapter leaving on its own
+// does not end what it started — Hermes keeps a child writing under $HERMES_HOME — and the test's
+// directories are removed as soon as the test returns: a survivor makes that removal fail
+// ("directory not empty") or outlives the test. In the image's check the test binary is PID 1,
+// so the group's orphans are reaped here; elsewhere init reaps them.
+func endProcessGroup(pgid int) {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		for {
+			var ws syscall.WaitStatus
+			if pid, err := syscall.Wait4(-pgid, &ws, syscall.WNOHANG, nil); pid <= 0 || err != nil {
+				break
+			}
+		}
+		if err := syscall.Kill(-pgid, 0); errors.Is(err, syscall.ESRCH) || time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
