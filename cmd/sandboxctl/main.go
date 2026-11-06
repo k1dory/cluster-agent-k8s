@@ -1909,14 +1909,20 @@ func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bo
 		}
 		resp, err := (&http.Client{}).Do(req)
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil || !retry.wait(ctx) {
 				return
 			}
-			time.Sleep(2 * time.Second)
 			continue
 		}
 		if resp.StatusCode != 200 {
 			resp.Body.Close()
+			if transientStatus(resp.StatusCode) {
+				fmt.Fprintln(os.Stderr, "chat: stream:", resp.Status, "(retrying)")
+				if !retry.wait(ctx) {
+					return
+				}
+				continue
+			}
 			fmt.Fprintln(os.Stderr, "chat: stream:", resp.Status)
 			return
 		}
@@ -1966,12 +1972,19 @@ func (c *cli) follow(path string, raw bool, print func(model.Event) bool) error 
 				return nil
 			}
 			fmt.Fprintln(os.Stderr, "watch:", err, "(retrying)")
-			time.Sleep(2 * time.Second)
+			retry.wait(ctx)
 			continue
 		}
 		if resp.StatusCode != 200 {
-			b, _ := io.ReadAll(resp.Body)
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 			resp.Body.Close()
+			if transientStatus(resp.StatusCode) {
+				// The server or its database is down for now (a 5xx before the stream began):
+				// the same cursor again later, as after an error frame.
+				fmt.Fprintln(os.Stderr, "watch:", resp.Status, "(retrying)")
+				retry.wait(ctx)
+				continue
+			}
 			return fmt.Errorf("events: %s: %s", resp.Status, strings.TrimSpace(string(b)))
 		}
 		failed, done := false, false

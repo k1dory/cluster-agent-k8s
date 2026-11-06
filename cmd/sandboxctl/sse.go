@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 )
@@ -69,6 +70,13 @@ var (
 	followRetry    = time.Second
 	followRetryMax = 30 * time.Second
 )
+
+// transientStatus: an answer worth retrying with the same cursor (the server, a proxy in front
+// of it or its database unavailable, or a rate limit). A 4xx otherwise is final: retrying a
+// refused token or a missing sandbox only repeats the refusal.
+func transientStatus(code int) bool {
+	return code >= 500 || code == http.StatusTooManyRequests
+}
 
 type backoff struct{ next time.Duration }
 
