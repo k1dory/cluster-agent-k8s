@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -192,19 +193,17 @@ func TestStreamsSurviveAStalledClientRound2(t *testing.T) {
 	}
 }
 
-// failingEvents fails every event read after the first n: the log becomes unreadable mid-stream.
+// failingEvents fails every event read once armed: the log becomes unreadable. It goes in
+// before the sandbox is created and is armed afterwards, because the start of a sandbox reads
+// orch.Store from its own goroutine until after its last event: replacing the field then is a
+// data race.
 type failingEvents struct {
 	store.Store
-	mu sync.Mutex
-	n  int
+	armed atomic.Bool
 }
 
 func (f *failingEvents) QueryEvents(ctx context.Context, q store.Filter) ([]*model.Event, error) {
-	f.mu.Lock()
-	f.n--
-	n := f.n
-	f.mu.Unlock()
-	if n < 0 {
+	if f.armed.Load() {
 		return nil, errors.New("connection refused")
 	}
 	return f.Store.QueryEvents(ctx, q)
@@ -214,8 +213,10 @@ func (f *failingEvents) QueryEvents(ctx context.Context, q store.Filter) ([]*mod
 // live frames only; it now ends the stream with an error frame, so the client reconnects.
 func TestStreamEndsWithAnErrorFrameWhenTheLogFailsRound2(t *testing.T) {
 	s := newStack(t)
+	failing := &failingEvents{Store: s.orch.Store}
+	s.orch.Store = failing
 	sb := streamSandbox(t, s)
-	s.orch.Store = &failingEvents{Store: s.orch.Store, n: 0}
+	failing.armed.Store(true)
 	req := httptest.NewRequest("GET", "/v1/sandboxes/"+sb.ID+"/events", nil)
 	req.Header.Set("Authorization", "Bearer t0k")
 	w := newStallWriter()
