@@ -1,0 +1,102 @@
+package main
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// The flag goes to the claude invocation, not to whatever the shell runs after it: a trailing
+// newline (a YAML block scalar), a `&& …`, a pipe or a comment keep their place; an argument
+// that merely contains "system-prompt" is not a system-prompt option; a quoted assignment in
+// front of the program is an assignment, not the program.
+func TestInstructionsRespectShellSyntax(t *testing.T) {
+	const flag = ` --append-system-prompt "$SANDBOX_INSTRUCTIONS"`
+	for _, tc := range []struct{ in, want string }{
+		{"claude -p \"$SANDBOX_TASK\"\n", "claude -p \"$SANDBOX_TASK\"" + flag + "\n"},
+		{`claude -p "$SANDBOX_TASK" && echo done`, `claude -p "$SANDBOX_TASK"` + flag + ` && echo done`},
+		{`claude -p "$SANDBOX_TASK" | tee run.log`, `claude -p "$SANDBOX_TASK"` + flag + ` | tee run.log`},
+		{`claude -p "$SANDBOX_TASK"; echo done`, `claude -p "$SANDBOX_TASK"` + flag + `; echo done`},
+		{`claude -p "$SANDBOX_TASK" # the shipped command`, `claude -p "$SANDBOX_TASK"` + flag + ` # the shipped command`},
+		{`claude -p "Review system-prompt handling"`, `claude -p "Review system-prompt handling"` + flag},
+		{`claude -p "a && b"`, `claude -p "a && b"` + flag},
+		{`claude -p 'it'"'"'s' --verbose`, `claude -p 'it'"'"'s' --verbose` + flag},
+		{`VAR="two words" claude -p "$SANDBOX_TASK"`, `VAR="two words" claude -p "$SANDBOX_TASK"` + flag},
+		{`A=1 B='x y' /usr/local/bin/claude -p x`, `A=1 B='x y' /usr/local/bin/claude -p x` + flag},
+	} {
+		if got := withInstructions(tc.in); got != tc.want {
+			t.Errorf("%q\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+	for _, cmd := range []string{
+		`claude -p x --system-prompt=brief`,
+		`claude -p x --append-system-prompt-file=/etc/agent.md`,
+		`claude -p x --system-prompt-file /etc/agent.md && echo done`,
+		`claude-agent-acp`,
+		`VAR=x claude-agent-acp --verbose`,
+		`VAR="two words" codex exec "$SANDBOX_TASK"`,
+		`echo claude`,
+		`# claude -p x`,
+	} {
+		if got := withInstructions(cmd); got != cmd {
+			t.Errorf("%q must be left alone, got %q", cmd, got)
+		}
+	}
+	// withMCPConfig shares the parser.
+	if got := withMCPConfig("claude -p x\n"); got != "claude -p x --mcp-config \"$SANDBOX_MCP_CONFIG\"\n" {
+		t.Errorf("mcp config on a block scalar: %q", got)
+	}
+	if got := withMCPConfig(`claude -p "with --mcp-config in the text"`); !strings.HasSuffix(got, `--mcp-config "$SANDBOX_MCP_CONFIG"`) {
+		t.Errorf("an argument mentioning the option is not the option: %q", got)
+	}
+}
+
+// The rewritten command lines run: the shell gets the flag as claude's argument, and the rest of
+// the line still runs after it.
+func TestInstructionsRewriteRunsInTheShell(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	if err := os.Mkdir(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stub := filepath.Join(bin, "claude")
+	if err := os.WriteFile(stub, []byte("#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$SANDBOX_REVIEW_ARGS\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const instructions = "Triage new incidents.\nQuote \"$HOME\" literally."
+	for _, cmd := range []string{
+		"claude -p \"$SANDBOX_TASK\" --verbose\n",
+		`claude -p "$SANDBOX_TASK" && echo done > "$SANDBOX_REVIEW_ARGS.done"`,
+		`VAR="two words" claude -p "$SANDBOX_TASK" # note`,
+	} {
+		argsFile := filepath.Join(root, "args")
+		_ = os.Remove(argsFile)
+		_ = os.Remove(argsFile + ".done")
+		sh := exec.Command("/bin/sh", "-c", withInstructions(cmd))
+		sh.Env = append(os.Environ(), "PATH="+bin+":/usr/bin:/bin", "SANDBOX_REVIEW_ARGS="+argsFile, "SANDBOX_TASK=task", "SANDBOX_INSTRUCTIONS="+instructions)
+		if out, err := sh.CombinedOutput(); err != nil {
+			t.Fatalf("%q: %v\n%s", cmd, err, out)
+		}
+		raw, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("%q: claude did not run: %v", cmd, err)
+		}
+		parts := strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00")
+		got := ""
+		for i, a := range parts {
+			if a == "--append-system-prompt" && i+1 < len(parts) {
+				got = parts[i+1]
+			}
+		}
+		if got != instructions {
+			t.Fatalf("%q: claude's argv %q lacks the instructions", cmd, parts)
+		}
+		if strings.Contains(cmd, "&&") {
+			if _, err := os.Stat(argsFile + ".done"); err != nil {
+				t.Fatalf("%q: the command after && did not run", cmd)
+			}
+		}
+	}
+}

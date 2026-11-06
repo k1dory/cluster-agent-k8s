@@ -330,36 +330,153 @@ func (t *tailWriter) last() string {
 
 // withMCPConfig makes a harness command load $SANDBOX_MCP_CONFIG: a command that runs claude
 // (first word, after any VAR=value assignments) and does not mention --mcp-config or the
-// variable gets ` --mcp-config "$SANDBOX_MCP_CONFIG"` appended; anything else is returned as
-// is, the variable being in its environment.
+// variable gets ` --mcp-config "$SANDBOX_MCP_CONFIG"` added to that claude invocation; anything
+// else is returned as is, the variable being in its environment.
 func withMCPConfig(cmdline string) string {
-	if strings.Contains(cmdline, "--mcp-config") || strings.Contains(cmdline, "SANDBOX_MCP_CONFIG") || !runsClaude(cmdline) {
+	cmd := parseHarnessCommand(cmdline)
+	if !cmd.runsClaude() || cmd.hasOption("--mcp-config") || strings.Contains(cmdline, "SANDBOX_MCP_CONFIG") {
 		return cmdline
 	}
-	return strings.TrimRight(cmdline, " \t") + ` --mcp-config "$SANDBOX_MCP_CONFIG"`
+	return cmd.withArgs(`--mcp-config "$SANDBOX_MCP_CONFIG"`)
 }
 
 // withInstructions gives the agent's instructions (SANDBOX_INSTRUCTIONS, from its definition) to
-// a harness command that runs claude: ` --append-system-prompt "$SANDBOX_INSTRUCTIONS"` is
-// appended unless the command already mentions the variable or sets a system prompt of its
-// own. Anything else is returned as is, the variable being in its environment.
+// a harness command that runs claude: ` --append-system-prompt "$SANDBOX_INSTRUCTIONS"` is added
+// to that claude invocation unless the command already mentions the variable or sets a system
+// prompt of its own (an option, not a word that happens to contain "system-prompt"). Anything
+// else is returned as is, the variable being in its environment.
 func withInstructions(cmdline string) string {
-	if strings.Contains(cmdline, "SANDBOX_INSTRUCTIONS") || strings.Contains(cmdline, "system-prompt") || !runsClaude(cmdline) {
+	cmd := parseHarnessCommand(cmdline)
+	if !cmd.runsClaude() || strings.Contains(cmdline, "SANDBOX_INSTRUCTIONS") ||
+		cmd.hasOption("--system-prompt", "--append-system-prompt", "--system-prompt-file", "--append-system-prompt-file") {
 		return cmdline
 	}
-	return strings.TrimRight(cmdline, " \t") + ` --append-system-prompt "$SANDBOX_INSTRUCTIONS"`
+	return cmd.withArgs(`--append-system-prompt "$SANDBOX_INSTRUCTIONS"`)
 }
 
 // runsClaude reports whether a harness command's program (its first word after any VAR=value
 // assignments) is claude.
-func runsClaude(cmdline string) bool {
-	for _, w := range strings.Fields(cmdline) {
-		if strings.Contains(w, "=") && !strings.HasPrefix(w, "-") {
-			continue // VAR=value prefix
+func runsClaude(cmdline string) bool { return parseHarnessCommand(cmdline).runsClaude() }
+
+// harnessCommand is the leading simple command of a harness command line, as the shell would
+// split it: words with their quotes kept, and where the simple command ends — at an unquoted
+// newline, `;`, `&`, `|` or a `#` comment — so that an argument can be added to the program's
+// invocation rather than to whatever follows it (a `&& echo done`, a trailing newline from a
+// YAML block scalar). The words are not evaluated: "$VAR" stays "$VAR".
+type harnessCommand struct {
+	line  string
+	words []string
+	end   int // index in line where the simple command ends (len(line) when it is all of it)
+}
+
+func parseHarnessCommand(line string) harnessCommand {
+	c := harnessCommand{line: line, end: len(line)}
+	var word strings.Builder
+	inWord, single, double, escaped := false, false, false, false
+	flush := func() {
+		if inWord {
+			c.words = append(c.words, word.String())
+			word.Reset()
+			inWord = false
 		}
-		return filepath.Base(w) == "claude"
+	}
+	for i := 0; i < len(line); i++ {
+		ch := line[i]
+		switch {
+		case escaped:
+			word.WriteByte(ch)
+			escaped = false
+		case single:
+			word.WriteByte(ch)
+			single = ch != '\''
+		case double:
+			word.WriteByte(ch)
+			if ch == '\\' && i+1 < len(line) {
+				i++
+				word.WriteByte(line[i])
+			} else if ch == '"' {
+				double = false
+			}
+		case ch == '\\':
+			word.WriteByte(ch)
+			escaped, inWord = true, true
+		case ch == '\'':
+			word.WriteByte(ch)
+			single, inWord = true, true
+		case ch == '"':
+			word.WriteByte(ch)
+			double, inWord = true, true
+		case ch == '\n' || ch == ';' || ch == '&' || ch == '|' || (ch == '#' && !inWord):
+			flush()
+			c.end = i
+			return c
+		case ch == ' ' || ch == '\t':
+			flush()
+		default:
+			word.WriteByte(ch)
+			inWord = true
+		}
+	}
+	flush()
+	return c
+}
+
+// program is the first word that is not a VAR=value assignment, quotes stripped.
+func (c harnessCommand) program() string {
+	for _, w := range c.words {
+		if isAssignment(w) {
+			continue
+		}
+		return strings.Trim(w, `"'`)
+	}
+	return ""
+}
+
+func (c harnessCommand) runsClaude() bool { return filepath.Base(c.program()) == "claude" }
+
+// hasOption reports whether one of the options is given to the program, as `--opt` or
+// `--opt=value`; an option's value, or a word that merely contains the name, does not count.
+func (c harnessCommand) hasOption(names ...string) bool {
+	past := false
+	for _, w := range c.words {
+		if !past {
+			past = !isAssignment(w) // the program
+			continue
+		}
+		for _, n := range names {
+			if w == n || strings.HasPrefix(w, n+"=") {
+				return true
+			}
+		}
 	}
 	return false
+}
+
+// withArgs adds args to the program's invocation: before whatever follows the simple command,
+// keeping that (a `&& …`, a comment, a trailing newline) where it was.
+func (c harnessCommand) withArgs(args string) string {
+	head := strings.TrimRight(c.line[:c.end], " \t")
+	// The blanks that stood between the last word and what follows stay where they were; blanks
+	// that trailed the whole line go.
+	tail := c.line[len(head):]
+	if strings.TrimSpace(tail) == "" && !strings.Contains(tail, "\n") {
+		tail = ""
+	}
+	return head + " " + args + tail
+}
+
+// isAssignment: a leading NAME=value word of a simple command (the value may be quoted).
+func isAssignment(w string) bool {
+	eq := strings.IndexByte(w, '=')
+	if eq <= 0 {
+		return false
+	}
+	for i, r := range w[:eq] {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // writeMCPConfig renders SANDBOX_MCP_SERVERS ([{name, url}]) as a Claude Code MCP
