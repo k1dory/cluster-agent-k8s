@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	"agent-sandbox/internal/model"
 	"agent-sandbox/internal/secrets"
@@ -46,6 +47,38 @@ type Service struct {
 	// signIns is the OAuth sign-ins' store once NewOAuth wired them: Put refuses a name a
 	// sign-in holds.
 	signIns store.OAuthCredentials
+	// names serializes writes to a scope's one namespace of plain credentials and sign-ins,
+	// across replicas when the store has the lock (see namespace).
+	names Locker
+}
+
+// Locker is the store's cross-replica lock on a key (store.Store.WithTenantLock: a Postgres
+// advisory lock held for fn, a mutex on the memory store).
+type Locker interface {
+	WithTenantLock(ctx context.Context, key string, fn func(ctx context.Context) error) error
+}
+
+// localLocker serializes within this process only: what a store without a lock of its own
+// (a test double) gets.
+type localLocker struct {
+	mu    sync.Mutex
+	locks map[string]*sync.Mutex
+}
+
+func (l *localLocker) WithTenantLock(ctx context.Context, key string, fn func(ctx context.Context) error) error {
+	l.mu.Lock()
+	if l.locks == nil {
+		l.locks = map[string]*sync.Mutex{}
+	}
+	m, ok := l.locks[key]
+	if !ok {
+		m = &sync.Mutex{}
+		l.locks[key] = m
+	}
+	l.mu.Unlock()
+	m.Lock()
+	defer m.Unlock()
+	return fn(ctx)
 }
 
 // New returns a service encrypting under key (32 bytes: AES-256-GCM).
@@ -54,7 +87,11 @@ func New(st store.Credentials, key []byte) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{Store: st, sealer: sl}, nil
+	names, ok := st.(Locker)
+	if !ok {
+		names = &localLocker{}
+	}
+	return &Service{Store: st, sealer: sl, names: names}, nil
 }
 
 // Sealer encrypts other server-side secrets at rest under credentials.key (the agent and
@@ -128,22 +165,36 @@ func (s *Service) Put(ctx context.Context, tenant, name, value, by string) (*mod
 	if len(value) > MaxValue {
 		return nil, false, fmt.Errorf("%w: value is larger than %d bytes", ErrInvalid, MaxValue)
 	}
-	// One name, one kind: `secret:NAME` must not mean a sign-in to one reader and a plain
-	// credential to another.
-	if s.signIns != nil {
-		if _, _, err := s.signIns.GetOAuthCredential(ctx, tenant, name); err == nil {
-			return nil, false, fmt.Errorf("%w: %q is an OAuth sign-in in this scope; remove it first", ErrInvalid, name)
-		} else if !errors.Is(err, store.ErrNotFound) {
-			return nil, false, err
-		}
-	}
 	ciphertext := s.seal(tenant, name, []byte(value))
 	c := &model.Credential{Tenant: tenant, Name: name, Fingerprint: fingerprint(value), CreatedBy: by}
-	created, err := s.Store.PutCredential(ctx, c, ciphertext)
+	var created bool
+	err := s.namespace(ctx, tenant, func(ctx context.Context) error {
+		// One name, one kind: `secret:NAME` must not mean a sign-in to one reader and a plain
+		// credential to another. NAME.account_id is the sign-in's too.
+		if s.signIns != nil {
+			base, _ := strings.CutSuffix(name, AccountSuffix)
+			if _, _, err := s.signIns.GetOAuthCredential(ctx, tenant, base); err == nil {
+				return fmt.Errorf("%w: %q is an OAuth sign-in in this scope; remove it first", ErrInvalid, base)
+			} else if !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+		}
+		var err error
+		created, err = s.Store.PutCredential(ctx, c, ciphertext)
+		return err
+	})
 	if err != nil {
 		return nil, false, err
 	}
 	return c, created, nil
+}
+
+// namespace runs fn holding the lock on a scope's names. Plain credentials and sign-ins live
+// in two tables, so "the other kind does not hold this name" is only true while no one can
+// write either: checked under the lock and written before it is released, two replicas
+// creating NAME as both kinds at once cannot both succeed.
+func (s *Service) namespace(ctx context.Context, tenant string, fn func(ctx context.Context) error) error {
+	return s.names.WithTenantLock(ctx, "credentials:"+tenant, fn)
 }
 
 // Get returns a credential's metadata.
@@ -219,3 +270,7 @@ func fingerprint(value string) string {
 
 // Compile-time: the resolver is a provider.
 var _ secrets.Provider = Resolver{}
+
+// Compile-time: the store sandboxd wires holds the cross-replica lock, so New never falls back
+// to the process-local one in production.
+var _ Locker = store.Store(nil)

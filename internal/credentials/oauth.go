@@ -156,11 +156,8 @@ func (o *OAuth) Start(ctx context.Context, tenant, name, provider, by string) (*
 	if !nameRe.MatchString(name) || strings.Contains(name, ".") {
 		return nil, false, fmt.Errorf("%w: name must be 1-64 characters: letters, digits, '_' or '-' (a '.' would clash with %s)", ErrInvalid, AccountSuffix)
 	}
-	// One name, one kind: `secret:NAME` must not mean a plain credential to one reader and a
-	// sign-in to another.
-	if _, _, err := o.Service.Store.GetCredential(ctx, tenant, name); err == nil {
-		return nil, false, fmt.Errorf("%w: %q is a plain credential in this scope; remove it first", ErrInvalid, name)
-	} else if !errors.Is(err, store.ErrNotFound) {
+	// Refused early, before the provider hands out a device code; checked again at the write.
+	if err := o.plainTaken(ctx, tenant, name); err != nil {
 		return nil, false, err
 	}
 	cl, err := o.client(provider)
@@ -175,11 +172,33 @@ func (o *OAuth) Start(ctx context.Context, tenant, name, provider, by string) (*
 	exp := d.ExpiresAt
 	c := &model.OAuthCredential{Tenant: tenant, Name: name, Provider: provider, Status: model.OAuthPending,
 		VerificationURL: d.VerificationURL, UserCode: d.UserCode, LoginExpiresAt: &exp, NextAt: now.Add(d.Interval), CreatedBy: by}
-	created, err := o.Store.PutOAuthCredential(ctx, c, o.seal(c, &oauthSecret{DeviceCode: d.Code, Interval: int64(d.Interval / time.Second)}))
+	var created bool
+	err = o.namespace(ctx, tenant, func(ctx context.Context) error {
+		if err := o.plainTaken(ctx, tenant, name); err != nil {
+			return err
+		}
+		var err error
+		created, err = o.Store.PutOAuthCredential(ctx, c, o.seal(c, &oauthSecret{DeviceCode: d.Code, Interval: int64(d.Interval / time.Second)}))
+		return err
+	})
 	if err != nil {
 		return nil, false, err
 	}
 	return c, created, nil
+}
+
+// plainTaken refuses a sign-in name a plain credential holds, as NAME or as NAME.account_id
+// (one name, one kind: `secret:NAME` must not mean a plain credential to one reader and a
+// sign-in to another).
+func (o *OAuth) plainTaken(ctx context.Context, tenant, name string) error {
+	for _, n := range [2]string{name, name + AccountSuffix} {
+		if _, _, err := o.Service.Store.GetCredential(ctx, tenant, n); err == nil {
+			return fmt.Errorf("%w: %q is a plain credential in this scope; remove it first", ErrInvalid, n)
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
 }
 
 // Get returns a sign-in's metadata.
