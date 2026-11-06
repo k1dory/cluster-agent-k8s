@@ -75,6 +75,12 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 			writeBodyErr(w, err)
 			return
 		}
+		// The parser stops at the closing boundary; what follows (the epilogue) counts against
+		// the cap too, and is read to its end before anything is written or sent.
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			writeBodyErr(w, err)
+			return
+		}
 		req.Text = r.FormValue("text")
 		files := r.MultipartForm.File["file"]
 		if len(files) > MaxUploadFiles {

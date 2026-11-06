@@ -290,3 +290,47 @@ func TestReviewMultipartIsParsedOnlyOnTheMessagesRoute(t *testing.T) {
 		}
 	}
 }
+
+// The whole-body cap holds after the closing boundary too: ParseMultipartForm stops there, so a
+// valid message followed by an endless epilogue is read to the cap and refused, keyed or not,
+// before any file is written or the message sent.
+func TestReviewMultipartEpilogueCountsAgainstTheCap(t *testing.T) {
+	if testing.Short() {
+		t.Skip("streams more than the multipart cap")
+	}
+	s := newStack(t)
+	api, gw := s.platform.URL, s.gateway.URL
+	sb, hdr := agentOf(t, s, "epilogue")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	files := map[string]string{}
+	go fakeRunner(ctx, t, gw, hdr, files)
+	for _, keyed := range []bool{false, true} {
+		pr, pw := io.Pipe()
+		mw := multipart.NewWriter(pw)
+		go func() {
+			_ = mw.WriteField("text", "hello")
+			fw, _ := mw.CreateFormFile("file", "small.txt")
+			_, _ = fw.Write([]byte("small"))
+			_ = mw.Close()
+			junk := bytes.Repeat([]byte("e"), 1<<20)
+			for i := int64(0); i <= multipartBodyLimit>>20+1; i++ {
+				if _, err := pw.Write(junk); err != nil {
+					pw.CloseWithError(err)
+					return
+				}
+			}
+			pw.Close()
+		}()
+		h := map[string]string{}
+		if keyed {
+			h["Idempotency-Key"] = "epilogue"
+		}
+		resp, body := postRaw(t, api+"/v1/sandboxes/"+sb.ID+"/messages", "alice-tok", mw.FormDataContentType(), pr, h)
+		pr.Close()
+		wantErr(t, fmt.Sprintf("keyed=%v epilogue over the cap", keyed), resp, body, 413, CodeTooLarge)
+		if len(files) > 0 {
+			t.Fatalf("keyed=%v: a file was written before the body was refused: %v", keyed, files)
+		}
+	}
+}
