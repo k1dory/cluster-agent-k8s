@@ -55,6 +55,9 @@ func TestMain(m *testing.M) {
 	if u := os.Getenv("ACP_BRIDGE_CLIENT"); u != "" {
 		os.Exit(bridgeClient(u))
 	}
+	// Orphans of an adapter's process group come back here to be reaped (endProcessGroup),
+	// whatever PID 1 of the place the tests run in does with them.
+	adoptOrphans()
 	os.Exit(m.Run())
 }
 
@@ -559,8 +562,9 @@ func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd) {
 // Setpgid) and returns when the group is empty, or after a bound. The adapter leaving on its own
 // does not end what it started — Hermes keeps a child writing under $HERMES_HOME — and the test's
 // directories are removed as soon as the test returns: a survivor makes that removal fail
-// ("directory not empty") or outlives the test. In the image's check the test binary is PID 1,
-// so the group's orphans are reaped here; elsewhere init reaps them.
+// ("directory not empty") or outlives the test. The group's orphans are reaped here: the test
+// binary adopts them (adoptOrphans in TestMain; it is PID 1 in the image's check anyway). A
+// zombie is still a member of its group, so without reaping the group would never be empty.
 func endProcessGroup(pgid int) {
 	deadline := time.Now().Add(5 * time.Second)
 	for {

@@ -30,6 +30,24 @@ func TestStopAdapterEndsWhatTheAdapterLeftBehind(t *testing.T) {
 		t.Fatal(err)
 	}
 	pgid := cmd.Process.Pid
+	// Independent of the helper under test: when the assertion below fails, the writer must not
+	// outlive the test and race the TempDir's removal. Runs before the TempDir cleanup (LIFO).
+	t.Cleanup(func() {
+		until := time.Now().Add(2 * time.Second)
+		for time.Now().Before(until) {
+			_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			var ws syscall.WaitStatus
+			for {
+				if pid, err := syscall.Wait4(-pgid, &ws, syscall.WNOHANG, nil); pid <= 0 || err != nil {
+					break
+				}
+			}
+			if errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH) {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	})
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if entries, _ := os.ReadDir(state); len(entries) > 0 {
