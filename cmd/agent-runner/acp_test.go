@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -58,9 +60,22 @@ func TestMain(m *testing.M) {
 }
 
 type fakeAgent struct {
-	conn *acp.AgentSideConnection
-	log  *os.File
-	mu   sync.Mutex
+	// The connection starts receiving as soon as it is made, so a handler may run before the
+	// assignment in runFakeAgent has landed: the handlers read it through conn(), published once.
+	connection atomic.Pointer[acp.AgentSideConnection]
+	log        *os.File
+	mu         sync.Mutex
+}
+
+// conn is the agent's connection, waiting for runFakeAgent to publish it — a handler cannot be
+// invoked before the connection exists, but the race detector does not know that.
+func (f *fakeAgent) conn() *acp.AgentSideConnection {
+	for {
+		if c := f.connection.Load(); c != nil {
+			return c
+		}
+		runtime.Gosched()
+	}
 }
 
 func (f *fakeAgent) record(kind string, v any) {
@@ -76,8 +91,9 @@ func runFakeAgent() {
 		os.Exit(3)
 	}
 	f := &fakeAgent{log: log}
-	f.conn = acp.NewAgentSideConnection(f, os.Stdout, os.Stdin)
-	<-f.conn.Done()
+	c := acp.NewAgentSideConnection(f, os.Stdout, os.Stdin)
+	f.connection.Store(c)
+	<-c.Done()
 }
 
 func (f *fakeAgent) Initialize(context.Context, acp.InitializeRequest) (acp.InitializeResponse, error) {
@@ -93,7 +109,7 @@ func (f *fakeAgent) NewSession(_ context.Context, p acp.NewSessionRequest) (acp.
 func (f *fakeAgent) LoadSession(ctx context.Context, p acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 	f.record("load", p)
 	// History is replayed as updates before the response.
-	_ = f.conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: acp.UpdateAgentMessageText("OLD HISTORY")})
+	_ = f.conn().SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: acp.UpdateAgentMessageText("OLD HISTORY")})
 	return acp.LoadSessionResponse{}, nil
 }
 
@@ -106,14 +122,14 @@ func (f *fakeAgent) Prompt(ctx context.Context, p acp.PromptRequest) (acp.Prompt
 	}
 	f.record("prompt", map[string]string{"session": string(p.SessionId), "text": text})
 	send := func(u acp.SessionUpdate) {
-		_ = f.conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: u})
+		_ = f.conn().SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: u})
 	}
 	send(acp.UpdateAgentMessageText("Hel"))
 	send(acp.UpdateAgentMessageText("lo"))
 	send(acp.StartToolCall("call_1", "Edit a.txt", acp.WithStartKind(acp.ToolKindEdit), acp.WithStartStatus(acp.ToolCallStatusPending),
 		acp.WithStartContent([]acp.ToolCallContent{acp.ToolDiffContent("/workspace/a.txt", "new line", "old line")})))
 	title := "Edit a.txt"
-	resp, err := f.conn.RequestPermission(ctx, acp.RequestPermissionRequest{SessionId: p.SessionId,
+	resp, err := f.conn().RequestPermission(ctx, acp.RequestPermissionRequest{SessionId: p.SessionId,
 		ToolCall: acp.ToolCallUpdate{ToolCallId: "call_1", Title: &title},
 		Options: []acp.PermissionOption{
 			{OptionId: "yes", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},

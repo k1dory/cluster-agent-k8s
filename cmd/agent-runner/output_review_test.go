@@ -186,7 +186,7 @@ func (f *floodAgent) Prompt(ctx context.Context, p acp.PromptRequest) (acp.Promp
 			time.Sleep(time.Millisecond)
 		}
 		u := acp.StartToolCall(acp.ToolCallId(fmt.Sprintf("call_%d", i)), "Read file", acp.WithStartKind(acp.ToolKindRead))
-		if err := f.conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: u}); err != nil {
+		if err := f.conn().SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: u}); err != nil {
 			return acp.PromptResponse{}, err
 		}
 	}
@@ -202,7 +202,8 @@ func TestACPFloodHelper(t *testing.T) {
 		os.Exit(3)
 	}
 	f := &floodAgent{fakeAgent: &fakeAgent{log: log}}
-	f.conn = acp.NewAgentSideConnection(f, os.Stdout, os.Stdin)
-	<-f.conn.Done()
+	c := acp.NewAgentSideConnection(f, os.Stdout, os.Stdin)
+	f.connection.Store(c)
+	<-c.Done()
 	os.Exit(0) // no Go test footer on the ACP transport
 }
