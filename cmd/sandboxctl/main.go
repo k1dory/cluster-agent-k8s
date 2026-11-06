@@ -1935,6 +1935,12 @@ func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bo
 				fmt.Fprintln(os.Stderr, "chat: stream:", msg, "(reconnecting)")
 				return false
 			}
+			if checkpoint(f) {
+				if f.ID != "" {
+					cursor = f.ID
+				}
+				return true
+			}
 			var m model.Message
 			if json.Unmarshal([]byte(f.Data), &m) != nil {
 				return true
@@ -2001,6 +2007,12 @@ func (c *cli) follow(path string, raw bool, print func(model.Event) bool) error 
 			if msg, ok := streamError(f); ok {
 				fmt.Fprintln(os.Stderr, "watch:", msg, "(reconnecting)")
 				return false
+			}
+			if checkpoint(f) {
+				if f.ID != "" {
+					cursor = f.ID
+				}
+				return true
 			}
 			var e model.Event
 			if err := json.Unmarshal([]byte(f.Data), &e); err != nil {

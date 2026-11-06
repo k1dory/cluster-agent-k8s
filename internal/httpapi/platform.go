@@ -1047,15 +1047,22 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		}
 		return items
 	}
-	open := func(ctx context.Context) (<-chan struct{}, func(), error) {
+	open := func(ctx context.Context) (<-chan struct{}, func(), string, error) {
 		var err error
 		if resumeHead >= 0 && !f.To.IsZero() {
 			head = resumeHead
 		} else if head, err = p.traceHead(ctx, f); err != nil {
-			return nil, nil, err
+			return nil, nil, "", err
 		}
 		wake, cancel := p.Hub.Wake(events.All, f.Types...)
-		return wake, cancel, nil
+		// The boundary reaches the client before any event does: a bounded stream with no
+		// matching history would otherwise give it none, and its resume would capture a new
+		// head, re-apply the window to it and skip what was committed meanwhile.
+		checkpoint := ""
+		if !f.To.IsZero() && head < math.MaxInt64 {
+			checkpoint = fmt.Sprintf("%d:%d", after, head)
+		}
+		return wake, cancel, checkpoint, nil
 	}
 	streamSSE(w, r, open, 20*time.Second, after, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
 		if after >= head {

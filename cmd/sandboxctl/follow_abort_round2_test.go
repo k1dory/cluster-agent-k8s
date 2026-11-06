@@ -115,3 +115,52 @@ func TestFollowMessagesBacksOffABrokenBodyRound2(t *testing.T) {
 	r, at := seen()
 	checkBackoff(t, r, at)
 }
+
+// The checkpoint frame a bounded trace opens with carries only a cursor: the follower keeps
+// it for its resume and prints nothing for it.
+func TestFollowKeepsACheckpointCursorRound2(t *testing.T) {
+	fastRetry(t)
+	var mu sync.Mutex
+	var resumes []string
+	conns := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		conns++
+		n := conns
+		if n > 1 {
+			resumes = append(resumes, r.Header.Get("Last-Event-ID"))
+		}
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if n == 1 {
+			fmt.Fprint(w, "id: 0:7\nevent: checkpoint\n\n: keepalive\n\n")
+			return // the connection ends before any event
+		}
+		fmt.Fprint(w, "id: 8:7\nevent: status\ndata: {\"id\":8,\"sandbox_id\":\"sb\",\"type\":\"status\"}\n\n")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	c := &cli{base: srv.URL, token: "t", http: srv.Client()}
+	var printed []int64
+	done := make(chan error, 1)
+	go func() {
+		done <- c.follow("/v1/trace?stream=true", false, func(e model.Event) bool {
+			printed = append(printed, e.ID)
+			return e.ID == 8
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("event 8 never arrived")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprintf("%q", resumes) != `["0:7"]` || fmt.Sprint(printed) != "[8]" {
+		t.Fatalf("reconnects %q, printed %v: want the checkpoint's 0:7 resumed and only event 8 shown", resumes, printed)
+	}
+}

@@ -64,9 +64,12 @@ func (s *stallWriter) String() string {
 
 var frameID = regexp.MustCompile(`(?m)^id: (\d+)(?::\d+)?$`)
 
+// checkpointFrame is a bounded trace's cursor-only frame: no event, not counted.
+var checkpointFrame = regexp.MustCompile(`(?m)^id: \S+\nevent: checkpoint\n\n`)
+
 func frameIDs(body string) []int64 {
 	var out []int64
-	for _, m := range frameID.FindAllStringSubmatch(body, -1) {
+	for _, m := range frameID.FindAllStringSubmatch(checkpointFrame.ReplaceAllString(body, ""), -1) {
 		n, _ := strconv.ParseInt(m[1], 10, 64)
 		out = append(out, n)
 	}

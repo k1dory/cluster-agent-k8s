@@ -29,14 +29,16 @@ type sseItem struct {
 type ssePage func(ctx context.Context, after int64) (items []sseItem, next int64, err error)
 
 // sseOpen subscribes a stream to its wake-ups (and does whatever must precede that, such as
-// reading a replay boundary). An error ends the stream with the error frame.
-type sseOpen func(ctx context.Context) (wake <-chan struct{}, cancel func(), err error)
+// reading a replay boundary). An error ends the stream with the error frame. checkpoint, when
+// set, is sent first as the id of an `event: checkpoint` frame without data: the cursor a
+// client must resume with even if no event ever reaches it (a bounded trace's boundary).
+type sseOpen func(ctx context.Context) (wake <-chan struct{}, cancel func(), checkpoint string, err error)
 
 // hubWake is the sseOpen of a stream that only needs the hub's wake-ups.
 func hubWake(h *events.Hub, key string, types ...string) sseOpen {
-	return func(context.Context) (<-chan struct{}, func(), error) {
+	return func(context.Context) (<-chan struct{}, func(), string, error) {
 		wake, cancel := h.Wake(key, types...)
-		return wake, cancel, nil
+		return wake, cancel, "", nil
 	}
 }
 
@@ -103,12 +105,18 @@ func streamSSE(w http.ResponseWriter, r *http.Request, open sseOpen, keepalive t
 		fmt.Fprintf(w, "event: error\ndata: %s\n\n", b)
 		fl.Flush()
 	}
-	wake, cancel, err := open(ctx)
+	wake, cancel, checkpoint, err := open(ctx)
 	if err != nil {
 		fail(err)
 		return
 	}
 	defer cancel()
+	if checkpoint != "" {
+		if _, err := fmt.Fprintf(w, "id: %s\nevent: checkpoint\n\n", checkpoint); err != nil {
+			return
+		}
+		fl.Flush()
+	}
 	if err := drain(); err != nil {
 		fail(err)
 		return

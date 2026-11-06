@@ -26,7 +26,9 @@ func readSSE(r io.Reader, fn func(sseFrame) bool) error {
 	for sc.Scan() {
 		line := sc.Text()
 		if line == "" {
-			if data != nil {
+			// A frame with an id but no data (a checkpoint) is dispatched too: its id is a
+			// cursor to keep, as an EventSource keeps it.
+			if data != nil || f.ID != "" || f.Event != "" {
 				f.Data = strings.Join(data, "\n")
 				if !fn(f) {
 					return nil
@@ -108,3 +110,8 @@ func frameCursor(f sseFrame, id int64) string {
 	}
 	return strconv.FormatInt(id, 10)
 }
+
+// checkpoint reports whether f is a cursor-only frame (`event: checkpoint`): sandboxd sends
+// one first on a bounded trace, so a resume keeps its replay boundary even when no event has
+// arrived. It is never printed.
+func checkpoint(f sseFrame) bool { return f.Event == "checkpoint" }

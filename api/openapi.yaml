@@ -1606,7 +1606,9 @@ paths:
         `event: error` frame (an `Error` body). With `to`, the replay keeps the window up to the
         newest event when the stream began and everything after that is followed live; such a
         stream's frames are named `<event id>:<boundary>`, and `Last-Event-ID` takes that value
-        back as sent, so a resume keeps the boundary of the stream it continues.
+        back as sent, so a resume keeps the boundary of the stream it continues. Such a stream
+        opens with an `event: checkpoint` frame that has an id (`<cursor>:<boundary>`) and no
+        data: it is no event, only the cursor to resume with when no event has arrived yet.
       parameters:
         - { name: tenant, in: query, schema: { type: string } }
         - { name: slug, in: query, schema: { type: string } }
