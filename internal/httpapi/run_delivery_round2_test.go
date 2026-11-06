@@ -313,3 +313,23 @@ func TestRound2CancelledRunWithoutCommandIsDeliveredOnPoll(t *testing.T) {
 		t.Fatalf("run.cancel written %d times", n)
 	}
 }
+
+// Codex round 2 of #31, finding 3, through the gateway: "a" stored whole under B; then "a" and
+// an oversized line under B (the scanner yields the same one-line prefix, cut short); then "a"
+// and a usage line. The second used to reopen the batch and the third to add its usage.
+func TestRound2OversizedBodyCannotReopenAWholeBatch(t *testing.T) {
+	p := newRound2Pod(t)
+	p.claim(t)
+	if code, out := p.post(t, "B", "a\n"); code != 200 {
+		t.Fatalf("first: %d %s", code, out)
+	}
+	if code, out := p.post(t, "B", "a\n"+strings.Repeat("x", MaxLineBytes+1)+"\n"); code != 422 {
+		t.Fatalf("a cut body under a whole batch's id: %d %s", code, out)
+	}
+	if code, out := p.post(t, "B", "a\n"+round2UsageLine+"\n"); code != 422 {
+		t.Fatalf("the third body: %d %s", code, out)
+	}
+	if out, r := p.events(t, model.EventRunOutput), p.run(t); len(out) != 1 || r.Usage.CostUSD != 0 {
+		t.Fatalf("after the three bodies: %d lines, usage %+v", len(out), r.Usage)
+	}
+}

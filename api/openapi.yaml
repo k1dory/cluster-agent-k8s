@@ -1645,7 +1645,9 @@ paths:
         first call about the run (`events`, `input` or `finish`) confirms it got it, the same
         instance asking again gets the same run back under the next attempt (its previous
         response was lost); no other instance gets it. Send the attempt back as `X-Run-Attempt`
-        on every call about the run: a call naming an earlier attempt is refused with 409.
+        on every call about the run: a call naming an earlier attempt is refused with 409. While
+        the instance executes a run it confirmed, it is handed no other one (204): a request of
+        it delayed past its own retry does not start the next run.
       parameters:
         - name: wait
           in: query
@@ -1679,8 +1681,9 @@ paths:
         many lines of that batch it stored in the same write as the lines, and a retry (on any
         replica, even one racing the original) skips them (`skipped` in the answer). The same id
         with a body that does not start with the lines already stored, or one that adds lines to a
-        body that was stored whole (not cut short by a 413), is a 422. Without it a retry after a
-        lost response duplicates lines.
+        body that was stored whole (not cut short by a 413, including one cut short now), is a 422.
+        The progress of a batch is kept for 24 hours after the last call under its id. Without it a
+        retry after a lost response duplicates lines.
       parameters:
         - { name: X-Batch-Id, in: header, schema: { type: string, maxLength: 100 } }
         - { $ref: "#/components/parameters/RunAttempt" }

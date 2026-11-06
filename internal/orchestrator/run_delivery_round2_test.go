@@ -233,3 +233,78 @@ func TestRound2ClaimStaysWithItsInstance(t *testing.T) {
 		t.Fatalf("after finish: %+v", got)
 	}
 }
+
+// Codex round 2 of #31, finding 2: a forced sleep whose cancellation of the running run failed
+// reported success and left the sandbox sleeping with the run running; an immediate wake gave
+// it a healthy pod, so nothing ever settled the run (the reconciler only fails runs of
+// sandboxes without one). The stop now stays pending until the cancellation commits.
+func TestRound2ForcedSleepWaitsForTheCancellation(t *testing.T) {
+	o, sb, run := round2Running(t)
+	ctx := context.Background()
+	hook, failed := failOnceAt(store.FaultSettle)
+	store.SetFaultHook(o.Store, hook)
+	defer store.SetFaultHook(o.Store, nil)
+	_, sleepErr := o.Sleep(ctx, sb.ID, true)
+	if failed.Load() != 1 {
+		t.Fatal("the cancellation was not attempted")
+	}
+	_, _ = o.Wake(ctx, sb.ID) // the client wakes it right away
+	if cur, _ := o.Store.GetSandbox(ctx, sb.ID); cur.Status == model.StatusSleeping || cur.Status == model.StatusWaking || cur.Status == model.StatusRunning {
+		if got, _ := o.Store.GetRun(ctx, run.ID); got.Status == model.RunRunning {
+			t.Fatalf("sleep answered %v, sandbox %s with its run still running", sleepErr, cur.Status)
+		}
+	}
+	if sleepErr == nil {
+		t.Fatal("a sleep whose cancellation failed reported success")
+	}
+	o.Reconcile(ctx) // finishes the stop: the run is cancelled, then the sandbox sleeps
+	cur, _ := o.Store.GetSandbox(ctx, sb.ID)
+	got, _ := o.Store.GetRun(ctx, run.ID)
+	if cur.Status != model.StatusSleeping || got.Status != model.RunCancelled || round2Events(t, o, sb.ID, run.ID, model.EventRunDone) != 1 {
+		t.Fatalf("after the reconciler: sandbox %s, run %s, %d run.finished", cur.Status, got.Status, round2Events(t, o, sb.ID, run.ID, model.EventRunDone))
+	}
+}
+
+// Codex round 2 of #31, finding 4: the original /next stalled, its retry claimed run 1 and the
+// runner confirmed it; when the original resumed it found no unconfirmed claim and took run 2
+// while run 1 executed. An owner executing a confirmed run gets no other one.
+func TestRound2DelayedRequestDoesNotClaimAheadOfAConfirmedRun(t *testing.T) {
+	o, _, sb := reviewRunningSandbox(t)
+	st := &queueHookStore{Store: o.Store}
+	o.Store = st
+	ctx := context.Background()
+	first, err := o.CreateRun(ctx, sb.ID, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	second, err := o.CreateRun(ctx, sb.ID, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := func() {
+		// The original request stalls here; its retry claims run 1 and the runner confirms it.
+		retry, err := o.NextRunFor(ctx, sb.ID, "1", 0)
+		if err != nil || retry.ID != first.ID {
+			t.Errorf("the retry: %v %+v", err, retry)
+			return
+		}
+		if err := o.AckClaim(ctx, retry, "1", retry.Attempt); err != nil {
+			t.Error(err)
+		}
+	}
+	st.hook.Store(&hook)
+	if r, err := o.NextRunFor(ctx, sb.ID, "1", 0); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("the delayed original got %+v (%v) while run 1 executes", r, err)
+	}
+	if got, _ := o.Store.GetRun(ctx, second.ID); got.Status != model.RunQueued {
+		t.Fatalf("run 2 was claimed while run 1 executes: %+v", got)
+	}
+	// Once run 1 is settled, run 2 is the owner's next.
+	if err := o.FinishRun(ctx, sb.ID, first.ID, 0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := o.NextRunFor(ctx, sb.ID, "1", 0); err != nil || r.ID != second.ID {
+		t.Fatalf("after run 1 finished: %v %+v", err, r)
+	}
+}

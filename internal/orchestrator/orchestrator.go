@@ -818,7 +818,11 @@ func (o *Orchestrator) stopPodIf(ctx context.Context, id string, final model.San
 			o.Log.Error("retire identities", "id", id, "err", err)
 		}
 	}
-	o.cancelRunning(ctx, id)
+	if err := o.cancelRunning(ctx, id); err != nil {
+		// The stop is not complete while its run may still be running: the sandbox stays
+		// stopping, and the reconciler cancels the run and settles it (settleStopped).
+		return nil, err
+	}
 	if final == model.StatusWaking {
 		return o.startPod(ctx, id)
 	}
@@ -878,8 +882,8 @@ func (o *Orchestrator) detached(ctx context.Context) (context.Context, context.C
 // cancelRunning settles the run that was executing in a sandbox whose pod is going away. Only
 // a run still running is moved: one its runner finished meanwhile keeps that result, and the
 // run.finished event is emitted once, by whoever settled it. An error means the run may still
-// be running: Delete keeps the sandbox (in deleting) so its retry settles it; a stop may go
-// on, since the reconciler fails a run left running in a sandbox without a pod.
+// be running: Delete keeps the sandbox in deleting and a stop keeps it in stopping, so the
+// retry (the reconciler's, or the caller's) settles it.
 func (o *Orchestrator) cancelRunning(ctx context.Context, id string) error {
 	r, err := o.Store.RunningRun(ctx, id)
 	if errors.Is(err, store.ErrNotFound) {
@@ -1145,6 +1149,9 @@ func (o *Orchestrator) claim(ctx context.Context, sandboxID string, stamp store.
 		r, reclaimed, err := o.claimAwake(ctx, sandboxID, q.ID, session, stamp)
 		if errors.Is(err, errNotAwake) {
 			return nil, false, store.ErrNotFound // stopping or gone: the poll waits for a running pod
+		}
+		if errors.Is(err, store.ErrOwnerBusy) {
+			return nil, false, store.ErrNotFound // nothing for this owner until its run is settled
 		}
 		if errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrNotFound) {
 			continue // claimed by another poller or cancelled meanwhile: the next one in line
@@ -1633,7 +1640,9 @@ func (o *Orchestrator) reconcileStopping(ctx context.Context, sb *model.Sandbox,
 			return // this replica's stop is still cleaning up after the pod: it settles itself
 		}
 		o.forgetStop(sb.ID)
-		o.settleStopped(ctx, sb.ID)
+		if err := o.settleStopped(ctx, sb.ID); err != nil {
+			o.Log.Warn("settle a stopped sandbox", "id", sb.ID, "err", err) // the next pass tries again
+		}
 		return
 	}
 	if err != nil && !errors.Is(err, ErrPodTerminated) {
@@ -1687,9 +1696,7 @@ func (o *Orchestrator) takeOverStop(seen *model.Sandbox) {
 				o.Log.Error("retire identities", "id", cur.ID, "err", err)
 			}
 		}
-		o.cancelRunning(ctx, cur.ID)
-		o.settleStopped(ctx, cur.ID)
-		return nil
+		return o.settleStopped(ctx, cur.ID)
 	})
 	switch {
 	case err == nil, errors.Is(err, errStopMoved), errors.Is(err, store.ErrNotFound):
@@ -1699,9 +1706,16 @@ func (o *Orchestrator) takeOverStop(seen *model.Sandbox) {
 	}
 }
 
-// settleStopped moves a sandbox whose pod is gone from stopping to sleeping.
-func (o *Orchestrator) settleStopped(ctx context.Context, id string) {
+// settleStopped moves a sandbox whose pod is gone from stopping to sleeping, once the run that
+// was executing in it is cancelled. Until then it stays stopping (the reconciler tries again):
+// a sleeping sandbox can be woken, and a healthy new pod would leave the old run running with
+// nothing that ever settles it.
+func (o *Orchestrator) settleStopped(ctx context.Context, id string) error {
+	if err := o.cancelRunning(ctx, id); err != nil {
+		return err
+	}
 	_, _ = o.setStatusFrom(ctx, id, []model.SandboxStatus{model.StatusStopping}, model.StatusSleeping, func(s *model.Sandbox) { s.PodName, s.IP = "", "" })
+	return nil
 }
 
 // forgetStop drops what the reconciler remembered about a stuck stop.
