@@ -126,9 +126,16 @@ func (pr Principal) expiresBefore() time.Time {
 func (pr Principal) admin() bool { return pr.Admin }
 
 // TokenVerifier resolves a bearer token that is not one of the configured static tokens.
+// An error that wraps ErrVerifierUnavailable says nothing about the token.
 type TokenVerifier interface {
 	Verify(ctx context.Context, token string) (Principal, error)
 }
+
+// ErrVerifierUnavailable marks a verification that could not be made: the identity provider
+// (its discovery document, its keys) did not answer. The token is not judged, so the attempt
+// it reserved is given back and the answer is 503, not 401: an outage of the provider must not
+// spend an address's budget and lock out the valid tokens sent from there.
+var ErrVerifierUnavailable = errors.New("token verification unavailable")
 
 type principalKey struct{}
 
@@ -357,6 +364,11 @@ func (p *Platform) auth(next http.HandlerFunc) http.HandlerFunc {
 		}
 		if pr == nil && p.Verifier != nil && strings.Count(string(got), ".") == 2 {
 			v, err := p.Verifier.Verify(r.Context(), string(got))
+			if errors.Is(err, ErrVerifierUnavailable) {
+				refund()
+				writeErr(w, http.StatusServiceUnavailable, fmt.Errorf("token: %w", err))
+				return
+			}
 			if err != nil {
 				writeErr(w, http.StatusUnauthorized, fmt.Errorf("token: %w", err))
 				return

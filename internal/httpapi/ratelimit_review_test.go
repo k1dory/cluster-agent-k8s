@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -226,4 +227,34 @@ func TestReviewTakeDoesNotRefillBackwards(t *testing.T) {
 	if d := l.take("a"); d != 0 {
 		t.Fatalf("A was refused with %v: the bucket was refilled backwards", d)
 	}
+}
+
+// downVerifier is an identity provider that cannot be reached.
+type downVerifier struct{}
+
+func (downVerifier) Verify(context.Context, string) (Principal, error) {
+	return Principal{}, fmt.Errorf("%w: oidc discovery: connection refused", ErrVerifierUnavailable)
+}
+
+// An outage of the identity provider does not spend the address's budget: its JWTs are 503
+// (not judged), and the valid static tokens from there still get in afterwards.
+func TestReviewVerifierOutageDoesNotSpendTheBudget(t *testing.T) {
+	s := newStack(t)
+	s.p.Verifier = downVerifier{}
+	s.p.AuthLimit = RateLimit{Burst: 2, Every: time.Hour}
+	srv := httptest.NewServer(s.p.Routes())
+	defer srv.Close()
+	for i := 0; i < 5; i++ {
+		resp, body := call(t, "GET", srv.URL+"/v1/whoami", "a.b.c", nil, nil)
+		wantErr(t, "JWT while the provider is down", resp, body, 503, CodeUnavailable)
+	}
+	if resp, body := call(t, "GET", srv.URL+"/v1/whoami", "t0k", nil, nil); resp.StatusCode != 200 {
+		t.Fatalf("admin token after the outage: %d %s", resp.StatusCode, body)
+	}
+	for i := 0; i < 2; i++ { // the budget is whole: two guesses, then 429
+		resp, body := call(t, "GET", srv.URL+"/v1/whoami", "guess", nil, nil)
+		wantErr(t, "guess", resp, body, 401, CodeUnauthorized)
+	}
+	resp, body := call(t, "GET", srv.URL+"/v1/whoami", "guess", nil, nil)
+	wantErr(t, "third guess", resp, body, 429, CodeRateLimited)
 }

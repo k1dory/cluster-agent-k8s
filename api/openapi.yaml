@@ -1890,7 +1890,7 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     Unauthorized:
-      description: "No bearer token, or one that is unknown, revoked or expired (`bad token`); every authenticated route answers it, and 429 (`rate_limited`, see RateLimited) once an address has failed too often"
+      description: "No bearer token, or one that is unknown, revoked or expired (`bad token`); every authenticated route answers it, and 429 (`rate_limited`, see RateLimited) once an address has failed too often. A JWT the identity provider could not be asked about (its discovery or keys do not answer) is 503 `unavailable` instead, and spends nothing of the address's budget"
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }

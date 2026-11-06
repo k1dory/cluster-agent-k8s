@@ -5,10 +5,14 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"agent-sandbox/internal/httpapi"
 
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
@@ -91,5 +95,44 @@ func TestVerify(t *testing.T) {
 	}
 	if _, err := New(Config{}); err == nil {
 		t.Fatal("issuer is required")
+	}
+}
+
+// An identity provider that does not answer (its discovery document, or later its keys) is
+// ErrVerifierUnavailable; a token that is simply bad is not.
+func TestVerifyTellsAnOutageFromABadToken(t *testing.T) {
+	ctx := context.Background()
+	gone := httptest.NewServer(http.NotFoundHandler())
+	gone.Close()
+	v, _ := New(Config{Issuer: gone.URL, ClientID: "sandboxd"})
+	if _, err := v.Verify(ctx, "a.b.c"); !errors.Is(err, httpapi.ErrVerifierUnavailable) {
+		t.Fatalf("discovery down: %v", err)
+	}
+
+	idp := newIdP(t)
+	var keysDown atomic.Bool
+	orig := idp.srv.Config.Handler
+	idp.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/keys" && keysDown.Load() {
+			http.Error(w, "down", http.StatusBadGateway)
+			return
+		}
+		orig.ServeHTTP(w, r)
+	})
+	keysDown.Store(true)
+	v, _ = New(Config{Issuer: idp.srv.URL, ClientID: "sandboxd"})
+	good := idp.token(t, map[string]any{"tenant": "acme"}, time.Hour)
+	if _, err := v.Verify(ctx, good); !errors.Is(err, httpapi.ErrVerifierUnavailable) {
+		t.Fatalf("keys down: %v", err)
+	}
+	keysDown.Store(false)
+	if pr, err := v.Verify(ctx, good); err != nil || pr.Tenant != "acme" {
+		t.Fatalf("keys back: %+v %v", pr, err)
+	}
+	other := newIdP(t)
+	for _, bad := range []string{"not.a.jwt", other.token(t, map[string]any{"tenant": "acme"}, time.Hour), idp.token(t, map[string]any{"tenant": "acme"}, -time.Minute)} {
+		if _, err := v.Verify(ctx, bad); err == nil || errors.Is(err, httpapi.ErrVerifierUnavailable) {
+			t.Fatalf("a bad token must be refused as such: %v", err)
+		}
 	}
 }
