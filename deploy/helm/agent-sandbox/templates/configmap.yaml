@@ -123,6 +123,16 @@ data:
       ticket_key: "${PREVIEW_TICKET_KEY}"
       cookie_ttl: {{ .Values.sandboxd.preview.cookieTtl }}
       hits_as_activity: {{ .Values.sandboxd.preview.hitsAsActivity }}
+    metrics:
+      listen: {{ ternary (printf ":%v" .Values.metrics.port) "" .Values.metrics.enabled | quote }}
+    {{- if .Values.tracing.enabled }}
+    tracing:
+      enabled: true
+      endpoint: {{ .Values.tracing.endpoint | quote }}
+      protocol: {{ .Values.tracing.protocol | quote }}
+      sampler_ratio: {{ .Values.tracing.samplerRatio }}
+      record_statements: {{ .Values.tracing.recordStatements }}
+    {{- end }}
 ---
 apiVersion: v1
 kind: ConfigMap

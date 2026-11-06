@@ -113,6 +113,8 @@ data:
       ticket_key: "${PREVIEW_TICKET_KEY}"
       cookie_ttl: 1h
       hits_as_activity: true
+    metrics:
+      listen: ":9090"
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -303,6 +305,7 @@ spec:
     app.kubernetes.io/instance: agent-sandbox
   ports:
     - { name: api, port: 8080, targetPort: 8080 }
+    - { name: metrics, port: 9090, targetPort: metrics }
 ---
 # The gateway pod: Caddy and sandboxd share the node's network namespace, so Caddy binds
 # :443/:8443 on the VLAN address and talks to sandboxd on localhost, exactly like the VM layout.
@@ -331,7 +334,10 @@ spec:
         app.kubernetes.io/version: "0.1.0"
         helm.sh/chart: agent-sandbox-0.1.0
       annotations:
-        checksum/config: 00e40b8af9b361e0f523af78b1bb06fdadd54fe615073faa4b89997ad8f729c1
+        checksum/config: 3ae677c362bffad865d1ca8b8656bfa05a8d35802ca7a03da6c49189a611624e
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: /metrics
     spec:
       serviceAccountName: agent-sandbox-sandboxd
       hostNetwork: true
@@ -365,6 +371,14 @@ spec:
           envFrom:
             - secretRef:
                 name: agent-sandbox-secrets
+          env:
+            # the pod a trace's spans come from (telemetry resource attributes)
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+          ports:
+            - { name: metrics, containerPort: 9090 }
           readinessProbe:
             # the store answers: a replica that lost the database stops taking traffic
             httpGet: { path: /readyz, port: 8080 }

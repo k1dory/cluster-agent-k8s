@@ -22,6 +22,11 @@ spec:
       labels: {{- include "agent-sandbox.labels" . | nindent 8 }}
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if and .Values.metrics.enabled .Values.metrics.podAnnotations }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.port | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
     spec:
       serviceAccountName: {{ include "agent-sandbox.fullname" . }}
       hostNetwork: true
@@ -81,9 +86,21 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ .Values.existingSecret }}
-          {{- if .Values.gateway.upstreamCAConfigMap }}
           env:
+            # the pod a trace's spans come from (telemetry resource attributes)
+            - name: POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: POD_NAMESPACE
+              valueFrom: { fieldRef: { fieldPath: metadata.namespace } }
+            {{- if .Values.gateway.upstreamCAConfigMap }}
             - { name: SSL_CERT_DIR, value: "/etc/sandbox/upstream-ca:/etc/ssl/certs" }
+            {{- end }}
+          {{- if .Values.metrics.enabled }}
+          {{- if has (int .Values.metrics.port) (list (int .Values.gateway.apiPort) 8081 8082 2019 443 8443 53) }}
+          {{- fail "metrics.port must not be a port the gateway pod already uses (apiPort, 8081, 8082, 2019, 443, 8443, 53)" }}
+          {{- end }}
+          ports:
+            - { name: metrics, containerPort: {{ .Values.metrics.port }} }
           {{- end }}
           readinessProbe:
             # the store answers: a replica that lost the database stops taking traffic
