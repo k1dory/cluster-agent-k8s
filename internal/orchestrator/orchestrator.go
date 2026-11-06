@@ -396,8 +396,14 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 	var sb *model.Sandbox
 	var from string
 	var volErr error
-	tenant := o.metaOf(ctx, id).tenant
-	err := o.Store.WithTenantLock(ctx, tenant, func(ctx context.Context) error {
+	started := false
+	// The lock must be the tenant's: markDeleting takes it to keep a Delete away from the volume
+	// provisioned below. A failed read is an error, never the lock of tenant "".
+	tenant, err := o.tenantOf(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	err = o.Store.WithTenantLock(ctx, tenant, func(ctx context.Context) error {
 		// Writers that do not take the lock can still move the record between the read and the
 		// transition: the reconciler (this replica's or another's) settling a stop whose pod is
 		// gone as sleeping, waitReady, a failure being recorded. The transition then fails its
@@ -417,6 +423,7 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 			}
 			break
 		}
+		started = true
 		// Every pod start ensures the volume (idempotent): a sandbox whose first provisioning
 		// failed would otherwise get a pod bound to a claim that does not exist, on every wake. It
 		// is done under this lock, which markDeleting also takes: a Delete either ran before (the
@@ -427,6 +434,13 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 		volErr = o.Runtime.EnsureVolume(vctx, sb)
 		return nil
 	})
+	if started && err != nil {
+		// The move to waking is committed (it does not go through the lock's transaction); a
+		// failure to release the lock, the client's cancelled context included, must not abandon
+		// it: the pod is created, or its failure recorded, below on a detached context.
+		o.Log.Warn("tenant lock released with an error after the start", "id", id, "err", err)
+		err = nil
+	}
 	if errors.Is(err, errAlreadyStarted) {
 		return sb, nil
 	}
@@ -932,7 +946,10 @@ func (o *Orchestrator) Delete(ctx context.Context, id string) error {
 // (waitReady flipping to running) is read again rather than overwritten.
 func (o *Orchestrator) markDeleting(ctx context.Context, id string) (*model.Sandbox, error) {
 	var sb *model.Sandbox
-	tenant := o.metaOf(ctx, id).tenant
+	tenant, err := o.tenantOf(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	for attempt := 0; ; attempt++ {
 		err := o.Store.WithTenantLock(ctx, tenant, func(ctx context.Context) error {
 			cur, err := o.Store.GetSandbox(ctx, id)
@@ -1858,3 +1875,21 @@ type stopNotBegun struct{ err error }
 
 func (e stopNotBegun) Error() string { return e.err.Error() }
 func (e stopNotBegun) Unwrap() error { return e.err }
+
+// tenantOf returns the sandbox's tenant (cached once read: it never changes), or the error of
+// the read. Unlike metaOf it never answers "" for a sandbox it could not read: the tenant names
+// the lock that keeps a wake's volume provisioning and a Delete apart.
+func (o *Orchestrator) tenantOf(ctx context.Context, id string) (string, error) {
+	o.mu.Lock()
+	m, ok := o.meta[id]
+	o.mu.Unlock()
+	if ok {
+		return m.tenant, nil
+	}
+	sb, err := o.Store.GetSandbox(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	o.remember(sb)
+	return sb.Tenant, nil
+}
