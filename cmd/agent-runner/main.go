@@ -359,91 +359,123 @@ func withInstructions(cmdline string) string {
 func runsClaude(cmdline string) bool { return parseHarnessCommand(cmdline).runsClaude() }
 
 // harnessCommand is the leading simple command of a harness command line, as the shell would
-// split it: words with their quotes kept, and where the simple command ends — at an unquoted
-// newline, `;`, `&` (not `&&`'s cousin in a redirection: `2>&1`, `&>`), `|` or a `#` comment,
-// outside any `$(…)` or backtick substitution — so that an argument can be added to the
-// program's invocation rather than to whatever follows it (a `&& echo done`, a trailing newline
-// from a YAML block scalar) or to a command inside a substitution. The words are not
-// evaluated: "$VAR" stays "$VAR"; options and the program are matched on their quote-stripped
-// text, so `"--system-prompt"` is the option too.
+// split it: words with their quotes kept and where each starts, and where the simple command
+// ends — at an unquoted newline, `;`, `&` or `|` (a redirection's `>&`, `<&`, `&>`, `>|` is
+// part of its word) or a `#` comment, outside any `$(…)` or backtick substitution (which may
+// hold separators and quotes of its own, and may itself sit inside double quotes) — so that an
+// argument can be added to the program's invocation rather than to whatever follows it (a
+// `&& echo done`, a trailing newline from a YAML block scalar) or to a command inside a
+// substitution. The words are not evaluated: "$VAR" stays "$VAR"; options and the program are
+// matched on their quote-stripped text, so `"--system-prompt"` is the option too. A standalone
+// `--` ends the options: generated ones go before it.
 type harnessCommand struct {
-	line  string
-	words []string
-	end   int // index in line where the simple command ends (len(line) when it is all of it)
+	line   string
+	words  []string
+	starts []int // where each word starts in line
+	end    int   // index in line where the simple command ends (len(line) when it is all of it)
 }
 
 func parseHarnessCommand(line string) harnessCommand {
 	c := harnessCommand{line: line, end: len(line)}
-	var word strings.Builder
-	inWord, single, double, escaped, backtick := false, false, false, false, false
-	subst := 0 // depth of $( … )
-	flush := func() {
+	start, inWord := 0, false
+	flush := func(i int) {
 		if inWord {
-			c.words = append(c.words, word.String())
-			word.Reset()
+			c.words = append(c.words, line[start:i])
+			c.starts = append(c.starts, start)
 			inWord = false
 		}
 	}
-	for i := 0; i < len(line); i++ {
+	for i := 0; i < len(line); {
 		ch := line[i]
 		switch {
-		case escaped:
-			word.WriteByte(ch)
-			escaped = false
-		case single:
-			word.WriteByte(ch)
-			single = ch != '\''
-		case double:
-			word.WriteByte(ch)
-			if ch == '\\' && i+1 < len(line) {
-				i++
-				word.WriteByte(line[i])
-			} else if ch == '"' {
-				double = false
+		case ch == '\'' || ch == '"' || ch == '`' || ch == '\\' || ch == '$' && i+1 < len(line) && line[i+1] == '(':
+			if !inWord {
+				start, inWord = i, true
 			}
-		case backtick:
-			word.WriteByte(ch)
-			backtick = ch != '`'
-		case ch == '\\':
-			word.WriteByte(ch)
-			escaped, inWord = true, true
-		case ch == '\'':
-			word.WriteByte(ch)
-			single, inWord = true, true
-		case ch == '"':
-			word.WriteByte(ch)
-			double, inWord = true, true
-		case ch == '`':
-			word.WriteByte(ch)
-			backtick, inWord = true, true
-		case ch == '$' && i+1 < len(line) && line[i+1] == '(':
-			word.WriteString("$(")
-			subst++
-			inWord = true
-			i++
-		case subst > 0:
-			word.WriteByte(ch)
-			if ch == '(' {
-				subst++
-			} else if ch == ')' {
-				subst--
-			}
-		case ch == '&' && (i+1 < len(line) && line[i+1] == '>' || inWord && (line[i-1] == '>' || line[i-1] == '<')):
-			word.WriteByte(ch) // a redirection: &>, >&, <&
-			inWord = true
+			i = skipQuoted(line, i)
+		case ch == '&' && (i+1 < len(line) && line[i+1] == '>' || inWord && (line[i-1] == '>' || line[i-1] == '<')),
+			ch == '|' && inWord && line[i-1] == '>':
+			i++ // a redirection operator's second character
 		case ch == '\n' || ch == ';' || ch == '&' || ch == '|' || (ch == '#' && !inWord):
-			flush()
+			flush(i)
 			c.end = i
 			return c
 		case ch == ' ' || ch == '\t':
-			flush()
+			flush(i)
+			i++
 		default:
-			word.WriteByte(ch)
-			inWord = true
+			if !inWord {
+				start, inWord = i, true
+			}
+			i++
 		}
 	}
-	flush()
+	flush(len(line))
 	return c
+}
+
+// skipQuoted returns the index just past the quoted or substituted text that starts at i (a
+// single- or double-quoted string, a backslash escape, a backtick or $(…) substitution), with
+// the nesting the shell allows: a substitution inside double quotes, quotes inside a
+// substitution. An unterminated construct runs to the end of the line.
+func skipQuoted(line string, i int) int {
+	switch line[i] {
+	case '\\':
+		return min(i+2, len(line))
+	case '\'':
+		if j := strings.IndexByte(line[i+1:], '\''); j >= 0 {
+			return i + 1 + j + 1
+		}
+		return len(line)
+	case '`':
+		for j := i + 1; j < len(line); j++ {
+			switch line[j] {
+			case '\\':
+				j++
+			case '`':
+				return j + 1
+			}
+		}
+		return len(line)
+	case '"':
+		for j := i + 1; j < len(line); {
+			switch line[j] {
+			case '\\':
+				j += 2
+			case '"':
+				return j + 1
+			case '`':
+				j = skipQuoted(line, j)
+			case '$':
+				if j+1 < len(line) && line[j+1] == '(' {
+					j = skipQuoted(line, j)
+				} else {
+					j++
+				}
+			default:
+				j++
+			}
+		}
+		return len(line)
+	default: // $(
+		for j := i + 2; j < len(line); {
+			switch line[j] {
+			case ')':
+				return j + 1
+			case '\'', '"', '`', '\\':
+				j = skipQuoted(line, j)
+			case '$':
+				if j+1 < len(line) && line[j+1] == '(' {
+					j = skipQuoted(line, j)
+				} else {
+					j++
+				}
+			default:
+				j++
+			}
+		}
+		return len(line)
+	}
 }
 
 // unquoted is a word's text without its shell quoting, statically: quotes dropped, backslash
@@ -460,7 +492,7 @@ func unquoted(w string) string {
 			} else {
 				out.WriteByte(ch)
 			}
-		case ch == '\\' && !single && i+1 < len(w):
+		case ch == '\\' && i+1 < len(w):
 			i++
 			out.WriteByte(w[i])
 		case ch == '\'' && !double:
@@ -476,27 +508,43 @@ func unquoted(w string) string {
 
 // program is the first word that is not a VAR=value assignment, quotes stripped.
 func (c harnessCommand) program() string {
-	for _, w := range c.words {
-		if isAssignment(w) {
-			continue
-		}
-		return unquoted(w)
+	if i := c.programIndex(); i >= 0 {
+		return unquoted(c.words[i])
 	}
 	return ""
 }
 
+func (c harnessCommand) programIndex() int {
+	for i, w := range c.words {
+		if !isAssignment(w) {
+			return i
+		}
+	}
+	return -1
+}
+
 func (c harnessCommand) runsClaude() bool { return filepath.Base(c.program()) == "claude" }
 
-// hasOption reports whether one of the options is given to the program, as `--opt` or
-// `--opt=value`, quoted or not; an option's value, or a word that merely contains the name,
-// does not count.
-func (c harnessCommand) hasOption(names ...string) bool {
-	past := false
-	for _, raw := range c.words {
-		if !past {
-			past = !isAssignment(raw) // the program
-			continue
+// optionsEnd is the index of the word that ends the program's options — a standalone `--` —
+// or len(words) when there is none.
+func (c harnessCommand) optionsEnd() int {
+	for i := c.programIndex() + 1; i < len(c.words); i++ {
+		if c.words[i] == "--" {
+			return i
 		}
+	}
+	return len(c.words)
+}
+
+// hasOption reports whether one of the options is given to the program, as `--opt` or
+// `--opt=value`, quoted or not, before any `--`; an option's value, or a word that merely
+// contains the name, does not count.
+func (c harnessCommand) hasOption(names ...string) bool {
+	p := c.programIndex()
+	if p < 0 {
+		return false
+	}
+	for _, raw := range c.words[p+1 : c.optionsEnd()] {
 		w := unquoted(raw)
 		for _, n := range names {
 			if w == n || strings.HasPrefix(w, n+"=") {
@@ -507,9 +555,14 @@ func (c harnessCommand) hasOption(names ...string) bool {
 	return false
 }
 
-// withArgs adds args to the program's invocation: before whatever follows the simple command,
-// keeping that (a `&& …`, a comment, a trailing newline) where it was.
+// withArgs adds args to the program's invocation: before a standalone `--` if there is one,
+// else before whatever follows the simple command, keeping that (a `&& …`, a comment, a
+// trailing newline) where it was.
 func (c harnessCommand) withArgs(args string) string {
+	if dd := c.optionsEnd(); dd < len(c.words) {
+		at := c.starts[dd]
+		return strings.TrimRight(c.line[:at], " \t") + " " + args + " " + c.line[at:]
+	}
 	head := strings.TrimRight(c.line[:c.end], " \t")
 	// The blanks that stood between the last word and what follows stay where they were; blanks
 	// that trailed the whole line go.

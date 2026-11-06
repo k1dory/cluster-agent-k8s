@@ -33,6 +33,12 @@ func TestInstructionsRespectShellSyntax(t *testing.T) {
 		{"claude --model `cat m | tr -d x` -p x", "claude --model `cat m | tr -d x` -p x" + flag},
 		{`claude -p "$(echo a; echo b)" && echo done`, `claude -p "$(echo a; echo b)"` + flag + ` && echo done`},
 		{`claude -p x $(f "$(g)") ; echo`, `claude -p x $(f "$(g)")` + flag + ` ; echo`},
+		{`claude -p "$(printf "Task: %s; context: %s" "$SANDBOX_TASK" context)"`, `claude -p "$(printf "Task: %s; context: %s" "$SANDBOX_TASK" context)"` + flag},
+		{`claude -p "$SANDBOX_TASK" >| run.log`, `claude -p "$SANDBOX_TASK" >| run.log` + flag},
+		{`claude -p "$SANDBOX_TASK" >| run.log; echo`, `claude -p "$SANDBOX_TASK" >| run.log` + flag + `; echo`},
+		{`claude -p -- "$SANDBOX_TASK"`, `claude -p` + flag + ` -- "$SANDBOX_TASK"`},
+		{`claude -- "$SANDBOX_TASK" --system-prompt x`, `claude` + flag + ` -- "$SANDBOX_TASK" --system-prompt x`},
+		{`claude -p "a -- b" x`, `claude -p "a -- b" x` + flag},
 	} {
 		if got := withInstructions(tc.in); got != tc.want {
 			t.Errorf("%q\n got %q\nwant %q", tc.in, got, tc.want)
@@ -89,6 +95,9 @@ func TestInstructionsRewriteRunsInTheShell(t *testing.T) {
 		`VAR="two words" claude -p "$SANDBOX_TASK" # note`,
 		`claude -p "$SANDBOX_TASK" 2>&1`,
 		`claude --model $(printf opus | tr a-z A-Z) -p "$SANDBOX_TASK" && echo done > "$SANDBOX_REVIEW_ARGS.done"`,
+		`claude -p "$(printf "Task: %s; context: %s" "$SANDBOX_TASK" context)"`,
+		`claude -p "$SANDBOX_TASK" >| "$SANDBOX_REVIEW_ARGS.log"`,
+		`claude -p -- "$SANDBOX_TASK"`,
 	} {
 		argsFile := filepath.Join(root, "args")
 		_ = os.Remove(argsFile)
@@ -103,16 +112,27 @@ func TestInstructionsRewriteRunsInTheShell(t *testing.T) {
 			t.Fatalf("%q: claude did not run: %v", cmd, err)
 		}
 		parts := strings.Split(strings.TrimSuffix(string(raw), "\x00"), "\x00")
-		got := ""
+		got, at := "", -1
 		for i, a := range parts {
 			if a == "--append-system-prompt" && i+1 < len(parts) {
-				got = parts[i+1]
+				got, at = parts[i+1], i
 			}
 		}
 		if got != instructions {
 			t.Fatalf("%q: claude's argv %q lacks the instructions", cmd, parts)
 		}
-		if strings.Contains(cmd, "$(printf") && !slices.Contains(parts, "OPUS") {
+		if dd := slices.Index(parts, "--"); dd >= 0 && at > dd {
+			t.Fatalf("%q: the flag came after -- (argv %q)", cmd, parts)
+		}
+		if strings.Contains(cmd, "printf \"Task") && !slices.Contains(parts, "Task: task; context: context") {
+			t.Fatalf("%q: the prompt built by the substitution was changed (argv %q)", cmd, parts)
+		}
+		if strings.Contains(cmd, ">|") {
+			if _, err := os.Stat(argsFile + ".log"); err != nil {
+				t.Fatalf("%q: the >| redirection did not happen", cmd)
+			}
+		}
+		if strings.Contains(cmd, "printf opus") && !slices.Contains(parts, "OPUS") {
 			t.Fatalf("%q: the substitution was not left intact: %q", cmd, parts)
 		}
 		if strings.Contains(cmd, "&&") {
