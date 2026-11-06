@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
@@ -55,17 +56,22 @@ func appendAt(t *testing.T, s *stack, at time.Time, data string) int64 {
 // used to be read after the subscription: an event appended in between became part of the
 // head, the window excluded it from the replay and the cursor moved past it. The event is
 // appended here at the first moment the hub has the stream's subscription, from whichever
-// read of the store comes first after it.
+// read of the store comes first after it. Two are appended: H+1 outside the window, then
+// H+2 inside it (times and ids disagree across replicas). A replay that was not bounded to
+// the head sent H+2 and moved its cursor past H+1 for good.
 func TestTraceStreamKeepsAnEventAppendedWhileItStartsRound2(t *testing.T) {
 	s := newStack(t)
 	mem := s.orch.Store
 	t0 := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
 	in := appendAt(t, s, t0, "inside")
 	var once sync.Once
-	var raced atomic.Int64
+	var outside, raced atomic.Int64
 	inject := func() {
 		if s.p.Hub.Waiting(events.All) > 0 {
-			once.Do(func() { raced.Store(appendAt(t, s, t0.Add(time.Hour), "appended while the stream starts")) })
+			once.Do(func() {
+				outside.Store(appendAt(t, s, t0.Add(time.Hour), "appended while the stream starts, outside the window"))
+				raced.Store(appendAt(t, s, t0.Add(time.Minute), "appended while the stream starts, inside the window"))
+			})
 		}
 	}
 	s.orch.Store = &hookedHead{Store: mem, query: inject, head: func(ctx context.Context) (int64, error) {
@@ -90,8 +96,8 @@ func TestTraceStreamKeepsAnEventAppendedWhileItStartsRound2(t *testing.T) {
 	got := waitBodyFor(t, w, raced.Load(), 3*time.Second)
 	cancel()
 	<-done
-	if got[len(got)-1] != raced.Load() {
-		t.Fatalf("frames %v, want %d (appended after the subscription) last", got, raced.Load())
+	if want := fmt.Sprint([]int64{in, outside.Load(), raced.Load()}); fmt.Sprint(got) != want {
+		t.Fatalf("frames %v, want %s (both appended after the subscription are live)", got, want)
 	}
 }
 

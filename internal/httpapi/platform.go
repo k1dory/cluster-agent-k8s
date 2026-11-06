@@ -1031,17 +1031,35 @@ func (p *Platform) trace(w http.ResponseWriter, r *http.Request) {
 		return wake, cancel, nil
 	}
 	streamSSE(w, r, open, 20*time.Second, after, func(ctx context.Context, after int64) ([]sseItem, int64, error) {
-		g := live
-		if after < head {
-			g = f
+		if after >= head {
+			g := live
+			g.AfterID, g.Limit = after, ssePageSize
+			evs, err := p.Orch.Store.QueryEvents(ctx, g)
+			return eventItems(evs), lastID(evs, after), err
 		}
+		// The replay: the window, and ids up to the head only. An event above the head is
+		// live whatever its time, and ids and times disagree across replicas: H+1 outside the
+		// window, H+2 inside it, a replay that sent H+2 moved the cursor past H+1 for good.
+		// The page is in id order, so cutting it at the head is exact.
+		g := f
 		g.AfterID, g.Limit = after, ssePageSize
 		evs, err := p.Orch.Store.QueryEvents(ctx, g)
-		if err == nil && len(evs) == 0 && after < head && head < math.MaxInt64 {
-			// The window holds nothing more up to the head: skip to it, live from there.
-			return nil, head, nil
+		if err != nil {
+			return nil, after, err
 		}
-		return eventItems(evs), lastID(evs, after), err
+		n := len(evs)
+		for i, e := range evs {
+			if e.ID > head {
+				n = i
+				break
+			}
+		}
+		next := lastID(evs[:n], after)
+		if (n < len(evs) || len(evs) < g.Limit) && head < math.MaxInt64 {
+			// The window holds nothing more up to the head: live from the head on.
+			next = head
+		}
+		return eventItems(evs[:n]), next, nil
 	})
 }
 
