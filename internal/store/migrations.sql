@@ -333,6 +333,43 @@ $$;
 DROP TRIGGER IF EXISTS events_ordered_id ON events;
 CREATE TRIGGER events_ordered_id BEFORE INSERT ON events FOR EACH ROW EXECUTE FUNCTION events_ordered_id();
 
+-- step 11: idempotency reservation owners and seeds
+-- token is the random owner of a reservation: finishing it (result or release) is conditional
+-- on it, and a token never repeats, so a handler that lost its reservation can never finish a
+-- later one. generation counts the attempts under the key. seed names what the keyed request
+-- creates and is kept by every later attempt with the same body, so one finds what an earlier
+-- one created. Rows of an older replica have no seed: an unfinished one is never run again
+-- (the resource it may have made has a random name nothing can find). created and said record
+-- what the seed's attempts did (the sandbox inserted, in the same transaction; a message's
+-- delivery): they live exactly as long as the reservation, and a deleted sandbox is not made
+-- again under its key.
+ALTER TABLE idempotency
+    ADD COLUMN IF NOT EXISTS generation integer NOT NULL DEFAULT 1,
+    ADD COLUMN IF NOT EXISTS seed text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS token text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS created text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS said text NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idempotency_seed ON idempotency (seed) WHERE seed <> '';
+
+-- step 12: idempotency reservations outlive an older replica's cleanup
+-- An older replica deletes every unfinished reservation older than two minutes on each
+-- reservation it makes (it took one that old for abandoned). Under a seed that would drop the
+-- record of what an attempt created and the seed itself: the retry would draw a new seed and
+-- create a second sandbox or run. A seeded reservation is kept until its TTL (store
+-- IdempotencyTTL, 24 hours) whatever deletes it; the row is skipped, not the statement failed,
+-- so the rest of the older replica's cleanup (expired rows, its own legacy releases) goes on.
+-- In the database, as step 10's events trigger: the older replicas' SQL cannot be changed.
+CREATE OR REPLACE FUNCTION idempotency_keep_seeded() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF OLD.seed <> '' AND OLD.created_at >= now() - interval '24 hours' THEN
+        RETURN NULL;
+    END IF;
+    RETURN OLD;
+END
+$$;
+DROP TRIGGER IF EXISTS idempotency_keep_seeded ON idempotency;
+CREATE TRIGGER idempotency_keep_seeded BEFORE DELETE ON idempotency FOR EACH ROW EXECUTE FUNCTION idempotency_keep_seeded();
+
 -- every start: repairs of rows a replica of an older release may still write
 -- No DDL here: these run on every start, after the steps, because during a rolling update an
 -- older replica keeps writing the old form after the step that introduced the new one ran.

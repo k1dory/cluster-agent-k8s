@@ -490,7 +490,14 @@ cached for `cache_ttl` and only ever appear in the gateway's response to Caddy, 
   stays valid when its anchor row is deleted.
 - **Idempotency.** `Idempotency-Key` on `POST /v1/sandboxes` and `POST .../runs`: the key is reserved
   before the request runs, so a CI retry after a timeout never creates a second sandbox or run, a
-  concurrent repeat waits (409), and a reuse with another body is refused (422).
+  concurrent repeat waits (409), and a reuse with another body is refused (422). A reservation left
+  unfinished for two minutes (its replica died), or released by a failed attempt, is taken over by the
+  next repeat, which answers with the sandbox or run an earlier attempt created, never a second one (a
+  sandbox deleted since is not made again: 409). A message is delivered once for all attempts, except
+  one delivered into an existing run (input, or joined to a queued task) whose replica died before
+  recording the delivery: the next attempt delivers it again. Upgrade: a reservation an older release
+  left unfinished is not run again (409 until it expires in 24h); check whether it took effect and use
+  a new key.
 - **Lifecycle.** `ttl` on create or `PATCH` sets `expires_at`; the sweeper deletes expired sandboxes.
   `PATCH` also changes `idle_timeout`, `wake_on_preview`, `repo`. Per-tenant `quotas` cap
   `max_sandboxes` and `max_awake` (429 `quota_exceeded`).

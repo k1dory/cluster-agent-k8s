@@ -132,6 +132,8 @@ func (p *Platform) sendMessage(w http.ResponseWriter, r *http.Request) {
 		// Listed after the text (every harness reads it); an ACP agent gets them as resource links.
 		text = harness.WithAttachments(text, paths)
 	}
+	// Under an Idempotency-Key, Say delivers the message once for every attempt: a later one
+	// gets the earlier one's delivery (see Orchestrator.Say).
 	run, delivery, err := p.Orch.Say(r.Context(), id, text)
 	if err != nil {
 		writeOrchErr(w, err)

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"agent-sandbox/internal/model"
@@ -39,6 +40,11 @@ func OpenPostgres(ctx context.Context, url string) (*Postgres, error) {
 	}
 	if !strings.Contains(url, "pool_max_conns") && cfg.MaxConns < 16 {
 		cfg.MaxConns = 16
+	}
+	if cfg.MaxConns < 2 {
+		// WithTenantLock holds one connection for its transaction while fn's queries take
+		// another: with a single connection the first locked call waits for itself forever.
+		return nil, fmt.Errorf("postgres: pool_max_conns=%d: at least 2 connections are needed (WithTenantLock holds one while its callback queries through another)", cfg.MaxConns)
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -240,14 +246,26 @@ func connectionsCol(s *model.Sandbox) []byte {
 }
 
 func (p *Postgres) CreateSandbox(ctx context.Context, s *model.Sandbox) error {
+	return createSandboxIn(ctx, p.pool, s)
+}
+
+// pgExec is what the pool and a transaction share: CreateSandbox runs on either.
+type pgExec interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
+func createSandboxIn(ctx context.Context, db pgExec, s *model.Sandbox) error {
 	port, access, host := previewCols(s)
 	s.Revision = 1
-	_, err := p.pool.Exec(ctx, `INSERT INTO sandboxes (`+sandboxCols+`)
+	_, err := db.Exec(ctx, `INSERT INTO sandboxes (`+sandboxCols+`)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)`,
 		s.ID, s.Name, s.Slug, s.Owner, s.Tenant, s.Repo, s.IdleTimeout, s.WakeOnPreview, s.Status, s.IP, s.Instance,
 		s.PodName, s.LastActivity, s.CreatedAt, s.ExpiresAt, port, access, host, s.Error,
 		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision, s.AdminGrant,
 		s.AgentRef, s.AgentRevision, s.EnvironmentRef, s.EnvironmentRevision, launchCol(s), connectionsCol(s), s.PreviewGen)
+	if uniqueViolation(err) {
+		return fmt.Errorf("%w: sandbox %s or its preview host exists: %v", ErrConflict, s.ID, err)
+	}
 	return err
 }
 
@@ -556,6 +574,9 @@ func (p *Postgres) UpdateSandbox(ctx context.Context, s *model.Sandbox) error {
 		s.PodName, s.LastActivity, s.ExpiresAt, port, access, host, s.Error,
 		s.AgentVersion, s.DesiredVersion, s.EnvVersion, s.Revision, s.AdminGrant,
 		s.AgentRef, s.AgentRevision, s.EnvironmentRef, s.EnvironmentRevision, launchCol(s), connectionsCol(s), s.PreviewGen)
+	if uniqueViolation(err) {
+		return fmt.Errorf("%w: preview host: %v", ErrDuplicate, err)
+	}
 	if err != nil {
 		return err
 	}
@@ -614,12 +635,19 @@ func scanRun(row pgx.Row) (*model.Run, error) {
 }
 
 func (p *Postgres) CreateRun(ctx context.Context, r *model.Run) error {
+	return createRunIn(ctx, p.pool, r)
+}
+
+func createRunIn(ctx context.Context, db pgExec, r *model.Run) error {
 	u := r.Usage
-	_, err := p.pool.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)`,
+	_, err := db.Exec(ctx, `INSERT INTO runs (`+runCols+`) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)`,
 		r.ID, r.SandboxID, r.Tenant, r.Slug, r.Task, r.Status, r.ExitCode, r.CreatedAt, r.StartedAt, r.FinishedAt,
 		u.Model, u.InputTokens, u.OutputTokens, u.CacheRead, u.CacheWrite, u.CostUSD, u.Turns,
 		r.AgentVersion, r.ResumeOf, r.Session, r.AgentRef, r.AgentRevision, r.EnvironmentRef, r.EnvironmentRevision, r.Mode,
 		r.Attempt, r.ClaimedBy, r.ClaimAcked)
+	if uniqueViolation(err) {
+		return fmt.Errorf("%w: run %s exists", ErrConflict, r.ID)
+	}
 	return err
 }
 
@@ -707,28 +735,6 @@ func (p *Postgres) AppendQueuedTask(ctx context.Context, runID, text string) (*m
 	return r, err
 }
 
-func (p *Postgres) ReleaseRun(ctx context.Context, runID string) error {
-	tag, err := p.pool.Exec(ctx, `UPDATE runs SET status=$2, started_at=NULL WHERE id=$1 AND status=$3`,
-		runID, model.RunQueued, model.RunRunning)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		if _, err := p.GetRun(ctx, runID); err != nil {
-			return err
-		}
-		return ErrConflict
-	}
-	return nil
-}
-
-func (p *Postgres) ClaimQueuedRun(ctx context.Context, sandboxID string, startedAt time.Time) (*model.Run, error) {
-	// One statement: pick the oldest queued run, skipping rows another poller is claiming.
-	return scanRun(p.pool.QueryRow(ctx, `UPDATE runs SET status=$3, started_at=$4, attempt=attempt+1 WHERE id = (
-			SELECT id FROM runs WHERE sandbox_id=$1 AND status=$2 ORDER BY created_at, id LIMIT 1 FOR UPDATE SKIP LOCKED)
-		RETURNING `+runCols, sandboxID, model.RunQueued, model.RunRunning, startedAt))
-}
-
 func (p *Postgres) QueuedRun(ctx context.Context, sandboxID string) (*model.Run, error) {
 	return scanRun(p.pool.QueryRow(ctx, `SELECT `+runCols+` FROM runs WHERE sandbox_id=$1 AND status=$2
 		ORDER BY created_at, id LIMIT 1`, sandboxID, model.RunQueued))
@@ -783,7 +789,7 @@ const eventsLockSQL = `SELECT pg_advisory_xact_lock(hashtext('agent-sandbox:even
 
 func (p *Postgres) ListEvents(ctx context.Context, sandboxID string, afterID int64, limit int) ([]*model.Event, error) {
 	if limit <= 0 {
-		limit = 1000
+		limit = DefaultEventLimit
 	}
 	return p.queryEvents(ctx, `SELECT `+eventCols+` FROM events WHERE sandbox_id=$1 AND id>$2 ORDER BY id LIMIT $3`, sandboxID, afterID, limit)
 }
@@ -877,7 +883,7 @@ func (p *Postgres) QueryRuns(ctx context.Context, f Filter) ([]*model.Run, error
 
 func (p *Postgres) QueryEvents(ctx context.Context, f Filter) ([]*model.Event, error) {
 	w, args := f.where("id", "at", true)
-	return p.queryEvents(ctx, `SELECT `+eventCols+` FROM events`+w+` ORDER BY id`+limitClause(f.Limit, 1000), args...)
+	return p.queryEvents(ctx, `SELECT `+eventCols+` FROM events`+w+` ORDER BY id`+limitClause(f.Limit, DefaultEventLimit), args...)
 }
 
 func (p *Postgres) CountEvents(ctx context.Context, f Filter) ([]EventCount, error) {
@@ -900,28 +906,68 @@ func (p *Postgres) CountEvents(ctx context.Context, f Filter) ([]EventCount, err
 	return out, rows.Err()
 }
 
-func (p *Postgres) ReserveIdempotent(ctx context.Context, key, bodyHash string) (*Idempotent, bool, error) {
-	// Expired responses and abandoned reservations make room; then the INSERT is the lock:
-	// exactly one concurrent caller gets a row back.
-	_, _ = p.pool.Exec(ctx, `DELETE FROM idempotency WHERE created_at < now() - $1::interval
-		OR (status = 0 AND created_at < now() - $2::interval)`, IdempotencyTTL.String(), IdempotencyStale.String())
-	tag, err := p.pool.Exec(ctx, `INSERT INTO idempotency (key, body_hash, status, body, created_at) VALUES ($1,$2,0,'',now())
-		ON CONFLICT (key) DO NOTHING`, key, bodyHash)
+const idemCols = `key, body_hash, status, body, created_at, generation, seed, token`
+
+func scanIdem(row pgx.Row) (*Idempotent, error) {
+	var rec Idempotent
+	err := row.Scan(&rec.Key, &rec.BodyHash, &rec.Status, &rec.Body, &rec.CreatedAt, &rec.Generation, &rec.Seed, &rec.Token)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	if tag.RowsAffected() == 1 {
-		return nil, true, nil
+	return &rec, nil
+}
+
+func (p *Postgres) ReserveIdempotent(ctx context.Context, key, bodyHash string) (*Idempotent, bool, error) {
+	// Expired records make room; then the INSERT is the lock: exactly one concurrent caller
+	// gets a row back. A released or abandoned reservation is not deleted but taken over in
+	// place, by one caller (the UPDATE's condition), with a token of its own.
+	_, _ = p.pool.Exec(ctx, `DELETE FROM idempotency WHERE created_at < now() - $1::interval`, IdempotencyTTL.String())
+	for attempt := 0; ; attempt++ {
+		rec, err := scanIdem(p.pool.QueryRow(ctx, `INSERT INTO idempotency (key, body_hash, status, body, created_at, generation, seed, token)
+			VALUES ($1,$2,0,'',now(),1,$3,$4) ON CONFLICT (key) DO NOTHING RETURNING `+idemCols, key, bodyHash, NewIdempotencySeed(), NewIdempotencySeed()))
+		if err == nil {
+			return rec, true, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return nil, false, err
+		}
+		// Released (no owner): any body takes it, keeping the seed only for the same body.
+		// Abandoned (owned, stale): only the same body, seed kept. Legacy (no seed): never.
+		rec, err = scanIdem(p.pool.QueryRow(ctx, `UPDATE idempotency SET generation = generation + 1, created_at = now(), token = $4,
+				seed = CASE WHEN body_hash = $2 THEN seed ELSE $3 END,
+				created = CASE WHEN body_hash = $2 THEN created ELSE '' END,
+				said = CASE WHEN body_hash = $2 THEN said ELSE '' END, body_hash = $2
+			WHERE key=$1 AND status=0 AND seed <> '' AND (token = '' OR body_hash=$2 AND created_at < now() - $5::interval)
+			RETURNING `+idemCols, key, bodyHash, NewIdempotencySeed(), NewIdempotencySeed(), IdempotencyStale.String()))
+		if err == nil {
+			return rec, true, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return nil, false, err
+		}
+		existing, err := p.GetIdempotent(ctx, key)
+		if errors.Is(err, ErrNotFound) && attempt < 3 {
+			continue // expired between the INSERT and the SELECT: reserve again
+		}
+		return existing, false, err
 	}
-	existing, err := p.GetIdempotent(ctx, key)
-	if errors.Is(err, ErrNotFound) {
-		// Released between our INSERT and SELECT; let the caller retry the reservation.
-		return p.ReserveIdempotent(ctx, key, bodyHash)
-	}
-	return existing, false, err
 }
 
 func (p *Postgres) PutIdempotent(ctx context.Context, rec *Idempotent) error {
+	if rec.Token != "" {
+		tag, err := p.pool.Exec(ctx, `UPDATE idempotency SET status=$2, body=$3, created_at=now()
+			WHERE key=$1 AND token=$4 AND status=0`, rec.Key, rec.Status, rec.Body, rec.Token)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: idempotency key is no longer reserved by this attempt", ErrConflict)
+		}
+		return nil
+	}
 	if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = time.Now()
 	}
@@ -931,22 +977,14 @@ func (p *Postgres) PutIdempotent(ctx context.Context, rec *Idempotent) error {
 	return err
 }
 
-func (p *Postgres) ReleaseIdempotent(ctx context.Context, key string) error {
-	_, err := p.pool.Exec(ctx, `DELETE FROM idempotency WHERE key=$1`, key)
+func (p *Postgres) ReleaseIdempotent(ctx context.Context, key, token string) error {
+	_, err := p.pool.Exec(ctx, `UPDATE idempotency SET token='' WHERE key=$1 AND token=$2 AND token <> '' AND status=0`, key, token)
 	return err
 }
 
 func (p *Postgres) GetIdempotent(ctx context.Context, key string) (*Idempotent, error) {
-	var rec Idempotent
-	err := p.pool.QueryRow(ctx, `SELECT key, body_hash, status, body, created_at FROM idempotency WHERE key=$1 AND created_at >= now() - $2::interval`,
-		key, IdempotencyTTL.String()).Scan(&rec.Key, &rec.BodyHash, &rec.Status, &rec.Body, &rec.CreatedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &rec, nil
+	return scanIdem(p.pool.QueryRow(ctx, `SELECT `+idemCols+` FROM idempotency WHERE key=$1 AND created_at >= now() - $2::interval`,
+		key, IdempotencyTTL.String()))
 }
 
 func (p *Postgres) NextInstance(ctx context.Context) (int, error) {
@@ -959,6 +997,9 @@ func (p *Postgres) CreateInstance(ctx context.Context, in *model.Instance) error
 	_, err := p.pool.Exec(ctx, `INSERT INTO instances (n, sandbox_id, slug, tenant, pod_name, serial, issued_at, not_after, retired_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 		in.N, in.SandboxID, in.Slug, in.Tenant, in.PodName, in.Serial, in.IssuedAt, in.NotAfter, in.RetiredAt)
+	if uniqueViolation(err) {
+		return fmt.Errorf("%w: instance %d or serial %s exists", ErrConflict, in.N, in.Serial)
+	}
 	return err
 }
 
@@ -1266,14 +1307,25 @@ func (p *Postgres) ListRevisions(ctx context.Context, kind, tenant, name string)
 }
 
 func (p *Postgres) DeleteItem(ctx context.Context, kind, tenant, name string) error {
-	tag, err := p.pool.Exec(ctx, `UPDATE catalog_items SET deleted_at = now() WHERE kind=$1 AND tenant=$2 AND name=$3 AND deleted_at IS NULL`, kind, tenant, name)
+	// Under the item's lock, as PutItem and ApplyStep write: without it a writer that checked
+	// revision N could insert N+1 after this marked N deleted, and the item deleted a moment ago
+	// would be live again. With it the outcome is one of the two serial orders.
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "catalog:"+kind+"|"+tenant+"|"+name); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `UPDATE catalog_items SET deleted_at = now() WHERE kind=$1 AND tenant=$2 AND name=$3 AND deleted_at IS NULL`, kind, tenant, name)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 // --- api keys ---------------------------------------------------------------------------
@@ -2437,3 +2489,78 @@ func (p *Postgres) credentialNames(ctx context.Context, tenant, other string, na
 	}
 	return tx.Commit(ctx)
 }
+
+// uniqueViolation reports a write refused by a unique constraint (SQLSTATE 23505): the store
+// turns it into ErrConflict or ErrDuplicate, the errors the memory store returns for the same
+// write.
+func uniqueViolation(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "23505"
+}
+
+func (p *Postgres) CreateKeyedSandbox(ctx context.Context, s *model.Sandbox, seed string) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	// FOR UPDATE: a concurrent attempt waits for this one's commit, then sees created set and
+	// finds no row.
+	var one int
+	err = tx.QueryRow(ctx, `SELECT 1 FROM idempotency WHERE seed=$1 AND seed <> '' AND status=0 AND created=''
+		AND created_at >= now() - $2::interval FOR UPDATE`, seed, IdempotencyTTL.String()).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("%w: the key's reservation is gone, finished or has created its sandbox already", ErrConflict)
+	}
+	if err != nil {
+		return err
+	}
+	if err := createSandboxIn(ctx, tx, s); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE idempotency SET created=$2 WHERE seed=$1 AND seed <> ''`, seed, s.ID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (p *Postgres) KeyedResult(ctx context.Context, seed string) (created, said string, err error) {
+	err = p.pool.QueryRow(ctx, `SELECT created, said FROM idempotency WHERE seed=$1 AND seed <> '' AND created_at >= now() - $2::interval LIMIT 1`,
+		seed, IdempotencyTTL.String()).Scan(&created, &said)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", "", ErrNotFound
+	}
+	return created, said, err
+}
+
+func (p *Postgres) NoteKeyedSaid(ctx context.Context, seed, said string) error {
+	_, err := p.pool.Exec(ctx, `UPDATE idempotency SET said=$2 WHERE seed=$1 AND seed <> ''`, seed, said)
+	return err
+}
+
+func (p *Postgres) CreateKeyedRun(ctx context.Context, r *model.Run, e *model.Event) error {
+	return pgx.BeginFunc(ctx, p.pool, func(tx pgx.Tx) error {
+		if err := createRunIn(ctx, tx, r); err != nil {
+			return err
+		}
+		if keyedRunHook != nil {
+			keyedRunHook(ctx, tx)
+		}
+		// The event last: its id is drawn under the events lock (see AppendEvent), held from
+		// here to the commit.
+		if e.At.IsZero() {
+			e.At = time.Now()
+		}
+		b := &pgx.Batch{}
+		b.Queue(eventsLockSQL)
+		b.Queue(`WITH ins AS (
+				INSERT INTO events (sandbox_id, tenant, slug, run_id, type, data, at) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id)
+			SELECT id FROM ins, pg_notify('`+eventsChannel+`', id::text)`,
+			e.SandboxID, e.Tenant, e.Slug, e.RunID, e.Type, e.Data, e.At).QueryRow(func(row pgx.Row) error { return row.Scan(&e.ID) })
+		return tx.SendBatch(ctx, b).Close()
+	})
+}
+
+// keyedRunHook, when set (tests), runs in CreateKeyedRun's transaction between the run's
+// insert and its event's.
+var keyedRunHook func(ctx context.Context, tx pgx.Tx)

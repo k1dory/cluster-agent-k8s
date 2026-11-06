@@ -310,7 +310,7 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 	}
 	now := time.Now()
 	sb := &model.Sandbox{
-		ID: newID("sb"), Name: req.Name, Slug: req.Slug, Owner: req.Owner, Tenant: req.Tenant, Repo: req.Repo,
+		ID: idFor(ctx, "sb"), Name: req.Name, Slug: req.Slug, Owner: req.Owner, Tenant: req.Tenant, Repo: req.Repo,
 		IdleTimeout: int(o.Cfg.DefaultIdleTimeout.Seconds()), WakeOnPreview: true, AgentVersion: version, AdminGrant: adminGrant,
 		AgentRef: req.AgentRef, AgentRevision: req.AgentRevision, EnvironmentRef: req.EnvironmentRef, EnvironmentRevision: req.EnvironmentRevision,
 		Launch: req.Launch, Connections: req.Connections, Status: model.StatusCreating, LastActivity: now, CreatedAt: now,
@@ -343,7 +343,7 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 		if err := o.checkQuota(ctx, sb.Tenant, sb.Slug, true); err != nil {
 			return err
 		}
-		return o.Store.CreateSandbox(ctx, sb)
+		return o.insertSandbox(ctx, sb)
 	})
 	if err != nil {
 		return nil, err
@@ -1015,7 +1015,14 @@ func (o *Orchestrator) queueRun(ctx context.Context, sandboxID string, r *model.
 		return nil, err
 	}
 	if wake {
-		o.wakeForRun(ctx, sandboxID, r.ID)
+		if err := o.wakeKeyed(ctx, sandboxID, r.ID); err != nil {
+			// Only the keyed request's own run fails it (its retry recovers the run and wakes);
+			// a run it queues on the way (a rollout's resume) keeps wakeForRun's handling.
+			if seed := keyedSeed(ctx); r.ID == KeyedID(seed, "run") {
+				return nil, err
+			}
+			o.Log.Warn("wake for run failed", "sandbox", sandboxID, "run", r.ID, "err", err)
+		}
 	}
 	return r, nil
 }
@@ -1034,12 +1041,11 @@ func (o *Orchestrator) enqueue(ctx context.Context, sandboxID string, r *model.R
 	if sb.Status == model.StatusDeleting {
 		return nil, false, fmt.Errorf("%w: sandbox is being deleted", ErrConflict)
 	}
-	r.ID, r.SandboxID, r.Tenant, r.Slug = newID("run"), sandboxID, sb.Tenant, sb.Slug
+	r.ID, r.SandboxID, r.Tenant, r.Slug = idFor(ctx, "run"), sandboxID, sb.Tenant, sb.Slug
 	r.Status, r.CreatedAt = model.RunQueued, time.Now()
-	if err := o.Store.CreateRun(ctx, r); err != nil {
+	if err := o.insertRun(ctx, r); err != nil {
 		return nil, false, err
 	}
-	o.emit(ctx, model.Event{SandboxID: sandboxID, RunID: r.ID, Type: model.EventRunQueued, Data: r.ResumeOf})
 	o.Touch(ctx, sandboxID)
 	return r, sb.Status == model.StatusSleeping || sb.Status == model.StatusError, nil
 }

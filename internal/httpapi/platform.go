@@ -451,38 +451,60 @@ func (p *Platform) keyed(uploads bool, next http.HandlerFunc) http.HandlerFunc {
 		full := principalOf(r).Tenant + "|" + r.Method + " " + r.URL.Path + "|" + key
 		// The reservation is the lock: concurrent repeats see it and wait, a repeat with another
 		// body is refused, and a finished request is replayed from the stored response.
-		existing, reserved, err := p.Orch.Store.ReserveIdempotent(r.Context(), full, hash)
+		res, reserved, err := p.Orch.Store.ReserveIdempotent(r.Context(), full, hash)
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
 		if !reserved {
 			switch {
-			case existing.BodyHash != hash && (legacy == "" || existing.BodyHash != legacy):
+			case res.BodyHash != hash && (legacy == "" || res.BodyHash != legacy):
 				writeErr(w, http.StatusUnprocessableEntity, errors.New("Idempotency-Key was already used with a different request body"))
-			case existing.InProgress():
+			case res.InProgress() && res.Legacy() && time.Since(res.CreatedAt) > store.IdempotencyStale:
+				// Left unfinished by a replica of an earlier release: what it created has a random
+				// name no new attempt can find, so the request is not run again under this key.
+				writeErr(w, http.StatusConflict, errors.New("a request with this Idempotency-Key did not finish before an upgrade and is not run again: check whether it took effect, then retry with a new key"))
+			case res.InProgress():
 				w.Header().Set("Retry-After", "1")
 				writeErr(w, http.StatusConflict, errors.New("a request with this Idempotency-Key is still in progress"))
 			default:
 				w.Header().Set("Idempotency-Replayed", "true")
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(existing.Status)
-				w.Write(existing.Body)
+				w.WriteHeader(res.Status)
+				w.Write(res.Body)
 			}
 			return
 		}
-		rec := &recorder{ResponseWriter: w, code: 200}
-		next(rec, r)
+		// What the request creates is named from the reservation's seed (orchestrator.KeyedID),
+		// so an attempt that takes over an abandoned reservation finds what that one created.
+		ctx := orchestrator.WithKeyedIDs(context.WithValue(r.Context(), reservationKey{}, res), res.Seed)
+		rec := &recorder{ResponseWriter: w, code: http.StatusOK}
+		next(rec, r.WithContext(ctx))
+		// The response is held until the key's result is stored, and stored on a context the
+		// client cannot cancel: a client that hangs up after the resource exists must not leave
+		// the key unfinished (its retry would wait IdempotencyStale and then run again). The
+		// write is conditional on the attempt's token: a holder that was slow, not dead, cannot
+		// overwrite or drop the reservation of a later attempt. A release keeps the seed, so
+		// the retry of a request whose outcome is unknown (it may have created the resource and
+		// then failed) finds what it created.
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), idempotencyFinishTimeout)
+		defer cancel()
 		if rec.code >= 200 && rec.code < 300 {
-			err = p.Orch.Store.PutIdempotent(r.Context(), &store.Idempotent{Key: full, BodyHash: hash, Status: rec.code, Body: rec.body.Bytes()})
+			err = p.Orch.Store.PutIdempotent(fctx, &store.Idempotent{Key: full, BodyHash: hash, Status: rec.code, Body: rec.body.Bytes(), Token: res.Token})
 		} else {
-			err = p.Orch.Store.ReleaseIdempotent(r.Context(), full)
+			err = p.Orch.Store.ReleaseIdempotent(fctx, full, res.Token)
 		}
 		if err != nil {
-			// The response is already on the wire; the reservation stays until IdempotencyStale,
-			// so a fast retry gets 409 rather than a duplicate, and the log says why.
-			p.Log.Error("finish idempotent request", "key", key, "err", err)
+			// Sent anyway: it describes what this attempt did. Unrecorded, the reservation stays
+			// until IdempotencyStale and a retry then takes it over and finds the keyed
+			// resource; superseded already (ErrConflict), a later attempt answers for the key.
+			log := p.Log
+			if log == nil {
+				log = slog.Default() // as logRequests: a Platform built without a logger
+			}
+			log.Error("finish idempotent request", "key", key, "generation", res.Generation, "err", err)
 		}
+		rec.flush()
 	}
 }
 
@@ -569,17 +591,31 @@ func multipartHash(form *multipart.Form) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// recorder holds a keyed request's response (status and body; headers go to the real writer's
+// map, sent with the status) until the idempotency middleware has stored it, then flush sends it.
 type recorder struct {
 	http.ResponseWriter
-	code int
-	body bytes.Buffer
+	code        int
+	wroteHeader bool
+	body        bytes.Buffer
 }
 
-func (rc *recorder) WriteHeader(c int)           { rc.code = c; rc.ResponseWriter.WriteHeader(c) }
+func (rc *recorder) WriteHeader(c int) {
+	if !rc.wroteHeader {
+		rc.code, rc.wroteHeader = c, true
+	}
+}
 func (rc *recorder) Unwrap() http.ResponseWriter { return rc.ResponseWriter }
 func (rc *recorder) Write(b []byte) (int, error) {
-	rc.body.Write(b)
-	return rc.ResponseWriter.Write(b)
+	rc.WriteHeader(http.StatusOK)
+	return rc.body.Write(b)
+}
+
+func (rc *recorder) flush() {
+	rc.ResponseWriter.WriteHeader(rc.code)
+	if rc.body.Len() > 0 {
+		rc.ResponseWriter.Write(rc.body.Bytes())
+	}
 }
 
 func (p *Platform) list(w http.ResponseWriter, r *http.Request) {
@@ -632,6 +668,14 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 	if p.TTLFromToken {
 		req.ExpiresBefore = pr.expiresBefore()
 	}
+	// A keyed retry after an earlier attempt answers with what that one created. Before the
+	// inputs of a fresh creation are resolved: the sandbox carries its resolved launch, so an
+	// agent or environment deleted (or a tenant restricted) since it was created must not
+	// fail the retry that only has to find it. After the tenant checks: the key is the
+	// tenant's, and nothing is answered to a caller who could not have made the request.
+	if p.keyedSandbox(w, r, false) {
+		return
+	}
 	if req.AgentRef != "" {
 		if err := p.resolveAgentRef(r, &req); err != nil {
 			writeCatalogErr(w, err)
@@ -644,7 +688,17 @@ func (p *Platform) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sb, err := p.Orch.Create(r.Context(), req)
+	// A keyed create that failed with its sandbox still creating (the start never began: on the
+	// memory store a cancelled lock wait, whose re-read ignores the cancellation) is not the
+	// sandbox's outcome to report: the success stored for every retry would be one nothing
+	// provisions. The recovery provisions it, or answers as failed and releases the key.
+	if err != nil && sb != nil && sb.Status == model.StatusCreating && p.keyedSandbox(w, r, true) {
+		return
+	}
 	if err != nil && sb == nil {
+		if p.keyedSandbox(w, r, true) {
+			return
+		}
 		writeOrchErr(w, err)
 		return
 	}
@@ -769,8 +823,16 @@ func (p *Platform) createRun(w http.ResponseWriter, r *http.Request) {
 		writeBodyErr(w, err)
 		return
 	}
+	if run, ok, err := p.keyedRun(r, r.PathValue("id"), false); err != nil || ok {
+		writeKeyedRun(w, run, err)
+		return
+	}
 	run, err := p.Orch.CreateRun(r.Context(), r.PathValue("id"), req.Task)
 	if err != nil {
+		if run, ok, kerr := p.keyedRun(r, r.PathValue("id"), true); kerr != nil || ok {
+			writeKeyedRun(w, run, kerr)
+			return
+		}
 		writeOrchErr(w, err)
 		return
 	}
@@ -1191,6 +1253,7 @@ const (
 	CodeCredential        = "credential"           // 422: the credential a spec names is not available
 	CodeStopped           = "stopped"              // 409: an apply of a sync did not finish
 	CodeRateLimited       = "rate_limited"         // 429: too many attempts from this address
+	CodePreviewTaken      = "preview_host_taken"   // 409: another sandbox holds the preview host
 )
 
 func codeFor(status int) string {
@@ -1272,6 +1335,9 @@ func writeOrchErr(w http.ResponseWriter, err error) {
 		writeErr(w, http.StatusBadRequest, err)
 	case errors.Is(err, orchestrator.ErrForbidden):
 		writeErr(w, http.StatusForbidden, err)
+	case errors.Is(err, store.ErrDuplicate):
+		// Not a lost race (retrying does not help): another sandbox holds the value.
+		writeErrWith(w, http.StatusConflict, ErrorBody{Code: CodePreviewTaken}, err)
 	case errors.Is(err, orchestrator.ErrConflict), errors.Is(err, store.ErrConflict):
 		writeErr(w, http.StatusConflict, err)
 	case errors.Is(err, orchestrator.ErrQuota):
@@ -1447,3 +1513,96 @@ func ShutdownServer(ctx context.Context, srv *http.Server) {
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 }
+
+// idempotencyFinishTimeout bounds storing a keyed request's result (detached from the client).
+const idempotencyFinishTimeout = 10 * time.Second
+
+// reservationKey carries a keyed request's reservation (store.Idempotent) to its handler.
+type reservationKey struct{}
+
+// keyedResult reports whether the handler should look for what an earlier attempt of the same
+// keyed request created: always after the handler's own attempt failed (the store refuses a
+// second resource of the keyed id: a holder that was slow, not dead, made it first; or this
+// attempt made it and then failed), and before it only when an earlier attempt ran under the
+// seed (generation > 1): the first attempt of a key has a fresh seed and nothing can carry its
+// id yet.
+func keyedResult(r *http.Request, failed bool) (seed string, ok bool) {
+	res, _ := r.Context().Value(reservationKey{}).(*store.Idempotent)
+	if res == nil || res.Seed == "" || !failed && res.Generation <= 1 {
+		return "", false
+	}
+	return res.Seed, true
+}
+
+// keyedSandbox answers a keyed create with what an earlier attempt (or this one, before it
+// failed) made, and reports whether it did: the sandbox, its provisioning finished first when
+// that attempt never got to it, so the success stored for every retry is one; or 409 when the
+// sandbox was created and has been deleted since (it is not created again under the key).
+func (p *Platform) keyedSandbox(w http.ResponseWriter, r *http.Request, failed bool) bool {
+	if _, ok := keyedResult(r, failed); !ok {
+		return false
+	}
+	ctx, cancel := recoveryContext(r)
+	defer cancel()
+	sb, gone, found, err := p.Orch.KeyedSandbox(ctx)
+	switch {
+	case err != nil:
+		writeOrchErr(w, err) // not stored: the release keeps the seed for the retry
+	case !found:
+		return false
+	case gone:
+		writeErr(w, http.StatusConflict, errors.New("the sandbox this Idempotency-Key created has been deleted since; it is not created again under this key"))
+	default:
+		sb, err := p.Orch.ResumeKeyedCreate(ctx, sb)
+		if err != nil {
+			writeOrchErr(w, err) // not stored: the release keeps the seed for the retry
+			return true
+		}
+		writeJSON(w, http.StatusCreated, sb)
+	}
+	return true
+}
+
+// keyedRun is the run an earlier attempt of this keyed request queued in the sandbox, if any.
+// An error means the recovery could not be finished (the run or its sandbox could not be
+// read): the request is answered as failed, so the key is released, not stored as a success
+// whose wake may never come, and the retry recovers again.
+func (p *Platform) keyedRun(r *http.Request, sandboxID string, failed bool) (*model.Run, bool, error) {
+	seed, ok := keyedResult(r, failed)
+	if !ok {
+		return nil, false, nil
+	}
+	ctx, cancel := recoveryContext(r)
+	defer cancel()
+	run, err := p.Orch.Store.GetRun(ctx, orchestrator.KeyedID(seed, "run"))
+	if errors.Is(err, store.ErrNotFound) || err == nil && run.SandboxID != sandboxID {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	// The attempt that queued it may have died before waking the sandbox for it.
+	if err := p.Orch.WakeForKeyedRun(ctx, run); err != nil {
+		return nil, false, err
+	}
+	return run, true, nil
+}
+
+// writeKeyedRun answers with the run keyedRun recovered, or with its error.
+func writeKeyedRun(w http.ResponseWriter, run *model.Run, err error) {
+	if err != nil {
+		writeOrchErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, run)
+}
+
+// recoveryContext is where a keyed request looks for (and finishes) what an earlier attempt
+// created: detached from the client (a hang-up after the creation must not turn a found
+// resource into an error and a released key) and bounded.
+func recoveryContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(r.Context()), recoveryTimeout)
+}
+
+// recoveryTimeout bounds a keyed request's recovery: reads, and a provisioning resumed.
+const recoveryTimeout = 30 * time.Second

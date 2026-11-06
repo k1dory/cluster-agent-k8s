@@ -33,10 +33,10 @@ func TestRunScopeAndCursor(t *testing.T) {
 		t.Fatalf("cursor round trip: %v %+v", err, parsed)
 	}
 	// Claim (and thereby change) the anchor, then page after it: the cursor still works.
-	if r, err := m.ClaimQueuedRun(ctx, "sb", t0); err != nil || r.ID != "r1" || r.Status != model.RunRunning {
+	if r, err := m.ClaimRun(ctx, "r1", t0, "", RunStamp{}); err != nil || r.ID != "r1" || r.Status != model.RunRunning {
 		t.Fatalf("claim: %v %+v", err, r)
 	}
-	if _, err := m.ClaimQueuedRun(ctx, "sb", t0); err != nil {
+	if _, err := m.ClaimRun(ctx, "r2", t0, "", RunStamp{}); err != nil {
 		t.Fatalf("second claim: %v", err)
 	}
 	next, _ := m.QueryRuns(ctx, Filter{SandboxID: "sb", Status: string(model.RunQueued), Cursor: parsed, Limit: 10})
