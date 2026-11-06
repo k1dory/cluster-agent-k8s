@@ -41,15 +41,34 @@ var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 
 // Service stores and resolves tenant credentials.
 type Service struct {
-	Store store.Credentials
-	aead  cipher.AEAD
-	// signIns is the OAuth sign-ins' store once NewOAuth wired them: Put refuses a name a
-	// sign-in holds.
-	signIns store.OAuthCredentials
+	Store  store.Credentials
+	sealer *Sealer
+	// names writes both kinds in the scope's one namespace: the check that the other kind
+	// does not hold the name and the write are one atomic store operation.
+	names store.CredentialNames
 }
 
 // New returns a service encrypting under key (32 bytes: AES-256-GCM).
 func New(st store.Credentials, key []byte) (*Service, error) {
+	sl, err := NewSealer(key)
+	if err != nil {
+		return nil, err
+	}
+	names, ok := st.(store.CredentialNames)
+	if !ok {
+		return nil, fmt.Errorf("credentials: the store keeps no single credential namespace (store.CredentialNames)")
+	}
+	return &Service{Store: st, sealer: sl, names: names}, nil
+}
+
+// Sealer encrypts other server-side secrets at rest under credentials.key (the agent and
+// gateway CA keys in the database), with the same AES-256-GCM the credentials use. The aad
+// names what is sealed, so a ciphertext copied under another name, or a credential's under a
+// CA's, does not open.
+type Sealer struct{ aead cipher.AEAD }
+
+// NewSealer returns a sealer under key (32 bytes).
+func NewSealer(key []byte) (*Sealer, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("credentials key must be 32 bytes, got %d", len(key))
 	}
@@ -61,7 +80,29 @@ func New(st store.Credentials, key []byte) (*Service, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Service{Store: st, aead: aead}, nil
+	return &Sealer{aead: aead}, nil
+}
+
+// Seal encrypts plain, authenticating aad with it: nonce || ciphertext.
+func (s *Sealer) Seal(aad string, plain []byte) []byte {
+	nonce := make([]byte, s.aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		panic("credentials: no randomness: " + err.Error())
+	}
+	return s.aead.Seal(nonce, nonce, plain, []byte(aad))
+}
+
+// Open reverses Seal; a wrong key, a wrong aad or a damaged ciphertext fail alike.
+func (s *Sealer) Open(aad string, sealed []byte) ([]byte, error) {
+	n := s.aead.NonceSize()
+	if len(sealed) < n {
+		return nil, errors.New("ciphertext too short")
+	}
+	plain, err := s.aead.Open(nil, sealed[:n], sealed[n:], []byte(aad))
+	if err != nil {
+		return nil, errors.New("cannot decrypt (wrong credentials.key?)")
+	}
+	return plain, nil
 }
 
 // ParseKey reads the server key from its configured form: 64 hex characters or the base64 of
@@ -91,18 +132,15 @@ func (s *Service) Put(ctx context.Context, tenant, name, value, by string) (*mod
 	if len(value) > MaxValue {
 		return nil, false, fmt.Errorf("%w: value is larger than %d bytes", ErrInvalid, MaxValue)
 	}
-	// One name, one kind: `secret:NAME` must not mean a sign-in to one reader and a plain
-	// credential to another.
-	if s.signIns != nil {
-		if _, _, err := s.signIns.GetOAuthCredential(ctx, tenant, name); err == nil {
-			return nil, false, fmt.Errorf("%w: %q is an OAuth sign-in in this scope; remove it first", ErrInvalid, name)
-		} else if !errors.Is(err, store.ErrNotFound) {
-			return nil, false, err
-		}
-	}
 	ciphertext := s.seal(tenant, name, []byte(value))
 	c := &model.Credential{Tenant: tenant, Name: name, Fingerprint: fingerprint(value), CreatedBy: by}
-	created, err := s.Store.PutCredential(ctx, c, ciphertext)
+	// One name, one kind: `secret:NAME` must not mean a sign-in to one reader and a plain
+	// credential to another. NAME.account_id is the sign-in NAME's too.
+	base, _ := strings.CutSuffix(name, AccountSuffix)
+	created, err := s.names.PutCredentialIfFree(ctx, c, ciphertext, []string{base})
+	if taken := (*store.NameTakenError)(nil); errors.As(err, &taken) {
+		return nil, false, fmt.Errorf("%w: %q is an OAuth sign-in in this scope; remove it first", ErrInvalid, taken.Name)
+	}
 	if err != nil {
 		return nil, false, err
 	}
@@ -164,21 +202,13 @@ func (r Resolver) open(ctx context.Context, tenant, name string) (string, error)
 // seal encrypts under the server key. The scope and the name are authenticated with the
 // value: a ciphertext moved to another tenant's row or renamed does not decrypt.
 func (s *Service) seal(tenant, name string, plain []byte) []byte {
-	nonce := make([]byte, s.aead.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		panic("credentials: no randomness: " + err.Error())
-	}
-	return s.aead.Seal(nonce, nonce, plain, []byte(tenant+"\x00"+name))
+	return s.sealer.Seal(tenant+"\x00"+name, plain)
 }
 
 func (s *Service) unseal(tenant, name string, ciphertext []byte) ([]byte, error) {
-	n := s.aead.NonceSize()
-	if len(ciphertext) < n {
-		return nil, fmt.Errorf("credential %s/%s: ciphertext too short", tenant, name)
-	}
-	plain, err := s.aead.Open(nil, ciphertext[:n], ciphertext[n:], []byte(tenant+"\x00"+name))
+	plain, err := s.sealer.Open(tenant+"\x00"+name, ciphertext)
 	if err != nil {
-		return nil, fmt.Errorf("credential %s/%s: cannot decrypt (wrong credentials.key?)", tenant, name)
+		return nil, fmt.Errorf("credential %s/%s: %v", tenant, name, err)
 	}
 	return plain, nil
 }

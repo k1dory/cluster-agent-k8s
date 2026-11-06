@@ -746,9 +746,16 @@ func (s *Service) preview(ctx context.Context, it *model.CatalogItem, sp gitrepo
 			return nil
 		}
 		if ferr != nil {
-			err = fmt.Errorf("%w: %v", ErrRead, ferr)
-			render.Failure(&body, "Plan", "", err)
+			// Files over the size bounds are the request's content, as for a sync: an invalid
+			// plan (failure status, not retried: the same head is as large next time), not a
+			// repository that could not be read.
+			kind := ErrRead
 			outcome = model.GitSyncError
+			if errors.Is(ferr, ErrTooLarge) {
+				kind, outcome = ErrInvalid, model.GitSyncInvalid
+			}
+			err = fmt.Errorf("%w: %v", kind, ferr)
+			render.Failure(&body, "Plan", "", err)
 		} else {
 			outcome, changes = s.planFiles(ctx, &body, files, scope)
 		}

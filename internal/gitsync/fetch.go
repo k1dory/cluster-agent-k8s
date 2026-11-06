@@ -16,6 +16,7 @@ import (
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -50,8 +51,23 @@ var (
 	shaRe = regexp.MustCompile(`^[0-9a-f]{40}$`)
 )
 
-// MaxFile bounds one bundle file.
-const MaxFile = 1 << 20
+// MaxFile bounds one bundle file; MaxFiles and MaxTotal bound the file set one Files call
+// returns: a sync reads it whole into sandboxd's memory.
+const (
+	MaxFile  = 1 << 20
+	MaxFiles = 256
+	MaxTotal = 16 << 20
+)
+
+// ErrTooLarge: a file, the file set or a git command's output is over its bound.
+var ErrTooLarge = errors.New("too large")
+
+// maxOutput bounds what any other git command may print (a listing of a large tree is a few
+// MiB); maxStderr is what is kept of its messages.
+const (
+	maxOutput = 64 << 20
+	maxStderr = 64 << 10
+)
 
 // CLI reads repositories with the git binary over HTTPS. Each call works in a temporary
 // directory with its own, empty Git configuration: no credential helper, no cached state. The
@@ -101,13 +117,57 @@ func env(dir string, r Remote) []string {
 
 // run executes git in dir and returns stdout; the error carries git's first message line.
 func (c CLI) run(ctx context.Context, dir string, r Remote, args ...string) ([]byte, error) {
+	return c.runMax(ctx, dir, r, maxOutput, args...)
+}
+
+// capWriter holds at most max bytes. The write that would pass it fails and stops the command,
+// so an oversized output costs max bytes of memory, never its whole size.
+type capWriter struct {
+	buf  bytes.Buffer
+	max  int
+	over bool
+	stop func()
+}
+
+func (w *capWriter) Write(p []byte) (int, error) {
+	if w.buf.Len()+len(p) > w.max {
+		w.over = true
+		w.stop()
+		return 0, ErrTooLarge
+	}
+	return w.buf.Write(p)
+}
+
+// headWriter keeps the first max bytes and drops the rest without failing: git's messages
+// are for the error text, their tail is never needed.
+type headWriter struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (w *headWriter) Write(p []byte) (int, error) {
+	if room := w.max - w.buf.Len(); room > 0 {
+		w.buf.Write(p[:min(room, len(p))])
+	}
+	return len(p), nil
+}
+
+// runMax is run with stdout bounded to max bytes (ErrTooLarge past it).
+func (c CLI) runMax(ctx context.Context, dir string, r Remote, max int, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout())
 	defer cancel()
-	cmd := exec.CommandContext(ctx, c.git(), args...)
+	cctx, stop := context.WithCancel(ctx)
+	defer stop()
+	cmd := exec.CommandContext(cctx, c.git(), args...)
 	cmd.Dir, cmd.Env = dir, env(dir, r)
-	var out, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &stderr
+	out := &capWriter{max: max, stop: stop}
+	errs := &headWriter{max: maxStderr}
+	cmd.Stdout, cmd.Stderr = out, errs
+	stderr := &errs.buf
 	if err := cmd.Run(); err != nil {
+		if out.over {
+			return nil, fmt.Errorf("git %s: %w: more than %d bytes of output", args[0], ErrTooLarge, max)
+		}
 		if ctx.Err() != nil {
 			return nil, fmt.Errorf("git %s: timed out after %s", args[0], c.timeout())
 		}
@@ -125,7 +185,7 @@ func (c CLI) run(ctx context.Context, dir string, r Remote, args ...string) ([]b
 		}
 		return nil, fmt.Errorf("git %s: %s", args[0], msg)
 	}
-	return out.Bytes(), nil
+	return out.buf.Bytes(), nil
 }
 
 func firstLine(s string) string {
@@ -262,16 +322,40 @@ func (c CLI) Files(ctx context.Context, r Remote, commit string, patterns []stri
 	if len(names) == 0 {
 		return nil, ErrNoMatch
 	}
+	maxFile, maxCount, maxTotal := MaxFile, MaxFiles, MaxTotal
+	if len(names) > maxCount {
+		return nil, fmt.Errorf("%w: %d files match the paths, more than a sync reads (%d)", ErrTooLarge, len(names), maxCount)
+	}
 	sort.Strings(names)
-	files := make(map[string][]byte, len(names))
+	// Every size first (git cat-file -s reads the object header, not the content): a file or
+	// a set over its bound is refused before any of it is read into memory.
+	total := 0
 	for _, n := range names {
-		b, err := c.run(ctx, repo, r, "cat-file", "blob", commit+":"+n)
+		b, err := c.run(ctx, repo, r, "cat-file", "-s", commit+":"+n)
 		if err != nil {
 			return nil, err
 		}
-		if len(b) > MaxFile {
-			return nil, fmt.Errorf("%s: %d bytes, more than a bundle may be (%d)", n, len(b), MaxFile)
+		size, err := strconv.Atoi(strings.TrimSpace(string(b)))
+		if err != nil {
+			return nil, fmt.Errorf("git cat-file -s %s: %q", n, b)
 		}
+		if size > maxFile {
+			return nil, fmt.Errorf("%s: %w: %d bytes, more than a bundle may be (%d)", n, ErrTooLarge, size, maxFile)
+		}
+		if total += size; total > maxTotal {
+			return nil, fmt.Errorf("%w: the files matching the paths are more than %d bytes together", ErrTooLarge, maxTotal)
+		}
+	}
+	files := make(map[string][]byte, len(names))
+	read := 0
+	for _, n := range names {
+		// Bounded again while reading, by the file's and the set's remaining budget: the size
+		// was the object's, this is the stream's.
+		b, err := c.runMax(ctx, repo, r, min(maxFile, maxTotal-read), "cat-file", "blob", commit+":"+n)
+		if err != nil {
+			return nil, err
+		}
+		read += len(b)
 		files[n] = b
 	}
 	return files, nil

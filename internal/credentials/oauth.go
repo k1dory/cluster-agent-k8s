@@ -72,7 +72,6 @@ func (o *OAuth) lock(tenant, name string) func() {
 // refuses a name the other holds) with the providers sandboxd may use (MergeOAuthProviders).
 // owner names this replica in the row leases.
 func NewOAuth(svc *Service, st store.OAuthCredentials, providers map[string]OAuthProvider, owner string) *OAuth {
-	svc.signIns = st
 	return &OAuth{Service: svc, Store: st, Providers: providers, Owner: owner}
 }
 
@@ -156,11 +155,8 @@ func (o *OAuth) Start(ctx context.Context, tenant, name, provider, by string) (*
 	if !nameRe.MatchString(name) || strings.Contains(name, ".") {
 		return nil, false, fmt.Errorf("%w: name must be 1-64 characters: letters, digits, '_' or '-' (a '.' would clash with %s)", ErrInvalid, AccountSuffix)
 	}
-	// One name, one kind: `secret:NAME` must not mean a plain credential to one reader and a
-	// sign-in to another.
-	if _, _, err := o.Service.Store.GetCredential(ctx, tenant, name); err == nil {
-		return nil, false, fmt.Errorf("%w: %q is a plain credential in this scope; remove it first", ErrInvalid, name)
-	} else if !errors.Is(err, store.ErrNotFound) {
+	// Refused early, before the provider hands out a device code; checked again at the write.
+	if err := o.plainTaken(ctx, tenant, name); err != nil {
 		return nil, false, err
 	}
 	cl, err := o.client(provider)
@@ -175,11 +171,29 @@ func (o *OAuth) Start(ctx context.Context, tenant, name, provider, by string) (*
 	exp := d.ExpiresAt
 	c := &model.OAuthCredential{Tenant: tenant, Name: name, Provider: provider, Status: model.OAuthPending,
 		VerificationURL: d.VerificationURL, UserCode: d.UserCode, LoginExpiresAt: &exp, NextAt: now.Add(d.Interval), CreatedBy: by}
-	created, err := o.Store.PutOAuthCredential(ctx, c, o.seal(c, &oauthSecret{DeviceCode: d.Code, Interval: int64(d.Interval / time.Second)}))
+	created, err := o.Service.names.PutOAuthCredentialIfFree(ctx, c, o.seal(c, &oauthSecret{DeviceCode: d.Code, Interval: int64(d.Interval / time.Second)}),
+		[]string{name, name + AccountSuffix})
+	if taken := (*store.NameTakenError)(nil); errors.As(err, &taken) {
+		return nil, false, fmt.Errorf("%w: %q is a plain credential in this scope; remove it first", ErrInvalid, taken.Name)
+	}
 	if err != nil {
 		return nil, false, err
 	}
 	return c, created, nil
+}
+
+// plainTaken refuses a sign-in name a plain credential holds, as NAME or as NAME.account_id
+// (one name, one kind: `secret:NAME` must not mean a plain credential to one reader and a
+// sign-in to another).
+func (o *OAuth) plainTaken(ctx context.Context, tenant, name string) error {
+	for _, n := range [2]string{name, name + AccountSuffix} {
+		if _, _, err := o.Service.Store.GetCredential(ctx, tenant, n); err == nil {
+			return fmt.Errorf("%w: %q is a plain credential in this scope; remove it first", ErrInvalid, n)
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
 }
 
 // Get returns a sign-in's metadata.

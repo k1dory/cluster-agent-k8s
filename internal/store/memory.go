@@ -1,9 +1,12 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -22,10 +25,11 @@ type Memory struct {
 	idem      map[string]*Idempotent
 	blobs     map[string][]byte
 	blobAt    map[string]time.Time
-	tenants   map[string]*sync.Mutex
+	tenants   map[string]chan struct{}        // a one-slot semaphore per tenant: a wait can give up with its ctx
 	catalog   map[string][]*model.CatalogItem // kind|tenant|name → revisions
 	applies   map[string]*model.Apply
 	apiKeys   map[string]*model.APIKey
+	keyOrigin map[string]*time.Time // api key id → its original_expires_at (Postgres: a column)
 	tokenUses map[string]tokenUse
 	gitSyncs  map[string]*model.GitSync
 	gitJobs   map[string]*model.GitJob
@@ -33,6 +37,17 @@ type Memory struct {
 	oauth     map[string]*memOAuth      // tenant|name
 	nextInst  int
 	nextEvent int64
+	batches   map[string]memBatch // run|batch id → progress (Postgres: run_output_batches)
+	// idemNow is the clock of Idempotency-Key reservations (time.Now; tests move it to age one).
+	idemNow func() time.Time
+}
+
+// SetIdempotencyClock replaces the clock reservations are dated and aged by (tests: a
+// reservation abandoned IdempotencyStale ago without waiting that long).
+func (m *Memory) SetIdempotencyClock(now func() time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.idemNow = now
 }
 
 // NewMemory returns an empty in-memory store.
@@ -44,7 +59,7 @@ func NewMemory() *Memory {
 		idem:      map[string]*Idempotent{},
 		blobs:     map[string][]byte{},
 		blobAt:    map[string]time.Time{},
-		tenants:   map[string]*sync.Mutex{},
+		tenants:   map[string]chan struct{}{},
 		catalog:   map[string][]*model.CatalogItem{},
 		applies:   map[string]*model.Apply{},
 		apiKeys:   map[string]*model.APIKey{},
@@ -53,6 +68,7 @@ func NewMemory() *Memory {
 		gitJobs:   map[string]*model.GitJob{},
 		creds:     map[string]*memCredential{},
 		oauth:     map[string]*memOAuth{},
+		idemNow:   time.Now,
 	}
 }
 
@@ -196,17 +212,27 @@ func (m *Memory) DeleteItem(_ context.Context, kind, tenant, name string) error 
 	return nil
 }
 
-// WithTenantLock serialises per tenant within this process (one process is all a memory store has).
+// WithTenantLock serialises per tenant within this process (one process is all a memory store
+// has). A wait ends with ctx, as the advisory lock's query does on Postgres.
 func (m *Memory) WithTenantLock(ctx context.Context, tenant string, fn func(ctx context.Context) error) error {
 	m.mu.Lock()
 	l, ok := m.tenants[tenant]
 	if !ok {
-		l = &sync.Mutex{}
+		l = make(chan struct{}, 1)
 		m.tenants[tenant] = l
 	}
 	m.mu.Unlock()
-	l.Lock()
-	defer l.Unlock()
+	select {
+	case l <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-l }()
+	// With the lock free and ctx already done, select may take either case: the callback
+	// never runs on an ended context, as the advisory lock's query fails on Postgres.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return fn(ctx)
 }
 
@@ -273,6 +299,8 @@ func (m *Memory) DeleteBlobsBefore(_ context.Context, prefix string, t time.Time
 	return n, nil
 }
 
+// cloneSandbox copies every map, slice and pointer of the record: neither the caller's input
+// nor what a read returns shares memory with what the store holds (Postgres serialises both).
 func cloneSandbox(s *model.Sandbox) *model.Sandbox {
 	c := *s
 	if s.Preview != nil {
@@ -281,21 +309,52 @@ func cloneSandbox(s *model.Sandbox) *model.Sandbox {
 	}
 	if s.Launch != nil {
 		l := *s.Launch
-		if s.Launch.Env != nil {
-			l.Env = map[string]string{}
-			for k, v := range s.Launch.Env {
-				l.Env[k] = v
-			}
-		}
+		l.Env = maps.Clone(s.Launch.Env)
+		l.HarnessFiles = maps.Clone(s.Launch.HarnessFiles)
+		l.MCPServers = slices.Clone(s.Launch.MCPServers)
 		c.Launch = &l
 	}
+	c.ExpiresAt = cloneTime(s.ExpiresAt)
 	c.Connections = append([]string(nil), s.Connections...)
 	return &c
+}
+
+// cloneTime copies an optional time.
+func cloneTime(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	return &c
+}
+
+// previewTaken reports another sandbox holding host (the unique index on preview_host); lock held.
+func (m *Memory) previewTaken(s *model.Sandbox) bool {
+	if s.Preview == nil {
+		return false
+	}
+	for id, o := range m.sandboxes {
+		if id != s.ID && o.Preview != nil && o.Preview.Host == s.Preview.Host {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Memory) CreateSandbox(_ context.Context, s *model.Sandbox) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.createSandbox(s)
+}
+
+// createSandbox is CreateSandbox under the lock already held.
+func (m *Memory) createSandbox(s *model.Sandbox) error {
+	if _, dup := m.sandboxes[s.ID]; dup {
+		return fmt.Errorf("%w: sandbox %s exists", ErrConflict, s.ID)
+	}
+	if m.previewTaken(s) {
+		return fmt.Errorf("%w: preview host %s is taken", ErrConflict, s.Preview.Host)
+	}
 	s.Revision = 1
 	m.sandboxes[s.ID] = cloneSandbox(s)
 	return nil
@@ -331,6 +390,9 @@ func (m *Memory) UpdateSandbox(_ context.Context, s *model.Sandbox) error {
 	}
 	if cur.Revision != s.Revision {
 		return ErrConflict
+	}
+	if m.previewTaken(s) {
+		return fmt.Errorf("%w: preview host %s", ErrDuplicate, s.Preview.Host)
 	}
 	s.Revision++
 	c := cloneSandbox(s)
@@ -376,11 +438,20 @@ func (m *Memory) SandboxByPreviewHost(_ context.Context, host string) (*model.Sa
 	return nil, ErrNotFound
 }
 
+// cloneRun copies the run with its optional times.
+func cloneRun(r *model.Run) *model.Run {
+	c := *r
+	c.StartedAt, c.FinishedAt = cloneTime(r.StartedAt), cloneTime(r.FinishedAt)
+	return &c
+}
+
 func (m *Memory) CreateRun(_ context.Context, r *model.Run) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	c := *r
-	m.runs[r.ID] = &c
+	if _, dup := m.runs[r.ID]; dup {
+		return fmt.Errorf("%w: run %s exists", ErrConflict, r.ID)
+	}
+	m.runs[r.ID] = cloneRun(r)
 	return nil
 }
 
@@ -391,27 +462,47 @@ func (m *Memory) GetRun(_ context.Context, id string) (*model.Run, error) {
 	if !ok {
 		return nil, ErrNotFound
 	}
-	c := *r
-	return &c, nil
+	return cloneRun(r), nil
 }
 
-func (m *Memory) UpdateRun(_ context.Context, r *model.Run) error {
+func (m *Memory) RecordRunUsage(_ context.Context, id string, u model.Usage, total bool) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if _, ok := m.runs[r.ID]; !ok {
+	r, ok := m.runs[id]
+	if !ok {
 		return ErrNotFound
 	}
-	c := *r
-	m.runs[r.ID] = &c
+	if r.Status == model.RunDone || r.Status == model.RunFailed {
+		return ErrConflict
+	}
+	if total {
+		r.Usage = u
+	} else {
+		r.Usage.Add(u)
+	}
 	return nil
+}
+
+func (m *Memory) SetRunSession(_ context.Context, id, session string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[id]
+	if !ok {
+		return ErrNotFound
+	}
+	r.Session = session
+	return nil
+}
+
+func (m *Memory) SettleRun(ctx context.Context, id string, from []model.RunStatus, to model.RunStatus, exitCode int, finishedAt time.Time, usage *model.Usage) (*model.Run, error) {
+	return m.SettleRunWithEvents(ctx, Settle{RunID: id, From: from, To: to, ExitCode: exitCode, FinishedAt: finishedAt, Usage: usage})
 }
 
 func (m *Memory) runsOf(sandboxID string) []*model.Run {
 	var out []*model.Run
 	for _, r := range m.runs {
 		if r.SandboxID == sandboxID {
-			c := *r
-			out = append(out, &c)
+			out = append(out, cloneRun(r))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
@@ -422,20 +513,6 @@ func (m *Memory) ListRuns(_ context.Context, sandboxID string) ([]*model.Run, er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.runsOf(sandboxID), nil
-}
-
-func (m *Memory) ClaimQueuedRun(_ context.Context, sandboxID string, startedAt time.Time) (*model.Run, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for _, c := range m.runsOf(sandboxID) {
-		if c.Status == model.RunQueued {
-			r := m.runs[c.ID]
-			r.Status, r.StartedAt = model.RunRunning, &startedAt
-			out := *r
-			return &out, nil
-		}
-	}
-	return nil, ErrNotFound
 }
 
 func (m *Memory) AppendQueuedTask(_ context.Context, runID, text string) (*model.Run, error) {
@@ -449,22 +526,7 @@ func (m *Memory) AppendQueuedTask(_ context.Context, runID, text string) (*model
 		return nil, ErrConflict
 	}
 	r.Task += text
-	out := *r
-	return &out, nil
-}
-
-func (m *Memory) ReleaseRun(_ context.Context, runID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	r, ok := m.runs[runID]
-	if !ok {
-		return ErrNotFound
-	}
-	if r.Status != model.RunRunning {
-		return ErrConflict
-	}
-	r.Status, r.StartedAt = model.RunQueued, nil
-	return nil
+	return cloneRun(r), nil
 }
 
 func (m *Memory) QueuedRun(_ context.Context, sandboxID string) (*model.Run, error) {
@@ -478,7 +540,7 @@ func (m *Memory) QueuedRun(_ context.Context, sandboxID string) (*model.Run, err
 	return nil, ErrNotFound
 }
 
-func (m *Memory) ClaimRun(_ context.Context, runID string, startedAt time.Time, session string) (*model.Run, error) {
+func (m *Memory) ClaimRun(_ context.Context, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	r, ok := m.runs[runID]
@@ -489,11 +551,13 @@ func (m *Memory) ClaimRun(_ context.Context, runID string, startedAt time.Time, 
 		return nil, ErrConflict
 	}
 	r.Status, r.StartedAt = model.RunRunning, &startedAt
+	r.Attempt, r.ClaimedBy, r.ClaimAcked = r.Attempt+1, stamp.Owner, false
 	if r.Session == "" {
 		r.Session = session
 	}
-	out := *r
-	return &out, nil
+	r.AgentVersion, r.AgentRef, r.AgentRevision = stamp.AgentVersion, stamp.AgentRef, stamp.AgentRevision
+	r.EnvironmentRef, r.EnvironmentRevision = stamp.EnvironmentRef, stamp.EnvironmentRevision
+	return cloneRun(r), nil
 }
 
 func (m *Memory) RunningRun(_ context.Context, sandboxID string) (*model.Run, error) {
@@ -523,12 +587,15 @@ func (m *Memory) AppendEvent(_ context.Context, e *model.Event) error {
 func (m *Memory) ListEvents(_ context.Context, sandboxID string, afterID int64, limit int) ([]*model.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if limit <= 0 {
+		limit = DefaultEventLimit
+	}
 	var out []*model.Event
 	for _, e := range m.events {
 		if e.SandboxID == sandboxID && e.ID > afterID {
 			c := *e
 			out = append(out, &c)
-			if limit > 0 && len(out) >= limit {
+			if len(out) >= limit {
 				break
 			}
 		}
@@ -546,8 +613,15 @@ func (m *Memory) NextInstance(_ context.Context) (int, error) {
 func (m *Memory) CreateInstance(_ context.Context, in *model.Instance) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	c := *in
-	m.instances[in.N] = &c
+	if _, dup := m.instances[in.N]; dup {
+		return fmt.Errorf("%w: instance %d exists", ErrConflict, in.N)
+	}
+	for _, o := range m.instances {
+		if o.Serial == in.Serial {
+			return fmt.Errorf("%w: serial %s is issued", ErrConflict, in.Serial)
+		}
+	}
+	m.instances[in.N] = cloneInstance(in)
 	return nil
 }
 
@@ -556,8 +630,7 @@ func (m *Memory) InstanceBySerial(_ context.Context, serial string) (*model.Inst
 	defer m.mu.Unlock()
 	for _, in := range m.instances {
 		if in.Serial == serial {
-			c := *in
-			return &c, nil
+			return cloneInstance(in), nil
 		}
 	}
 	return nil, ErrNotFound
@@ -583,46 +656,73 @@ func (m *Memory) ListInstances(_ context.Context, sandboxID string) ([]*model.In
 	var out []*model.Instance
 	for _, in := range m.instances {
 		if in.SandboxID == sandboxID {
-			c := *in
-			out = append(out, &c)
+			out = append(out, cloneInstance(in))
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].N < out[j].N })
 	return out, nil
 }
 
+func cloneIdem(v *Idempotent) *Idempotent {
+	c := *v
+	c.Body = append([]byte(nil), v.Body...)
+	return &c
+}
+
 func (m *Memory) ReserveIdempotent(_ context.Context, key, bodyHash string) (*Idempotent, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	now := time.Now()
+	now := m.idemNow()
 	for k, v := range m.idem {
-		if v.CreatedAt.Before(now.Add(-IdempotencyTTL)) || v.InProgress() && v.CreatedAt.Before(now.Add(-IdempotencyStale)) {
+		if v.CreatedAt.Before(now.Add(-IdempotencyTTL)) {
 			delete(m.idem, k)
 		}
 	}
-	if v, ok := m.idem[key]; ok {
-		c := *v
-		return &c, false, nil
+	v, ok := m.idem[key]
+	if !ok {
+		v = &Idempotent{Key: key, BodyHash: bodyHash, CreatedAt: now, Generation: 1, Seed: NewIdempotencySeed(), Token: NewIdempotencySeed()}
+		m.idem[key] = v
+		return cloneIdem(v), true, nil
 	}
-	m.idem[key] = &Idempotent{Key: key, BodyHash: bodyHash, CreatedAt: now}
-	return nil, true, nil
+	// As Postgres: released (no owner) is taken by any body, the seed kept for the same one;
+	// abandoned (owned, stale) only by the same body; a legacy record (no seed) never.
+	released := v.Token == ""
+	abandoned := v.BodyHash == bodyHash && v.CreatedAt.Before(now.Add(-IdempotencyStale))
+	if v.InProgress() && !v.Legacy() && (released || abandoned) {
+		if v.BodyHash != bodyHash {
+			v.Seed, v.keyedCreated, v.keyedSaid = NewIdempotencySeed(), "", ""
+		}
+		v.BodyHash, v.Generation, v.CreatedAt, v.Token = bodyHash, v.Generation+1, now, NewIdempotencySeed()
+		return cloneIdem(v), true, nil
+	}
+	return cloneIdem(v), false, nil
 }
 
 func (m *Memory) PutIdempotent(_ context.Context, rec *Idempotent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	c := *rec
+	c := cloneIdem(rec)
 	if c.CreatedAt.IsZero() {
-		c.CreatedAt = time.Now()
+		c.CreatedAt = m.idemNow()
 	}
-	m.idem[rec.Key] = &c
+	if rec.Token != "" {
+		cur, ok := m.idem[rec.Key]
+		if !ok || !cur.InProgress() || cur.Token != rec.Token {
+			return fmt.Errorf("%w: idempotency key is no longer reserved by this attempt", ErrConflict)
+		}
+		c.Seed, c.Generation, c.CreatedAt = cur.Seed, cur.Generation, m.idemNow()
+		c.keyedCreated, c.keyedSaid = cur.keyedCreated, cur.keyedSaid
+	}
+	m.idem[rec.Key] = c
 	return nil
 }
 
-func (m *Memory) ReleaseIdempotent(_ context.Context, key string) error {
+func (m *Memory) ReleaseIdempotent(_ context.Context, key, token string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.idem, key)
+	if cur, ok := m.idem[key]; ok && token != "" && cur.InProgress() && cur.Token == token {
+		cur.Token = ""
+	}
 	return nil
 }
 
@@ -630,11 +730,10 @@ func (m *Memory) GetIdempotent(_ context.Context, key string) (*Idempotent, erro
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	v, ok := m.idem[key]
-	if !ok || v.CreatedAt.Before(time.Now().Add(-IdempotencyTTL)) {
+	if !ok || v.CreatedAt.Before(m.idemNow().Add(-IdempotencyTTL)) {
 		return nil, ErrNotFound
 	}
-	c := *v
-	return &c, nil
+	return cloneIdem(v), nil
 }
 
 func (m *Memory) Close() error { return nil }
@@ -769,14 +868,17 @@ func (m *Memory) QueryRuns(_ context.Context, f Filter) ([]*model.Run, error) {
 		}
 		return all[i].CreatedAt.Before(all[j].CreatedAt)
 	})
+	limit := f.Limit
+	if limit <= 0 || limit > MaxRunsPerQuery {
+		limit = MaxRunsPerQuery // as Postgres does
+	}
 	var out []*model.Run
 	for _, r := range all {
 		if !f.Cursor.after(r.CreatedAt, r.ID) {
 			continue
 		}
-		c := *r
-		out = append(out, &c)
-		if f.Limit > 0 && len(out) >= f.Limit {
+		out = append(out, cloneRun(r))
+		if len(out) >= limit {
 			break
 		}
 	}
@@ -786,12 +888,16 @@ func (m *Memory) QueryRuns(_ context.Context, f Filter) ([]*model.Run, error) {
 func (m *Memory) QueryEvents(_ context.Context, f Filter) ([]*model.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	limit := f.Limit
+	if limit <= 0 {
+		limit = DefaultEventLimit
+	}
 	var out []*model.Event
 	for _, e := range m.events {
 		if f.matchEvent(e) {
 			c := *e
 			out = append(out, &c)
-			if f.Limit > 0 && len(out) >= f.Limit {
+			if len(out) >= limit {
 				break
 			}
 		}
@@ -831,9 +937,10 @@ func cloneApply(a *model.Apply) *model.Apply {
 	c := *a
 	c.Steps = append([]model.ApplyStep(nil), a.Steps...)
 	c.Documents = append(json.RawMessage(nil), a.Documents...)
-	if a.LeaseUntil != nil {
-		t := *a.LeaseUntil
-		c.LeaseUntil = &t
+	c.LeaseUntil = cloneTime(a.LeaseUntil)
+	if a.Source != nil {
+		src := *a.Source
+		c.Source = &src
 	}
 	return &c
 }
@@ -953,7 +1060,10 @@ func (m *Memory) ListApplies(_ context.Context, tenant string, limit int) ([]*mo
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
-	if limit > 0 && len(out) > limit {
+	if limit <= 0 {
+		limit = 100 // as Postgres does
+	}
+	if len(out) > limit {
 		out = out[:limit]
 	}
 	return out, nil
@@ -1050,6 +1160,7 @@ func (m *Memory) DeleteAPIKey(_ context.Context, id string) error {
 		return ErrNotFound
 	}
 	delete(m.apiKeys, id)
+	delete(m.keyOrigin, id)
 	return nil
 }
 
@@ -1060,6 +1171,7 @@ func (m *Memory) PruneTrustedAPIKeys(_ context.Context, before time.Time) (int, 
 	for id, k := range m.apiKeys {
 		if k.Trust != "" && k.ExpiresAt != nil && k.ExpiresAt.Before(before) {
 			delete(m.apiKeys, id)
+			delete(m.keyOrigin, id)
 			n++
 		}
 	}
@@ -1129,6 +1241,10 @@ type memCredential struct {
 func (m *Memory) PutCredential(_ context.Context, c *model.Credential, ciphertext []byte) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.putCredential(c, ciphertext), nil
+}
+
+func (m *Memory) putCredential(c *model.Credential, ciphertext []byte) bool {
 	key := c.Tenant + "|" + c.Name
 	now := time.Now()
 	cur, ok := m.creds[key]
@@ -1138,7 +1254,7 @@ func (m *Memory) PutCredential(_ context.Context, c *model.Credential, ciphertex
 		c.Version, c.CreatedAt, c.UpdatedAt = 1, now, now
 	}
 	m.creds[key] = &memCredential{meta: *c, ciphertext: append([]byte(nil), ciphertext...)}
-	return !ok, nil
+	return !ok
 }
 
 func (m *Memory) GetCredential(_ context.Context, tenant, name string) (*model.Credential, []byte, error) {
@@ -1185,13 +1301,24 @@ type memOAuth struct {
 }
 
 func (o *memOAuth) copyOut() (*model.OAuthCredential, []byte) {
-	meta := o.meta
-	return &meta, append([]byte(nil), o.ciphertext...)
+	return cloneOAuth(&o.meta), append([]byte(nil), o.ciphertext...)
+}
+
+// cloneOAuth copies the sign-in with its optional times.
+func cloneOAuth(c *model.OAuthCredential) *model.OAuthCredential {
+	out := *c
+	out.LoginExpiresAt, out.ExpiresAt, out.RefreshedAt = cloneTime(c.LoginExpiresAt), cloneTime(c.ExpiresAt), cloneTime(c.RefreshedAt)
+	out.LeaseUntil = cloneTime(c.LeaseUntil)
+	return &out
 }
 
 func (m *Memory) PutOAuthCredential(_ context.Context, c *model.OAuthCredential, ciphertext []byte) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.putOAuthCredential(c, ciphertext), nil
+}
+
+func (m *Memory) putOAuthCredential(c *model.OAuthCredential, ciphertext []byte) bool {
 	key := c.Tenant + "|" + c.Name
 	now := time.Now()
 	cur, ok := m.oauth[key]
@@ -1200,8 +1327,8 @@ func (m *Memory) PutOAuthCredential(_ context.Context, c *model.OAuthCredential,
 		c.Generation, c.CreatedAt = cur.meta.Generation+1, cur.meta.CreatedAt
 	}
 	c.LeaseOwner, c.LeaseUntil = "", nil
-	m.oauth[key] = &memOAuth{meta: *c, ciphertext: append([]byte(nil), ciphertext...)}
-	return !ok, nil
+	m.oauth[key] = &memOAuth{meta: *cloneOAuth(c), ciphertext: append([]byte(nil), ciphertext...)}
+	return !ok
 }
 
 func (m *Memory) GetOAuthCredential(_ context.Context, tenant, name string) (*model.OAuthCredential, []byte, error) {
@@ -1245,11 +1372,11 @@ func (m *Memory) DueOAuthCredentials(_ context.Context, now time.Time, limit int
 	defer m.mu.Unlock()
 	var out []*model.OAuthCredential
 	for _, o := range m.oauth {
-		c := o.meta
+		c := cloneOAuth(&o.meta)
 		if c.Status == model.OAuthFailed || c.NextAt.After(now) || leaseHeld(c.LeaseOwner, c.LeaseUntil, "", now) {
 			continue
 		}
-		out = append(out, &c)
+		out = append(out, c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NextAt.Before(out[j].NextAt) })
 	if limit > 0 && len(out) > limit {
@@ -1284,7 +1411,7 @@ func (m *Memory) SaveOAuthCredential(_ context.Context, c *model.OAuthCredential
 	next := *c
 	next.Provider, next.CreatedBy, next.CreatedAt = cur.meta.Provider, cur.meta.CreatedBy, cur.meta.CreatedAt
 	next.UpdatedAt, next.LeaseOwner, next.LeaseUntil = time.Now(), "", nil
-	m.oauth[c.Tenant+"|"+c.Name] = &memOAuth{meta: next, ciphertext: append([]byte(nil), ciphertext...)}
+	m.oauth[c.Tenant+"|"+c.Name] = &memOAuth{meta: *cloneOAuth(&next), ciphertext: append([]byte(nil), ciphertext...)}
 	*c = next
 	return nil
 }
@@ -1487,4 +1614,568 @@ func (m *Memory) GetGitJobByDelivery(_ context.Context, tenant, name, delivery s
 		}
 	}
 	return nil, ErrNotFound
+}
+
+// RotateAPIKey: see Atomics. Every check happens before the first change, under one lock.
+func (m *Memory) RotateAPIKey(_ context.Context, oldID string, next *model.APIKey, at time.Time, opts RotateOptions) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	old, ok := m.apiKeys[oldID]
+	if !ok {
+		return ErrNotFound
+	}
+	if old.RevokedAt != nil || !old.Active(at) {
+		return ErrKeyInactive
+	}
+	if _, dup := m.apiKeys[next.ID]; dup {
+		return fmt.Errorf("%w: api key %s exists", ErrConflict, next.ID)
+	}
+	var withdraw *model.APIKey
+	if prev, ok := m.apiKeys[old.RotatedTo]; ok && old.RotatedTo != "" {
+		switch {
+		case prev.LastUsedAt != nil || prev.RotatedTo != "":
+			// Used, or rotated on in turn: the branch is taken, even if no longer active.
+			return &SuccessorInUseError{ID: prev.ID}
+		case prev.RevokedAt == nil && prev.Active(at):
+			withdraw = prev
+		}
+	}
+	orig, recorded := memKeyOrigin(m, oldID)
+	if !recorded && old.RotatedTo == "" {
+		orig, recorded = old.ExpiresAt, true
+	}
+	if opts.InheritExpiry {
+		exp := old.ExpiresAt
+		if recorded {
+			exp = orig
+		}
+		if exp != nil && !exp.After(at) {
+			return ErrKeyInactive
+		}
+		next.ExpiresAt = earliest(exp, next.ExpiresAt)
+	}
+	if withdraw != nil {
+		t := at
+		withdraw.RevokedAt = &t
+	}
+	if next.CreatedAt.IsZero() {
+		next.CreatedAt = at
+	}
+	m.apiKeys[next.ID] = cloneKey(next)
+	if recorded {
+		setMemKeyOrigin(m, oldID, orig)
+	}
+	old.RotatedTo = next.ID
+	if opts.Grace <= 0 {
+		if old.RevokedAt == nil {
+			t := at
+			old.RevokedAt = &t
+		}
+		return nil
+	}
+	if end := at.Add(opts.Grace); old.ExpiresAt == nil || end.Before(*old.ExpiresAt) {
+		old.ExpiresAt = &end
+	}
+	return nil
+}
+
+// LockedAPIKey: see Atomics (the store lock serialises it with every write).
+func (m *Memory) LockedAPIKey(ctx context.Context, id string) (*model.APIKey, error) {
+	return m.GetAPIKey(ctx, id)
+}
+
+// earliest of two optional times (nil: none).
+func earliest(a, b *time.Time) *time.Time {
+	switch {
+	case a == nil:
+		return b
+	case b == nil || a.Before(*b):
+		t := *a
+		return &t
+	}
+	t := *b
+	return &t
+}
+
+// memKeyOrigin and setMemKeyOrigin read and write the original_expires_at a rotation kept;
+// m.mu held. The entry goes with the key (DeleteAPIKey, PruneTrustedAPIKeys), as the column
+// goes with the row.
+func memKeyOrigin(m *Memory, id string) (*time.Time, bool) {
+	t, ok := m.keyOrigin[id]
+	return t, ok
+}
+
+func setMemKeyOrigin(m *Memory, id string, t *time.Time) {
+	if m.keyOrigin == nil {
+		m.keyOrigin = map[string]*time.Time{}
+	}
+	m.keyOrigin[id] = t
+}
+
+// FirstUseAPIKey: see Atomics.
+func (m *Memory) FirstUseAPIKey(_ context.Context, id string, at time.Time) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k, ok := m.apiKeys[id]
+	if !ok {
+		return ErrNotFound
+	}
+	if k.RevokedAt != nil || !k.Active(at) {
+		return ErrKeyInactive
+	}
+	t := at
+	k.LastUsedAt = &t
+	return nil
+}
+
+// SwapBlob: see Atomics.
+func (m *Memory) SwapBlob(_ context.Context, name string, old, data []byte) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cur, ok := m.blobs[name]
+	if !ok {
+		return false, ErrNotFound
+	}
+	if !bytes.Equal(cur, old) {
+		return false, nil
+	}
+	m.blobs[name] = append([]byte(nil), data...)
+	return true, nil
+}
+
+// BindInstance: see Atomics. issue runs under the store lock, as it runs inside the
+// transaction in Postgres.
+func (m *Memory) BindInstance(_ context.Context, b InstanceBinding, issue func(n int, existing *model.Instance) (*model.Instance, error)) (*BoundInstance, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sb, ok := m.sandboxes[b.SandboxID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	var reuse *model.Instance
+	var others []*model.Instance
+	for _, in := range m.instances {
+		if in.SandboxID != b.SandboxID || in.PodName != b.PodName || in.RetiredAt != nil {
+			continue
+		}
+		if in.Serial == b.Serial && (reuse == nil || in.N > reuse.N) {
+			reuse = in
+		}
+	}
+	for _, in := range m.instances {
+		if in.SandboxID == b.SandboxID && in.PodName == b.PodName && in.RetiredAt == nil && in != reuse {
+			others = append(others, in)
+		}
+	}
+	n := 0
+	var existing *model.Instance
+	if reuse != nil {
+		n, existing = reuse.N, cloneInstance(reuse)
+	} else {
+		n = m.nextInst + 1
+	}
+	in, err := issue(n, existing)
+	if err != nil {
+		return nil, err
+	}
+	if reuse == nil {
+		for _, o := range m.instances {
+			if o.Serial == in.Serial {
+				return nil, fmt.Errorf("%w: serial %s is issued", ErrConflict, in.Serial)
+			}
+		}
+		m.nextInst = n
+		in.N = n
+		m.instances[n] = cloneInstance(in)
+	}
+	out := &BoundInstance{Reused: reuse != nil}
+	now := time.Now()
+	for _, o := range others {
+		t := now
+		o.RetiredAt = &t
+		out.Retired = append(out.Retired, o.N)
+	}
+	sort.Ints(out.Retired)
+	c := cloneSandbox(sb)
+	c.Instance = n
+	if c.PodName == "" {
+		c.PodName = b.PodName
+	}
+	c.Revision++
+	m.sandboxes[b.SandboxID] = c
+	out.Instance, out.Current = cloneInstance(m.instances[n]), c.PodName
+	return out, nil
+}
+
+func cloneInstance(in *model.Instance) *model.Instance {
+	c := *in
+	c.RetiredAt = cloneTime(in.RetiredAt)
+	return &c
+}
+
+var (
+	_ Store = (*Memory)(nil)
+	_ Store = (*Postgres)(nil)
+)
+
+type memBatch struct {
+	batchProgress
+	at time.Time
+}
+
+// appendEventLocked is AppendEvent under the lock already held.
+func (m *Memory) appendEventLocked(e *model.Event) {
+	m.nextEvent++
+	e.ID = m.nextEvent
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
+	c := *e
+	m.events = append(m.events, &c)
+}
+
+// memUndo restores what a RunDelivery write changed when it fails at its fault point: the memory
+// store's form of a rolled-back transaction.
+type memUndo struct {
+	m         *Memory
+	events    int
+	nextEvent int64
+	run       *model.Run
+	saved     model.Run
+	batchKey  string
+	batch     memBatch
+	hadBatch  bool
+	idemKey   string
+	idem      *Idempotent
+}
+
+func (m *Memory) undoFor(r *model.Run, batchKey string) *memUndo {
+	u := &memUndo{m: m, events: len(m.events), nextEvent: m.nextEvent, run: r, saved: *r, batchKey: batchKey}
+	if batchKey != "" {
+		u.batch, u.hadBatch = m.batches[batchKey]
+	}
+	return u
+}
+
+// withIdem makes the undo restore the idempotency record key too.
+func (u *memUndo) withIdem(key string) *memUndo {
+	u.idemKey, u.idem = key, u.m.idem[key]
+	return u
+}
+
+func (u *memUndo) rollback() {
+	u.m.events, u.m.nextEvent = u.m.events[:u.events], u.nextEvent
+	*u.run = u.saved
+	if u.batchKey != "" {
+		if u.hadBatch {
+			u.m.batches[u.batchKey] = u.batch
+		} else {
+			delete(u.m.batches, u.batchKey)
+		}
+	}
+	if u.idemKey != "" {
+		if u.idem != nil {
+			u.m.idem[u.idemKey] = u.idem
+		} else {
+			delete(u.m.idem, u.idemKey)
+		}
+	}
+}
+
+func (m *Memory) AppendRunOutput(_ context.Context, b *OutputBatch) (*OutputResult, error) {
+	chain := outputChain(b.Lines)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[b.RunID]
+	if !ok || r.SandboxID != b.SandboxID {
+		return nil, ErrNotFound
+	}
+	if b.Attempt > 0 && b.Attempt != r.Attempt {
+		return nil, ErrStaleAttempt
+	}
+	res := &OutputResult{}
+	key := ""
+	prevComplete := false // of the batch's progress still in retention
+	if b.BatchID != "" {
+		key = b.RunID + "|" + b.BatchID
+		// Each record counts only within its retention, checked here and not left to a cleanup
+		// that other traffic happens to trigger (as in the Postgres store).
+		now := time.Now()
+		var rec *batchProgress
+		if v, ok := m.batches[key]; ok && !v.at.Before(now.Add(-outputBatchTTL)) {
+			rec = &v.batchProgress
+		}
+		legacy := -1 // a batch an older release stored or continued
+		if v, ok := m.idem[legacyBatchKey(b.RunID, b.BatchID)]; ok && !v.CreatedAt.Before(now.Add(-IdempotencyTTL)) {
+			legacy = v.Status
+		}
+		n, err := batchResume(rec, legacy, b, chain)
+		if err != nil {
+			return nil, err
+		}
+		res.Skipped = n
+		if rec != nil {
+			prevComplete = rec.complete
+		}
+	}
+	undo := m.undoFor(r, key)
+	if key != "" {
+		undo.withIdem(legacyBatchKey(b.RunID, b.BatchID))
+	}
+	rest := b.Lines[res.Skipped:]
+	at := time.Now()
+	for _, l := range rest {
+		e := &model.Event{SandboxID: b.SandboxID, Tenant: r.Tenant, Slug: r.Slug, RunID: b.RunID, Type: model.EventRunOutput, Data: l.Data, At: at}
+		m.appendEventLocked(e)
+		res.Events = append(res.Events, e)
+	}
+	if u, replace, ok := batchUsage(rest); ok && r.Status != model.RunDone && r.Status != model.RunFailed {
+		if replace {
+			r.Usage = u
+		} else {
+			r.Usage.Add(u)
+		}
+	}
+	if s := batchSession(rest); s != "" {
+		r.Session = s
+	}
+	if key != "" {
+		if m.batches == nil {
+			m.batches = map[string]memBatch{}
+		}
+		for k, v := range m.batches {
+			if v.at.Before(at.Add(-outputBatchTTL)) {
+				delete(m.batches, k)
+			}
+		}
+		m.batches[key] = memBatch{batchProgress: batchProgress{lines: len(b.Lines), hash: chain[len(b.Lines)], complete: prevComplete || !b.Partial}, at: at}
+		// The form an older release reads (see legacyBatchKey).
+		lk := legacyBatchKey(b.RunID, b.BatchID)
+		m.idem[lk] = &Idempotent{Key: lk, Status: len(b.Lines), Body: []byte{}, CreatedAt: at}
+	}
+	if err := faultAt(m, FaultOutput); err != nil {
+		undo.rollback()
+		return nil, err
+	}
+	res.Accepted = len(rest)
+	return res, nil
+}
+
+func (m *Memory) SettleRunWithEvents(_ context.Context, s Settle) (*model.Run, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// The fence first, as in the Postgres store: a caller acting on a stale observation must
+	// learn that it is stale even when the run was settled meanwhile too. A plain ErrConflict
+	// would read as "settled elsewhere, carry on" and let it retire identities or move the
+	// sandbox on the strength of what it saw.
+	if f := s.Sandbox; f != nil {
+		if sb, ok := m.sandboxes[f.ID]; !ok || sb.Status != f.Status || f.Revision != 0 && sb.Revision != f.Revision {
+			return nil, ErrFenced
+		}
+	}
+	r, ok := m.runs[s.RunID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if s.Attempt > 0 && s.Attempt != r.Attempt {
+		return nil, ErrStaleAttempt
+	}
+	if !slices.Contains(s.From, r.Status) {
+		return nil, ErrConflict
+	}
+	undo := m.undoFor(r, "")
+	r.Status, r.ExitCode, r.FinishedAt = s.To, s.ExitCode, &s.FinishedAt
+	if s.Usage != nil {
+		r.Usage = *s.Usage
+	}
+	for _, e := range s.Events {
+		if e.Tenant == "" && e.Slug == "" {
+			e.Tenant, e.Slug = r.Tenant, r.Slug
+		}
+		m.appendEventLocked(e)
+	}
+	if err := faultAt(m, FaultSettle); err != nil {
+		undo.rollback()
+		for _, e := range s.Events {
+			e.ID = 0
+		}
+		return nil, err
+	}
+	return cloneRun(r), nil
+}
+
+func (m *Memory) ReclaimRun(ctx context.Context, sandboxID, owner string) (*model.Run, error) {
+	r, _, err := m.ClaimRunFor(ctx, sandboxID, "", time.Time{}, "", RunStamp{Owner: owner})
+	return r, err
+}
+
+func (m *Memory) ClaimRunFor(_ context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp RunStamp) (*model.Run, *model.Event, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if stamp.Owner != "" {
+		busy := false
+		for _, c := range m.runsOf(sandboxID) {
+			if c.Status != model.RunRunning || c.ClaimedBy != stamp.Owner {
+				continue
+			}
+			if !c.ClaimAcked {
+				r := m.runs[c.ID]
+				r.Attempt++
+				return cloneRun(r), nil, nil
+			}
+			busy = true
+		}
+		if busy {
+			return nil, nil, ErrOwnerBusy
+		}
+	}
+	if runID == "" {
+		return nil, nil, ErrNotFound
+	}
+	r, ok := m.runs[runID]
+	if !ok || r.SandboxID != sandboxID {
+		return nil, nil, ErrNotFound
+	}
+	if r.Status != model.RunQueued {
+		return nil, nil, ErrConflict
+	}
+	r.Status, r.StartedAt = model.RunRunning, &startedAt
+	r.Attempt, r.ClaimedBy, r.ClaimAcked = r.Attempt+1, stamp.Owner, false
+	if r.Session == "" {
+		r.Session = session
+	}
+	r.AgentVersion, r.AgentRef, r.AgentRevision = stamp.AgentVersion, stamp.AgentRef, stamp.AgentRevision
+	r.EnvironmentRef, r.EnvironmentRevision = stamp.EnvironmentRef, stamp.EnvironmentRevision
+	start := &model.Event{SandboxID: sandboxID, Tenant: r.Tenant, Slug: r.Slug, RunID: r.ID, Type: model.EventRunStart, Data: r.AgentVersion}
+	m.appendEventLocked(start)
+	return cloneRun(r), start, nil
+}
+
+func (m *Memory) AckRunClaim(_ context.Context, runID string, attempt int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[runID]
+	if !ok {
+		return ErrNotFound
+	}
+	if r.Attempt != attempt {
+		return ErrStaleAttempt
+	}
+	r.ClaimAcked = true
+	return nil
+}
+
+func (m *Memory) EnsureRunEvent(_ context.Context, e *model.Event) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.runs[e.RunID]
+	if !ok {
+		return false, ErrNotFound
+	}
+	for _, x := range m.events {
+		if x.SandboxID == e.SandboxID && x.RunID == e.RunID && x.Type == e.Type {
+			return false, nil
+		}
+	}
+	if e.Tenant == "" && e.Slug == "" {
+		e.Tenant, e.Slug = r.Tenant, r.Slug
+	}
+	m.appendEventLocked(e)
+	return true, nil
+}
+
+// LastEventID implements EventHead.
+func (m *Memory) LastEventID(context.Context) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.nextEvent, nil
+}
+
+// PutCredentialIfFree implements CredentialNames: the check and the write under one hold of
+// the store's mutex.
+func (m *Memory) PutCredentialIfFree(_ context.Context, c *model.Credential, ciphertext []byte, signIns []string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, n := range slices.Sorted(slices.Values(signIns)) {
+		if _, ok := m.oauth[c.Tenant+"|"+n]; ok {
+			return false, &NameTakenError{Name: n}
+		}
+	}
+	return m.putCredential(c, ciphertext), nil
+}
+
+// PutOAuthCredentialIfFree implements CredentialNames.
+func (m *Memory) PutOAuthCredentialIfFree(_ context.Context, c *model.OAuthCredential, ciphertext []byte, plains []string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, n := range slices.Sorted(slices.Values(plains)) {
+		if _, ok := m.creds[c.Tenant+"|"+n]; ok {
+			return false, &NameTakenError{Name: n}
+		}
+	}
+	return m.putOAuthCredential(c, ciphertext), nil
+}
+
+// idemBySeed is the live reservation with seed; lock held.
+func (m *Memory) idemBySeed(seed string) *Idempotent {
+	if seed == "" {
+		return nil
+	}
+	now := m.idemNow()
+	for _, v := range m.idem {
+		if v.Seed == seed && !v.CreatedAt.Before(now.Add(-IdempotencyTTL)) {
+			return v
+		}
+	}
+	return nil
+}
+
+func (m *Memory) CreateKeyedSandbox(_ context.Context, s *model.Sandbox, seed string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v := m.idemBySeed(seed)
+	if v == nil || !v.InProgress() || v.keyedCreated != "" {
+		return fmt.Errorf("%w: the key's reservation is gone, finished or has created its sandbox already", ErrConflict)
+	}
+	if err := m.createSandbox(s); err != nil {
+		return err
+	}
+	v.keyedCreated = s.ID
+	return nil
+}
+
+func (m *Memory) KeyedResult(_ context.Context, seed string) (string, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v := m.idemBySeed(seed)
+	if v == nil {
+		return "", "", ErrNotFound
+	}
+	return v.keyedCreated, v.keyedSaid, nil
+}
+
+func (m *Memory) NoteKeyedSaid(_ context.Context, seed, said string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if v := m.idemBySeed(seed); v != nil {
+		v.keyedSaid = said
+	}
+	return nil
+}
+
+func (m *Memory) CreateKeyedRun(_ context.Context, r *model.Run, e *model.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, dup := m.runs[r.ID]; dup {
+		return fmt.Errorf("%w: run %s exists", ErrConflict, r.ID)
+	}
+	m.runs[r.ID] = cloneRun(r)
+	m.nextEvent++
+	e.ID = m.nextEvent
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
+	c := *e
+	m.events = append(m.events, &c)
+	return nil
 }

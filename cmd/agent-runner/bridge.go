@@ -65,19 +65,43 @@ func splitBridgePath(escaped string) (host, rest string, ok bool) {
 	return host, "/" + rest, true
 }
 
+// certDir is where agent-init wrote the pod's identity ($CERT_DIR, /certs).
+func certDir() string {
+	if d := os.Getenv("CERT_DIR"); d != "" {
+		return d
+	}
+	return "/certs"
+}
+
+// loadIdentity reads the pod's client certificate and the gateway's trust from certDir: the
+// gateway CA agent-init wrote, else the system pool. A CA file with no certificate in it, or no
+// system pool, is an error: a client that trusts nothing fails later and less clearly.
+func loadIdentity(certDir string) (tls.Certificate, *x509.CertPool, error) {
+	cert, err := tls.LoadX509KeyPair(filepath.Join(certDir, "tls.crt"), filepath.Join(certDir, "tls.key"))
+	if err != nil {
+		return cert, nil, fmt.Errorf("client cert: %w", err)
+	}
+	if gw, err := os.ReadFile(filepath.Join(certDir, "gateway-ca.crt")); err == nil && len(bytes.TrimSpace(gw)) > 0 {
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(gw) {
+			return cert, nil, fmt.Errorf("trust: %s holds no certificate", filepath.Join(certDir, "gateway-ca.crt"))
+		}
+		return cert, pool, nil
+	}
+	pool, err := x509.SystemCertPool()
+	if err != nil {
+		return cert, nil, fmt.Errorf("trust: %w", err)
+	}
+	return cert, pool, nil
+}
+
 // newGatewayBridge is the bridge's handler: client certificate and trust from certDir (what
 // agent-init wrote), connections to the gateway at GATEWAY_IP (port SANDBOX_GATEWAY_PORT, 443)
 // whatever the host, with the host as SNI; without GATEWAY_IP the host itself is dialled.
 func newGatewayBridge(certDir string) (http.Handler, error) {
-	cert, err := tls.LoadX509KeyPair(filepath.Join(certDir, "tls.crt"), filepath.Join(certDir, "tls.key"))
+	cert, pool, err := loadIdentity(certDir)
 	if err != nil {
-		return nil, fmt.Errorf("client cert: %w", err)
-	}
-	pool := x509.NewCertPool()
-	if gw, err := os.ReadFile(filepath.Join(certDir, "gateway-ca.crt")); err == nil && len(bytes.TrimSpace(gw)) > 0 {
-		pool.AppendCertsFromPEM(gw)
-	} else if pool, err = x509.SystemCertPool(); err != nil {
-		return nil, fmt.Errorf("trust: %w", err)
+		return nil, err
 	}
 	gwIP, gwPort := os.Getenv("GATEWAY_IP"), os.Getenv("SANDBOX_GATEWAY_PORT")
 	if gwPort == "" {

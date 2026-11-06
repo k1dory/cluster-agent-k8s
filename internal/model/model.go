@@ -62,6 +62,8 @@ type Launch struct {
 	HarnessThoughtLevel string `json:"harness_thought_level,omitempty"`
 	// HarnessSessionMeta is the _meta (a JSON object) every session request of an "acp" harness carries.
 	HarnessSessionMeta string `json:"harness_session_meta,omitempty"`
+	// HarnessAskTimeout is how many seconds a request waits for a person (permissions ask; 0: 900).
+	HarnessAskTimeout int `json:"harness_ask_timeout,omitempty"`
 	// HarnessInstructions is how an "acp" harness gets the instructions: "", file or env:NAME.
 	HarnessInstructions string `json:"harness_instructions,omitempty"`
 	Model               string `json:"model,omitempty"`        // exported as SANDBOX_MODEL and ANTHROPIC_MODEL
@@ -101,7 +103,7 @@ func PlatformEnv(name string) bool {
 	switch name {
 	case "GATEWAY_IP", "GATEWAY_CA_FILE", "REGISTRAR_URL", "API_URL", "CERT_DIR", "HOME",
 		"HARNESS_CMD", "HARNESS_RESUME_CMD", "HARNESS_INPUT", "HARNESS_CHAT_IDLE", "HARNESS_PERMISSIONS", "HARNESS_AUTH_METHOD",
-		"HARNESS_MODE", "HARNESS_MCP", "HARNESS_THOUGHT_LEVEL", "HARNESS_SESSION_META", "HARNESS_INSTRUCTIONS":
+		"HARNESS_MODE", "HARNESS_MCP", "HARNESS_THOUGHT_LEVEL", "HARNESS_SESSION_META", "HARNESS_INSTRUCTIONS", "HARNESS_ASK_TIMEOUT":
 		return true
 	}
 	return false
@@ -310,6 +312,9 @@ type Sandbox struct {
 	ExpiresAt      *time.Time `json:"expires_at,omitempty"` // when set, the sandbox is deleted after this time
 	Preview        *Preview   `json:"preview,omitempty"`
 	Error          string     `json:"error,omitempty"`
+	// PreviewGen is the preview's access generation: bumped when the preview is closed or its
+	// access level changes, it invalidates every preview sign-in issued before.
+	PreviewGen int64 `json:"-"`
 }
 
 // IdleDuration returns the idle timeout as a duration.
@@ -387,6 +392,13 @@ type Run struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// Attempt counts the times the run was handed to a runner (the claim, and each time a claim
+	// whose response was lost is handed out again). The runner sends it back with every call
+	// about the run, so an earlier attempt cannot write once a later one exists.
+	Attempt int `json:"attempt,omitempty"`
+	// ClaimedBy is the instance the run was handed to; ClaimAcked that it confirmed it got it.
+	ClaimedBy  string `json:"-"`
+	ClaimAcked bool   `json:"-"`
 }
 
 // Run modes (Mode): how the run relates to the conversation.
@@ -403,9 +415,13 @@ const (
 type Message struct {
 	ID    int64     `json:"id"`
 	RunID string    `json:"run_id,omitempty"`
-	Role  string    `json:"role"` // user | assistant | tool | system | log
+	Role  string    `json:"role"` // user | assistant | tool | system | request | resolved | commands | log
 	Text  string    `json:"text"`
 	At    time.Time `json:"at"`
+	// Data is the structured event behind a request, resolved or commands turn, as the runner
+	// wrote it (an acp.request, acp.request_resolved or acp.commands line, docs/chat-and-files.md):
+	// what a client needs to show the request and answer it, or to list the agent's commands.
+	Data json.RawMessage `json:"data,omitempty"`
 }
 
 // Message roles.
@@ -415,6 +431,14 @@ const (
 	RoleTool      = "tool"   // a tool call the agent made (name only)
 	RoleSystem    = "system" // run boundaries: queued, resumed, finished
 	RoleLog       = "log"    // raw harness output that is not a message (only with raw=true)
+	// RoleRequest: the agent asks the person something (a permission, a question) and waits; the
+	// answer is POST /v1/sandboxes/{id}/requests/{request_id}.
+	RoleRequest = "request"
+	// RoleResolved: a request was answered (by the person, by the profile's policy, or by its
+	// timeout).
+	RoleResolved = "resolved"
+	// RoleCommands: the slash commands the agent offers now (the whole list each time it changes).
+	RoleCommands = "commands"
 )
 
 // FSRequest is the payload of an fs.request event: one file operation the control plane
@@ -654,6 +678,7 @@ const (
 	EventRunCancel = "run.cancel" // control event: the runner must stop the harness
 	EventRunClose  = "run.close"  // control event: the runner closes the harness's input; the run ends when the harness does
 	EventInput     = "input"
+	EventReply     = "reply"        // data: the answer to a request of the agent (acpx.Reply JSON), control plane → pod
 	EventFSRequest = "fs.request"   // data: FSRequest JSON (control plane → pod)
 	EventFSResult  = "fs.result"    // data: FSResult JSON (pod → control plane)
 	EventEgressOK  = "egress.allow" // data: Egress JSON

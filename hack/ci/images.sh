@@ -14,10 +14,17 @@ prefix=${IMAGE_PREFIX:-agent-sandbox} tag=${IMAGE_TAG:-ci}
 sandboxd=$prefix/sandboxd:$tag ctl=$prefix/sandboxctl:$tag agent=$prefix/agent:$tag hermes=$prefix/agent-hermes:$tag
 
 echo "== build"
-docker build -f images/agent/Dockerfile $("$ci_dir/versions.sh" build-args) -t "$agent" .
-docker build -f images/sandboxd/Dockerfile -t "$sandboxd" .
-docker build -f images/sandboxd/Dockerfile --target sandboxctl -t "$ctl" .
-docker build -f images/agent-hermes/Dockerfile $("$ci_dir/versions.sh" hermes-build-args) -t "$hermes" .
+# Each build also records the id of the image it produced (--iidfile): the vulnerability scan
+# at the end reads that id, so a tag another job on the same daemon re-pointed meanwhile
+# cannot put a different image under the scanner.
+iids=$(mktemp -d "${TMPDIR:-/tmp}/agent-sandbox-ci-iid.XXXXXX")
+# The archives the scan exports there are a few GiB: removed however the check ends.
+ci_images_cleanup() { rm -rf "$iids"; }
+trap ci_images_cleanup EXIT
+docker build -f images/agent/Dockerfile $("$ci_dir/versions.sh" build-args) -t "$agent" --iidfile "$iids/agent" .
+docker build -f images/sandboxd/Dockerfile -t "$sandboxd" --iidfile "$iids/sandboxd" .
+docker build -f images/sandboxd/Dockerfile --target sandboxctl -t "$ctl" --iidfile "$iids/sandboxctl" .
+docker build -f images/agent-hermes/Dockerfile $("$ci_dir/versions.sh" hermes-build-args) -t "$hermes" --iidfile "$iids/agent-hermes" .
 
 echo "== agent image: the harnesses of versions.env, installed and labelled"
 # The label is what an operator reads off a pulled image (docker inspect); the binary is what
@@ -29,6 +36,9 @@ harness() { # harness LABEL-NAME COMMAND WANT
   seen=$(docker run --rm --entrypoint /bin/sh "$agent" -lc "$2 --version" 2>&1 || true)
   case "$seen" in *"$3"*) echo "$1 $3" ;; *) ci_die "images: '$2 --version' in the agent image says '$seen', versions.env says $3" ;; esac
 }
+seen=$(docker run --rm --entrypoint npm "$agent" --version 2>&1 || true)
+[ "$seen" = "$NPM_VERSION" ] || ci_die "images: npm in the agent image is '$seen', versions.env says $NPM_VERSION"
+echo "npm $NPM_VERSION"
 harness claude-code claude "$CLAUDE_CODE_VERSION"
 harness codex codex "$CODEX_VERSION"
 harness opencode opencode "$OPENCODE_VERSION"
@@ -63,7 +73,7 @@ echo "== sandboxctl: a checkout owned by another user is read and its SHA record
 # docker-in-docker service) sees none of this job's files.
 vol=agent-sandbox-ci-checkout-$$
 docker volume create "$vol" >/dev/null
-trap 'docker rm -f "$vol-copy" >/dev/null 2>&1 || true; docker volume rm -f "$vol" >/dev/null 2>&1 || true' EXIT
+ci_images_cleanup() { docker rm -f "$vol-copy" >/dev/null 2>&1 || true; docker volume rm -f "$vol" >/dev/null 2>&1 || true; rm -rf "$iids"; }
 docker create --name "$vol-copy" -v "$vol:/w" --user 0 --entrypoint sh "$ctl" -c 'chown -R 0:0 /w' >/dev/null
 docker cp . "$vol-copy:/w"
 docker start -a "$vol-copy" >/dev/null
@@ -136,4 +146,24 @@ acp_in_image "$hermes" TestACPHermesExampleCreatesAndLoadsASession TestACPHermes
 echo "== agent image: smoke test and network lock"
 hack/smoke-image.sh "$agent"
 python3 hack/test-netlock.py "$agent"
+
+echo "== every image: known vulnerabilities (trivy $TRIVY_VERSION; every HIGH and CRITICAL reported, those with a fix fail)"
+# The same policy as ci-scan, on what the images carry: the base image's packages, the
+# harnesses' npm packages, the Go binaries. Each image is read from this daemon by its id, the
+# image built above and no other copy of the tag. Hermes's own tree (/opt/hermes, the agent
+# and the tools its image bundles, pinned by digest) is reported but not part of the verdict:
+# its fix is a HERMES_VERSION bump, not a change here.
+# Each image is exported from the daemon by its recorded id with the docker CLI (so whatever
+# the CLI needs to reach the daemon, a TLS context included, is what the scan uses too) and
+# scanned from the archive, one at a time: the archive of the largest image is a few GiB.
+for name in sandboxd sandboxctl agent agent-hermes; do
+  id=$(cat "$iids/$name" 2>/dev/null) && [ -n "$id" ] || ci_die "images: no image id recorded for the $name build"
+  skip=""
+  [ "$name" = agent-hermes ] && skip=opt/hermes
+  echo "-- $prefix/$name:$tag ($id)"
+  docker image save -o "$iids/$name.tar" "$id" || ci_die "images: cannot export the $name image built here ($id) from the daemon"
+  ci_trivy_scan image "$skip" --input "$iids/$name.tar" \
+    || ci_die "images: fixable HIGH or CRITICAL vulnerabilities in $prefix/$name:$tag (upgrade the base image or a harness in hack/ci/versions.env, or accept the finding in .trivyignore.yaml with an expiry)"
+  rm -f "$iids/$name.tar"
+done
 ci_ok images

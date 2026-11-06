@@ -77,7 +77,8 @@ func (o *Orchestrator) FS(ctx context.Context, sandboxID string, req model.FSReq
 		}
 	}
 	req.ID = newID("fs")
-	ch, cancel := o.Hub.Subscribe(sandboxID)
+	// Only answers: a run streaming output meanwhile must not crowd the answer out of the buffer.
+	ch, cancel := o.Hub.SubscribeTypes(sandboxID, model.EventFSResult)
 	defer cancel()
 	b, _ := json.Marshal(req)
 	if err := o.emit(ctx, model.Event{SandboxID: sandboxID, Type: model.EventFSRequest, Data: string(b)}); err != nil {

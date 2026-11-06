@@ -82,7 +82,11 @@ type reviewClaimBeforeAppendStore struct {
 func (s *reviewClaimBeforeAppendStore) AppendQueuedTask(ctx context.Context, id, text string) (*model.Run, error) {
 	if s.claim {
 		s.claim = false
-		if _, err := s.Store.ClaimQueuedRun(ctx, s.sandbox, time.Now()); err != nil {
+		queued, err := s.Store.QueuedRun(ctx, s.sandbox)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := s.Store.ClaimRun(ctx, queued.ID, time.Now(), "", store.RunStamp{}); err != nil {
 			return nil, err
 		}
 	}

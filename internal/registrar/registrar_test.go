@@ -34,7 +34,10 @@ func TestBootstrapIssuesMonotonicInstances(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := r.Bootstrap(ctx, "tok-pod-a", BootstrapRequest{CSR: string(csr)})
+	// A new key (the init container restarted): a new instance. The same key again would get
+	// the same one (see bootstrap_review_test.go).
+	_, csr2, _ := ca.NewCSR("backend-dev")
+	second, err := r.Bootstrap(ctx, "tok-pod-a", BootstrapRequest{CSR: string(csr2)})
 	if err != nil {
 		t.Fatal(err)
 	}

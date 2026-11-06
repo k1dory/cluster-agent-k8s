@@ -18,6 +18,7 @@ FROM node:22-bookworm-slim
 # from hack/ci/versions.env (`hack/ci/versions.sh build-args`, which make images, ci-images and
 # publish-images pass), so an image never installs whatever npm calls latest that day, and the
 # versions it carries are labels `docker inspect` shows.
+ARG NPM_VERSION
 ARG CLAUDE_CODE_VERSION
 ARG CODEX_VERSION
 ARG CLAUDE_AGENT_ACP_VERSION
@@ -29,11 +30,15 @@ LABEL io.agent-sandbox.harness.claude-code.version="${CLAUDE_CODE_VERSION}" \
       io.agent-sandbox.harness.codex-acp.version="${CODEX_ACP_VERSION}" \
       io.agent-sandbox.harness.opencode.version="${OPENCODE_VERSION}"
 # nftables: the netlock init container (pod-level egress firewall) runs from this same image.
-RUN { test -n "${CLAUDE_CODE_VERSION}" && test -n "${CODEX_VERSION}" && test -n "${CLAUDE_AGENT_ACP_VERSION}" && test -n "${CODEX_ACP_VERSION}" && test -n "${OPENCODE_VERSION}"; } \
-      || { echo "build args CLAUDE_CODE_VERSION, CODEX_VERSION, CLAUDE_AGENT_ACP_VERSION, CODEX_ACP_VERSION and OPENCODE_VERSION are required (hack/ci/versions.sh build-args)" >&2; exit 1; } \
- && apt-get update && apt-get install -y --no-install-recommends \
+# The base image's packages are upgraded at build time (its tag lags Debian's security updates)
+# and its npm is replaced by the pinned one (NPM_VERSION: the base's copy carries its own
+# modules, which ci-images scans with the rest of the image).
+RUN { test -n "${NPM_VERSION}" && test -n "${CLAUDE_CODE_VERSION}" && test -n "${CODEX_VERSION}" && test -n "${CLAUDE_AGENT_ACP_VERSION}" && test -n "${CODEX_ACP_VERSION}" && test -n "${OPENCODE_VERSION}"; } \
+      || { echo "build args NPM_VERSION, CLAUDE_CODE_VERSION, CODEX_VERSION, CLAUDE_AGENT_ACP_VERSION, CODEX_ACP_VERSION and OPENCODE_VERSION are required (hack/ci/versions.sh build-args)" >&2; exit 1; } \
+ && apt-get update && apt-get upgrade -y --no-install-recommends && apt-get install -y --no-install-recommends \
       git curl ca-certificates python3 python3-venv python3-pip build-essential jq ripgrep openssh-client nftables \
  && rm -rf /var/lib/apt/lists/* \
+ && npm install -g npm@${NPM_VERSION} \
  && npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} @openai/codex@${CODEX_VERSION} \
       @agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION} @agentclientprotocol/codex-acp@${CODEX_ACP_VERSION} \
       opencode-ai@${OPENCODE_VERSION} \

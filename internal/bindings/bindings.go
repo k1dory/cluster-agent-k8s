@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"agent-sandbox/internal/model"
@@ -164,6 +165,18 @@ type Guard struct {
 	*policy.Set
 	Bindings *Service
 	Headers  HeaderSource // optional
+
+	// hosts is the merged host list for the fingerprint it was built at: Hosts runs on every
+	// DNS query and MCP request, and the repository's list is rebuilt from every rule each
+	// time it is asked for.
+	mu    sync.Mutex
+	hosts hostCache
+}
+
+type hostCache struct {
+	key    string
+	list   []policy.Host
+	byName map[string]policy.Host
 }
 
 // HeadersFor forwards to the connections service when one is wired (see authz.Connections).
@@ -186,12 +199,40 @@ func (g *Guard) hostSource() HostSource {
 // the gateway renders sites for, the DNS answers and the MCP proxy accepts. A repository host
 // stays the repository's whatever a connection says.
 func (g *Guard) Hosts() []policy.Host {
-	hs := g.Set.Hosts()
-	src := g.hostSource()
-	if src == nil {
-		return hs
+	c := g.cached()
+	out := make([]policy.Host, len(c.list))
+	for i, h := range c.list {
+		h.Injected = append([]string(nil), h.Injected...) // callers merge names into it
+		out[i] = h
 	}
-	own, _ := src.OwnHosts()
+	return out
+}
+
+// HostInfo looks a host up in Hosts.
+func (g *Guard) HostInfo(name string) (policy.Host, bool) {
+	h, ok := g.cached().byName[name]
+	if ok {
+		h.Injected = append([]string(nil), h.Injected...)
+	}
+	return h, ok
+}
+
+// cached returns the merged host list, rebuilt only when the fingerprint moved.
+func (g *Guard) cached() hostCache {
+	key := g.Set.Fingerprint()
+	src := g.hostSource()
+	var own []policy.Host
+	if src != nil {
+		var ownFP string
+		own, ownFP = src.OwnHosts()
+		key += "+" + ownFP
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.hosts.byName != nil && g.hosts.key == key {
+		return g.hosts
+	}
+	hs := g.Set.Hosts()
 	seen := map[string]bool{}
 	for _, h := range hs {
 		seen[h.Name] = true
@@ -201,17 +242,12 @@ func (g *Guard) Hosts() []policy.Host {
 			hs = append(hs, h)
 		}
 	}
-	return hs
-}
-
-// HostInfo looks a host up in Hosts.
-func (g *Guard) HostInfo(name string) (policy.Host, bool) {
-	for _, h := range g.Hosts() {
-		if h.Name == name {
-			return h, true
-		}
+	byName := make(map[string]policy.Host, len(hs))
+	for _, h := range hs {
+		byName[h.Name] = h
 	}
-	return policy.Host{}, false
+	g.hosts = hostCache{key: key, list: hs, byName: byName}
+	return g.hosts
 }
 
 // Fingerprint changes when the repository or the connections' hosts change: the gateway syncer

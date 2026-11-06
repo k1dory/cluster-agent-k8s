@@ -121,7 +121,7 @@ func codexExampleSession(t *testing.T, adapter, file string) {
 	}
 	// The profile's mode is one codex-acp offers and accepts.
 	var notices []string
-	configureACPSession(ctx, conn, session.SessionId, acpSessionState{Modes: session.Modes, Options: session.ConfigOptions},
+	configureACPSession(func() (context.Context, context.CancelFunc) { return context.WithCancel(ctx) }, conn, session.SessionId, acpSessionState{Modes: session.Modes, Options: session.ConfigOptions},
 		acpSettings{mode: profile.Harness.Mode}, func(f string, a ...any) { notices = append(notices, fmt.Sprintf(f, a...)) })
 	if profile.Harness.Mode == "" || len(notices) != 0 {
 		t.Fatalf("mode %q: %q", profile.Harness.Mode, notices)

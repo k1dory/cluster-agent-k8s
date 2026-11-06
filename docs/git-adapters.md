@@ -173,6 +173,10 @@ spec:
   names no state and leaves the transition on record as it is (an unfinished one included),
   recording its error against it. Exit codes as for `apply`: 0 done, 2 a bundle invalid (nothing
   of it written), 3 an apply stopped, 1 the repository unreadable.
+  The files a sync reads are bounded: at most 1 MiB per file, 256 files and 16 MiB together.
+  Sizes are read from Git before any content, and a set over a bound is refused before
+  anything is applied: HTTP 422, code `invalid_plan`, error `… too large: …` naming the file or
+  the bound, the sync recorded as `invalid` with no bundles (exit 2; a push job is not retried). Split or narrow `paths`.
 - `sandboxctl gitrepo status config` (`GET /v1/gitrepos/config/status`) shows the last check
   and the last sync: the head, the commit, one line per bundle with its apply id and status.
   The two halves are recorded independently and atomically, so a check running next to a sync

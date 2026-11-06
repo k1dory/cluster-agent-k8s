@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"agent-sandbox/internal/catalog"
+	"agent-sandbox/internal/harness"
 	"agent-sandbox/internal/model"
 	"github.com/k1dory/acpx"
 )
@@ -70,6 +71,7 @@ func exampleSmoke(t *testing.T, file, binEnv, program string, extraEnv func(home
 		t.Fatalf("the example's command is %q; this test runs %s acp", profile.Harness.Command, program)
 	}
 	home := t.TempDir()
+	t.Cleanup(func() { logSurvivors(t, home); removeHomeFirst(t, home) })
 	files, _ := json.Marshal(profile.Harness.Files)
 	if n, err := writeHarnessFiles(string(files), home); err != nil || n != len(profile.Harness.Files) {
 		t.Fatalf("the profile's harness files: %d written, %v", n, err)
@@ -191,6 +193,7 @@ func TestACPClaudeExampleTakesTheSystemPromptAndMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	home := t.TempDir()
+	t.Cleanup(func() { logSurvivors(t, home); removeHomeFirst(t, home) })
 	files, _ := json.Marshal(profile.Harness.Files)
 	if _, err := writeHarnessFiles(string(files), home); err != nil {
 		t.Fatal(err)
@@ -223,13 +226,18 @@ func TestACPClaudeExampleTakesTheSystemPromptAndMode(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer stopAdapter(stdin, cancel, cmd)
+	defer stopAdapter(stdin, cancel, cmd, home)
 	var notices []string
-	emit := func(l string) { notices = append(notices, l) }
+	emit := func(l string) {
+		if strings.HasPrefix(l, "[agent-runner] ") { // a notice; ACP lines (acp.commands…) are output
+			notices = append(notices, l)
+		}
+	}
 	// The runner's own wiring: notices and compaction updates asked for, the profile's session
 	// options in _meta (the adapter refuses options it cannot take).
 	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{Notices: true, Compaction: true})
-	cl := &acpClient{emit: emit, wire: wire, systemPrompt: wire.SystemPrompt}
+	// A person answers (permissions ask): the client offers elicitation, which the adapter takes.
+	cl := &acpClient{emit: emit, wire: wire, systemPrompt: wire.SystemPrompt, permissions: harness.PermissionsAsk}
 	conn := wire.Connect(cl)
 	meta, _ := json.Marshal(profile.Harness.SessionMeta)
 	t.Setenv("HARNESS_SESSION_META", string(meta))

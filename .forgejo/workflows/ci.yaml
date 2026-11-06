@@ -31,6 +31,11 @@ jobs:
       - run: make ci-vet
       - run: make ci-unit
       - run: make ci-policy
+  scan:
+    runs-on: docker
+    steps:
+      - uses: https://code.forgejo.org/actions/checkout@v4
+      - run: make ci-scan
   postgres:
     needs: versions
     runs-on: docker

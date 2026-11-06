@@ -236,7 +236,7 @@ A profile's `env` (and `model.env`) is the agent container's only: it never reac
 containers that lock the network and bootstrap the identity, and it cannot set a platform name
 (`SANDBOX_*`, `GATEWAY_IP`, `REGISTRAR_URL`, `API_URL`, `CERT_DIR`, `HOME`, `HARNESS_CMD`,
 `HARNESS_RESUME_CMD`, `HARNESS_INPUT`, `HARNESS_CHAT_IDLE`, `HARNESS_PERMISSIONS`, `HARNESS_AUTH_METHOD`,
-`HARNESS_MODE`, `HARNESS_MCP`, `HARNESS_THOUGHT_LEVEL`, `HARNESS_SESSION_META`, `HARNESS_INSTRUCTIONS`,
+`HARNESS_MODE`, `HARNESS_MCP`, `HARNESS_THOUGHT_LEVEL`, `HARNESS_SESSION_META`, `HARNESS_INSTRUCTIONS`, `HARNESS_ASK_TIMEOUT`,
 `GATEWAY_CA_FILE`: refused with 422) or shadow the operator's `agent.env`.
 The model name and the instructions are exported by the platform (`SANDBOX_MODEL`,
 `ANTHROPIC_MODEL`, `SANDBOX_INSTRUCTIONS`). Resources are Kubernetes quantities, positive, with
@@ -385,7 +385,8 @@ sandboxctl rollout -version stable -all -force                     # admin: ever
 
 Per sandbox the mode is `wake` (asleep: applied on the next wake), `now` (running and idle: the pod
 is replaced, the identity retired and reissued), `deferred` (a run is in progress: applied when it
-finishes) or, with `-force`, `forced`: the run is cancelled, the pod replaced and a resume run is
+finishes; also when the runs could not be read or the restart could not begin, with that reason,
+applied by the reconciler once the sandbox is running and idle) or, with `-force`, `forced`: the run is cancelled, the pod replaced and a resume run is
 queued that carries the harness session id captured from the output stream (Claude Code
 `session_id`, Codex `thread_id`). The runner continues it with `harness_resume_command`
 (default `claude --resume`; for Codex `codex exec resume "$SANDBOX_SESSION" ...`). The workspace
@@ -403,6 +404,11 @@ behind) runs on the replica holding the leadership lease, and events appended by
 the SSE clients of the others through `LISTEN/NOTIFY`. Each replica drives its own Caddy and DNS,
 so in the node layout you label several gateway nodes and put a VIP or DNS round-robin in front
 (`gateway.replicas` in the chart, which refuses more than one replica without `ca.source: db`).
+With `credentials.key` set the CA private keys are stored in the database encrypted under it
+(a database written before that is upgraded in place on the next start); without it they are
+stored in clear and sandboxd warns at startup. Keep `credentials.key` with the database dump:
+it now unlocks the CA as well as the tenants' credentials, and a replica started with a
+different key refuses to start rather than mint a new CA.
 
 ### Authentication: tenant API keys, static tokens or OIDC
 
@@ -422,6 +428,10 @@ sandboxctl keys revoke key_3f2a9c1e7b04                  # refused on the very n
 request looks the key up, so revocation needs no restart and no cache to expire. `api_keys.max_ttl`
 caps the lifetime a key may be issued with; an expiring key bounds the sandboxes it creates like an
 expiring OIDC token does. `GET /v1/whoami` shows `subject: key:<id>`.
+
+Failed bearer tokens and `POST /v1/auth/ci` are rate limited per client address (`auth_limit`:
+`burst` 30 attempts at once, then one per `every`, 1s; `off: true` behind a proxy that hides client
+addresses). Over the budget every token from that address is 429 with `Retry-After`, unchecked.
 
 
 ```yaml
@@ -480,7 +490,14 @@ cached for `cache_ttl` and only ever appear in the gateway's response to Caddy, 
   stays valid when its anchor row is deleted.
 - **Idempotency.** `Idempotency-Key` on `POST /v1/sandboxes` and `POST .../runs`: the key is reserved
   before the request runs, so a CI retry after a timeout never creates a second sandbox or run, a
-  concurrent repeat waits (409), and a reuse with another body is refused (422).
+  concurrent repeat waits (409), and a reuse with another body is refused (422). A reservation left
+  unfinished for two minutes (its replica died), or released by a failed attempt, is taken over by the
+  next repeat, which answers with the sandbox or run an earlier attempt created, never a second one (a
+  sandbox deleted since is not made again: 409). A message is delivered once for all attempts, except
+  one delivered into an existing run (input, or joined to a queued task) whose replica died before
+  recording the delivery: the next attempt delivers it again. Upgrade: a reservation an older release
+  left unfinished is not run again (409 until it expires in 24h); check whether it took effect and use
+  a new key.
 - **Lifecycle.** `ttl` on create or `PATCH` sets `expires_at`; the sweeper deletes expired sandboxes.
   `PATCH` also changes `idle_timeout`, `wake_on_preview`, `repo`. Per-tenant `quotas` cap
   `max_sandboxes` and `max_awake` (429 `quota_exceeded`).
@@ -512,7 +529,7 @@ implemented once, and GitHub, GitLab, Forgejo and local development invoke the s
 The contract defines ownership, acceptance criteria and the remaining adoption work.
 
 ```sh
-make ci-fast        # before a push: build, vet, every test under -race, the policy gate
+make ci-fast        # before a push: build, vet, every test under -race, the policy gate, the dependency scan
 make ci             # the full required set (needs SANDBOX_TEST_POSTGRES_URL, Docker, python3)
 make ci-caddy CADDY_BIN=/path/to/caddy   # one group with an input of yours; make ci-versions lists the pins
 make test           # unit tests

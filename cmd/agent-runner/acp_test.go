@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -58,9 +60,22 @@ func TestMain(m *testing.M) {
 }
 
 type fakeAgent struct {
-	conn *acp.AgentSideConnection
-	log  *os.File
-	mu   sync.Mutex
+	// The connection starts receiving as soon as it is made, so a handler may run before the
+	// assignment in runFakeAgent has landed: the handlers read it through conn(), published once.
+	connection atomic.Pointer[acp.AgentSideConnection]
+	log        *os.File
+	mu         sync.Mutex
+}
+
+// conn is the agent's connection, waiting for runFakeAgent to publish it — a handler cannot be
+// invoked before the connection exists, but the race detector does not know that.
+func (f *fakeAgent) conn() *acp.AgentSideConnection {
+	for {
+		if c := f.connection.Load(); c != nil {
+			return c
+		}
+		runtime.Gosched()
+	}
 }
 
 func (f *fakeAgent) record(kind string, v any) {
@@ -76,8 +91,9 @@ func runFakeAgent() {
 		os.Exit(3)
 	}
 	f := &fakeAgent{log: log}
-	f.conn = acp.NewAgentSideConnection(f, os.Stdout, os.Stdin)
-	<-f.conn.Done()
+	c := acp.NewAgentSideConnection(f, os.Stdout, os.Stdin)
+	f.connection.Store(c)
+	<-c.Done()
 }
 
 func (f *fakeAgent) Initialize(context.Context, acp.InitializeRequest) (acp.InitializeResponse, error) {
@@ -93,7 +109,7 @@ func (f *fakeAgent) NewSession(_ context.Context, p acp.NewSessionRequest) (acp.
 func (f *fakeAgent) LoadSession(ctx context.Context, p acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 	f.record("load", p)
 	// History is replayed as updates before the response.
-	_ = f.conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: acp.UpdateAgentMessageText("OLD HISTORY")})
+	_ = f.conn().SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: acp.UpdateAgentMessageText("OLD HISTORY")})
 	return acp.LoadSessionResponse{}, nil
 }
 
@@ -106,14 +122,14 @@ func (f *fakeAgent) Prompt(ctx context.Context, p acp.PromptRequest) (acp.Prompt
 	}
 	f.record("prompt", map[string]string{"session": string(p.SessionId), "text": text})
 	send := func(u acp.SessionUpdate) {
-		_ = f.conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: u})
+		_ = f.conn().SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: u})
 	}
 	send(acp.UpdateAgentMessageText("Hel"))
 	send(acp.UpdateAgentMessageText("lo"))
 	send(acp.StartToolCall("call_1", "Edit a.txt", acp.WithStartKind(acp.ToolKindEdit), acp.WithStartStatus(acp.ToolCallStatusPending),
 		acp.WithStartContent([]acp.ToolCallContent{acp.ToolDiffContent("/workspace/a.txt", "new line", "old line")})))
 	title := "Edit a.txt"
-	resp, err := f.conn.RequestPermission(ctx, acp.RequestPermissionRequest{SessionId: p.SessionId,
+	resp, err := f.conn().RequestPermission(ctx, acp.RequestPermissionRequest{SessionId: p.SessionId,
 		ToolCall: acp.ToolCallUpdate{ToolCallId: "call_1", Title: &title},
 		Options: []acp.PermissionOption{
 			{OptionId: "yes", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
@@ -436,6 +452,7 @@ func TestACPRealAdapterOpensASession(t *testing.T) {
 	}
 	isolate := noNetwork(t)
 	home := t.TempDir()
+	t.Cleanup(func() { logSurvivors(t, home); removeHomeFirst(t, home) })
 	t.Setenv("HARNESS_AUTH_METHOD", os.Getenv("ACP_REAL_AUTH_METHOD"))
 	t.Setenv("SANDBOX_MCP_SERVERS", "")
 	t.Setenv("PWD", home)
@@ -501,8 +518,12 @@ func openRealACP(t *testing.T, isolate []string, agent, home string, env []strin
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer stopAdapter(stdin, cancel, cmd)
-	emit := func(l string) { notices = append(notices, l) }
+	defer stopAdapter(stdin, cancel, cmd, home)
+	emit := func(l string) {
+		if strings.HasPrefix(l, "[agent-runner] ") { // a notice; ACP lines (acp.commands…) are output
+			notices = append(notices, l)
+		}
+	}
 	// The runner's own wiring (executeACP): the wire carries the system prompt.
 	wire := acpx.NewWire(stdin, stdout, acpx.WireOptions{})
 	cl := &acpClient{emit: emit, systemPrompt: wire.SystemPrompt}
@@ -537,7 +558,7 @@ func noNetwork(t *testing.T) []string {
 // stopAdapter ends an agent process as the runner does (executeACP): end of input, a grace period
 // to exit on its own, then the process group. An agent killed at once can leave helpers that
 // keep writing into its home (hermes), which then outlives the test's temporary directory.
-func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd) {
+func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd, home string) {
 	_ = stdin.Close()
 	exited := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(exited) }()
@@ -546,5 +567,41 @@ func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd) {
 	case <-time.After(5 * time.Second):
 		cancel()
 		<-exited
+	}
+	endProcessGroup(cmd.Process.Pid, home)
+}
+
+// endProcessGroup ends what the adapter left behind and returns when none of it is alive, or
+// after a bound. The adapter leaving on its own does not end what it started — Hermes keeps
+// children writing under $HERMES_HOME, some in sessions of their own — and the test's
+// directories are removed as soon as the test returns: a survivor makes that removal fail
+// ("directory not empty") or outlives the test. Two sweeps: the adapter's process group (it is
+// the group's leader, Setpgid), then, where /proc tells, every process whose environment names
+// the test's home (the adapter's env, inherited by all its descendants, detached or not). Alive
+// is what counts: a zombie writes nothing, and whether it gets reaped is PID 1's business (in
+// the image's check that is this binary; the zombies go when it exits). Only what is ours is
+// reaped here, without waiting.
+func endProcessGroup(pgid int, home string) {
+	deadline := time.Now().Add(5 * time.Second)
+	reap := func(pid int) {
+		for {
+			var ws syscall.WaitStatus
+			if p, err := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil); p <= 0 || err != nil {
+				return
+			}
+		}
+	}
+	for {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		reap(-pgid)
+		strays := processesWithEnv(home)
+		for _, pid := range strays {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			reap(pid)
+		}
+		if (!groupAlive(pgid) && len(strays) == 0) || time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

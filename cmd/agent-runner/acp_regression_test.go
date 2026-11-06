@@ -30,6 +30,7 @@ func TestACPQueuedPromptKeepsInputOpen(t *testing.T) {
 	secondQueued := make(chan struct{})
 	secondStarted := make(chan struct{})
 	inputDone := make(chan struct{})
+	thirdDelivered := make(chan struct{})
 	requests := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++ // forwardInput makes one request at a time
@@ -47,8 +48,11 @@ func TestACPQueuedPromptKeepsInputOpen(t *testing.T) {
 			}
 		case 3:
 			events = []model.Event{{ID: 2, Type: model.EventInput, Data: "third"}, {ID: 3, Type: model.EventRunClose}}
+			defer close(thirdDelivered)
 		default:
-			t.Errorf("unexpected input poll %d", requests)
+			// After the close the runner still listens for a cancel: a long poll that ends with the run.
+			<-r.Context().Done()
+			return
 		}
 		_ = json.NewEncoder(w).Encode(events)
 	}))
@@ -72,7 +76,7 @@ func TestACPQueuedPromptKeepsInputOpen(t *testing.T) {
 			chat.mu.Unlock()
 			close(secondStarted)
 			select {
-			case <-inputDone:
+			case <-thirdDelivered:
 			case <-ctx.Done():
 				return acp.PromptResponse{}, ctx.Err()
 			}
@@ -145,8 +149,9 @@ func TestACPOutputRegressionHelper(t *testing.T) {
 			os.Exit(3)
 		}
 		f := &oversizedDiffAgent{fakeAgent: &fakeAgent{log: log}}
-		f.conn = acp.NewAgentSideConnection(f, os.Stdout, os.Stdin)
-		<-f.conn.Done()
+		c := acp.NewAgentSideConnection(f, os.Stdout, os.Stdin)
+		f.connection.Store(c)
+		<-c.Done()
 		_ = log.Close()
 		os.Exit(0) // no Go test footer on the ACP transport
 	case "runner":
@@ -181,7 +186,7 @@ func (f *oversizedDiffAgent) Prompt(ctx context.Context, p acp.PromptRequest) (a
 		})),
 		acp.UpdateAgentMessageText("after-large-diff"),
 	} {
-		if err := f.conn.SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: update}); err != nil {
+		if err := f.conn().SessionUpdate(ctx, acp.SessionNotification{SessionId: p.SessionId, Update: update}); err != nil {
 			return acp.PromptResponse{}, err
 		}
 	}
