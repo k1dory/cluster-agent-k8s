@@ -2231,6 +2231,9 @@ func (p *Postgres) CreateKeyedRun(ctx context.Context, r *model.Run, e *model.Ev
 		if err := createRunIn(ctx, tx, r); err != nil {
 			return err
 		}
+		if keyedRunHook != nil {
+			keyedRunHook(ctx, tx)
+		}
 		// The event last: its id is drawn under the events lock (see AppendEvent), held from
 		// here to the commit.
 		if e.At.IsZero() {
@@ -2245,3 +2248,7 @@ func (p *Postgres) CreateKeyedRun(ctx context.Context, r *model.Run, e *model.Ev
 		return tx.SendBatch(ctx, b).Close()
 	})
 }
+
+// keyedRunHook, when set (tests), runs in CreateKeyedRun's transaction between the run's
+// insert and its event's.
+var keyedRunHook func(ctx context.Context, tx pgx.Tx)

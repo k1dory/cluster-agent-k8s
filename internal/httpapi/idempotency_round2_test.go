@@ -40,8 +40,10 @@ type idemFaultStore struct {
 	afterRun   hook          // runs after CreateRun and CreateKeyedRun
 	// failSandboxRead, when set to n, fails the n-th GetSandbox from then on (once).
 	failSandboxRead atomic.Int32
-	mu              sync.Mutex
-	putErrs         []error
+	// failLock, when set to n, fails the n-th WithTenantLock from then on (once).
+	failLock atomic.Int32
+	mu       sync.Mutex
+	putErrs  []error
 }
 
 func (s *idemFaultStore) PutIdempotent(ctx context.Context, rec *store.Idempotent) error {
@@ -73,7 +75,7 @@ func (s *idemFaultStore) WithTenantLock(ctx context.Context, tenant string, fn f
 	if hold != nil {
 		<-hold
 	}
-	if s.lockDown.Load() {
+	if s.lockDown.Load() || s.failLock.Add(-1) == 0 {
 		return errors.New("fixture: lock unavailable")
 	}
 	if err := s.Memory.WithTenantLock(ctx, tenant, fn); err != nil {
@@ -852,42 +854,58 @@ func round4UserTurns(t *testing.T, s *stack, sbID string) int {
 }
 
 // Finding 1: the attempt that queued a keyed run died before waking the sleeping sandbox, and
-// the takeover's look at the sandbox fails. The takeover answers as failed (not a stored 202
-// for a run nothing will wake), and the next retry wakes the sandbox. Both recovery paths:
-// POST /runs and POST /messages.
+// the takeover's recovery fails before the sandbox moves: its look at the sandbox, or (review
+// round 5 of #32, finding 1) the wake's own read of it or its tenant lock. The takeover
+// answers as failed (not a stored 202 for a run nothing will wake), and the next retry wakes
+// the sandbox. Both recovery paths: POST /runs and POST /messages.
 func TestRound4FailedWakeInspectionIsNotStoredAsSuccess(t *testing.T) {
 	for _, route := range []string{"runs", "messages"} {
-		t.Run(route, func(t *testing.T) {
-			s, fs, age := idemFaults(t)
-			sbID := round4Sleeping(t, s, fs)
-			url := s.platform.URL + "/v1/sandboxes/" + sbID + "/" + route
-			body := map[string]any{"task": "build"}
-			if route == "messages" {
-				body = map[string]any{"text": "build"}
-			}
-			raw, _ := json.Marshal(body)
-			key := "inspect-" + route
-			round4Die(t, fs, url, string(raw), key)
-			age()
-			// The first GetSandbox is the handler's access check; the second, the recovery's.
-			fs.failSandboxRead.Store(2)
-			resp, b := call(t, "POST", url, "t0k", body, map[string]string{"Idempotency-Key": key})
-			fs.failSandboxRead.Store(0)
-			if resp.StatusCode < 500 {
-				t.Fatalf("recovery that could not inspect the sandbox answered %d %s, want a failure to retry", resp.StatusCode, b)
-			}
-			resp, b = call(t, "POST", url, "t0k", body, map[string]string{"Idempotency-Key": key})
-			if resp.StatusCode != 202 || resp.Header.Get("Idempotency-Replayed") == "true" {
-				t.Fatalf("retry after the failed recovery: %d replayed=%s %s", resp.StatusCode, resp.Header.Get("Idempotency-Replayed"), b)
-			}
-			round2WaitFor(t, func() bool {
-				sb, _ := fs.Memory.GetSandbox(context.Background(), sbID)
-				return sb.Status == model.StatusWaking || sb.Status == model.StatusRunning
+		// The handler's access check is sandbox read 1, the recovery's look at it read 2, the
+		// wake's read 3. A message's delivery takes the sandbox's lock before the wake's.
+		wakeLock := int32(1)
+		if route == "messages" {
+			wakeLock = 2
+		}
+		for _, fault := range []struct {
+			name       string
+			read, lock int32
+		}{{"inspection", 2, 0}, {"wake-read", 3, 0}, {"wake-lock", 0, wakeLock}} {
+			t.Run(route+"/"+fault.name, func(t *testing.T) {
+				s, fs, age := idemFaults(t)
+				sbID := round4Sleeping(t, s, fs)
+				url := s.platform.URL + "/v1/sandboxes/" + sbID + "/" + route
+				body := map[string]any{"task": "build"}
+				if route == "messages" {
+					body = map[string]any{"text": "build"}
+				}
+				raw, _ := json.Marshal(body)
+				key := "inspect-" + route + "-" + fault.name
+				round4Die(t, fs, url, string(raw), key)
+				age()
+				fs.failSandboxRead.Store(fault.read)
+				fs.failLock.Store(fault.lock)
+				resp, b := call(t, "POST", url, "t0k", body, map[string]string{"Idempotency-Key": key})
+				fs.failSandboxRead.Store(0)
+				fs.failLock.Store(0)
+				if resp.StatusCode < 500 {
+					t.Fatalf("recovery that did not start the sandbox answered %d %s, want a failure to retry", resp.StatusCode, b)
+				}
+				if sb, _ := fs.Memory.GetSandbox(context.Background(), sbID); sb.Status != model.StatusSleeping {
+					t.Fatalf("the failed recovery moved the sandbox: %s", sb.Status)
+				}
+				resp, b = call(t, "POST", url, "t0k", body, map[string]string{"Idempotency-Key": key})
+				if resp.StatusCode != 202 || resp.Header.Get("Idempotency-Replayed") == "true" {
+					t.Fatalf("retry after the failed recovery: %d replayed=%s %s", resp.StatusCode, resp.Header.Get("Idempotency-Replayed"), b)
+				}
+				round2WaitFor(t, func() bool {
+					sb, _ := fs.Memory.GetSandbox(context.Background(), sbID)
+					return sb.Status == model.StatusWaking || sb.Status == model.StatusRunning
+				})
+				if runs, _ := fs.Memory.ListRuns(context.Background(), sbID); len(runs) != 1 {
+					t.Fatalf("%d runs for one key", len(runs))
+				}
 			})
-			if runs, _ := fs.Memory.ListRuns(context.Background(), sbID); len(runs) != 1 {
-				t.Fatalf("%d runs for one key", len(runs))
-			}
-		})
+		}
 	}
 }
 
@@ -966,4 +984,88 @@ func TestRound4KeyedRunKeepsItsUserTurnAfterACrash(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Review round 5 of #32, finding 2: the attempt that created a sandbox from an agent died
+// before its result was stored, the agent was deleted, and the takeover's recovery read
+// fails. The takeover answers as failed, not as "nothing created" (which would resolve the
+// deleted agent and answer 404); the next retry finds the sandbox.
+func TestRound5FailedRecoveryReadIsNotNothingCreated(t *testing.T) {
+	for _, fault := range []string{"sandbox-read", "keyed-result"} {
+		t.Run(fault, func(t *testing.T) {
+			s := catalogStack(t)
+			mem := s.orch.Store.(*store.Memory)
+			var offset atomic.Int64
+			mem.SetIdempotencyClock(func() time.Time { return time.Now().Add(time.Duration(offset.Load())) })
+			fs := &round5Store{idemFaultStore: idemFaultStore{Memory: mem}}
+			s.orch.Store = fs
+			api := s.platform.URL
+			if code, _ := putDoc(t, api, "alice-tok", "environments", "lean", `{"spec":{"image":"stable"}}`); code != 201 {
+				t.Fatalf("environment: %d", code)
+			}
+			if code, _ := putDoc(t, api, "alice-tok", "agents", "lean", `{"spec":{"policy":"backend-dev","environment":"lean"}}`); code != 201 {
+				t.Fatalf("agent: %d", code)
+			}
+			body := map[string]any{"name": "shop", "owner": "alice", "agent_ref": "lean"}
+			raw, _ := json.Marshal(body)
+			fs.afterWrite.set(func() { panic(http.ErrAbortHandler) })
+			req, _ := http.NewRequest("POST", api+"/v1/sandboxes", bytes.NewReader(append(raw, '\n')))
+			req.Header.Set("Authorization", "Bearer alice-tok")
+			req.Header.Set("Idempotency-Key", "deleted-agent-"+fault)
+			if resp, err := http.DefaultClient.Do(req); err == nil {
+				resp.Body.Close()
+			}
+			fs.afterWrite.set(nil)
+			if resp, b := call(t, "DELETE", api+"/v1/agents/lean", "alice-tok", nil, nil); resp.StatusCode >= 300 {
+				t.Fatalf("delete agent: %d %s", resp.StatusCode, b)
+			}
+			offset.Add(int64(store.IdempotencyStale + time.Minute))
+			if fault == "sandbox-read" {
+				fs.failSandboxRead.Store(1) // the create route reads no sandbox before its recovery
+			} else {
+				// The sandbox read must find nothing for KeyedResult to be asked: hide it once.
+				fs.hideSandbox.Store(true)
+				fs.resultDown.Store(true)
+			}
+			resp, b := call(t, "POST", api+"/v1/sandboxes", "alice-tok", body, map[string]string{"Idempotency-Key": "deleted-agent-" + fault})
+			fs.failSandboxRead.Store(0)
+			fs.hideSandbox.Store(false)
+			fs.resultDown.Store(false)
+			if resp.StatusCode < 500 {
+				t.Fatalf("recovery whose read failed answered %d %s, want a failure to retry", resp.StatusCode, b)
+			}
+			resp, b = call(t, "POST", api+"/v1/sandboxes", "alice-tok", body, map[string]string{"Idempotency-Key": "deleted-agent-" + fault})
+			var sb model.Sandbox
+			_ = json.Unmarshal(b, &sb)
+			if resp.StatusCode != 201 || sb.ID == "" {
+				t.Fatalf("retry after the failed recovery: %d %s", resp.StatusCode, b)
+			}
+			c, err := fs.CountSandboxes(context.Background(), "alice", "")
+			if err != nil || c.Total != 1 {
+				t.Fatalf("%+v sandboxes for one key (%v)", c, err)
+			}
+		})
+	}
+}
+
+// round5Store adds the faults of KeyedSandbox's second read: the sandbox reads as absent once
+// (hideSandbox), and KeyedResult fails (resultDown).
+type round5Store struct {
+	idemFaultStore
+	hideSandbox atomic.Bool
+	resultDown  atomic.Bool
+}
+
+func (s *round5Store) GetSandbox(ctx context.Context, id string) (*model.Sandbox, error) {
+	if s.hideSandbox.CompareAndSwap(true, false) {
+		return nil, store.ErrNotFound
+	}
+	return s.idemFaultStore.GetSandbox(ctx, id)
+}
+
+func (s *round5Store) KeyedResult(ctx context.Context, seed string) (string, string, error) {
+	if s.resultDown.Load() {
+		return "", "", errors.New("fixture: store unavailable")
+	}
+	return s.idemFaultStore.KeyedResult(ctx, seed)
 }

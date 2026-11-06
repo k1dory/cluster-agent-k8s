@@ -72,17 +72,35 @@ func keyedSeed(ctx context.Context) string {
 // WakeForKeyedRun wakes the sandbox of a run an earlier attempt of a keyed request queued, when
 // the run still waits and the sandbox sleeps: that attempt may have died between the insert and
 // its wake, and nothing else wakes a sandbox for queued work.
-// An error means the sandbox could not be inspected: the caller must answer as failed (not
-// store a success the wake may never follow).
+// An error means the sandbox could not be inspected or the wake did not get to start it: the
+// caller must answer as failed (not store a success the wake may never follow).
 func (o *Orchestrator) WakeForKeyedRun(ctx context.Context, run *model.Run) error {
 	waits, err := o.keyedRunWaits(ctx, run)
 	if err != nil {
 		return err
 	}
 	if waits {
-		o.wakeForRun(ctx, run.SandboxID, run.ID)
+		return o.keyedWake(ctx, run.SandboxID, run.ID)
 	}
 	return nil
+}
+
+// keyedWake is wakeForRun for a keyed request, whose success every retry replays and a replay
+// wakes nothing: a wake that failed before it moved the sandbox (its read, its tenant lock, an
+// ended context) is returned, so the request is answered as failed and its retry wakes again.
+// A wake whose outcome the sandbox shows is not an error here, as for wakeForRun: a runtime
+// failure is recorded on it (status error, the run starts on the next wake), a revoked slug
+// or a status that refuses a start (deleting, stopping) answers the same on every retry.
+func (o *Orchestrator) keyedWake(ctx context.Context, sandboxID, runID string) error {
+	_, err := o.Wake(ctx, sandboxID)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrRuntime) || errors.Is(err, ErrForbidden) || errors.Is(err, ErrConflict) {
+		o.Log.Warn("wake for run failed", "sandbox", sandboxID, "run", runID, "err", err)
+		return nil
+	}
+	return err
 }
 
 func (o *Orchestrator) keyedRunWaits(ctx context.Context, run *model.Run) (bool, error) {
@@ -203,34 +221,45 @@ func (o *Orchestrator) insertSandbox(ctx context.Context, sb *model.Sandbox) err
 // wakeKeyed wakes the sandbox for a run just queued. Under an Idempotency-Key the wake does
 // not end with the client: the request's success is stored for every retry to replay, and a
 // replay wakes nothing, so a wake cut short by a hang-up would leave the run waiting in a
-// sleeping sandbox.
-func (o *Orchestrator) wakeKeyed(ctx context.Context, sandboxID, runID string) {
-	if keyedSeed(ctx) != "" {
-		var cancel context.CancelFunc
-		ctx, cancel = detached(ctx)
-		defer cancel()
+// sleeping sandbox. For the same reason a keyed wake that did not get to start the sandbox
+// is returned (keyedWake); without a key it is logged, as wakeForRun does.
+func (o *Orchestrator) wakeKeyed(ctx context.Context, sandboxID, runID string) error {
+	if keyedSeed(ctx) == "" {
+		o.wakeForRun(ctx, sandboxID, runID)
+		return nil
 	}
-	o.wakeForRun(ctx, sandboxID, runID)
+	ctx, cancel := detached(ctx)
+	defer cancel()
+	return o.keyedWake(ctx, sandboxID, runID)
 }
 
 // KeyedSandbox is what an earlier attempt of the keyed create in ctx made: the sandbox, or
 // gone=true when it was created and has been deleted since (it is not created again).
-// found=false when no attempt created one.
-func (o *Orchestrator) KeyedSandbox(ctx context.Context) (sb *model.Sandbox, gone, found bool) {
+// found=false when no attempt created one. An error means that could not be established (a
+// read failed): the caller answers as failed, never as "nothing created", since a fresh
+// creation would then resolve inputs the existing sandbox no longer needs (and fail on a
+// definition deleted since) or race the one that exists.
+func (o *Orchestrator) KeyedSandbox(ctx context.Context) (sb *model.Sandbox, gone, found bool, err error) {
 	seed := keyedSeed(ctx)
 	if seed == "" {
-		return nil, false, false
+		return nil, false, false, nil
 	}
 	id := KeyedID(seed, "sb")
-	sb, err := o.Store.GetSandbox(ctx, id)
+	sb, err = o.Store.GetSandbox(ctx, id)
 	if err == nil {
-		return sb, false, true
+		return sb, false, true, nil
 	}
 	if !errors.Is(err, store.ErrNotFound) {
-		return nil, false, false
+		return nil, false, false, err
 	}
 	created, _, err := o.Store.KeyedResult(ctx, seed)
-	return nil, err == nil && created == id, err == nil && created == id
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, false, false, nil // no live reservation has the seed: nothing to find
+	}
+	if err != nil {
+		return nil, false, false, err
+	}
+	return nil, created == id, created == id, nil
 }
 
 // ResumeKeyedCreate finishes the provisioning of a sandbox an earlier attempt of the keyed

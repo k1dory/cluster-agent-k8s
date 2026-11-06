@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"agent-sandbox/internal/model"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // Round 2 of the review (wiki ревью-codex-agent-sandbox-main-2026-11-06): one body per
@@ -729,4 +731,55 @@ func TestRound2KeyedRunCarriesItsQueuedEvent(t *testing.T) {
 			t.Fatalf("run.queued events for one keyed run: %+v", evs)
 		}
 	})
+}
+
+// Review round 5 of #32, finding 3: on PostgreSQL the keyed run and its run.queued are one
+// transaction. The event write is held inside it: the run is not visible meanwhile, and when
+// the write is cut off (the context ends) neither row remains. Two writes committed one
+// after the other would show the run during the hold and leave it behind.
+func TestRound2PostgresKeyedRunIsOneTransaction(t *testing.T) {
+	p := reviewOpenPostgres(t, reviewPostgresURL(t, false))
+	bg := context.Background()
+	sb := round2Sandbox("sb_keyed_tx")
+	if err := p.CreateSandbox(bg, sb); err != nil {
+		t.Fatal(err)
+	}
+	entered := make(chan struct{})
+	keyedRunHook = func(ctx context.Context, _ pgx.Tx) {
+		close(entered)
+		<-ctx.Done()
+	}
+	t.Cleanup(func() { keyedRunHook = nil })
+	ctx, cancel := context.WithCancel(bg)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		r := &model.Run{ID: "run_keyed_tx", SandboxID: sb.ID, Tenant: sb.Tenant, Slug: sb.Slug, Task: "build",
+			Status: model.RunQueued, CreatedAt: time.Now().UTC().Truncate(time.Microsecond)}
+		done <- p.CreateKeyedRun(ctx, r, &model.Event{SandboxID: sb.ID, Tenant: sb.Tenant, Slug: sb.Slug, RunID: r.ID, Type: model.EventRunQueued})
+	}()
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatalf("CreateKeyedRun returned before its event write: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the event write was never reached")
+	}
+	if _, err := p.GetRun(bg, "run_keyed_tx"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the run is visible before its event is written: %v", err)
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Fatal("CreateKeyedRun succeeded on a context that ended before its event write")
+	}
+	if _, err := p.GetRun(bg, "run_keyed_tx"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the run remains without its event: %v", err)
+	}
+	evs, err := p.QueryEvents(bg, Filter{SandboxID: sb.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 0 {
+		t.Fatalf("events remain after the failed write: %+v", evs)
+	}
 }

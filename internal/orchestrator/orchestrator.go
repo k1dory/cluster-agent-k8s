@@ -981,7 +981,14 @@ func (o *Orchestrator) queueRun(ctx context.Context, sandboxID string, r *model.
 		return nil, err
 	}
 	if wake {
-		o.wakeKeyed(ctx, sandboxID, r.ID)
+		if err := o.wakeKeyed(ctx, sandboxID, r.ID); err != nil {
+			// Only the keyed request's own run fails it (its retry recovers the run and wakes);
+			// a run it queues on the way (a rollout's resume) keeps wakeForRun's handling.
+			if seed := keyedSeed(ctx); r.ID == KeyedID(seed, "run") {
+				return nil, err
+			}
+			o.Log.Warn("wake for run failed", "sandbox", sandboxID, "run", r.ID, "err", err)
+		}
 	}
 	return r, nil
 }

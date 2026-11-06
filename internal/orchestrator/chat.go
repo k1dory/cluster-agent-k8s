@@ -50,7 +50,9 @@ func (o *Orchestrator) Say(ctx context.Context, sandboxID, text string) (run *mo
 		return err
 	})
 	if err == nil && wake {
-		o.wakeKeyed(ctx, sandboxID, run.ID)
+		// Under a key, a wake that did not start the sandbox fails the request: the delivery is
+		// recorded, so the retry finds it and wakes again (keyedSaid) instead of saying it twice.
+		err = o.wakeKeyed(ctx, sandboxID, run.ID)
 	}
 	return run, how, err
 }

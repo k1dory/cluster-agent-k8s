@@ -1537,8 +1537,10 @@ func (p *Platform) keyedSandbox(w http.ResponseWriter, r *http.Request, failed b
 	}
 	ctx, cancel := recoveryContext(r)
 	defer cancel()
-	sb, gone, found := p.Orch.KeyedSandbox(ctx)
+	sb, gone, found, err := p.Orch.KeyedSandbox(ctx)
 	switch {
+	case err != nil:
+		writeOrchErr(w, err) // not stored: the release keeps the seed for the retry
 	case !found:
 		return false
 	case gone:
