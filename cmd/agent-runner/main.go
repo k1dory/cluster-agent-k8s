@@ -330,24 +330,269 @@ func (t *tailWriter) last() string {
 
 // withMCPConfig makes a harness command load $SANDBOX_MCP_CONFIG: a command that runs claude
 // (first word, after any VAR=value assignments) and does not mention --mcp-config or the
-// variable gets ` --mcp-config "$SANDBOX_MCP_CONFIG"` appended; anything else is returned as
-// is, the variable being in its environment.
+// variable gets ` --mcp-config "$SANDBOX_MCP_CONFIG"` added to that claude invocation; anything
+// else is returned as is, the variable being in its environment.
 func withMCPConfig(cmdline string) string {
-	if strings.Contains(cmdline, "--mcp-config") || strings.Contains(cmdline, "SANDBOX_MCP_CONFIG") {
+	cmd := parseHarnessCommand(cmdline)
+	if !cmd.runsClaude() || cmd.hasOption("--mcp-config") || strings.Contains(cmdline, "SANDBOX_MCP_CONFIG") {
 		return cmdline
 	}
-	program := ""
-	for _, w := range strings.Fields(cmdline) {
-		if strings.Contains(w, "=") && !strings.HasPrefix(w, "-") {
-			continue // VAR=value prefix
+	return cmd.withArgs(`--mcp-config "$SANDBOX_MCP_CONFIG"`)
+}
+
+// withInstructions gives the agent's instructions (SANDBOX_INSTRUCTIONS, from its definition) to
+// a harness command that runs claude: ` --append-system-prompt "$SANDBOX_INSTRUCTIONS"` is added
+// to that claude invocation unless the command already mentions the variable or sets a system
+// prompt of its own (an option, not a word that happens to contain "system-prompt"). Anything
+// else is returned as is, the variable being in its environment.
+func withInstructions(cmdline string) string {
+	cmd := parseHarnessCommand(cmdline)
+	if !cmd.runsClaude() || strings.Contains(cmdline, "SANDBOX_INSTRUCTIONS") ||
+		cmd.hasOption("--system-prompt", "--append-system-prompt", "--system-prompt-file", "--append-system-prompt-file") {
+		return cmdline
+	}
+	return cmd.withArgs(`--append-system-prompt "$SANDBOX_INSTRUCTIONS"`)
+}
+
+// runsClaude reports whether a harness command's program (its first word after any VAR=value
+// assignments) is claude.
+func runsClaude(cmdline string) bool { return parseHarnessCommand(cmdline).runsClaude() }
+
+// harnessCommand is the leading simple command of a harness command line, as the shell would
+// split it: words with their quotes kept and where each starts, and where the simple command
+// ends — at an unquoted newline, `;`, `&` or `|` (a redirection's `>&`, `<&`, `&>`, `>|` is
+// part of its word) or a `#` comment, outside any `$(…)` or backtick substitution (which may
+// hold separators and quotes of its own, and may itself sit inside double quotes) — so that an
+// argument can be added to the program's invocation rather than to whatever follows it (a
+// `&& echo done`, a trailing newline from a YAML block scalar) or to a command inside a
+// substitution. The words are not evaluated: "$VAR" stays "$VAR"; options and the program are
+// matched on their quote-stripped text, so `"--system-prompt"` is the option too. A standalone
+// `--` ends the options: generated ones go before it.
+type harnessCommand struct {
+	line   string
+	words  []string
+	starts []int // where each word starts in line
+	end    int   // index in line where the simple command ends (len(line) when it is all of it)
+}
+
+func parseHarnessCommand(line string) harnessCommand {
+	c := harnessCommand{line: line, end: len(line)}
+	start, inWord := 0, false
+	flush := func(i int) {
+		if inWord {
+			c.words = append(c.words, line[start:i])
+			c.starts = append(c.starts, start)
+			inWord = false
 		}
-		program = w
-		break
 	}
-	if filepath.Base(program) != "claude" {
-		return cmdline
+	for i := 0; i < len(line); {
+		ch := line[i]
+		switch {
+		case ch == '\'' || ch == '"' || ch == '`' || ch == '\\' || ch == '$' && i+1 < len(line) && line[i+1] == '(':
+			if !inWord {
+				start, inWord = i, true
+			}
+			i = skipQuoted(line, i)
+		case ch == '&' && (i+1 < len(line) && line[i+1] == '>' || inWord && (line[i-1] == '>' || line[i-1] == '<')),
+			ch == '|' && inWord && line[i-1] == '>':
+			i++ // a redirection operator's second character
+		case ch == '\n' || ch == ';' || ch == '&' || ch == '|' || (ch == '#' && !inWord):
+			flush(i)
+			c.end = i
+			return c
+		case ch == ' ' || ch == '\t':
+			flush(i)
+			i++
+		default:
+			if !inWord {
+				start, inWord = i, true
+			}
+			i++
+		}
 	}
-	return strings.TrimRight(cmdline, " \t") + ` --mcp-config "$SANDBOX_MCP_CONFIG"`
+	flush(len(line))
+	return c
+}
+
+// skipQuoted returns the index just past the quoted or substituted text that starts at i (a
+// single- or double-quoted string, a backslash escape, a backtick or $(…) substitution), with
+// the nesting the shell allows: a substitution inside double quotes, quotes inside a
+// substitution. An unterminated construct runs to the end of the line.
+func skipQuoted(line string, i int) int {
+	switch line[i] {
+	case '\\':
+		return min(i+2, len(line))
+	case '\'':
+		if j := strings.IndexByte(line[i+1:], '\''); j >= 0 {
+			return i + 1 + j + 1
+		}
+		return len(line)
+	case '`':
+		for j := i + 1; j < len(line); j++ {
+			switch line[j] {
+			case '\\':
+				j++
+			case '`':
+				return j + 1
+			}
+		}
+		return len(line)
+	case '"':
+		for j := i + 1; j < len(line); {
+			switch line[j] {
+			case '\\':
+				j += 2
+			case '"':
+				return j + 1
+			case '`':
+				j = skipQuoted(line, j)
+			case '$':
+				if j+1 < len(line) && line[j+1] == '(' {
+					j = skipQuoted(line, j)
+				} else {
+					j++
+				}
+			default:
+				j++
+			}
+		}
+		return len(line)
+	default: // $( … ), with plain parentheses nested inside: $( (a || b) | c )
+		depth := 0
+		for j := i + 2; j < len(line); {
+			switch line[j] {
+			case '(':
+				depth++
+				j++
+			case ')':
+				if depth == 0 {
+					return j + 1
+				}
+				depth--
+				j++
+			case '\'', '"', '`', '\\':
+				j = skipQuoted(line, j)
+			case '$':
+				if j+1 < len(line) && line[j+1] == '(' {
+					j = skipQuoted(line, j)
+				} else {
+					j++
+				}
+			default:
+				j++
+			}
+		}
+		return len(line)
+	}
+}
+
+// unquoted is a word's text without its shell quoting, statically: quotes dropped, backslash
+// escapes resolved, nothing expanded.
+func unquoted(w string) string {
+	var out strings.Builder
+	single, double := false, false
+	for i := 0; i < len(w); i++ {
+		ch := w[i]
+		switch {
+		case single:
+			if ch == '\'' {
+				single = false
+			} else {
+				out.WriteByte(ch)
+			}
+		case ch == '\\' && i+1 < len(w):
+			i++
+			out.WriteByte(w[i])
+		case ch == '\'' && !double:
+			single = true
+		case ch == '"':
+			double = !double
+		default:
+			out.WriteByte(ch)
+		}
+	}
+	return out.String()
+}
+
+// program is the first word that is not a VAR=value assignment, quotes stripped.
+func (c harnessCommand) program() string {
+	if i := c.programIndex(); i >= 0 {
+		return unquoted(c.words[i])
+	}
+	return ""
+}
+
+func (c harnessCommand) programIndex() int {
+	for i, w := range c.words {
+		if !isAssignment(w) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (c harnessCommand) runsClaude() bool { return filepath.Base(c.program()) == "claude" }
+
+// optionsEnd is the index of the word that ends the program's options — a standalone `--` —
+// or len(words) when there is none.
+func (c harnessCommand) optionsEnd() int {
+	for i := c.programIndex() + 1; i < len(c.words); i++ {
+		if unquoted(c.words[i]) == "--" { // "--" and '--' are the terminator too: the shell strips the quotes
+			return i
+		}
+	}
+	return len(c.words)
+}
+
+// hasOption reports whether one of the options is given to the program, as `--opt` or
+// `--opt=value`, quoted or not, before any `--`; an option's value, or a word that merely
+// contains the name, does not count.
+func (c harnessCommand) hasOption(names ...string) bool {
+	p := c.programIndex()
+	if p < 0 {
+		return false
+	}
+	for _, raw := range c.words[p+1 : c.optionsEnd()] {
+		w := unquoted(raw)
+		for _, n := range names {
+			if w == n || strings.HasPrefix(w, n+"=") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// withArgs adds args to the program's invocation: before a standalone `--` if there is one,
+// else before whatever follows the simple command, keeping that (a `&& …`, a comment, a
+// trailing newline) where it was.
+func (c harnessCommand) withArgs(args string) string {
+	if dd := c.optionsEnd(); dd < len(c.words) {
+		at := c.starts[dd]
+		return strings.TrimRight(c.line[:at], " \t") + " " + args + " " + c.line[at:]
+	}
+	head := strings.TrimRight(c.line[:c.end], " \t")
+	// The blanks that stood between the last word and what follows stay where they were; blanks
+	// that trailed the whole line go.
+	tail := c.line[len(head):]
+	if strings.TrimSpace(tail) == "" && !strings.Contains(tail, "\n") {
+		tail = ""
+	}
+	return head + " " + args + tail
+}
+
+// isAssignment: a leading NAME=value word of a simple command (the value may be quoted).
+func isAssignment(w string) bool {
+	eq := strings.IndexByte(w, '=')
+	if eq <= 0 {
+		return false
+	}
+	for i, r := range w[:eq] {
+		if !(r == '_' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || i > 0 && r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // writeMCPConfig renders SANDBOX_MCP_SERVERS ([{name, url}]) as a Claude Code MCP
@@ -508,6 +753,11 @@ func execute(ctx context.Context, c *client, run *model.Run) int {
 	}
 	if mcpConfig != "" {
 		cmdline = withMCPConfig(cmdline)
+	}
+	// The agent definition's instructions are what makes a task like "triage the new incidents"
+	// mean something: without them the harness sees the task text alone.
+	if os.Getenv("SANDBOX_INSTRUCTIONS") != "" {
+		cmdline = withInstructions(cmdline)
 	}
 	fmt.Printf("agent-runner: run %s: %q\n", run.ID, truncate(run.Task, 80))
 	runCtx, cancel := context.WithCancel(w.ctx) // a cancel the watch sees stops the harness too

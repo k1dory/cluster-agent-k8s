@@ -258,6 +258,12 @@ An ACP agent (`harness.input: acp`, e.g. `command: claude-agent-acp` or `codex-a
 same servers in its `session/new` instead of a configuration file, and the definition's
 instructions ahead of its first prompt; see docs/chat-and-files.md, "ACP harnesses".
 
+A text-mode claude harness (`harness.input: text` or `stream-json`, a custom `claude -p ...`
+command) gets the definition's `instructions` from the pod's `SANDBOX_INSTRUCTIONS`: the runner
+appends `--append-system-prompt "$SANDBOX_INSTRUCTIONS"` to the run and resume commands, so the
+agent reads them before the task. A custom command that names the variable, or sets a system
+prompt of its own, is left alone; a harness that is not claude reads the variable itself.
+
 ## What stays with the operator
 
 - The policy repository: the slugs and the network rules reviewed as code, their `tenants:`
