@@ -72,7 +72,6 @@ func (o *OAuth) lock(tenant, name string) func() {
 // refuses a name the other holds) with the providers sandboxd may use (MergeOAuthProviders).
 // owner names this replica in the row leases.
 func NewOAuth(svc *Service, st store.OAuthCredentials, providers map[string]OAuthProvider, owner string) *OAuth {
-	svc.signIns = st
 	return &OAuth{Service: svc, Store: st, Providers: providers, Owner: owner}
 }
 
@@ -172,15 +171,11 @@ func (o *OAuth) Start(ctx context.Context, tenant, name, provider, by string) (*
 	exp := d.ExpiresAt
 	c := &model.OAuthCredential{Tenant: tenant, Name: name, Provider: provider, Status: model.OAuthPending,
 		VerificationURL: d.VerificationURL, UserCode: d.UserCode, LoginExpiresAt: &exp, NextAt: now.Add(d.Interval), CreatedBy: by}
-	var created bool
-	err = o.namespace(ctx, tenant, func(ctx context.Context) error {
-		if err := o.plainTaken(ctx, tenant, name); err != nil {
-			return err
-		}
-		var err error
-		created, err = o.Store.PutOAuthCredential(ctx, c, o.seal(c, &oauthSecret{DeviceCode: d.Code, Interval: int64(d.Interval / time.Second)}))
-		return err
-	})
+	created, err := o.Service.names.PutOAuthCredentialIfFree(ctx, c, o.seal(c, &oauthSecret{DeviceCode: d.Code, Interval: int64(d.Interval / time.Second)}),
+		[]string{name, name + AccountSuffix})
+	if taken := (*store.NameTakenError)(nil); errors.As(err, &taken) {
+		return nil, false, fmt.Errorf("%w: %q is a plain credential in this scope; remove it first", ErrInvalid, taken.Name)
+	}
 	if err != nil {
 		return nil, false, err
 	}

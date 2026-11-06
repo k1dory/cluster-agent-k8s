@@ -530,3 +530,27 @@ var (
 	_ EventHead = (*Memory)(nil)
 	_ EventHead = (*Postgres)(nil)
 )
+
+// CredentialNames keeps plain credentials and OAuth sign-ins in one namespace per scope: each
+// writes only while no credential of the other kind holds one of the names given, checked and
+// written atomically (one transaction holding the scope's lock on Postgres, the store's mutex
+// in memory). A check on one connection and a write on another could both pass for the two
+// kinds at once. The names are the caller's (a sign-in NAME also owns NAME.account_id).
+type CredentialNames interface {
+	// PutCredentialIfFree is PutCredential unless a sign-in holds one of signIns.
+	PutCredentialIfFree(ctx context.Context, c *model.Credential, ciphertext []byte, signIns []string) (created bool, err error)
+	// PutOAuthCredentialIfFree is PutOAuthCredential unless a plain credential holds one of plains.
+	PutOAuthCredentialIfFree(ctx context.Context, c *model.OAuthCredential, ciphertext []byte, plains []string) (created bool, err error)
+}
+
+// NameTakenError: a credential of the other kind holds Name in the scope.
+type NameTakenError struct{ Name string }
+
+func (e *NameTakenError) Error() string {
+	return fmt.Sprintf("%q is held by a credential of the other kind", e.Name)
+}
+
+var (
+	_ CredentialNames = (*Memory)(nil)
+	_ CredentialNames = (*Postgres)(nil)
+)
