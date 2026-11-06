@@ -7,14 +7,14 @@ import (
 	"time"
 )
 
-// removeHomeFirst removes a test's home before t.TempDir does, trying more than once. The agent
-// images' check runs on a container filesystem (overlayfs) where os.RemoveAll of a directory
-// the agent filled with many entries can end in "directory not empty" with nothing left
-// alive to write there (PR #33's survivor dump showed only zombies): the directory listing
-// read while entries are being unlinked misses some, RemoveAll stops early and the final rmdir
-// fails. A second pass sees what the first missed. Registered right after t.TempDir, so it
-// runs before TempDir's own removal (cleanups run last-in first-out); what it logs on a slow
-// pass is the evidence for the next investigation.
+// removeHomeFirst removes a test's home before t.TempDir does, trying more than once. In the
+// agent images' check, os.RemoveAll of the home an agent filled has ended in ENOTEMPTY
+// ("directory not empty") on .hermes with nothing left alive to write there (PR #33's
+// survivor dump showed only zombies), and a static tree of the same shape removes fine on the
+// same overlayfs. Why entries are still there when the final rmdir runs is not known; the
+// retries are a mitigation, not a diagnosis. Registered right after t.TempDir, so it runs before
+// TempDir's own removal (cleanups run last-in first-out); what a failed pass logs — the error
+// and the entries still present — is the evidence for the next investigation.
 func removeHomeFirst(t *testing.T, home string) {
 	t.Helper()
 	const tries = 5
