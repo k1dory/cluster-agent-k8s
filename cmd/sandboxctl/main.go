@@ -1899,6 +1899,7 @@ func (c *cli) chat(id string, raw bool) error {
 
 // followMessages prints the conversation as it grows (SSE, reconnecting with Last-Event-ID).
 func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bool, state *chatState) {
+	var retry backoff
 	for ctx.Err() == nil {
 		req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/sandboxes/%s/messages/stream?raw=%v", c.base, id, raw), nil)
 		req.Header.Set("Authorization", "Bearer "+c.token)
@@ -1919,24 +1920,29 @@ func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bo
 			fmt.Fprintln(os.Stderr, "chat: stream:", resp.Status)
 			return
 		}
-		sc := bufio.NewScanner(resp.Body)
-		sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
-		for sc.Scan() {
-			line := sc.Text()
-			if !strings.HasPrefix(line, "data: ") {
-				continue
+		failed := false
+		_ = readSSE(resp.Body, func(f sseFrame) bool {
+			if msg, ok := streamError(f); ok {
+				fmt.Fprintln(os.Stderr, "chat: stream:", msg, "(reconnecting)")
+				failed = true
+				return false
 			}
 			var m model.Message
-			if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) != nil {
-				continue
+			if json.Unmarshal([]byte(f.Data), &m) != nil {
+				return true
 			}
+			retry.reset()
 			after = m.ID
 			state.observe(m)
 			if m.Role != model.RoleUser { // what you typed is already on your screen
 				printMessage(m)
 			}
-		}
+			return true
+		})
 		resp.Body.Close()
+		if failed && !retry.wait(ctx) {
+			return
+		}
 	}
 }
 
@@ -1946,6 +1952,7 @@ func (c *cli) follow(path string, raw bool, print func(model.Event) bool) error 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	var after int64
+	var retry backoff
 	for ctx.Err() == nil {
 		req, _ := http.NewRequestWithContext(ctx, "GET", c.base+path, nil)
 		if after > 0 {
@@ -1967,33 +1974,39 @@ func (c *cli) follow(path string, raw bool, print func(model.Event) bool) error 
 			resp.Body.Close()
 			return fmt.Errorf("events: %s: %s", resp.Status, strings.TrimSpace(string(b)))
 		}
-		sc := bufio.NewScanner(resp.Body)
-		sc.Buffer(make([]byte, 0, 64<<10), 4<<20)
-		for sc.Scan() {
-			line := sc.Text()
-			if !strings.HasPrefix(line, "data: ") {
-				continue
+		failed, done := false, false
+		_ = readSSE(resp.Body, func(f sseFrame) bool {
+			// The error frame is not an event: taken for one, its id 0 became the cursor and
+			// the reconnect replayed everything already shown.
+			if msg, ok := streamError(f); ok {
+				fmt.Fprintln(os.Stderr, "watch:", msg, "(reconnecting)")
+				failed = true
+				return false
 			}
 			var e model.Event
-			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &e); err != nil {
-				continue
+			if err := json.Unmarshal([]byte(f.Data), &e); err != nil {
+				return true
 			}
+			retry.reset()
 			after = e.ID
-			if raw {
-				fmt.Println(strings.TrimPrefix(line, "data: "))
-				continue
-			}
-			if print == nil {
+			switch {
+			case raw:
+				fmt.Println(f.Data)
+			case print == nil:
 				printTrace(e)
-				continue
+			case print(e):
+				done = true
+				return false
 			}
-			if print(e) {
-				resp.Body.Close()
-				return nil
-			}
-		}
+			return true
+		})
 		resp.Body.Close()
-		if ctx.Err() == nil {
+		if done {
+			return nil
+		}
+		if failed {
+			retry.wait(ctx)
+		} else if ctx.Err() == nil {
 			time.Sleep(time.Second)
 		}
 	}
