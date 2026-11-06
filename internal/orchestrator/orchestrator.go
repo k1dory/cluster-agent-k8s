@@ -350,11 +350,8 @@ func (o *Orchestrator) Create(ctx context.Context, req CreateRequest) (*model.Sa
 		return nil, err
 	}
 	o.remember(sb)
-	if err := o.Runtime.EnsureVolume(ctx, sb); err != nil {
-		o.fail(ctx, sb.ID, model.StatusCreating, "volume: "+err.Error())
-		sb, _ = o.Store.GetSandbox(ctx, sb.ID)
-		return sb, fmt.Errorf("%w: volume: %v", ErrRuntime, err)
-	}
+	// The volume is provisioned by startPod, as on every start: a creation whose volume failed is
+	// recovered by a wake.
 	id := sb.ID
 	if sb, err = o.startPod(ctx, id); err != nil {
 		cur, _ := o.Store.GetSandbox(ctx, id)
@@ -430,6 +427,12 @@ func (o *Orchestrator) startPod(ctx context.Context, id string) (*model.Sandbox,
 	// because the client went away, or the record stays waking with nothing behind it.
 	ctx, cancel := o.detached(ctx)
 	defer cancel()
+	// Every pod start ensures the volume first (idempotent): a sandbox whose first provisioning
+	// failed would otherwise get a pod bound to a claim that does not exist, on every wake.
+	if err := o.Runtime.EnsureVolume(ctx, sb); err != nil {
+		o.fail(ctx, id, model.StatusWaking, "volume: "+err.Error())
+		return nil, fmt.Errorf("%w: volume: %v", ErrRuntime, err)
+	}
 	pod, err := o.Runtime.CreatePod(ctx, sb)
 	if err != nil {
 		o.fail(ctx, id, model.StatusWaking, "pod: "+err.Error())
