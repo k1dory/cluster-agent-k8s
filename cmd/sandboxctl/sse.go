@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -96,4 +97,14 @@ func (b *backoff) wait(ctx context.Context) bool {
 	case <-t.C:
 		return true
 	}
+}
+
+// frameCursor is what a reconnect hands back as Last-Event-ID: the frame's own id as the
+// server wrote it (a bounded trace adds its replay boundary to the event id), else the id of
+// the event or message in it.
+func frameCursor(f sseFrame, id int64) string {
+	if f.ID != "" {
+		return f.ID
+	}
+	return strconv.FormatInt(id, 10)
 }

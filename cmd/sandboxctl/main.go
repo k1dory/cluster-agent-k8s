@@ -1900,12 +1900,16 @@ func (c *cli) chat(id string, raw bool) error {
 // followMessages prints the conversation as it grows (SSE, reconnecting with Last-Event-ID).
 func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bool, state *chatState) {
 	var retry backoff
+	var cursor string
+	if after > 0 {
+		cursor = strconv.FormatInt(after, 10)
+	}
 	for ctx.Err() == nil {
 		req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/v1/sandboxes/%s/messages/stream?raw=%v", c.base, id, raw), nil)
 		req.Header.Set("Authorization", "Bearer "+c.token)
 		req.Header.Set("Accept", "text/event-stream")
-		if after > 0 {
-			req.Header.Set("Last-Event-ID", fmt.Sprint(after))
+		if cursor != "" {
+			req.Header.Set("Last-Event-ID", cursor)
 		}
 		resp, err := (&http.Client{}).Do(req)
 		if err != nil {
@@ -1926,11 +1930,9 @@ func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bo
 			fmt.Fprintln(os.Stderr, "chat: stream:", resp.Status)
 			return
 		}
-		failed := false
-		_ = readSSE(resp.Body, func(f sseFrame) bool {
+		rerr := readSSE(resp.Body, func(f sseFrame) bool {
 			if msg, ok := streamError(f); ok {
 				fmt.Fprintln(os.Stderr, "chat: stream:", msg, "(reconnecting)")
-				failed = true
 				return false
 			}
 			var m model.Message
@@ -1938,7 +1940,7 @@ func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bo
 				return true
 			}
 			retry.reset()
-			after = m.ID
+			cursor = frameCursor(f, m.ID)
 			state.observe(m)
 			if m.Role != model.RoleUser { // what you typed is already on your screen
 				printMessage(m)
@@ -1946,7 +1948,12 @@ func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bo
 			return true
 		})
 		resp.Body.Close()
-		if failed && !retry.wait(ctx) {
+		// The server never ends a stream on its own: an error frame, a reset or a truncated
+		// body alike are a reconnect from the cursor after the backoff, never at once.
+		if rerr != nil && ctx.Err() == nil {
+			fmt.Fprintln(os.Stderr, "chat: stream:", rerr, "(reconnecting)")
+		}
+		if !retry.wait(ctx) {
 			return
 		}
 	}
@@ -1957,12 +1964,12 @@ func (c *cli) followMessages(ctx context.Context, id string, after int64, raw bo
 func (c *cli) follow(path string, raw bool, print func(model.Event) bool) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	var after int64
+	var cursor string
 	var retry backoff
 	for ctx.Err() == nil {
 		req, _ := http.NewRequestWithContext(ctx, "GET", c.base+path, nil)
-		if after > 0 {
-			req.Header.Set("Last-Event-ID", fmt.Sprint(after))
+		if cursor != "" {
+			req.Header.Set("Last-Event-ID", cursor)
 		}
 		req.Header.Set("Authorization", "Bearer "+c.token)
 		req.Header.Set("Accept", "text/event-stream")
@@ -1987,13 +1994,12 @@ func (c *cli) follow(path string, raw bool, print func(model.Event) bool) error 
 			}
 			return fmt.Errorf("events: %s: %s", resp.Status, strings.TrimSpace(string(b)))
 		}
-		failed, done := false, false
-		_ = readSSE(resp.Body, func(f sseFrame) bool {
+		done := false
+		rerr := readSSE(resp.Body, func(f sseFrame) bool {
 			// The error frame is not an event: taken for one, its id 0 became the cursor and
 			// the reconnect replayed everything already shown.
 			if msg, ok := streamError(f); ok {
 				fmt.Fprintln(os.Stderr, "watch:", msg, "(reconnecting)")
-				failed = true
 				return false
 			}
 			var e model.Event
@@ -2001,7 +2007,7 @@ func (c *cli) follow(path string, raw bool, print func(model.Event) bool) error 
 				return true
 			}
 			retry.reset()
-			after = e.ID
+			cursor = frameCursor(f, e.ID)
 			switch {
 			case raw:
 				fmt.Println(f.Data)
@@ -2017,11 +2023,11 @@ func (c *cli) follow(path string, raw bool, print func(model.Event) bool) error 
 		if done {
 			return nil
 		}
-		if failed {
-			retry.wait(ctx)
-		} else if ctx.Err() == nil {
-			time.Sleep(time.Second)
+		// An error frame, a reset or a truncated body: the same cursor after the backoff.
+		if rerr != nil && ctx.Err() == nil {
+			fmt.Fprintln(os.Stderr, "watch:", rerr, "(reconnecting)")
 		}
+		retry.wait(ctx)
 	}
 	return nil
 }
