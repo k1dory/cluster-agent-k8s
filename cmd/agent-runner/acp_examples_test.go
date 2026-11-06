@@ -71,6 +71,7 @@ func exampleSmoke(t *testing.T, file, binEnv, program string, extraEnv func(home
 		t.Fatalf("the example's command is %q; this test runs %s acp", profile.Harness.Command, program)
 	}
 	home := t.TempDir()
+	t.Cleanup(func() { logSurvivors(t, home) })
 	files, _ := json.Marshal(profile.Harness.Files)
 	if n, err := writeHarnessFiles(string(files), home); err != nil || n != len(profile.Harness.Files) {
 		t.Fatalf("the profile's harness files: %d written, %v", n, err)
@@ -192,6 +193,7 @@ func TestACPClaudeExampleTakesTheSystemPromptAndMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	home := t.TempDir()
+	t.Cleanup(func() { logSurvivors(t, home) })
 	files, _ := json.Marshal(profile.Harness.Files)
 	if _, err := writeHarnessFiles(string(files), home); err != nil {
 		t.Fatal(err)
