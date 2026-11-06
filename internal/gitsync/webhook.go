@@ -34,6 +34,9 @@ import (
 const (
 	ProviderGitHub = "github"
 	ProviderGitLab = "gitlab"
+	// ProviderForgejo is Forgejo and Gitea alike: Forgejo is a fork of Gitea and both send the
+	// same webhook (headers, signature, payloads) and serve the same REST API under /api/v1.
+	ProviderForgejo = "forgejo"
 )
 
 // Hook events as the platform names them.
@@ -56,14 +59,18 @@ type Delivery struct {
 
 // PullRequest is a pull or merge request as a delivery describes it.
 type PullRequest struct {
-	Number  int
-	Action  string // the provider's action
-	HeadSHA string
-	HeadRef string // the ref the platform fetches the head from (refs/pull/N/head, refs/merge-requests/N/head)
+	// Provider is the provider that sent the delivery. It decides which API the plan is posted
+	// to; a job persisted before the field existed has it empty, and its head ref decides then
+	// (GitHub and Forgejo share refs/pull/N/head, so the ref alone cannot tell them apart).
+	Provider string
+	Number   int
+	Action   string // the provider's action
+	HeadSHA  string
+	HeadRef  string // the ref the platform fetches the head from (refs/pull/N/head, refs/merge-requests/N/head)
 }
 
 var (
-	// ErrUnknownProvider: the headers name neither GitHub nor GitLab.
+	// ErrUnknownProvider: the headers name neither GitHub, GitLab nor Forgejo (Gitea).
 	ErrUnknownProvider = errors.New("unknown webhook provider")
 	// ErrBadSignature: the delivery is not signed with the repository's webhook secret.
 	ErrBadSignature = errors.New("the webhook signature does not match")
@@ -71,11 +78,21 @@ var (
 	ErrNoWebhook = errors.New("the repository accepts no webhooks (no webhook_secret in its spec)")
 )
 
-// ParseDelivery reduces a GitHub or GitLab payload to a Delivery. The provider comes from the
-// headers; an event the platform does not act on is returned with the provider's name and no
-// error, so the caller can record it as ignored.
+// ParseDelivery reduces a GitHub, GitLab or Forgejo (Gitea) payload to a Delivery. The provider
+// comes from the headers; an event the platform does not act on is returned with the provider's
+// name and no error, so the caller can record it as ignored.
+//
+// Forgejo and Gitea are recognised first: besides their own X-Forgejo-* / X-Gitea-* headers
+// they send GitHub's (X-GitHub-Event, X-GitHub-Delivery, X-Hub-Signature-256) for tools that
+// only know GitHub, and taken for GitHub such a delivery would have its plan posted to the
+// GitHub Enterprise API path (/api/v3) the server does not have, and its updated pull requests
+// ("synchronized", not GitHub's "synchronize") ignored.
 func ParseDelivery(hdr http.Header, body []byte) (Delivery, error) {
 	switch {
+	case hdr.Get("X-Forgejo-Event") != "":
+		return parseForgejo(hdr.Get("X-Forgejo-Event"), firstHeader(hdr, "X-Forgejo-Delivery", "X-Gitea-Delivery"), body)
+	case hdr.Get("X-Gitea-Event") != "":
+		return parseForgejo(hdr.Get("X-Gitea-Event"), hdr.Get("X-Gitea-Delivery"), body)
 	case hdr.Get("X-GitHub-Event") != "":
 		return parseGitHub(hdr.Get("X-GitHub-Event"), hdr.Get("X-GitHub-Delivery"), body)
 	case hdr.Get("X-Gitlab-Event") != "":
@@ -84,8 +101,33 @@ func ParseDelivery(hdr http.Header, body []byte) (Delivery, error) {
 	return Delivery{}, ErrUnknownProvider
 }
 
+// firstHeader is the first of the headers that is set.
+func firstHeader(hdr http.Header, names ...string) string {
+	for _, n := range names {
+		if v := hdr.Get(n); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
 func parseGitHub(event, id string, body []byte) (Delivery, error) {
-	d := Delivery{Provider: ProviderGitHub, Event: event, ID: id}
+	return parseGitHubShaped(ProviderGitHub, event, id, body)
+}
+
+// parseForgejo reads a Forgejo (Gitea) delivery. Its payloads have GitHub's shape where the
+// platform reads them (modules/structs/hook.go in Forgejo: PushPayload's ref, after and
+// repository.clone_url/html_url; PullRequestPayload's action, number and pull_request.head.sha),
+// and the event header names the same events (push, pull_request; a push of new commits to a
+// pull request is the event pull_request with the action "synchronized"). What differs is the
+// action names (planActions), the signature (Verify) and the API (TargetOf, RESTReporter).
+func parseForgejo(event, id string, body []byte) (Delivery, error) {
+	return parseGitHubShaped(ProviderForgejo, event, id, body)
+}
+
+// parseGitHubShaped reads a payload of GitHub's shape on behalf of the provider that sent it.
+func parseGitHubShaped(provider, event, id string, body []byte) (Delivery, error) {
+	d := Delivery{Provider: provider, Event: event, ID: id}
 	var p struct {
 		Ref        string `json:"ref"`
 		After      string `json:"after"`
@@ -123,7 +165,7 @@ func parseGitHub(event, id string, body []byte) (Delivery, error) {
 			n = p.Number
 		}
 		d.Event = EventPullRequest
-		d.PR = &PullRequest{Number: n, Action: p.Action, HeadSHA: p.PullRequest.Head.SHA, HeadRef: fmt.Sprintf("refs/pull/%d/head", n)}
+		d.PR = &PullRequest{Provider: provider, Number: n, Action: p.Action, HeadSHA: p.PullRequest.Head.SHA, HeadRef: fmt.Sprintf("refs/pull/%d/head", n)}
 	}
 	return d, nil
 }
@@ -162,13 +204,16 @@ func parseGitLab(event, id string, body []byte) (Delivery, error) {
 			return d, errors.New("payload: object_attributes missing")
 		}
 		d.Event = EventMergeRequest
-		d.PR = &PullRequest{Number: p.Attributes.IID, Action: p.Attributes.Action, HeadSHA: p.Attributes.LastCommit.ID, HeadRef: fmt.Sprintf("refs/merge-requests/%d/head", p.Attributes.IID)}
+		d.PR = &PullRequest{Provider: ProviderGitLab, Number: p.Attributes.IID, Action: p.Attributes.Action, HeadSHA: p.Attributes.LastCommit.ID, HeadRef: fmt.Sprintf("refs/merge-requests/%d/head", p.Attributes.IID)}
 	}
 	return d, nil
 }
 
 // Verify checks the delivery against the repository's webhook secret: GitHub signs the body
-// (X-Hub-Signature-256, HMAC-SHA256), GitLab sends the secret itself (X-Gitlab-Token).
+// (X-Hub-Signature-256, "sha256=" and the hex HMAC-SHA256), GitLab sends the secret itself
+// (X-Gitlab-Token), Forgejo and Gitea sign the body too, the bare hex HMAC-SHA256 in
+// X-Forgejo-Signature (Forgejo) and X-Gitea-Signature (both). Forgejo's copy of GitHub's header
+// carries the same digest, but the provider's own header is the one checked.
 func Verify(provider string, hdr http.Header, body []byte, secret string) error {
 	if secret == "" {
 		return ErrNoWebhook
@@ -176,20 +221,29 @@ func Verify(provider string, hdr http.Header, body []byte, secret string) error 
 	switch provider {
 	case ProviderGitHub:
 		sig := strings.TrimPrefix(hdr.Get("X-Hub-Signature-256"), "sha256=")
-		mac := hmac.New(sha256.New, []byte(secret))
-		mac.Write(body)
-		want := hex.EncodeToString(mac.Sum(nil))
-		if sig == "" || subtle.ConstantTimeCompare([]byte(strings.ToLower(sig)), []byte(want)) != 1 {
+		if sig == "" || subtle.ConstantTimeCompare([]byte(strings.ToLower(sig)), []byte(hmacHex(secret, body))) != 1 {
 			return ErrBadSignature
 		}
 	case ProviderGitLab:
 		if got := hdr.Get("X-Gitlab-Token"); got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(secret)) != 1 {
 			return ErrBadSignature
 		}
+	case ProviderForgejo:
+		sig := firstHeader(hdr, "X-Forgejo-Signature", "X-Gitea-Signature")
+		if sig == "" || subtle.ConstantTimeCompare([]byte(strings.ToLower(sig)), []byte(hmacHex(secret, body))) != 1 {
+			return ErrBadSignature
+		}
 	default:
 		return ErrUnknownProvider
 	}
 	return nil
+}
+
+// hmacHex is the hex HMAC-SHA256 of the body under the secret.
+func hmacHex(secret string, body []byte) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // SameRepository reports whether one of the URLs a delivery names is the registered one:
@@ -632,10 +686,15 @@ func newJobID() string {
 	return "gitjob_" + hex.EncodeToString(b[:])
 }
 
-// planActions are the pull request actions that get a plan: a new or updated head.
+// planActions are the pull request actions that get a plan: a new or updated head. Forgejo
+// (Gitea) names them in modules/structs/hook.go (HookIssueAction): "opened", "reopened", and
+// "synchronized" for new commits on the head (the event pull_request_sync, sent as
+// pull_request); its other actions on the event (edited, label_updated, assigned, closed...)
+// leave the head as it was.
 var planActions = map[string]map[string]bool{
-	ProviderGitHub: {"opened": true, "synchronize": true, "reopened": true, "ready_for_review": true},
-	ProviderGitLab: {"open": true, "update": true, "reopen": true},
+	ProviderGitHub:  {"opened": true, "synchronize": true, "reopened": true, "ready_for_review": true},
+	ProviderGitLab:  {"open": true, "update": true, "reopen": true},
+	ProviderForgejo: {"opened": true, "synchronized": true, "reopened": true},
 }
 
 // emit publishes an event about the repository when an emitter is wired: git.hook with the
