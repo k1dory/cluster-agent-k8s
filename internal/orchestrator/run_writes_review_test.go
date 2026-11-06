@@ -65,6 +65,11 @@ func TestReviewCancelDuringOutputStaysCancelled(t *testing.T) {
 	if err := o.Output(ctx, sb.ID, run.ID, `{"type":"usage","output_tokens":7}`); err != nil {
 		t.Fatal(err)
 	}
+	// Output no longer reads the run before writing (the line and its usage are one store
+	// write), so the window is gone: the cancel lands right after it instead, if it has not.
+	if h := st.hook.Swap(nil); h != nil {
+		(*h)()
+	}
 	got, err := o.Store.GetRun(ctx, run.ID)
 	if err != nil || got.Status != model.RunCancelled || got.FinishedAt == nil {
 		t.Fatalf("run after cancel during output: %v %+v", err, got)
@@ -149,6 +154,16 @@ func (s *claimHookStore) ClaimRun(ctx context.Context, runID string, startedAt t
 		h(r)
 	}
 	return r, err
+}
+
+// ClaimRunFor is the claim NextRun makes (with the reclaim check): the same hook.
+func (s *claimHookStore) ClaimRunFor(ctx context.Context, sandboxID, runID string, startedAt time.Time, session string, stamp store.RunStamp) (*model.Run, *model.Event, error) {
+	r, start, err := s.Store.ClaimRunFor(ctx, sandboxID, runID, startedAt, session, stamp)
+	if h := s.hook; h != nil && err == nil {
+		s.hook = nil
+		h(r)
+	}
+	return r, start, err
 }
 
 // The claim stamps what executes the run in the same write. NextRun used to stamp it with a

@@ -552,17 +552,27 @@ func TestConcurrency(t *testing.T) {
 	blk, _ := pem.Decode([]byte(boot.Cert))
 	certHdr := map[string]string{identity.HeaderCertDER: base64.StdEncoding.EncodeToString(blk.Bytes)}
 	call(t, "POST", api+"/v1/sandboxes/"+sb.ID+"/runs", "t0k", map[string]string{"task": "once"}, nil)
+	// Both pollers present the same pod's certificate: the second either finds nothing or (the
+	// first claim not confirmed yet) gets the same run back under a newer attempt. Never two runs.
 	got := make([]int, 2)
+	claimed := make([]model.Run, 2)
 	for i := range got {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			resp, _ := call(t, "GET", gw+"/agent/runs/next?wait=1s", "", nil, certHdr)
+			resp, body := call(t, "GET", gw+"/agent/runs/next?wait=1s", "", nil, certHdr)
 			got[i] = resp.StatusCode
+			_ = json.Unmarshal(body, &claimed[i])
 		}(i)
 	}
 	wg.Wait()
-	if !(got[0] == 200 && got[1] == 204 || got[0] == 204 && got[1] == 200) {
+	switch {
+	case got[0] == 200 && got[1] == 204, got[0] == 204 && got[1] == 200:
+	case got[0] == 200 && got[1] == 200:
+		if claimed[0].ID != claimed[1].ID || claimed[0].Attempt == claimed[1].Attempt {
+			t.Fatalf("one run, two pollers of one pod: %+v %+v", claimed[0], claimed[1])
+		}
+	default:
 		t.Fatalf("one run, two pollers: %v", got)
 	}
 	_, body = call(t, "GET", api+"/v1/sandboxes/"+sb.ID+"/runs?status=running", "t0k", nil, nil)

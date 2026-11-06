@@ -392,6 +392,13 @@ type Run struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	// Attempt counts the times the run was handed to a runner (the claim, and each time a claim
+	// whose response was lost is handed out again). The runner sends it back with every call
+	// about the run, so an earlier attempt cannot write once a later one exists.
+	Attempt int `json:"attempt,omitempty"`
+	// ClaimedBy is the instance the run was handed to; ClaimAcked that it confirmed it got it.
+	ClaimedBy  string `json:"-"`
+	ClaimAcked bool   `json:"-"`
 }
 
 // Run modes (Mode): how the run relates to the conversation.

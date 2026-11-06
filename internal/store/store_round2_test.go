@@ -27,7 +27,7 @@ type round2Store struct {
 	ageBy func(t *testing.T, key string, d time.Duration) // ages the reservation by d
 }
 
-func round2Run(t *testing.T, body func(t *testing.T, s round2Store)) {
+func round2Contract(t *testing.T, body func(t *testing.T, s round2Store)) {
 	t.Run("memory", func(t *testing.T) {
 		m := NewMemory()
 		var offset atomic.Int64
@@ -58,7 +58,7 @@ func round2Sandbox(id string) *model.Sandbox {
 // drop it. Review round 1 of #32: a token never repeats, not even after a release, and a
 // release keeps the seed for the next attempt with the same body.
 func TestRound2IdempotencyOwners(t *testing.T) {
-	round2Run(t, func(t *testing.T, s round2Store) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
 		ctx := context.Background()
 		key := "acme|POST /v1/sandboxes|gen"
 		a, reserved, err := s.ReserveIdempotent(ctx, key, "h")
@@ -181,7 +181,7 @@ func TestRound2PostgresLegacyReservationIsNotRunAgain(t *testing.T) {
 // Item 5: DeleteItem and a conditional PutItem of the same item end in one of their serial
 // outcomes: put then delete, or delete then a refused put. Never "deleted, then alive again".
 func TestRound2DeleteItemRacesPutItem(t *testing.T) {
-	round2Run(t, func(t *testing.T, s round2Store) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
 		ctx := context.Background()
 		for i := range 60 {
 			name := fmt.Sprintf("race-%d", i)
@@ -304,7 +304,7 @@ func TestRound2PostgresEventCursorSurvivesALateCommit(t *testing.T) {
 // Item 6 on both stores: concurrent writers and a reader paging by id; the reader ends having
 // read every event exactly once.
 func TestRound2EventReaderMissesNothing(t *testing.T) {
-	round2Run(t, func(t *testing.T, s round2Store) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
 		ctx := context.Background()
 		const writers, each = 6, 25
 		var wg sync.WaitGroup
@@ -359,7 +359,7 @@ func TestRound2EventReaderMissesNothing(t *testing.T) {
 
 // Item 8: nothing the caller passes in or gets back shares memory with the stored record.
 func TestRound2RecordsAreCopies(t *testing.T) {
-	round2Run(t, func(t *testing.T, s round2Store) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
 		ctx := context.Background()
 		exp := time.Now().UTC().Truncate(time.Microsecond).Add(time.Hour)
 		sb := round2Sandbox("copies")
@@ -421,7 +421,7 @@ func TestRound2RecordsAreCopies(t *testing.T) {
 
 // Item 9: duplicates are refused with the same errors on both stores.
 func TestRound2DuplicatesAreRefused(t *testing.T) {
-	round2Run(t, func(t *testing.T, s round2Store) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
 		ctx := context.Background()
 		a := round2Sandbox("dup-a")
 		a.Preview = &model.Preview{Port: 3000, Access: "private", Host: "a.preview.test"}
@@ -487,7 +487,7 @@ func TestRound2DuplicatesAreRefused(t *testing.T) {
 
 // Item 9: no limit means DefaultEventLimit on both stores.
 func TestRound2DefaultEventLimit(t *testing.T) {
-	round2Run(t, func(t *testing.T, s round2Store) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
 		ctx := context.Background()
 		for i := range DefaultEventLimit + 5 {
 			if err := s.AppendEvent(ctx, &model.Event{SandboxID: "sb-limit", Tenant: "acme", Slug: "dev", Type: "t", Data: fmt.Sprint(i)}); err != nil {
@@ -505,7 +505,7 @@ func TestRound2DefaultEventLimit(t *testing.T) {
 
 // Item 9: a wait for a tenant lock ends with its context; the callback does not run.
 func TestRound2TenantLockWaitHonoursContext(t *testing.T) {
-	round2Run(t, func(t *testing.T, s round2Store) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
 		held, release := make(chan struct{}), make(chan struct{})
 		holder := make(chan error, 1)
 		go func() {
@@ -545,7 +545,7 @@ func TestRound2PoolOfOneConnectionIsRefused(t *testing.T) {
 // Item 9, review round 1 of #32: an already-ended context never runs the callback, even with
 // the lock free (select may pick the free lock over the done context).
 func TestRound2TenantLockRefusesAnEndedContext(t *testing.T) {
-	round2Run(t, func(t *testing.T, s round2Store) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		for i := range 200 {
@@ -563,7 +563,7 @@ func TestRound2TenantLockRefusesAnEndedContext(t *testing.T) {
 // end of the key's life and the cleanup that follows; both go with the reservation, and a
 // takeover by another body starts with neither.
 func TestRound2KeyedResultsLiveAsLongAsTheReservation(t *testing.T) {
-	round2Run(t, func(t *testing.T, s round2Store) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
 		ctx := context.Background()
 		key := "acme|POST /v1/sandboxes|results"
 		rec, _, err := s.ReserveIdempotent(ctx, key, "h")
@@ -627,7 +627,7 @@ func TestRound2KeyedResultsLiveAsLongAsTheReservation(t *testing.T) {
 // later attempt created the sandbox and it was deleted, does not make it again; of two
 // attempts racing for one reservation, one inserts.
 func TestRound2KeyedInsertNeedsALiveUnusedReservation(t *testing.T) {
-	round2Run(t, func(t *testing.T, s round2Store) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
 		ctx := context.Background()
 		gone := func(id string) {
 			t.Helper()
@@ -689,7 +689,7 @@ func TestRound2KeyedInsertNeedsALiveUnusedReservation(t *testing.T) {
 // attempts racing to insert the run, one does, and the stream holds exactly one run.queued
 // for it: a refused insert leaves no event, a written run never lacks its event.
 func TestRound2KeyedRunCarriesItsQueuedEvent(t *testing.T) {
-	round2Run(t, func(t *testing.T, s round2Store) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
 		ctx := context.Background()
 		sb := round2Sandbox("sb_keyed_run")
 		if err := s.CreateSandbox(ctx, sb); err != nil {
@@ -782,4 +782,37 @@ func TestRound2PostgresKeyedRunIsOneTransaction(t *testing.T) {
 	if len(evs) != 0 {
 		t.Fatalf("events remain after the failed write: %+v", evs)
 	}
+}
+
+// Item 8, after PR #31 added run delivery: the runs a claim and a settle return are copies too
+// (their time pointers included), as every other read of a run.
+func TestRound2DeliveredRunsAreCopies(t *testing.T) {
+	round2Contract(t, func(t *testing.T, s round2Store) {
+		ctx := context.Background()
+		sb := round2Sandbox("sb_delivered_copies")
+		if err := s.CreateSandbox(ctx, sb); err != nil {
+			t.Fatal(err)
+		}
+		now := time.Now().UTC().Truncate(time.Microsecond)
+		if err := s.CreateRun(ctx, &model.Run{ID: "run_delivered_copies", SandboxID: sb.ID, Tenant: sb.Tenant, Slug: sb.Slug,
+			Task: "t", Status: model.RunQueued, CreatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		r, _, err := s.ClaimRunFor(ctx, sb.ID, "run_delivered_copies", now, "", RunStamp{})
+		if err != nil || r.StartedAt == nil {
+			t.Fatalf("claim: %+v %v", r, err)
+		}
+		*r.StartedAt = now.Add(time.Hour)
+		if got, _ := s.GetRun(ctx, r.ID); got.StartedAt == nil || !got.StartedAt.Equal(now) {
+			t.Fatalf("the claimed run shares its StartedAt with the store: %v", got.StartedAt)
+		}
+		done, err := s.SettleRunWithEvents(ctx, Settle{RunID: r.ID, From: []model.RunStatus{model.RunRunning}, To: model.RunDone, FinishedAt: now})
+		if err != nil || done.FinishedAt == nil {
+			t.Fatalf("settle: %+v %v", done, err)
+		}
+		*done.FinishedAt = now.Add(time.Hour)
+		if got, _ := s.GetRun(ctx, r.ID); got.FinishedAt == nil || !got.FinishedAt.Equal(now) {
+			t.Fatalf("the settled run shares its FinishedAt with the store: %v", got.FinishedAt)
+		}
+	})
 }

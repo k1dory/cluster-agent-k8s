@@ -294,7 +294,46 @@ ALTER TABLE git_jobs ADD COLUMN IF NOT EXISTS run integer NOT NULL DEFAULT 0;
 -- generation they were issued under, and older ones are refused.
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS preview_gen bigint NOT NULL DEFAULT 0;
 
--- step 9: idempotency reservation owners and seeds
+-- step 9: run delivery
+-- attempt counts the times a run was handed to a runner; claimed_by/claim_acked let a claim
+-- whose response was lost be handed to the same instance again (and to no other).
+ALTER TABLE runs
+    ADD COLUMN IF NOT EXISTS attempt integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS claimed_by text NOT NULL DEFAULT '',
+    ADD COLUMN IF NOT EXISTS claim_acked boolean NOT NULL DEFAULT false;
+-- The progress of each X-Batch-Id of a run's output: how many of its lines are stored, the
+-- running hash of those lines and whether they were the whole body, written in the
+-- transaction that stores them.
+CREATE TABLE IF NOT EXISTS run_output_batches (
+    run_id     text NOT NULL,
+    batch_id   text NOT NULL,
+    lines      integer NOT NULL,
+    hash       text NOT NULL,
+    complete   boolean NOT NULL DEFAULT true,
+    touched_at timestamptz NOT NULL DEFAULT now(), -- the last call under the id: retention counts from it
+    PRIMARY KEY (run_id, batch_id)
+);
+CREATE INDEX IF NOT EXISTS run_output_batches_touched ON run_output_batches (touched_at);
+
+-- step 10: event ids in commit order
+-- Readers page events by id, so an id must not become visible before a smaller one: a writer
+-- holding id N uncommitted while another commits N+1 makes a listener move past N for good.
+-- The id is drawn here, under a transaction-scoped lock held to the commit, so the next
+-- writer's id is drawn only after this one is visible. In the database, not in the Go code:
+-- during a rolling update the replicas of an older release keep sending a bare INSERT, and
+-- they must take the same lock. The column default has already drawn a value when a BEFORE
+-- trigger runs, outside the lock; it is replaced (the gap it leaves is harmless).
+CREATE OR REPLACE FUNCTION events_ordered_id() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext('agent-sandbox:events'));
+    NEW.id := nextval(pg_get_serial_sequence('events', 'id'));
+    RETURN NEW;
+END
+$$;
+DROP TRIGGER IF EXISTS events_ordered_id ON events;
+CREATE TRIGGER events_ordered_id BEFORE INSERT ON events FOR EACH ROW EXECUTE FUNCTION events_ordered_id();
+
+-- step 11: idempotency reservation owners and seeds
 -- token is the random owner of a reservation: finishing it (result or release) is conditional
 -- on it, and a token never repeats, so a handler that lost its reservation can never finish a
 -- later one. generation counts the attempts under the key. seed names what the keyed request

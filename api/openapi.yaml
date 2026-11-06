@@ -1668,6 +1668,14 @@ paths:
       tags: [agent]
       security: [{ mtls: [] }]
       summary: Long-poll for the next queued run of the calling sandbox
+      description: |
+        The run is handed to the calling pod instance under a new `attempt`. Until the runner's
+        first call about the run (`events`, `input` or `finish`) confirms it got it, the same
+        instance asking again gets the same run back under the next attempt (its previous
+        response was lost); no other instance gets it. Send the attempt back as `X-Run-Attempt`
+        on every call about the run: a call naming an earlier attempt is refused with 409. While
+        the instance executes a run it confirmed, it is handed no other one (204): a request of
+        it delayed past its own retry does not start the next run.
       parameters:
         - name: wait
           in: query
@@ -1687,17 +1695,26 @@ paths:
       summary: Append output (one event per line of the body)
       description: |
         Limits: 4 MiB per request, 1 MiB per line. Lines up to the first violation are stored and
-        the 413 message says how many (`stored N lines`), so a retry resumes after them. Lines
+        the 413 message says how many (`stored N lines`), so a retry resumes after them. The lines,
+        their usage and session are stored in one write, all of them or none. A 5xx (or a lost
+        response) does not say which: the write may have been committed while its acknowledgement
+        was lost. Retry it with the same `X-Batch-Id`, which makes the retry safe; a retry without
+        one may store the lines and their usage twice. Lines
         that carry usage (Claude Code's `result`, generic `{"type":"usage"}`) update the run's accounting
         while the run is `queued`, `running` or `cancelled` (a cancelled harness still reports what it
         spent before it saw `run.cancel`). Once the run is `done` or `failed` the lines are still
         stored but their usage is ignored: send all output before `POST /agent/runs/{run}/finish`.
 
-        Send `X-Batch-Id` (any id, kept across retries of the same batch): the server remembers how
-        many lines of that batch it stored, records that before every response, and a retry skips
-        them (`skipped` in the answer). Without it a retry after a lost response duplicates lines.
+        Send `X-Batch-Id` (any id, kept across retries of the same batch): the server records how
+        many lines of that batch it stored in the same write as the lines, and a retry (on any
+        replica, even one racing the original) skips them (`skipped` in the answer). The same id
+        with a body that does not start with the lines already stored, or one that adds lines to a
+        body that was stored whole (not cut short by a 413, including one cut short now), is a 422.
+        The progress of a batch is kept for 24 hours after the last call under its id. Without it a
+        retry after a lost response duplicates lines.
       parameters:
         - { name: X-Batch-Id, in: header, schema: { type: string, maxLength: 100 } }
+        - { $ref: "#/components/parameters/RunAttempt" }
       requestBody:
         content:
           text/plain:
@@ -1712,7 +1729,10 @@ paths:
                 properties:
                   accepted: { type: integer, description: "Lines of this batch stored in total" }
                   skipped: { type: integer, description: "Lines skipped because an earlier attempt stored them" }
+        "409": { description: "X-Run-Attempt names an attempt the run was handed out past", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "413": { $ref: "#/components/responses/Error" }
+        "422": { description: "X-Batch-Id was already used for a different body (nothing is stored)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: "The write failed, or its acknowledgement was lost: the batch may or may not be stored. Send it again with the same X-Batch-Id", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /agent/runs/{run}/input:
     parameters: [{ name: run, in: path, required: true, schema: { type: string } }]
     get:
@@ -1722,9 +1742,10 @@ paths:
       description: |
         Returns `input` and `run.cancel` events with id > `after`, filtered in the store, so a
         run producing a lot of output cannot push them out of reach. Keep `after` at the id of the
-        last event you received.
+        last event you received. A run that is `cancelled` always has its `run.cancel` here.
       parameters:
         - { name: after, in: query, schema: { type: integer, format: int64 } }
+        - { $ref: "#/components/parameters/RunAttempt" }
         - { name: wait, in: query, schema: { type: string, default: 30s } }
       responses:
         "200":
@@ -1734,6 +1755,7 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Event" }
+        "409": { description: "X-Run-Attempt names an attempt the run was handed out past: this attempt must stop", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
   /agent/runs/{run}/finish:
     parameters: [{ name: run, in: path, required: true, schema: { type: string } }]
     post:
@@ -1745,7 +1767,9 @@ paths:
         first: usage on output lines appended after this call is ignored. On a run that was
         cancelled meanwhile the status stays `cancelled`, but a non-zero `usage` total given here is
         still recorded. On a run already `done` or `failed` (a retry after a lost response) nothing
-        changes. Each of these answers 204.
+        changes. Each of these answers 204. The new status and `run.finished` are one write.
+      parameters:
+        - { $ref: "#/components/parameters/RunAttempt" }
       requestBody:
         content:
           application/json:
@@ -1759,6 +1783,7 @@ paths:
       responses:
         "204": { description: Recorded }
         "400": { description: "The body is not one JSON object with these fields (nothing is recorded)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "409": { description: "X-Run-Attempt names an attempt the run was handed out past (nothing is recorded)", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "413": { $ref: "#/components/responses/Error" }
   /agent/fs/requests:
     get:
@@ -1940,6 +1965,11 @@ components:
       in: query
       schema: { type: string }
       description: "Admin only: the tenant scope to work in (empty = shared items). Tenant tokens are confined to their own scope and read shared items."
+    RunAttempt:
+      name: X-Run-Attempt
+      in: header
+      schema: { type: integer, minimum: 1 }
+      description: "The `attempt` of the run as `/agent/runs/next` handed it out. Absent: any attempt (a runner of an older release)."
     idempotencyKey:
       name: Idempotency-Key
       in: header
@@ -2080,6 +2110,7 @@ components:
         created_at: { type: string, format: date-time }
         started_at: { type: string, format: date-time, nullable: true }
         finished_at: { type: string, format: date-time, nullable: true }
+        attempt: { type: integer, description: "How many times the run was handed to a runner; the runner sends it back as X-Run-Attempt" }
     Launch:
       type: object
       description: The environment profile rendered at creation, kept on the sandbox; every pod of the sandbox starts with it
