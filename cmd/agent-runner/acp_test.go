@@ -505,7 +505,7 @@ func openRealACP(t *testing.T, isolate []string, agent, home string, env []strin
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer stopAdapter(stdin, cancel, cmd)
+	defer stopAdapter(stdin, cancel, cmd, home)
 	emit := func(l string) {
 		if strings.HasPrefix(l, "[agent-runner] ") { // a notice; ACP lines (acp.commands…) are output
 			notices = append(notices, l)
@@ -545,7 +545,7 @@ func noNetwork(t *testing.T) []string {
 // stopAdapter ends an agent process as the runner does (executeACP): end of input, a grace period
 // to exit on its own, then the process group. An agent killed at once can leave helpers that
 // keep writing into its home (hermes), which then outlives the test's temporary directory.
-func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd) {
+func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd, home string) {
 	_ = stdin.Close()
 	exited := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(exited) }()
@@ -555,27 +555,41 @@ func stopAdapter(stdin io.Closer, cancel context.CancelFunc, cmd *exec.Cmd) {
 		cancel()
 		<-exited
 	}
-	endProcessGroup(cmd.Process.Pid)
+	endProcessGroup(cmd.Process.Pid, home)
 }
 
-// endProcessGroup ends what the adapter left in its process group (it is the group's leader,
-// Setpgid) and returns when the group is empty, or after a bound. The adapter leaving on its own
-// does not end what it started — Hermes keeps a child writing under $HERMES_HOME — and the test's
+// endProcessGroup ends what the adapter left behind and returns when nothing of it is left, or
+// after a bound. The adapter leaving on its own does not end what it started — Hermes keeps
+// children writing under $HERMES_HOME, some in sessions of their own — and the test's
 // directories are removed as soon as the test returns: a survivor makes that removal fail
-// ("directory not empty") or outlives the test. The group's orphans are reaped here: the test
-// binary adopts them (adoptOrphans in TestMain; it is PID 1 in the image's check anyway). A
-// zombie is still a member of its group, so without reaping the group would never be empty.
-func endProcessGroup(pgid int) {
+// ("directory not empty") or outlives the test. Two sweeps: the adapter's process group (it is
+// the group's leader, Setpgid), then, where /proc tells, every process whose environment names
+// the test's home (the adapter's env, inherited by all its descendants, detached or not). The
+// orphans are reaped here: the test binary adopts them (adoptOrphans in TestMain; it is PID 1 in
+// the image's check anyway). A zombie is still a member of its group, so without reaping the
+// group would never be empty.
+func endProcessGroup(pgid int, home string) {
 	deadline := time.Now().Add(5 * time.Second)
-	for {
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	// Everything here has just been SIGKILLed, so a blocking wait returns at once: what is ours
+	// is reaped (ECHILD ends the loop), what is not is somebody else's to reap.
+	reap := func(pid int) {
 		for {
 			var ws syscall.WaitStatus
-			if pid, err := syscall.Wait4(-pgid, &ws, syscall.WNOHANG, nil); pid <= 0 || err != nil {
-				break
+			if p, err := syscall.Wait4(pid, &ws, 0, nil); p <= 0 || err != nil {
+				return
 			}
 		}
-		if err := syscall.Kill(-pgid, 0); errors.Is(err, syscall.ESRCH) || time.Now().After(deadline) {
+	}
+	for {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		reap(-pgid)
+		strays := processesWithEnv(home)
+		for _, pid := range strays {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			reap(pid)
+		}
+		groupGone := errors.Is(syscall.Kill(-pgid, 0), syscall.ESRCH)
+		if (groupGone && len(strays) == 0) || time.Now().After(deadline) {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)

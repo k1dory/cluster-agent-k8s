@@ -224,7 +224,7 @@ func TestACPClaudeExampleTakesTheSystemPromptAndMode(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer stopAdapter(stdin, cancel, cmd)
+	defer stopAdapter(stdin, cancel, cmd, home)
 	var notices []string
 	emit := func(l string) {
 		if strings.HasPrefix(l, "[agent-runner] ") { // a notice; ACP lines (acp.commands…) are output
