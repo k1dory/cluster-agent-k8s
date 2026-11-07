@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -520,7 +522,9 @@ func driveACP(ctx context.Context, conn acpConn, cl *acpClient, run *model.Run, 
 				notice("steering: %v: the message waits for the turn to end", err)
 				return false
 			case out == acpx.SteerInjected:
-				notice("the message joined the turn in progress (steering)")
+				// Which message it is, for a client telling turns apart: the input's fingerprint
+				// (the first 16 hex of its sha256, as the input event carries the text).
+				notice("the message joined the turn in progress (steering) [input sha256:%s]", inputFingerprint(text))
 				return true
 			case out == acpx.SteerStartedNewTurn:
 				notice("the agent started a turn with the message itself (steering)")
@@ -1401,4 +1405,11 @@ func (a *acpClient) ReleaseTerminal(context.Context, acp.ReleaseTerminalRequest)
 
 func (a *acpClient) WaitForTerminalExit(context.Context, acp.WaitForTerminalExitRequest) (acp.WaitForTerminalExitResponse, error) {
 	return acp.WaitForTerminalExitResponse{}, errNoClientCapability
+}
+
+// inputFingerprint names an input in a notice without repeating it: the first 8 bytes of its
+// sha256, in hex.
+func inputFingerprint(text string) string {
+	h := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(h[:8])
 }
