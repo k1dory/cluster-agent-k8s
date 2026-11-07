@@ -661,6 +661,11 @@ func TestACPSteeringJoinsTheTurnInProgress(t *testing.T) {
 			if code != 0 || !reflect.DeepEqual(conn.prompts, tc.prompts) || !hasCall(conn, "steer more") {
 				t.Fatalf("exit %d prompts %q calls %v\n%s", code, conn.prompts, conn.calls, notices(lines))
 			}
+			// The notice names the message it took by its fingerprint (a client tells its turn
+			// apart by it).
+			if joined := strings.Contains(notices(lines), "joined the turn in progress (steering) [input sha256:"+inputFingerprint("more")+"]"); joined != (tc.outcome == acpx.SteerInjected) {
+				t.Fatalf("steering notice for %q: %s", tc.name, notices(lines))
+			}
 		})
 	}
 }

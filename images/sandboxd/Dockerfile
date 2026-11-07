@@ -19,7 +19,9 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags=
 # This image exists to read CI checkouts, so every directory is a safe one here; `sandboxctl apply
 # -require-commit` still fails the job when a SHA cannot be verified for any other reason.
 FROM alpine:3.20 AS sandboxctl
-RUN apk add --no-cache ca-certificates curl jq git \
+# The base's own packages patched at build (a fix like musl's lands before the tag is rebuilt).
+RUN apk upgrade --no-cache \
+ && apk add --no-cache ca-certificates curl jq git \
  && adduser -D -u 1000 sandboxctl \
  && git config --system safe.directory '*'
 COPY --from=build /out/sandboxctl /sandboxctl
@@ -30,7 +32,8 @@ ENTRYPOINT ["/sandboxctl"]
 # GitRepository, internal/gitsync), so the image carries git and CA roots and nothing else; the
 # process runs as nonroot (uid 65532, as the distroless image it replaced).
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates git \
+RUN apk upgrade --no-cache \
+ && apk add --no-cache ca-certificates git \
  && adduser -D -H -u 65532 -g nonroot nonroot
 COPY --from=build /out/sandboxd /sandboxd
 COPY --from=build /out/sandboxctl /sandboxctl
