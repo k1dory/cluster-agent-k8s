@@ -9,6 +9,11 @@ cd "$ci_root"
 ci_docker
 cleanup() { [ -n "${ACCEPT_KEEP:-}" ] || hack/acceptance/kind.sh down; }
 trap cleanup EXIT
+# Four kind nodes share this host's inotify limits; the runner's default number of instances
+# (128) runs out and Multus's daemon fails "too many open files" watching /etc/cni/net.d.
+if [ "$(uname)" = Linux ] && command -v sudo >/dev/null; then
+  sudo sysctl -qw fs.inotify.max_user_instances=8192 fs.inotify.max_user_watches=524288
+fi
 hack/acceptance/kind.sh up
 hack/acceptance/kind.sh run
 ci_ok acceptance
