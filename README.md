@@ -1,4 +1,8 @@
-# agent-sandbox
+# Yggdrasill
+
+*(formerly agent-sandbox. The name is the product's: its parts keep theirs — `sandboxd`,
+`sandboxctl`, the Helm chart `agent-sandbox`, the labels `agent-sandbox.io/*`, the images — so a
+running installation needs no change.)*
 
 Run coding agents in isolated Kubernetes pods: one network interface per pod, an mTLS egress
 gateway (Caddy) that enforces per-agent host+path policy and injects secrets, and one Go service
