@@ -60,7 +60,10 @@ up() {
   k taint nodes $gateways agent-sandbox.io/gateway=true:NoSchedule --overwrite >/dev/null
   echo "nodes: gateways $gateways(10.77.77.1, 10.77.77.2), agents $(echo "$workers" | tail -n +3 | tr '\n' ' ')"
   # Multus (the pods' second interface) and whereabouts (its addresses, cluster-wide).
-  k apply -f "$(manifest "multus-$MULTUS_VERSION.yml" "$raw/multus-cni/$MULTUS_VERSION/deployments/multus-daemonset-thick.yml")" >/dev/null
+  # The release's manifest names the moving tag snapshot-thick (the development branch's latest
+  # build, which changes under us): the image of that release is pinned instead.
+  sed "s|multus-cni:snapshot-thick|multus-cni:$MULTUS_VERSION-thick|" \
+    "$(manifest "multus-$MULTUS_VERSION.yml" "$raw/multus-cni/$MULTUS_VERSION/deployments/multus-daemonset-thick.yml")" | k apply -f - >/dev/null
   local crd
   for crd in whereabouts.cni.cncf.io_ippools whereabouts.cni.cncf.io_overlappingrangeipreservations; do
     k apply -f "$(manifest "$crd-$WHEREABOUTS_VERSION.yaml" "$raw/whereabouts/$WHEREABOUTS_VERSION/doc/crds/$crd.yaml")" >/dev/null
