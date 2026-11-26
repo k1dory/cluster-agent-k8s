@@ -104,7 +104,10 @@ diagnose() {
       done
     done
     if [ -n "${SB:-}" ] && [ -n "${API:-}" ]; then echo "== sandbox $SB"; get_json "$API/v1/sandboxes/$SB" 2>&1; echo; fi
-    echo "== multus"; "$kubectl" -n kube-system logs ds/kube-multus-ds --tail=40 2>&1 || true
+    # Every node's Multus (one pod picked at random is usually a gateway's, not the agent's node).
+    echo "== multus"; "$kubectl" -n kube-system logs -l app=multus -c kube-multus --prefix --tail=25 --max-log-requests=8 2>&1 || true
+    echo "== networks of the agent pods"
+    "$kubectl" -n "$ACCEPT_NAMESPACE" get pods -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/networks}{" "}{.metadata.annotations.k8s\.v1\.cni\.cncf\.io/network-status}{"\n"}{end}' 2>&1 | grep '^agent-' || true
     echo "== whereabouts"; "$kubectl" -n kube-system logs ds/whereabouts --tail=40 2>&1 || true
   } > "$f"
   acc_log "diagnostics for $1 ($f):"

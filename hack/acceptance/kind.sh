@@ -68,8 +68,16 @@ up() {
   for crd in whereabouts.cni.cncf.io_ippools whereabouts.cni.cncf.io_overlappingrangeipreservations; do
     k apply -f "$(manifest "$crd-$WHEREABOUTS_VERSION.yaml" "$raw/whereabouts/$WHEREABOUTS_VERSION/doc/crds/$crd.yaml")" >/dev/null
   done
-  k apply -f "$(manifest "whereabouts-$WHEREABOUTS_VERSION.yaml" "$raw/whereabouts/$WHEREABOUTS_VERSION/doc/crds/daemonset-install.yaml")" >/dev/null
-  k -n kube-system rollout status ds/kube-multus-ds --timeout=300s
+  # Its daemon set too names a moving tag (latest): the release's image is pinned the same way.
+  sed "s|whereabouts:latest|whereabouts:$WHEREABOUTS_VERSION|" \
+    "$(manifest "whereabouts-$WHEREABOUTS_VERSION.yaml" "$raw/whereabouts/$WHEREABOUTS_VERSION/doc/crds/daemonset-install.yaml")" | k apply -f - >/dev/null
+  k -n kube-system rollout status ds/kube-multus-ds --timeout=300s || {
+    # Why it did not come up: the pods' states, their last termination, the daemon's log.
+    k -n kube-system get pods -l app=multus -o wide
+    k -n kube-system describe pods -l app=multus | grep -A4 -E "Last State|State:|Events:" || true
+    k -n kube-system logs -l app=multus --all-containers --previous --tail=40 2>/dev/null || k -n kube-system logs -l app=multus --all-containers --tail=40 || true
+    return 1
+  }
   k -n kube-system rollout status ds/whereabouts --timeout=300s
   # PostgreSQL in the cluster.
   k get ns "$ACCEPT_NAMESPACE" >/dev/null 2>&1 || k create ns "$ACCEPT_NAMESPACE" >/dev/null
