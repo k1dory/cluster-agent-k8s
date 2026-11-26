@@ -62,15 +62,15 @@ up() {
   # Multus (the pods' second interface) and whereabouts (its addresses, cluster-wide).
   # The release's manifest names the moving tag snapshot-thick (the development branch's latest
   # build, which changes under us): the image of that release is pinned instead.
-  # Its daemon is also limited to 50Mi, under which the thick daemon is OOM-killed on start
-  # (the daemon set then never becomes available): it gets 300Mi.
-  sed -e "s|multus-cni:snapshot-thick|multus-cni:$MULTUS_VERSION-thick|" -e 's|memory: "50Mi"|memory: "300Mi"|' \
+  sed "s|multus-cni:snapshot-thick|multus-cni:$MULTUS_VERSION-thick|" \
     "$(manifest "multus-$MULTUS_VERSION.yml" "$raw/multus-cni/$MULTUS_VERSION/deployments/multus-daemonset-thick.yml")" | k apply -f - >/dev/null
   local crd
   for crd in whereabouts.cni.cncf.io_ippools whereabouts.cni.cncf.io_overlappingrangeipreservations; do
     k apply -f "$(manifest "$crd-$WHEREABOUTS_VERSION.yaml" "$raw/whereabouts/$WHEREABOUTS_VERSION/doc/crds/$crd.yaml")" >/dev/null
   done
-  k apply -f "$(manifest "whereabouts-$WHEREABOUTS_VERSION.yaml" "$raw/whereabouts/$WHEREABOUTS_VERSION/doc/crds/daemonset-install.yaml")" >/dev/null
+  # Its daemon set too names a moving tag (latest): the release's image is pinned the same way.
+  sed "s|whereabouts:latest|whereabouts:$WHEREABOUTS_VERSION|" \
+    "$(manifest "whereabouts-$WHEREABOUTS_VERSION.yaml" "$raw/whereabouts/$WHEREABOUTS_VERSION/doc/crds/daemonset-install.yaml")" | k apply -f - >/dev/null
   k -n kube-system rollout status ds/kube-multus-ds --timeout=300s || {
     # Why it did not come up: the pods' states, their last termination, the daemon's log.
     k -n kube-system get pods -l app=multus -o wide
